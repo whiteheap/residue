@@ -1,6 +1,6 @@
 pkgbase = residue-bin
 	pkgdesc = Find the Git worktrees coding agents leave behind, and remove one only when nothing in it would be lost
-	pkgver = 0.0.2
+	pkgver = 0.0.3
 	pkgrel = 1
 	url = https://github.com/whiteheap/residue
 	arch = x86_64
@@ -11,9 +11,9 @@ pkgbase = residue-bin
 	conflicts = residue
 	options = !debug
 	options = !strip
-	source_x86_64 = https://github.com/whiteheap/residue/releases/download/v0.0.2/residue-v0.0.2-x86_64-unknown-linux-musl.tar.gz
-	sha256sums_x86_64 = 9aac0a60a249d4bdd129cd1615566f2b6439186a6b6bd3b702e989b5aded0930
-	source_aarch64 = https://github.com/whiteheap/residue/releases/download/v0.0.2/residue-v0.0.2-aarch64-unknown-linux-musl.tar.gz
-	sha256sums_aarch64 = 72999412c0cec6149ad2f6f04cca7329a46df7ab97d5e6a7a59b424252b083cd
+	source_x86_64 = https://github.com/whiteheap/residue/releases/download/v0.0.3/residue-v0.0.3-x86_64-unknown-linux-musl.tar.gz
+	sha256sums_x86_64 = 88fb6210cc0506e4811f4672361208440eb47ce197a208935a7d304449874f13
+	source_aarch64 = https://github.com/whiteheap/residue/releases/download/v0.0.3/residue-v0.0.3-aarch64-unknown-linux-musl.tar.gz
+	sha256sums_aarch64 = 1dd2989e67ce77589bbc4b92d9368741bd7a3515cdd8462e874ea807e02b0d4d
 
 pkgname = residue-bin

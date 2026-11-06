@@ -30,7 +30,7 @@ These are the reasons people trust the tool. Do not weaken them without an expli
 | `src/discover.rs` | Finding repositories under a root |
 | `src/output.rs`, `src/json.rs` | Terminal text and JSON documents |
 | `src/run.rs` | Child processes with a deadline and an output cap |
-| `packaging/` | Linux packages (`nfpm.yaml`, `linux-packages.sh`) and the AUR package (`aur/`) |
+| `packaging/` | Linux packages (`nfpm.yaml`, `linux-packages.sh`), the apt repository (`apt-repo.sh`, `apt/` holds its public key) and the AUR package (`aur/`) |
 
 ## Verify a change
 
@@ -45,7 +45,7 @@ Then run the binary on real repositories. Make a scratch repository with worktre
 ## Release
 
 1. Bump `version` in `Cargo.toml`, run `cargo build` to update `Cargo.lock`, and turn `## Unreleased` in `CHANGELOG.md` into a `## X.Y.Z (date)` section (add the section if there is no `## Unreleased`). The release notes come from that section.
-2. Commit, then tag `vX.Y.Z` and push the tag. `.github/workflows/release.yml` builds four targets, attests provenance, and publishes the GitHub release with `SHA256SUMS`. Its last job runs `.github/workflows/packages.yml`, which builds `.deb`, `.rpm` and Arch packages from the two Linux archives, attests them, and adds them to the release with an updated `SHA256SUMS`. To package a release made before that workflow existed, run `gh workflow run packages.yml -f tag=vX.Y.Z`.
+2. Commit, then tag `vX.Y.Z` and push the tag. `.github/workflows/release.yml` builds four targets, attests provenance, and publishes the GitHub release with `SHA256SUMS`. Its last job runs `.github/workflows/packages.yml`, which builds `.deb`, `.rpm` and Arch packages from the two Linux archives, attests them, and adds them to the release with an updated `SHA256SUMS`. When the tag is the latest release, its `apt` job then rebuilds the signed apt repository from the two `.deb` files and deploys it to GitHub Pages at https://whiteheap.github.io/residue/apt. The repository holds only the latest release. To package a release made before that workflow existed, run `gh workflow run packages.yml -f tag=vX.Y.Z`.
 3. Update `Formula/residue.rb` in [whiteheap/homebrew-tap](https://github.com/whiteheap/homebrew-tap) with the new tag in the four URLs and the four checksums from `SHA256SUMS`. The formula has no `version` line: Homebrew reads it from the URL, and `brew audit --strict` rejects a redundant one. Then run `brew install whiteheap/tap/residue`, `brew test whiteheap/tap/residue` and `brew audit --strict --online whiteheap/tap/residue`. After the tap update, upgrade this machine's install, so the copy we dogfood is always the latest release:
 
    ```sh
@@ -61,3 +61,9 @@ Then run the binary on real repositories. Make a scratch repository with worktre
    git -C /tmp/residue-bin add PKGBUILD .SRCINFO
    git -C /tmp/residue-bin commit -m "Update to vX.Y.Z" && git -C /tmp/residue-bin push
    ```
+
+### The apt signing key
+
+The apt repository is signed with an ed25519 key, fingerprint `1AEAB31435118A1FE575D36EE1553632FC32554A`, with no expiry date: an expired key would break `apt update` for every user at once. The public key is `packaging/apt/residue-archive-keyring.asc`, and the `apt` job checks each signature against it before deploying. The armored private key is the `APT_SIGNING_KEY` secret of the `github-pages` environment, so only that job can read it, and the `github-pages` environment only deploys from `main` and `v*` tags. A backup is in the maintainer's macOS keychain, item `Whiteheap residue apt signing key` (base64 of the armored key).
+
+To rotate it, generate a new key, replace `packaging/apt/residue-archive-keyring.asc`, update the secret with `gh secret set APT_SIGNING_KEY --env github-pages --repo whiteheap/residue`, update the fingerprint in the README, and tell users to fetch the keyring again. Their `apt update` fails until they do.

@@ -31,12 +31,16 @@ Homebrew, on macOS and Linux:
 brew install whiteheap/tap/residue
 ```
 
-Debian and Ubuntu:
+Debian and Ubuntu, from the signed apt repository, so `apt upgrade` keeps residue current:
 
 ```sh
-curl -fLO https://github.com/whiteheap/residue/releases/latest/download/residue_amd64.deb
-sudo apt install ./residue_amd64.deb
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://whiteheap.github.io/residue/apt/residue-archive-keyring.gpg | sudo tee /etc/apt/keyrings/residue.gpg >/dev/null
+echo "deb [signed-by=/etc/apt/keyrings/residue.gpg] https://whiteheap.github.io/residue/apt stable main" | sudo tee /etc/apt/sources.list.d/residue.list
+sudo apt update && sudo apt install residue
 ```
+
+The repository's signing key has the fingerprint `1AEA B314 3511 8A1F E575  D36E E155 3632 FC32 554A`. To install one release without adding the repository, download `residue_amd64.deb` or `residue_arm64.deb` from the [latest release](https://github.com/whiteheap/residue/releases/latest) and run `sudo apt install ./residue_amd64.deb`.
 
 Fedora and RHEL:
 
@@ -51,7 +55,7 @@ curl -fLO https://github.com/whiteheap/residue/releases/latest/download/residue-
 sudo pacman -U ./residue-x86_64.pkg.tar.zst
 ```
 
-On arm64, use `residue_arm64.deb`, `residue.aarch64.rpm` or `residue-aarch64.pkg.tar.zst`. Each package installs `/usr/bin/residue` and pulls in Git if it is missing. The packages are not in a package repository yet, so `apt upgrade`, `dnf upgrade` and `pacman -Syu` do not update them: install the new release's package the same way.
+On arm64, use `residue.aarch64.rpm` or `residue-aarch64.pkg.tar.zst`. The apt repository picks the architecture itself. Each package installs `/usr/bin/residue` and pulls in Git if it is missing. The `.rpm` and Arch packages are not in a package repository yet, so `dnf upgrade` and `pacman -Syu` do not update them: install the new release's package the same way.
 
 Prebuilt binaries for macOS (Apple silicon and Intel) and static Linux (x86_64 and arm64) are on the [releases page](https://github.com/whiteheap/residue/releases). Each archive and package has a SHA-256 checksum in `SHA256SUMS` and a GitHub build-provenance attestation:
 

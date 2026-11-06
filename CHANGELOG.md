@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- A signed apt repository for Debian and Ubuntu at https://whiteheap.github.io/residue/apt, so `sudo apt install residue` works and `apt upgrade` keeps residue current. It holds the latest release for amd64 and arm64, and every release updates it.
+
 ## 0.0.3 (2026-11-07)
 
 Feedback from running 0.0.2 on an agent monorepo: a user set `residue.regenerable` through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`, the environment form of `git -c`, and residue ignored it without a word.

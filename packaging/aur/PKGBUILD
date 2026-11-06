@@ -4,7 +4,7 @@
 # packaging/aur/update.sh TAG bumps pkgver and the checksums from the
 # release's SHA256SUMS and regenerates .SRCINFO.
 pkgname=residue-bin
-pkgver=0.0.2
+pkgver=0.0.3
 pkgrel=1
 pkgdesc='Find the Git worktrees coding agents leave behind, and remove one only when nothing in it would be lost'
 arch=('x86_64' 'aarch64')
@@ -16,8 +16,8 @@ conflicts=('residue')
 options=('!debug' '!strip')
 source_x86_64=("$url/releases/download/v$pkgver/residue-v$pkgver-x86_64-unknown-linux-musl.tar.gz")
 source_aarch64=("$url/releases/download/v$pkgver/residue-v$pkgver-aarch64-unknown-linux-musl.tar.gz")
-sha256sums_x86_64=('9aac0a60a249d4bdd129cd1615566f2b6439186a6b6bd3b702e989b5aded0930')
-sha256sums_aarch64=('72999412c0cec6149ad2f6f04cca7329a46df7ab97d5e6a7a59b424252b083cd')
+sha256sums_x86_64=('88fb6210cc0506e4811f4672361208440eb47ce197a208935a7d304449874f13')
+sha256sums_aarch64=('1dd2989e67ce77589bbc4b92d9368741bd7a3515cdd8462e874ea807e02b0d4d')
 
 package() {
   cd "residue-v$pkgver-$CARCH-unknown-linux-musl"
