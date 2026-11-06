@@ -5,19 +5,30 @@ mod activity;
 mod cli;
 mod commands;
 mod discover;
+mod events;
 mod fsinfo;
 mod git;
 mod inspect;
 mod json;
+mod jsonread;
 mod output;
 mod policy;
 mod remove;
 mod run;
+mod service;
+mod watch;
 
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let command = match cli::parse(std::env::args_os().skip(1).collect()) {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // `watch` and `service` parse their own arguments.
+    match args.first().and_then(|a| a.to_str()) {
+        Some("watch") => return ExitCode::from(watch::main(&args[1..])),
+        Some("service") => return ExitCode::from(service::main(&args[1..])),
+        _ => {}
+    }
+    let command = match cli::parse(args) {
         Ok(command) => command,
         Err(message) => {
             eprintln!("residue: {}", output::clean(&message));

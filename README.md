@@ -83,6 +83,8 @@ residue scan [PATH...]     # every linked worktree of the repositories at or und
 residue explain PATH       # every check for one worktree, and why it passed or failed
 residue remove PATH...     # check again, confirm, then `git worktree remove` each one
 residue remove --all PATH  # the same for every candidate a scan of PATH finds
+residue watch ROOT...      # stay running; remove a worktree when its branch lands or the disk runs low
+residue service install ROOT...   # run `residue watch` from login
 ```
 
 `scan` with no PATH looks at the current directory. If PATH is inside a repository, residue scans that repository. Otherwise it searches up to four levels below PATH. The search does not follow symbolic links, does not cross into another filesystem, and skips hidden directories, `node_modules`, `target` and `Library`. Linked worktrees come from Git's own list, so they are found wherever they live.
@@ -135,6 +137,32 @@ git worktree lock --reason "resume on Monday" PATH
 ```
 
 residue treats every lock as final. It is Git's own mechanism, so other tools respect it too.
+
+## Reclaim storage automatically
+
+```sh
+residue service install ~/src
+```
+
+This starts `residue watch ~/src` now and at every login, as a launchd agent on macOS or a systemd user service on Linux. It removes a worktree in two cases, and otherwise does nothing:
+
+- **Its work landed.** Its upstream branch was deleted, which is what merging a pull request with branch deletion, or `git push --delete`, does, and the worktree has not changed for an hour (`--grace`). residue never fetches, so it notices after your next `git fetch --prune`. `git config --global fetch.prune true` makes every fetch prune.
+- **The disk is low.** Free space on the worktree's filesystem is below 10% (`--min-free`). Then worktrees unchanged for two days (`--idle`) go, largest first, until free space is 5 points above that. While the disk has room, idle worktrees stay.
+
+Each removal is `residue remove --yes --idle`, so every check in [What makes a worktree a candidate](#what-makes-a-worktree-a-candidate) runs, and runs again right before the deletion. Branches and commits stay, and a locked worktree stays. It works the same for worktrees from any tool (Claude Code, Codex, Cursor, Conductor, `git worktree add`), because it reads Git and the disk, not the agent.
+
+There is no schedule. `watch` sleeps until a fetch or prune changes a repository's `refs/remotes` or `packed-refs` (inotify on Linux, kqueue on macOS and the BSDs), until a waiting worktree passes `--grace` or `--idle`, or until a filesystem drops below `--min-free`. Free space is read every five minutes, because no system sends an event for it. Every six hours `watch` also looks for repositories created under the roots since. One `watch` runs per user.
+
+Try it without removing anything first:
+
+```sh
+residue watch --once --dry-run ~/src       # what it would remove right now
+residue service install --dry-run ~/src    # a service that only logs what it would remove
+residue service status                     # is it running, and the last lines of its log
+residue service uninstall
+```
+
+The log is `~/Library/Logs/residue/watch.log` on macOS and `journalctl --user -u residue-watch` on Linux. A Linux user service stops when you log out unless you run `loginctl enable-linger "$USER"` once. On other systems, `residue service install` prints the `residue watch` command to run from your system's service manager. [Why `--idle` matters](#why---idle-matters) explains what counts as a change, and why a paused agent session needs a wait. If you would rather sweep at a fixed time, see the next section.
 
 ## Run it on a schedule
 
@@ -373,7 +401,7 @@ These are the exact platforms and versions that ran. residue has no automated te
 | 0.0.1 | Ubuntu 24.04.5 LTS, arm64 (Docker, Linux 7.0.14) | 2.43.0 | Static musl binary as a non-root user: `scan`, in-use detection through `/proc`, hard-link accounting, and `remove` with and without a terminal. As root on another user's repository, Git refused with "dubious ownership" and residue reported the error instead of guessing. |
 | 0.0.1 to 0.0.4 | GitHub Actions `macos-latest`, `ubuntu-24.04` (x86_64), `ubuntu-24.04-arm` | runner Git | Build, then `scan` and `explain` of a temporary worktree. No removal. |
 
-Not run: the Intel macOS binary (built by cross-compiling, never executed), NetBSD, OpenBSD, DragonFly and illumos (they build, but have no activity probe, so nothing is a candidate), and Windows (not supported). CI runs `.github/smoke.sh` (a clean candidate, a kept `.env`, a worktree a process is using, and a removal that keeps the branch) on macOS, Linux x86_64 and arm64, and FreeBSD 14 as root and as an ordinary user, on every push.
+Not run: the Intel macOS binary (built by cross-compiling, never executed), NetBSD, OpenBSD, DragonFly and illumos (they build, but have no activity probe, so nothing is a candidate), and Windows (not supported). CI runs `.github/smoke.sh` (a clean candidate, a kept `.env`, a worktree a process is using, and a removal that keeps the branch) and `.github/watch-smoke.sh` (`watch` removing a worktree whose branch landed, once and as a running process woken by a `git fetch --prune`, and under disk pressure) on macOS, Linux x86_64 and arm64, and FreeBSD 14 as root and as an ordinary user, on every push. `.github/service-smoke.sh` installs, checks and uninstalls the launchd agent on macOS and the systemd user service on Linux.
 
 ## Limits
 

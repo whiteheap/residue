@@ -37,6 +37,11 @@ jobs:
           ./target/release/residue scan . --json | jq -e '.schema == "residue.scan/v1" and .summary.linked_worktrees == 1'
       - name: Smoke test
         run: sh .github/smoke.sh ./target/release/residue
+      - name: Watch smoke test
+        run: sh .github/watch-smoke.sh ./target/release/residue
+      - name: Service smoke test
+        if: matrix.os != 'ubuntu-24.04-arm'
+        run: sh .github/service-smoke.sh ./target/release/residue
 
   # FreeBSD runs in a virtual machine. residue's probe there is the base
   # system's procstat, so nothing beyond Rust and Git is installed. The smoke
@@ -57,5 +62,7 @@ jobs:
             rustc --version
             cargo build --locked --release
             sh .github/smoke.sh ./target/release/residue
+            sh .github/watch-smoke.sh ./target/release/residue
             pw useradd smoke -m
             su smoke -c "sh $PWD/.github/smoke.sh $PWD/target/release/residue"
+            su smoke -c "sh $PWD/.github/watch-smoke.sh $PWD/target/release/residue"
