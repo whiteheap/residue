@@ -19,8 +19,11 @@ Options:
   --yes                 remove: skip the prompt. Only for the session that owns
                         the worktree and knows its task is finished; every
                         check still runs
-  --regenerable NAME    Also treat ignored entries named NAME (or *.ext) as
-                        regenerable output that removal may delete
+  --regenerable RULE    Also treat ignored entries matching RULE as regenerable
+                        output that removal may delete. A NAME or *.ext matches
+                        at any depth; a PATH with a slash is anchored at the
+                        worktree root and may use * within a segment
+                        (web/.tscache, .local-dev/*.lock)
   -h, --help            Show this help
   -V, --version         Show the version
 
@@ -30,7 +33,8 @@ ignored files outside the regenerable list. It never deletes branches, never
 kills processes and never passes --force to Git.
 
 Keep a worktree:  git worktree lock --reason \"resume later\" PATH
-Config file:      ~/.config/residue/regenerable (one name or *.ext per line)
+Per repository:   git config --add residue.regenerable RULE
+Config file:      ~/.config/residue/regenerable (one RULE per line, every repo)
 Exit status:      0 ok, 1 error, 2 usage, 3 remove refused or skipped a path
 ";
 
@@ -83,10 +87,10 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
                         continue;
                     }
                     "--regenerable" => {
-                        let value = args.next().ok_or("--regenerable needs a NAME")?;
+                        let value = args.next().ok_or("--regenerable needs a RULE")?;
                         let value = value
                             .into_string()
-                            .map_err(|_| "--regenerable NAME must be valid UTF-8")?;
+                            .map_err(|_| "--regenerable RULE must be valid UTF-8")?;
                         options.regenerable.push(value);
                         continue;
                     }

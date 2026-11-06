@@ -25,7 +25,14 @@ pub fn prepare(options: &Options) -> Result<Policy, String> {
     Policy::load(&options.regenerable)
 }
 
+/// `residue 0.0.2 · as of 14:03:12`: the moment the snapshot started.
+/// Worktrees created after it are not in the report.
+pub fn header(started: i64) -> String {
+    format!("residue {VERSION} · as of {}", output::clock(started))
+}
+
 pub fn scan(options: &Options) -> u8 {
+    let started = output::now();
     let policy = match prepare(options) {
         Ok(p) => p,
         Err(e) => return fail(&e),
@@ -92,6 +99,7 @@ pub fn scan(options: &Options) -> u8 {
         let doc = Json::Obj(vec![
             ("schema", Json::str(output::SCHEMA_SCAN)),
             ("version", Json::str(VERSION)),
+            ("generated_at", Json::str(output::rfc3339(started))),
             ("activity", output::activity_json(&snapshot)),
             (
                 "regenerable_config",
@@ -135,7 +143,8 @@ pub fn scan(options: &Options) -> u8 {
     let places = Places::new();
     let mut out = String::new();
     out.push_str(&style.dim(&format!(
-        "residue {VERSION} · activity: {}\n",
+        "{} · activity: {}\n",
+        header(started),
         clean(&snapshot.scope())
     )));
     for (repo, list, _) in &grouped {
@@ -272,6 +281,7 @@ pub fn locate(path: &Path) -> Result<Target, String> {
 }
 
 pub fn explain(options: &Options) -> u8 {
+    let started = output::now();
     let policy = match prepare(options) {
         Ok(p) => p,
         Err(e) => return fail(&e),
@@ -286,6 +296,7 @@ pub fn explain(options: &Options) -> u8 {
         let doc = Json::Obj(vec![
             ("schema", Json::str(output::SCHEMA_EXPLAIN)),
             ("version", Json::str(VERSION)),
+            ("generated_at", Json::str(output::rfc3339(started))),
             ("activity", output::activity_json(&snapshot)),
             ("main_path", Json::path(&target.repo.main.path)),
             ("worktree", output::report_json(&report)),
@@ -293,9 +304,15 @@ pub fn explain(options: &Options) -> u8 {
         println!("{}", doc.render());
         return 0;
     }
+    let style = Style::stdout();
     print!(
-        "{}",
-        explain_text(&report, &target.repo, &Places::new(), &Style::stdout())
+        "{}\n{}",
+        style.dim(&format!(
+            "{} · activity: {}\n",
+            header(started),
+            clean(&snapshot.scope())
+        )),
+        explain_text(&report, &target.repo, &Places::new(), &style)
     );
     0
 }
@@ -408,18 +425,41 @@ pub fn explain_text(r: &Report, repo: &Repo, places: &Places, style: &Style) -> 
         );
     }
     if !r.ignored.is_empty() {
-        let names: Vec<String> = r
+        const SHOWN: usize = 8;
+        let mut names: Vec<String> = r
             .ignored
             .iter()
+            .take(SHOWN)
             .map(|i| {
                 format!(
-                    "{} ({})",
-                    clean(&i.path),
-                    if i.regenerable { "regenerable" } else { "kept" }
+                    "{}: {}",
+                    clean(&i.sized()),
+                    match i.judgement {
+                        inspect::Judgement::Regenerable => "regenerable",
+                        inspect::Judgement::Kept => "kept",
+                        inspect::Judgement::Unknown => "not judged",
+                    }
                 )
             })
             .collect();
-        fact(&mut out, "ignored entries", names.join(", "));
+        if r.ignored.len() > SHOWN {
+            let files: u64 = r.ignored.iter().filter_map(|i| i.files).sum();
+            let bytes: u64 = r.ignored.iter().filter_map(|i| i.bytes).sum();
+            names.push(format!(
+                "+{} more; {} entries hold {} file{}, {}",
+                r.ignored.len() - SHOWN,
+                r.ignored.len(),
+                files,
+                if files == 1 { "" } else { "s" },
+                output::bytes(bytes)
+            ));
+        }
+        // One entry per line, aligned under the first.
+        fact(
+            &mut out,
+            "ignored entries",
+            names.join(&format!("\n{:26}", "")),
+        );
     }
     out
 }

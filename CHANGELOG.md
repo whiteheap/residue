@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.0.2 (2026-11-06)
+
+Feedback from running 0.0.1 on a busy agent monorepo: every worktree there held `.local-dev/` lock files, `.cargo/config.toml` and `web/.tscache/`, so nothing was a candidate unless each user added those names to a config file that then applied to every repository.
+
+- Rules per repository from Git config: `git config --add residue.regenerable RULE`. residue reads them with `git config --get-all` in each worktree. An invalid value makes the `ignored` check `unknown` and names the value. It does not stop the scan. `explain` lists the values. residue never reads rules from a file committed to the repository, because a cloned repository must not be able to declare your files disposable.
+- Path rules: a rule with a slash is a path from the worktree root (`web/.tscache`, `.local-dev/*.lock`). `*` matches within one segment. A path rule matches that entry and everything below it. Path rules work in the config file, `--regenerable` and Git config. Name rules are unchanged.
+- Git reports a fully ignored directory once, as `dir/`. When a path rule reaches inside one, residue judges each file in it during the walk it already makes. The directory is regenerable only if a rule matches every file in it. `explain` names the first file that no rule matches. Above 100,000 entries, the directory is kept.
+- Ignored entries show their file count and apparent size in the `scan` line, in `explain` (up to 8 entries), and on the `deletes ignored:` line of the `remove` plan, for example `ignored: .local-dev/ (2 files, 0 B), .vercel/ (2 files, 1.2 KB) (+5 more; 7 entries hold 31 files, 3.1 MB)`. Each hard-linked file counts once. JSON `ignored[]` entries gain `files` and `bytes` (null when not measured). The schemas stay at v1.
+- The same walk sizes the ignored entries, judges collapsed directories and runs the safety checks. `git status` now runs before the walk. The order of the checks in the report is unchanged.
+- Snapshot time: the text output of `scan`, `explain` and `remove` starts with `as of HH:MM:SS` in local time. Every JSON document has `generated_at` in RFC 3339 UTC. `explain` text now starts with the same header line as `scan`.
+- `remove` still inspects each worktree twice, once for the plan and once right before deletion. Measured on macOS 26.3.1 (Apple silicon) with a 1.0 GB worktree of 46,572 entries (a pnpm `node_modules` and a Cargo `target`), over three rounds: `residue explain` took 0.65 to 0.83 s, `git worktree remove` of an identical copy took 2.69 to 3.04 s, and `residue remove --yes` took 3.68 to 4.34 s. The plan inspection is 13 to 22% of `remove --yes` (about 17% on average), under the 20% bar for removing it under `--yes`, so `remove` is unchanged.
+- README: the `results[].result` values, a scan as a snapshot, `.vercel/` as a common non-regenerable entry, rules and their sources, the cost of the walk, and the platforms that ran 0.0.2.
+
 ## 0.0.1 (2026-11-06)
 
 First release.

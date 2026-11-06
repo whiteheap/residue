@@ -164,8 +164,9 @@ pub fn age(seconds: i64) -> String {
     }
 }
 
-/// UTC civil time from Unix seconds (Howard Hinnant's days-from-civil inverse).
-pub fn date(seconds: i64) -> String {
+/// UTC civil date and seconds into the day, from Unix seconds (Howard
+/// Hinnant's days-from-civil inverse).
+fn civil(seconds: i64) -> (i64, i64, i64, i64) {
     let days = seconds.div_euclid(86_400);
     let rem = seconds.rem_euclid(86_400);
     let z = days + 719_468;
@@ -177,11 +178,54 @@ pub fn date(seconds: i64) -> String {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day, rem)
+}
+
+/// `2026-11-06 21:04 UTC`
+pub fn date(seconds: i64) -> String {
+    let (year, month, day, rem) = civil(seconds);
     format!(
         "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
         rem / 3_600,
         (rem % 3_600) / 60
     )
+}
+
+/// RFC 3339 in UTC: `2026-11-06T21:04:05Z`.
+pub fn rfc3339(seconds: i64) -> String {
+    let (year, month, day, rem) = civil(seconds);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3_600,
+        (rem % 3_600) / 60,
+        rem % 60
+    )
+}
+
+/// `HH:MM:SS` in the local time zone. If the C library cannot convert the
+/// time, the clock is shown in UTC and says so.
+pub fn clock(seconds: i64) -> String {
+    let utc = || {
+        let rem = seconds.rem_euclid(86_400);
+        format!(
+            "{:02}:{:02}:{:02} UTC",
+            rem / 3_600,
+            (rem % 3_600) / 60,
+            rem % 60
+        )
+    };
+    // `time_t` is inferred from localtime_r's signature rather than named:
+    // the libc crate deprecates the name on musl while its width changes.
+    // It is i64 on every target residue ships, so the cast is the identity.
+    let t = seconds as _;
+    // SAFETY: localtime_r reads `t` and writes into the zeroed struct we
+    // own; both outlive the call. It is the reentrant form, safe across the
+    // threads residue runs.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return utc();
+    }
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
 /// The facts that never block, one short phrase each, for the scan table.
@@ -361,7 +405,9 @@ pub fn report_json(r: &Report) -> Json {
                     .map(|i| {
                         Json::Obj(vec![
                             ("path", Json::str(i.path.clone())),
-                            ("regenerable", Json::Bool(i.regenerable)),
+                            ("regenerable", Json::Bool(i.regenerable())),
+                            ("files", Json::opt(i.files, Json::UInt)),
+                            ("bytes", Json::opt(i.bytes, Json::UInt)),
                         ])
                     })
                     .collect(),

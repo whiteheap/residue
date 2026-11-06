@@ -45,6 +45,7 @@ struct Item {
 }
 
 pub fn remove(options: &Options) -> u8 {
+    let started = output::now();
     let policy = match commands::prepare(options) {
         Ok(p) => p,
         Err(e) => return fail(&e),
@@ -88,7 +89,7 @@ pub fn remove(options: &Options) -> u8 {
         .filter(|&i| items[i].outcome.is_none())
         .collect();
     if !options.json {
-        print!("{}", plan_text(&items, &ready, &places, &style));
+        print!("{}", plan_text(&items, &ready, started, &places, &style));
     }
 
     let mut declined: Option<String> = None;
@@ -120,7 +121,7 @@ pub fn remove(options: &Options) -> u8 {
         .iter()
         .all(|i| matches!(i.outcome, Some(Outcome::Removed)));
     if options.json {
-        println!("{}", json(&items, &snapshot).render());
+        println!("{}", json(&items, &snapshot, started).render());
     } else if let Some(why) = declined {
         println!("nothing removed: {}", clean(&why));
     }
@@ -199,9 +200,15 @@ fn execute(item: &Item, policy: &crate::policy::Policy) -> Outcome {
     Outcome::Removed
 }
 
-fn plan_text(items: &[Item], ready: &[usize], places: &Places, style: &Style) -> String {
+fn plan_text(
+    items: &[Item],
+    ready: &[usize],
+    started: i64,
+    places: &Places,
+    style: &Style,
+) -> String {
     let mut out = String::new();
-    out.push_str(&style.dim(&format!("residue {VERSION}\n")));
+    out.push_str(&style.dim(&format!("{}\n", commands::header(started))));
     if !ready.is_empty() {
         out.push_str(&format!(
             "\n{}\n",
@@ -222,7 +229,7 @@ fn plan_text(items: &[Item], ready: &[usize], places: &Places, style: &Style) ->
                 style.dim(&branch),
                 size
             ));
-            let deleted: Vec<&str> = r.ignored.iter().map(|i| i.path.as_str()).collect();
+            let deleted: Vec<String> = r.ignored.iter().map(|i| i.sized()).collect();
             if !deleted.is_empty() {
                 out.push_str(&format!(
                     "    deletes ignored: {}\n",
@@ -295,7 +302,7 @@ fn outcome_line(item: &Item, outcome: &Outcome, places: &Places) -> String {
     }
 }
 
-fn json(items: &[Item], snapshot: &Snapshot) -> Json {
+fn json(items: &[Item], snapshot: &Snapshot, started: i64) -> Json {
     let results = items
         .iter()
         .map(|item| {
@@ -324,6 +331,7 @@ fn json(items: &[Item], snapshot: &Snapshot) -> Json {
     Json::Obj(vec![
         ("schema", Json::str(output::SCHEMA_REMOVE)),
         ("version", Json::str(VERSION)),
+        ("generated_at", Json::str(output::rfc3339(started))),
         ("activity", output::activity_json(snapshot)),
         ("results", Json::Arr(results)),
     ])

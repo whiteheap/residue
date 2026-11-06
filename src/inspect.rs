@@ -11,9 +11,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::activity::{Evidence, Snapshot};
-use crate::fsinfo::{self, Usage};
+use crate::fsinfo::{self, Bucket, Expansion, Usage};
 use crate::git::{self, Entry};
-use crate::policy::Policy;
+use crate::policy::{GIT_CONFIG_KEY, Policy, Rules};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -62,9 +62,79 @@ impl Verdict {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Judgement {
+    Regenerable,
+    Kept,
+    /// residue could not tell (part of a collapsed directory was unreadable).
+    Unknown,
+}
+
 pub struct Ignored {
     pub path: String,
-    pub regenerable: bool,
+    pub judgement: Judgement,
+    /// Non-directory entries inside it, each hard-linked inode once, and
+    /// their apparent bytes. `None` when the walk did not measure it.
+    pub files: Option<u64>,
+    pub bytes: Option<u64>,
+    /// How a collapsed directory was judged entry by entry, when it was.
+    pub note: Option<String>,
+}
+
+impl Ignored {
+    pub fn regenerable(&self) -> bool {
+        self.judgement == Judgement::Regenerable
+    }
+
+    /// `node_modules/ (1204 files, 31 MB)`, or the bare path when unmeasured.
+    pub fn sized(&self) -> String {
+        match (self.files, self.bytes) {
+            (Some(files), Some(bytes)) => format!(
+                "{} ({}, {})",
+                self.path,
+                plural(files as usize, "file", "files"),
+                crate::output::bytes(bytes)
+            ),
+            _ => self.path.clone(),
+        }
+    }
+
+    /// [`Ignored::sized`] plus the note, for `explain`.
+    fn described(&self) -> String {
+        match (&self.note, self.files, self.bytes) {
+            (Some(note), Some(files), Some(bytes)) => format!(
+                "{} ({}, {}; {note})",
+                self.path,
+                plural(files as usize, "file", "files"),
+                crate::output::bytes(bytes)
+            ),
+            (Some(note), _, _) => format!("{} ({note})", self.path),
+            (None, _, _) => self.sized(),
+        }
+    }
+}
+
+/// Up to `limit` entries; past it, how many more and what all of them hold.
+fn ignored_examples(items: &[&Ignored], limit: usize, show: fn(&Ignored) -> String) -> String {
+    let shown: Vec<String> = items.iter().take(limit).map(|i| show(i)).collect();
+    let more = items.len().saturating_sub(limit);
+    if more == 0 {
+        return shown.join(", ");
+    }
+    let files: u64 = items.iter().filter_map(|i| i.files).sum();
+    let bytes: u64 = items.iter().filter_map(|i| i.bytes).sum();
+    let partial = if items.iter().any(|i| i.files.is_none()) {
+        "at least "
+    } else {
+        ""
+    };
+    format!(
+        "{} (+{more} more; {} entries hold {partial}{}, {})",
+        shown.join(", "),
+        items.len(),
+        plural(files as usize, "file", "files"),
+        crate::output::bytes(bytes)
+    )
 }
 
 pub struct Upstream {
@@ -230,15 +300,70 @@ pub fn worktree(entry: &Entry, common_dir: &Path, snapshot: &Snapshot, policy: &
 
     check_lock(&mut r, entry);
     check_activity(&mut r, &canonical, snapshot);
-    check_status(&mut r, &canonical, policy);
+    // `git status` runs before the walk so the walk can size each ignored
+    // entry and judge the collapsed directories a path rule reaches into.
+    // The checks are still reported in their usual order.
+    let status = git::status(&canonical);
+    let repo = RepoRules::read(&canonical);
+    let rules = policy.with(&repo.rules);
+    let buckets: Vec<Bucket> = match &status {
+        Ok(s) => s
+            .ignored
+            .iter()
+            .map(|(text, rel)| Bucket {
+                rel: rel.clone(),
+                expand: text.ends_with('/') && !rules.matches(text) && rules.reaches_inside(text),
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    let usage = fsinfo::measure(&canonical, &buckets, &|rel| rules.matches(rel));
+    check_status(&mut r, status, &repo, &rules, &buckets, &usage);
     check_index_flags(&mut r, &canonical);
     check_operation(&mut r, &identity.git_dir);
     check_private_refs(&mut r, &canonical);
     check_head(&mut r, entry, &canonical);
     check_layout(&mut r, &canonical);
-    check_size(&mut r, &canonical);
+    check_size(&mut r, &canonical, usage);
     gather_facts(&mut r, entry, &canonical);
     r.finish()
+}
+
+/// The rules a repository adds through `git config residue.regenerable`.
+struct RepoRules {
+    rules: Rules,
+    /// Every value as read, valid or not, for `explain`.
+    values: Vec<String>,
+    /// An invalid value or a failed read, as (short, detail). It makes the
+    /// `ignored` check unknown; it never aborts the scan.
+    problem: Option<(String, String)>,
+}
+
+impl RepoRules {
+    fn read(dir: &Path) -> RepoRules {
+        let mut repo = RepoRules {
+            rules: Rules::default(),
+            values: Vec::new(),
+            problem: None,
+        };
+        match git::regenerable_config(dir) {
+            Ok(values) => {
+                for value in &values {
+                    if let Err(e) = repo.rules.add(value) {
+                        repo.problem.get_or_insert((
+                            format!("invalid {GIT_CONFIG_KEY} {value:?}"),
+                            format!(
+                                "git config {GIT_CONFIG_KEY} has an invalid value {value:?}: {e}"
+                            ),
+                        ));
+                    }
+                }
+                repo.values = values;
+            }
+            Err(e) => repo.problem = Some((format!("{GIT_CONFIG_KEY} unreadable"), e)),
+        }
+        repo
+    }
 }
 
 fn check_lock(r: &mut Report, entry: &Entry) {
@@ -287,8 +412,15 @@ fn check_activity(r: &mut Report, dir: &Path, snapshot: &Snapshot) {
     r.activity = Some(evidence);
 }
 
-fn check_status(r: &mut Report, dir: &Path, policy: &Policy) {
-    let status = match git::status(dir) {
+fn check_status(
+    r: &mut Report,
+    status: Result<git::Status, String>,
+    repo: &RepoRules,
+    rules: &Rules,
+    buckets: &[Bucket],
+    usage: &std::io::Result<Usage>,
+) {
+    let status = match status {
         Ok(s) => s,
         Err(e) => {
             for id in ["tracked_changes", "untracked", "ignored"] {
@@ -328,43 +460,134 @@ fn check_status(r: &mut Report, dir: &Path, policy: &Policy) {
     r.ignored = status
         .ignored
         .into_iter()
-        .map(|path| Ignored {
-            regenerable: policy.regenerable(&path),
-            path,
-        })
+        .enumerate()
+        .map(|(i, (path, _))| judge(path, rules, &buckets[i], i, usage))
         .collect();
-    let kept: Vec<String> = r
+    let kept: Vec<&Ignored> = r
         .ignored
         .iter()
-        .filter(|i| !i.regenerable)
-        .map(|i| i.path.clone())
+        .filter(|i| i.judgement == Judgement::Kept)
         .collect();
-    let deletable: Vec<String> = r
+    let unsure: Vec<&Ignored> = r
         .ignored
         .iter()
-        .filter(|i| i.regenerable)
-        .map(|i| i.path.clone())
+        .filter(|i| i.judgement == Judgement::Unknown)
         .collect();
-    if !kept.is_empty() {
-        r.block(
-            "ignored",
-            format!("ignored: {}", examples(&kept, 2)),
-            format!(
-                "ignored entries not known to be regenerable: {}. `git worktree remove` would delete them without asking. If they are regenerable, add their names to the residue config or pass --regenerable",
-                examples(&kept, 8)
-            ),
-        );
-    } else if deletable.is_empty() {
-        r.pass("ignored", "no ignored files");
+    let deletable: Vec<&Ignored> = r.ignored.iter().filter(|i| i.regenerable()).collect();
+    let from_config = if repo.values.is_empty() {
+        String::new()
     } else {
-        r.pass(
-            "ignored",
+        let values: Vec<String> = repo.values.iter().map(|v| format!("{v:?}")).collect();
+        format!(
+            ". This repository's git config {GIT_CONFIG_KEY} adds: {}",
+            values.join(", ")
+        )
+    };
+    let (status, short, detail) = if let Some((short, problem)) = &repo.problem {
+        (
+            Status::Unknown,
+            short.clone(),
             format!(
-                "every ignored entry is regenerable: {}",
-                examples(&deletable, 6)
+                "{problem}. Ignored entries cannot be judged until it is fixed (`git config --get-all {GIT_CONFIG_KEY}` lists the values){from_config}"
             ),
-        );
+        )
+    } else if !kept.is_empty() {
+        (
+            Status::Block,
+            format!("ignored: {}", ignored_examples(&kept, 2, Ignored::sized)),
+            format!(
+                "ignored entries not known to be regenerable: {}. `git worktree remove` would delete them without asking. If they are regenerable, add their names or paths with `git config --add {GIT_CONFIG_KEY} PATH` in this repository, the residue config file, or --regenerable{from_config}",
+                ignored_examples(&kept, 8, Ignored::described)
+            ),
+        )
+    } else if !unsure.is_empty() {
+        (
+            Status::Unknown,
+            format!(
+                "ignored: {} not judged",
+                ignored_examples(&unsure, 2, Ignored::sized)
+            ),
+            format!(
+                "could not judge every ignored entry: {}{from_config}",
+                ignored_examples(&unsure, 8, Ignored::described)
+            ),
+        )
+    } else if deletable.is_empty() {
+        (
+            Status::Pass,
+            String::new(),
+            format!("no ignored files{from_config}"),
+        )
+    } else {
+        (
+            Status::Pass,
+            String::new(),
+            format!(
+                "every ignored entry is regenerable: {}{from_config}",
+                ignored_examples(&deletable, 8, Ignored::described)
+            ),
+        )
+    };
+    r.push("ignored", status, short, detail);
+}
+
+/// Decide one ignored entry: matched by a rule itself, or (for a collapsed
+/// directory a path rule reaches into) by the walk's verdict on its contents.
+fn judge(
+    path: String,
+    rules: &Rules,
+    bucket: &Bucket,
+    index: usize,
+    usage: &std::io::Result<Usage>,
+) -> Ignored {
+    let measured = usage
+        .as_ref()
+        .ok()
+        .and_then(|u| u.buckets.get(index))
+        .filter(|b| b.seen);
+    let mut item = Ignored {
+        judgement: Judgement::Kept,
+        files: measured.map(|b| b.files),
+        bytes: measured.map(|b| b.bytes),
+        note: None,
+        path,
+    };
+    if rules.matches(&item.path) {
+        item.judgement = Judgement::Regenerable;
+        return item;
     }
+    if !bucket.expand {
+        return item;
+    }
+    let (judgement, note) = match (usage, measured) {
+        (Err(e), _) => (
+            Judgement::Unknown,
+            format!("could not walk the worktree: {e}"),
+        ),
+        (Ok(_), None) => (Judgement::Unknown, "the walk did not reach it".to_string()),
+        (Ok(_), Some(b)) => match &b.expansion {
+            Expansion::Matched => (
+                Judgement::Regenerable,
+                "every file in it matches a rule".to_string(),
+            ),
+            Expansion::Unmatched(p) => (Judgement::Kept, format!("{p} matches no rule")),
+            Expansion::OverLimit => (
+                Judgement::Kept,
+                format!(
+                    "over {} entries, too many to judge one by one",
+                    fsinfo::EXPAND_LIMIT
+                ),
+            ),
+            Expansion::Unreadable(e) => (Judgement::Unknown, format!("could not read {e}")),
+            Expansion::NotRequested => (
+                Judgement::Unknown,
+                "its contents were not judged".to_string(),
+            ),
+        },
+    };
+    item.judgement = judgement;
+    item.note = Some(note);
+    item
 }
 
 fn check_index_flags(r: &mut Report, dir: &Path) {
@@ -556,8 +779,8 @@ fn check_layout(r: &mut Report, dir: &Path) {
     }
 }
 
-fn check_size(r: &mut Report, dir: &Path) {
-    let usage = match fsinfo::measure(dir) {
+fn check_size(r: &mut Report, dir: &Path, usage: std::io::Result<Usage>) {
+    let usage = match usage {
         Ok(u) => u,
         Err(e) => {
             r.unknown(

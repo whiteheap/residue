@@ -18,7 +18,7 @@ Open an issue before you start on anything larger than a small fix, so we can ag
 
 [AGENTS.md](AGENTS.md#invariants) lists the invariants: deletion only through `git worktree remove` without `--force`, an `unknown` check blocks like a failed one, three activity states, a fresh re-check before every removal, and one dependency. A change that weakens one of them needs an explicit decision recorded in [CHANGELOG.md](CHANGELOG.md), so raise it in an issue first.
 
-To add a name to the regenerable list, open a pull request that names the tool that recreates the directory and links to its documentation. A name belongs on the list only when deleting it loses nothing that the tool cannot rebuild.
+To add a name to the regenerable list, open a pull request that names the tool that recreates the directory and links to its documentation. A name belongs on the list only when deleting it loses nothing that the tool cannot rebuild. A lock file or cache that belongs to one project does not go on the built-in list: that project adds it with `git config --add residue.regenerable PATH`.
 
 ## Set up
 

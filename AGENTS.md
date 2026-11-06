@@ -10,6 +10,7 @@ These are the reasons people trust the tool. Do not weaken them without an expli
 - A worktree is removable only when every check in `inspect::worktree` passes. An `unknown` check blocks, the same as a failed one.
 - Activity has three states (`in_use`, `not_observed`, `unknown`). A probe failure is `unknown`, never `not_observed`.
 - `remove` re-inspects against a fresh activity snapshot right before acting, and skips the worktree on any change.
+- Regenerable rules come only from the built-in list, the user's config file, `--regenerable` and Git config (`residue.regenerable`). Never from a file committed to the repository: a cloned repository must not be able to declare a user's files disposable.
 - Every string from the filesystem, Git or another process passes through `output::clean` before it reaches a terminal.
 - Git runs through `git::command`: argv only, optional locks off, prompts off, hooks and fsmonitor disabled, inherited `GIT_DIR`-style variables removed.
 - One dependency (`libc`). Add another only when hand-written code would be riskier.
@@ -25,7 +26,7 @@ These are the reasons people trust the tool. Do not weaken them without an expli
 | `src/activity.rs` | The process probe (`lsof` on macOS, `/proc` on Linux) |
 | `src/git.rs` | Hardened Git invocation and porcelain parsers |
 | `src/fsinfo.rs` | Disk usage walk and free space |
-| `src/policy.rs` | The regenerable list for ignored entries |
+| `src/policy.rs` | Regenerable rules (names and paths) for ignored entries |
 | `src/discover.rs` | Finding repositories under a root |
 | `src/output.rs`, `src/json.rs` | Terminal text and JSON documents |
 | `src/run.rs` | Child processes with a deadline and an output cap |
@@ -38,7 +39,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo build --release
 ```
 
-Then run the binary on real repositories. Make a scratch repository with worktrees in the states your change touches; [CONTRIBUTING.md](CONTRIBUTING.md#verify-a-change) has a script that builds one with each common state. The README's "Tested on" table lists the states 0.0.1 covered. Run `scan`, `explain` and `remove`, and record the exact platform and Git version that ran. For Linux from a Mac: `cargo zigbuild --release --target aarch64-unknown-linux-musl`, then run the binary in an `ubuntu:24.04` container as a non-root user.
+Then run the binary on real repositories. Make a scratch repository with worktrees in the states your change touches; [CONTRIBUTING.md](CONTRIBUTING.md#verify-a-change) has a script that builds one with each common state. The README's "Tested on" table lists the states each version covered. Run `scan`, `explain` and `remove`, and record the exact platform and Git version that ran. For Linux from a Mac: `cargo zigbuild --release --target aarch64-unknown-linux-musl`, then run the binary in an `ubuntu:24.04` container as a non-root user.
 
 ## Release
 

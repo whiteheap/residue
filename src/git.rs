@@ -284,7 +284,9 @@ fn parse_worktrees(out: &[u8]) -> Result<Vec<Entry>, String> {
 pub struct Status {
     pub tracked: Vec<String>,
     pub untracked: Vec<String>,
-    pub ignored: Vec<String>,
+    /// Each ignored entry as text (for display and rule matching), and as
+    /// the exact relative path without a trailing slash (for the size walk).
+    pub ignored: Vec<(String, PathBuf)>,
 }
 
 /// Staged, modified, untracked and ignored entries. Ignored and untracked
@@ -313,7 +315,11 @@ pub fn status(dir: &Path) -> Result<Status, String> {
         let path = String::from_utf8_lossy(&record[3..]).into_owned();
         match &record[..2] {
             b"??" => status.untracked.push(path),
-            b"!!" => status.ignored.push(path),
+            b"!!" => {
+                let raw = &record[3..];
+                let raw = raw.strip_suffix(b"/").unwrap_or(raw);
+                status.ignored.push((path, path_from(raw)));
+            }
             xy => {
                 status.tracked.push(path);
                 // A rename or copy is followed by its source path.
@@ -324,6 +330,47 @@ pub fn status(dir: &Path) -> Result<Status, String> {
         }
     }
     Ok(status)
+}
+
+/// The values of `residue.regenerable` in this worktree's git config, in
+/// the order Git reads them. An unset key is an empty list.
+pub fn regenerable_config(dir: &Path) -> Result<Vec<String>, String> {
+    let exit = git_exit(
+        dir,
+        &[
+            "config",
+            "--null",
+            "--get-all",
+            crate::policy::GIT_CONFIG_KEY,
+        ],
+    )?;
+    if exit.code == Some(1) {
+        return Ok(Vec::new());
+    }
+    if !exit.success {
+        return Err(format!(
+            "git config --get-all {} failed: {}",
+            crate::policy::GIT_CONFIG_KEY,
+            exit.stderr
+        ));
+    }
+    if exit.stdout.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Each value ends in a NUL. An empty value stays in the list so the
+    // caller rejects it rather than silently skipping it.
+    let body = exit.stdout.strip_suffix(&[0]).unwrap_or(&exit.stdout);
+    body.split(|b| *b == 0)
+        .map(|v| {
+            String::from_utf8(v.to_vec()).map_err(|_| {
+                format!(
+                    "{} has a value that is not valid UTF-8: {:?}",
+                    crate::policy::GIT_CONFIG_KEY,
+                    String::from_utf8_lossy(v)
+                )
+            })
+        })
+        .collect()
 }
 
 pub fn remove_worktree(main: &Path, worktree: &Path) -> Result<(), String> {
