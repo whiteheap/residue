@@ -166,6 +166,10 @@ Several tools already address this problem. Pick the one that matches how you wo
 
 residue does one job: it removes linked worktrees from any tool, and only when every check above passes. It hands the deletion to Git, reports activity as one of three states on both macOS and Linux, keeps any ignored file that is not on the regenerable list, and depends on one crate (`libc`).
 
+## Contributing
+
+Bug reports, fixes and test reports from other platforms are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) has the setup, the checks to run, and a script that builds a scratch repository covering each verdict.
+
 ## License
 
 MIT
