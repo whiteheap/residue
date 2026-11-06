@@ -31,7 +31,9 @@ Homebrew, on macOS and Linux:
 brew install whiteheap/tap/residue
 ```
 
-Debian and Ubuntu, from the signed apt repository, so `apt upgrade` keeps residue current:
+On Linux, add residue's signed package repository once, and your normal upgrades keep it current. Each repository serves x86_64 and arm64.
+
+Debian and Ubuntu:
 
 ```sh
 sudo install -d -m 0755 /etc/apt/keyrings
@@ -40,27 +42,28 @@ echo "deb [signed-by=/etc/apt/keyrings/residue.gpg] https://whiteheap.github.io/
 sudo apt update && sudo apt install residue
 ```
 
-The repository's signing key has the fingerprint `1AEA B314 3511 8A1F E575  D36E E155 3632 FC32 554A`. To install one release without adding the repository, download `residue_amd64.deb` or `residue_arm64.deb` from the [latest release](https://github.com/whiteheap/residue/releases/latest) and run `sudo apt install ./residue_amd64.deb`.
-
-Fedora and RHEL:
+Fedora, RHEL and their rebuilds (dnf asks you to confirm the key):
 
 ```sh
-sudo dnf install https://github.com/whiteheap/residue/releases/latest/download/residue.x86_64.rpm
+sudo curl -fsSLo /etc/yum.repos.d/residue.repo https://whiteheap.github.io/residue/rpm/residue.repo
+sudo dnf install residue
 ```
 
 Arch Linux, Omarchy and other Arch-based systems:
 
 ```sh
-curl -fLO https://github.com/whiteheap/residue/releases/latest/download/residue-x86_64.pkg.tar.zst
-sudo pacman -U ./residue-x86_64.pkg.tar.zst
+curl -fsSL https://whiteheap.github.io/residue/residue-signing-key.asc | sudo pacman-key --add -
+sudo pacman-key --lsign-key 1AEAB31435118A1FE575D36EE1553632FC32554A
+printf '\n[residue]\nServer = https://whiteheap.github.io/residue/arch/$arch\n' | sudo tee -a /etc/pacman.conf
+sudo pacman -Syu residue
 ```
 
-On arm64, use `residue.aarch64.rpm` or `residue-aarch64.pkg.tar.zst`. The apt repository picks the architecture itself. Each package installs `/usr/bin/residue` and pulls in Git if it is missing. The `.rpm` and Arch packages are not in a package repository yet, so `dnf upgrade` and `pacman -Syu` do not update them: install the new release's package the same way.
+All three are signed with the key `1AEA B314 3511 8A1F E575  D36E E155 3632 FC32 554A`. Each package installs `/usr/bin/residue` and pulls in Git if it is missing. To install one release without adding a repository, every release also carries `residue_amd64.deb`, `residue.x86_64.rpm` and `residue-x86_64.pkg.tar.zst` (and their arm64 builds) on the [releases page](https://github.com/whiteheap/residue/releases/latest).
 
-Prebuilt binaries for macOS (Apple silicon and Intel) and static Linux (x86_64 and arm64) are on the [releases page](https://github.com/whiteheap/residue/releases). Each archive and package has a SHA-256 checksum in `SHA256SUMS` and a GitHub build-provenance attestation:
+Prebuilt binaries for macOS (Apple silicon and Intel) and static Linux (x86_64 and arm64) are on the releases page too. Each archive and package has a SHA-256 checksum in `SHA256SUMS` and a GitHub build-provenance attestation:
 
 ```sh
-gh attestation verify residue-v0.0.4-aarch64-apple-darwin.tar.gz --repo whiteheap/residue
+gh attestation verify residue_amd64.deb --repo whiteheap/residue
 ```
 
 From source, with Rust 1.85 or later:

@@ -86,13 +86,16 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS \
             --title "residue $GITHUB_REF_NAME" --notes-file notes.md
 
+  # Starts packages.yml as its own run on main instead of calling it as a
+  # reusable workflow: a called workflow does not receive the github-pages
+  # environment's PACKAGE_SIGNING_KEY, so the repositories would not be signed.
   packages:
     needs: publish
-    uses: ./.github/workflows/packages.yml
-    with:
-      tag: ${{ github.ref_name }}
+    runs-on: ubuntu-24.04
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
-      pages: write
+      actions: write
+    steps:
+      - name: Start packages.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run packages.yml --repo "$GITHUB_REPOSITORY" --ref main -f tag="$GITHUB_REF_NAME"

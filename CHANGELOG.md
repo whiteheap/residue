@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Signed dnf and pacman repositories next to the apt one, at https://whiteheap.github.io/residue/rpm and https://whiteheap.github.io/residue/arch: `dnf install residue` on Fedora and RHEL, `pacman -S residue` on Arch and Omarchy, and `dnf upgrade` and `pacman -Syu` keep residue current. Every release updates all three. The `.rpm` files in the dnf repository are signed, and one key signs everything (`packaging/signing-key.asc`).
+
 ## 0.0.4 (2026-11-07)
 
 Scheduled sweeps. A machine running agents all day leaked 44 worktrees (4.2 GB) in two days, so the plan was a daily unattended `residue remove`. The activity check cannot see a paused agent session: harnesses such as Claude Code reset the shell to the main checkout after every command, so a worktree whose agent is waiting for approval has no process inside it, and if its work is pushed it is a candidate. A person sees the plan before deleting; a scheduled run does not.

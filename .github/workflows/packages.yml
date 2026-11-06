@@ -2,17 +2,13 @@ name: packages
 
 # Builds .deb, .rpm and Arch packages from a published release's static Linux
 # archives, attests them, and adds them and an updated SHA256SUMS to that
-# release. When the tag is the latest release, it also publishes the signed apt
-# repository at https://whiteheap.github.io/residue/apt with GitHub Pages.
-# release.yml calls it after publishing. To package a release that predates
-# this workflow: gh workflow run packages.yml -f tag=vX.Y.Z
+# release. When the tag is the latest release, it also publishes signed apt,
+# dnf and pacman repositories to https://whiteheap.github.io/residue/ with
+# GitHub Pages.
+# release.yml starts it after publishing. To package an existing release by
+# hand: gh workflow run packages.yml -f tag=vX.Y.Z
 
 on:
-  workflow_call:
-    inputs:
-      tag:
-        type: string
-        required: true
   workflow_dispatch:
     inputs:
       tag:
@@ -65,10 +61,10 @@ jobs:
       - name: Upload
         run: gh release upload "$TAG" pkgs/* SHA256SUMS --clobber
 
-  # The apt repository holds only the latest release, so packaging an older
-  # tag never rolls it back. The signing key is a secret of the github-pages
-  # environment, which only this job can read.
-  apt:
+  # The package repositories hold only the latest release, so packaging an
+  # older tag never rolls them back. The signing key is a secret of the
+  # github-pages environment, which only this job can read.
+  repositories:
     needs: linux
     if: needs.linux.outputs.latest == 'true'
     runs-on: ubuntu-24.04
@@ -78,32 +74,47 @@ jobs:
       id-token: write
     environment:
       name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}apt/
+      url: ${{ steps.deploy.outputs.page_url }}
     env:
       TAG: ${{ inputs.tag }}
       GH_TOKEN: ${{ github.token }}
+      KEYRING: packaging/signing-key.asc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: apt-ftparchive
-        run: command -v apt-ftparchive || { sudo apt-get update -qq && sudo apt-get install -y -qq apt-utils; }
-      - name: Download the .deb packages
+      - name: Tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq apt-utils createrepo-c rpm
+      - name: Download the packages
         run: |
-          gh release download "$TAG" --dir debs --pattern '*.deb' --pattern SHA256SUMS
-          cd debs && grep -E '\.deb$' SHA256SUMS | sha256sum -c
-      - name: Build and sign the repository
+          gh release download "$TAG" --dir pkgs --pattern '*.deb' --pattern '*.rpm' --pattern '*.pkg.tar.zst' --pattern SHA256SUMS
+          cd pkgs && grep -E '\.(deb|rpm|pkg\.tar\.zst)$' SHA256SUMS | sha256sum -c
+      - name: Build and sign the apt, dnf and pacman repositories
         env:
-          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          PACKAGE_SIGNING_KEY: ${{ secrets.PACKAGE_SIGNING_KEY }}
         run: |
+          fpr=$(gpg --show-keys --with-colons "$KEYRING" | awk -F: '/^fpr/ { print $10; exit }')
           export GNUPGHOME="$RUNNER_TEMP/gnupg"
           mkdir -m 700 "$GNUPGHOME"
-          printf '%s\n' "$APT_SIGNING_KEY" | gpg --batch --import
-          keyring=packaging/apt/residue-archive-keyring.asc
-          fpr=$(gpg --show-keys --with-colons "$keyring" | awk -F: '/^fpr/ { print $10; exit }')
-          packaging/apt-repo.sh debs site/apt "$fpr"
-          gpg --dearmor < "$keyring" > site/apt/residue-archive-keyring.gpg
-          gpgv --keyring site/apt/residue-archive-keyring.gpg site/apt/dists/stable/InRelease
-          gpgv --keyring site/apt/residue-archive-keyring.gpg site/apt/dists/stable/Release.gpg site/apt/dists/stable/Release
+          printf '%s\n' "$PACKAGE_SIGNING_KEY" | gpg --batch --import
+          packaging/apt-repo.sh pkgs site/apt "$fpr"
+          packaging/rpm-repo.sh pkgs site/rpm "$fpr"
+          # repo-add only exists on Arch.
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e PACKAGE_SIGNING_KEY \
+            -v "$PWD:/w" -w /w archlinux:base bash -c '
+              export GNUPGHOME=$(mktemp -d)
+              printf "%s\n" "$PACKAGE_SIGNING_KEY" | gpg --batch --quiet --import
+              packaging/arch-repo.sh pkgs site/arch "$0"' "$fpr"
           rm -rf "$GNUPGHOME"
+          cp "$KEYRING" site/residue-signing-key.asc
+          gpg --dearmor < "$KEYRING" > site/apt/residue-archive-keyring.gpg
+          cp packaging/rpm/residue.repo site/rpm/residue.repo
+      - name: Check every signature against the committed public key
+        run: |
+          keyring=site/apt/residue-archive-keyring.gpg
+          gpgv --keyring "$keyring" site/apt/dists/stable/InRelease
+          gpgv --keyring "$keyring" site/apt/dists/stable/Release.gpg site/apt/dists/stable/Release
+          for sig in site/arch/*/*.sig site/rpm/*/repodata/repomd.xml.asc; do
+            gpgv --keyring "$keyring" "$sig" "${sig%.*}"
+          done
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: site
