@@ -42,11 +42,15 @@ jobs:
       - name: Service smoke test
         if: matrix.os != 'ubuntu-24.04-arm'
         run: sh .github/service-smoke.sh ./target/release/residue
+      # The race check: change a worktree while the release binary waits at
+      # its prompt, answer yes, and check that residue removes nothing.
+      - name: Race check
+        run: bash scripts/race-check.sh target/release/residue
 
   # FreeBSD runs in a virtual machine. residue's probe there is the base
-  # system's procstat, so nothing beyond Rust and Git is installed. The smoke
-  # test runs as root and as an ordinary user, who can inspect only their own
-  # processes.
+  # system's procstat, so nothing beyond Rust and Git is installed, plus bash
+  # for the race check. The smoke tests and the race check run as root and as
+  # an ordinary user, who can inspect only their own processes.
   freebsd:
     name: freebsd-14
     runs-on: ubuntu-24.04
@@ -56,13 +60,15 @@ jobs:
         with:
           release: "14"
           copyback: false
-          prepare: pkg install -y rust git
+          prepare: pkg install -y rust git bash
           run: |
             freebsd-version
             rustc --version
             cargo build --locked --release
             sh .github/smoke.sh ./target/release/residue
             sh .github/watch-smoke.sh ./target/release/residue
+            bash scripts/race-check.sh ./target/release/residue
             pw useradd smoke -m
             su smoke -c "sh $PWD/.github/smoke.sh $PWD/target/release/residue"
             su smoke -c "sh $PWD/.github/watch-smoke.sh $PWD/target/release/residue"
+            su smoke -c "bash $PWD/scripts/race-check.sh $PWD/target/release/residue"

@@ -16,6 +16,7 @@ mod policy;
 mod remove;
 mod run;
 mod service;
+mod trash;
 mod watch;
 
 use std::process::ExitCode;
@@ -48,6 +49,7 @@ fn main() -> ExitCode {
         cli::Command::Scan(options) => commands::scan(&options),
         cli::Command::Explain(options) => commands::explain(&options),
         cli::Command::Remove(options) => remove::remove(&options),
+        cli::Command::Restore(options) => trash::command(&options),
     };
     ExitCode::from(code)
 }

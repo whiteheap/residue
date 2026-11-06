@@ -27,7 +27,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use crate::cli::Idle;
+use crate::cli::Span;
 
 pub const DEFAULTS: &[&str] = &[
     // JavaScript and TypeScript
@@ -213,18 +213,19 @@ pub struct RuleSource {
     pub origin: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct Policy {
     rules: Rules,
     pub config: Option<PathBuf>,
-    /// Rules from the residue config file and `--regenerable`, with their
-    /// source. Each worktree adds its Git config rules to these.
+    /// Rules from `--regenerable` and the residue config file, in that
+    /// order, with their source. Each worktree adds its Git config rules.
     pub sources: Vec<RuleSource>,
     /// `residue.regenerable` values set through the environment, which
     /// residue ignores and reports (`git::environment_regenerable`). An
     /// error when Git could not read that environment.
     pub ignored_environment: Result<Vec<String>, String>,
     /// `--idle`: keep a worktree changed more recently than this.
-    pub idle: Option<Idle>,
+    pub idle: Option<Span>,
 }
 
 impl Policy {
@@ -268,6 +269,9 @@ impl Policy {
                 origin: None,
             });
         }
+        // The order every rule_sources list uses: --regenerable, then the
+        // residue config file (each worktree then adds its Git config).
+        sources.sort_by_key(|s| s.scope != "command_line");
         Ok(Policy {
             rules,
             config,

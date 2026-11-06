@@ -58,6 +58,10 @@ pub struct BucketUsage {
     /// Non-directory entries, each hard-linked inode counted once.
     pub files: u64,
     pub bytes: u64,
+    /// The newest modification time of the entry or anything below it, in
+    /// seconds and nanoseconds, so `remove` can tell that it changed even
+    /// when its file count and size did not.
+    pub newest: Option<(i64, i64)>,
     pub expansion: Expansion,
 }
 
@@ -183,6 +187,11 @@ pub fn measure(
             }
             let first = account(&mut usage, &mut shared, &meta, &path);
             if let Some(i) = here.bucket {
+                let stamp = (meta.mtime(), meta.mtime_nsec());
+                let newest = &mut usage.buckets[i].newest;
+                if newest.is_none_or(|n| stamp > n) {
+                    *newest = Some(stamp);
+                }
                 if !meta.is_dir() && first {
                     usage.buckets[i].files += 1;
                     usage.buckets[i].bytes += meta.len();
