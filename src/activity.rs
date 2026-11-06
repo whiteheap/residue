@@ -289,7 +289,185 @@ mod platform {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// FreeBSD: one `procstat -f` snapshot from the base system. procstat is
+/// built with the running kernel, unlike a packaged lsof, which on FreeBSD
+/// can list a process without resolving its working directory.
+#[cfg(target_os = "freebsd")]
+mod platform {
+    use super::{Seen, Snapshot, Use, unavailable};
+    use crate::run::{self, RunError};
+    use std::collections::HashSet;
+    use std::process::Command;
+    use std::time::Duration;
+
+    const BACKEND: &str = "procstat";
+
+    pub fn take() -> Snapshot {
+        let mut cmd = Command::new("/usr/bin/procstat");
+        // -h: no header. -a: every process. -f: its files, working directory
+        // (fd `cwd`) and executable (fd `text`).
+        cmd.args(["-h", "-a", "-f"]).env("LC_ALL", "C");
+        let out = match run::run(&mut cmd, Duration::from_secs(30), 512 << 20) {
+            Ok(out) => out,
+            Err(RunError::NotFound) => {
+                return unavailable(
+                    BACKEND,
+                    "probe_missing",
+                    "/usr/bin/procstat not found".into(),
+                );
+            }
+            Err(RunError::Timeout(d)) => {
+                return unavailable(
+                    BACKEND,
+                    "timeout",
+                    format!("procstat ran longer than {}s", d.as_secs()),
+                );
+            }
+            Err(e) => return unavailable(BACKEND, "probe_failed", format!("procstat: {e}")),
+        };
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let first = stderr.lines().next().unwrap_or("no error output");
+            return unavailable(
+                BACKEND,
+                "probe_failed",
+                format!("procstat exited with {}: {first}", out.status),
+            );
+        }
+        let mut uses = Vec::new();
+        // Processes whose working directory came back as a path. procstat
+        // prints nothing for a process the user may not inspect, and `-` for
+        // a path the kernel cannot name; neither counts as inspected.
+        let mut inspected: HashSet<u32> = HashSet::new();
+        for line in out.stdout.split(|b| *b == b'\n') {
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let Some(row) = parse(line) else {
+                return unavailable(
+                    BACKEND,
+                    "parse_error",
+                    format!(
+                        "procstat printed a line residue cannot read: {}",
+                        String::from_utf8_lossy(line).trim()
+                    ),
+                );
+            };
+            if row.kind != b"v" || row.path.first() != Some(&b'/') {
+                continue;
+            }
+            if row.fd == b"cwd" {
+                inspected.insert(row.pid);
+            }
+            uses.push(Use {
+                pid: row.pid,
+                command: row.command,
+                path: row.path.to_vec(),
+            });
+        }
+        Snapshot {
+            backend: BACKEND,
+            state: Ok(Seen {
+                uses,
+                inspected: inspected.len(),
+                total: count_processes(),
+            }),
+        }
+    }
+
+    struct Row<'a> {
+        pid: u32,
+        command: String,
+        fd: &'a [u8],
+        kind: &'a [u8],
+        path: &'a [u8],
+    }
+
+    /// One line of `procstat -h -f`: PID COMM FD T V FLAGS REF OFFSET PRO
+    /// NAME. COMM can contain spaces, so the FD column is the first one
+    /// followed by the shape of T, V, FLAGS, REF and OFFSET. `None` when no
+    /// column has that shape, so an unexpected format fails the whole probe
+    /// instead of hiding a process.
+    fn parse(line: &[u8]) -> Option<Row<'_>> {
+        let cols = columns(line);
+        let col = |i: usize| &line[cols[i].0..cols[i].1];
+        let pid = std::str::from_utf8(col(0)).ok()?.parse::<u32>().ok()?;
+        for i in 2..cols.len().saturating_sub(5) {
+            let fd = col(i);
+            let fd_ok = (!fd.is_empty() && fd.iter().all(u8::is_ascii_digit))
+                || matches!(
+                    fd,
+                    b"cwd" | b"text" | b"ctty" | b"root" | b"jail" | b"trace"
+                );
+            let flags = col(i + 3);
+            let shaped = fd_ok
+                && col(i + 1).len() == 1
+                && col(i + 2).len() == 1
+                && flags.len() == 8
+                && flags.iter().all(|c| b"rwasfndl-".contains(c))
+                && dash_or_number(col(i + 4))
+                && dash_or_number(col(i + 5));
+            if !shaped {
+                continue;
+            }
+            let kind = col(i + 1);
+            // For a vnode the PRO column is `-` and NAME is the rest of the
+            // line, padded on the right.
+            let path = if kind == b"v" && cols.len() > i + 7 && col(i + 6) == b"-" {
+                line[cols[i + 7].0..].trim_ascii_end()
+            } else {
+                &[]
+            };
+            return Some(Row {
+                pid,
+                command: String::from_utf8_lossy(&line[cols[1].0..cols[i - 1].1]).into_owned(),
+                fd,
+                kind,
+                path,
+            });
+        }
+        None
+    }
+
+    fn dash_or_number(s: &[u8]) -> bool {
+        s == b"-" || (!s.is_empty() && s.iter().all(u8::is_ascii_digit))
+    }
+
+    /// The byte ranges of the whitespace-separated columns of `line`.
+    fn columns(line: &[u8]) -> Vec<(usize, usize)> {
+        let mut cols = Vec::new();
+        let mut start = None;
+        for (i, b) in line.iter().enumerate() {
+            match (b.is_ascii_whitespace(), start) {
+                (false, None) => start = Some(i),
+                (true, Some(s)) => {
+                    cols.push((s, i));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(s) = start {
+            cols.push((s, line.len()));
+        }
+        cols
+    }
+
+    /// The number of running processes, to state how much procstat could see.
+    fn count_processes() -> Option<usize> {
+        let mut cmd = Command::new("/bin/ps");
+        cmd.args(["-A", "-o", "pid="]);
+        let out = run::run(&mut cmd, Duration::from_secs(10), 16 << 20).ok()?;
+        out.status.success().then(|| {
+            out.stdout
+                .split(|b| *b == b'\n')
+                .filter(|l| l.iter().any(u8::is_ascii_digit))
+                .count()
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
 mod platform {
     use super::{Snapshot, unavailable};
 

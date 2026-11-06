@@ -314,7 +314,8 @@ For every repository on the machine, put one rule per line in `~/.config/residue
 
 - **macOS**: one `lsof` snapshot of the working directories and open files of the processes your user can inspect. residue reports how many processes that covered, for example "lsof inspected 506 of 807 running processes".
 - **Linux**: `/proc/*/cwd`, `/proc/*/exe` and `/proc/*/fd`, for the processes your user can read.
-- **Other Unix systems**: there is no probe. Every worktree reports activity `unknown`, so none is a candidate.
+- **FreeBSD**: one `procstat -f` snapshot from the base system, of the working directories and open files of the processes your user can inspect. procstat is built with the running kernel. A packaged lsof is not used: in testing on FreeBSD 14 it listed processes without resolving their working directories, which would have hidden a worktree in use. A process whose working directory the kernel cannot name does not count as inspected. There are no prebuilt FreeBSD binaries yet; install with `cargo install` (see Install).
+- **Other Unix systems** (NetBSD, OpenBSD, DragonFly, illumos): residue builds, but there is no probe yet. Every worktree reports activity `unknown`, so none is a candidate.
 
 The probe has three answers. `in_use` means a process was seen inside the worktree. `not_observed` means none of the inspected processes was inside it. `unknown` means the probe failed: lsof is missing, it timed out, it failed, or residue could not parse its output. `not_observed` is not proof that a worktree is idle. The probe cannot see processes owned by other users, processes inside containers or virtual machines, processes on other machines that share the disk, or a session that is closed now but that you mean to resume. A process can also open the directory a moment after the snapshot. That is why removal asks a human, why `--yes` belongs to the session that owns the work, and why a scheduled sweep needs `--idle`.
 
@@ -372,7 +373,7 @@ These are the exact platforms and versions that ran. residue has no automated te
 | 0.0.1 | Ubuntu 24.04.5 LTS, arm64 (Docker, Linux 7.0.14) | 2.43.0 | Static musl binary as a non-root user: `scan`, in-use detection through `/proc`, hard-link accounting, and `remove` with and without a terminal. As root on another user's repository, Git refused with "dubious ownership" and residue reported the error instead of guessing. |
 | 0.0.1 to 0.0.4 | GitHub Actions `macos-latest`, `ubuntu-24.04` (x86_64), `ubuntu-24.04-arm` | runner Git | Build, then `scan` and `explain` of a temporary worktree. No removal. |
 
-Not run: the Intel macOS binary (built by cross-compiling, never executed), FreeBSD, OpenBSD, NetBSD and other Unix systems (no activity probe, so nothing is a candidate), and Windows (not supported).
+Not run: the Intel macOS binary (built by cross-compiling, never executed), NetBSD, OpenBSD, DragonFly and illumos (they build, but have no activity probe, so nothing is a candidate), and Windows (not supported). CI runs `.github/smoke.sh` (a clean candidate, a kept `.env`, a worktree a process is using, and a removal that keeps the branch) on macOS, Linux x86_64 and arm64, and FreeBSD 14 as root and as an ordinary user, on every push.
 
 ## Limits
 
