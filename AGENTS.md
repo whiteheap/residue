@@ -44,4 +44,4 @@ Then run the binary on real repositories. Make a scratch repository with worktre
 
 1. Bump `version` in `Cargo.toml`, run `cargo build` to update `Cargo.lock`, and add a `## X.Y.Z (date)` section to `CHANGELOG.md`.
 2. Commit, then tag `vX.Y.Z` and push the tag. `.github/workflows/release.yml` builds four targets, attests provenance, and publishes the GitHub release with `SHA256SUMS`.
-3. Update `Formula/residue.rb` in [whiteheap/homebrew-tap](https://github.com/whiteheap/homebrew-tap) with the new version and the four checksums from `SHA256SUMS`, then run `brew install whiteheap/tap/residue && brew test residue`.
+3. Update `Formula/residue.rb` in [whiteheap/homebrew-tap](https://github.com/whiteheap/homebrew-tap) with the new tag in the four URLs and the four checksums from `SHA256SUMS`. The formula has no `version` line: Homebrew reads it from the URL, and `brew audit --strict` rejects a redundant one. Then run `brew install whiteheap/tap/residue`, `brew test whiteheap/tap/residue` and `brew audit --strict --online whiteheap/tap/residue`.
