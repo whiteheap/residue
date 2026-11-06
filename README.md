@@ -1,5 +1,7 @@
 # residue
 
+**Reclaim your storage from Git worktrees, automatically and safely.**
+
 Coding agents leave Git worktrees behind. Each one is a full checkout with its own `node_modules`, `target` and build output, and a machine that runs agents all day fills its disk with them. residue finds those worktrees, measures them, and removes one only when nothing in it would be lost.
 
 ```text
