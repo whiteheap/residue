@@ -18,7 +18,10 @@
 //! `--regenerable`, and each repository's own git config
 //! (`residue.regenerable`). Never from a file committed to the repository:
 //! a cloned repository must not be able to declare a user's files
-//! disposable, and git config is never transferred by clone.
+//! disposable, and git config is never transferred by clone. Never from
+//! the environment either (`git -c`, `GIT_CONFIG_COUNT`, the legacy
+//! `GIT_CONFIG`): every subprocess inherits it, so it must not widen what
+//! residue deletes. residue reports those values instead of using them.
 
 use std::fs;
 use std::io;
@@ -197,6 +200,10 @@ fn glob(pattern: &str, text: &str) -> bool {
 pub struct Policy {
     rules: Rules,
     pub config: Option<PathBuf>,
+    /// `residue.regenerable` values set through the environment, which
+    /// residue ignores and reports (`git::environment_regenerable`). An
+    /// error when Git could not read that environment.
+    pub ignored_environment: Result<Vec<String>, String>,
 }
 
 impl Policy {
@@ -229,7 +236,11 @@ impl Policy {
                 .add(name)
                 .map_err(|e| format!("--regenerable {name}: {e}"))?;
         }
-        Ok(Policy { rules, config })
+        Ok(Policy {
+            rules,
+            config,
+            ignored_environment: Ok(Vec::new()),
+        })
     }
 
     /// The rules for one worktree: everything machine-wide plus the

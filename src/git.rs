@@ -3,8 +3,9 @@
 //! Git runs with optional locks off (no index refresh writes), prompts off,
 //! fsmonitor and hooks disabled, lazy fetches off, and with inherited
 //! `GIT_DIR`-style variables removed so a hook environment cannot redirect
-//! a query to another repository. Arguments are passed as argv, never
-//! through a shell.
+//! a query to another repository, and with config from the environment
+//! removed so it cannot bend `git status` or widen the regenerable rules.
+//! Arguments are passed as argv, never through a shell.
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStringExt;
@@ -27,7 +28,9 @@ const CONFIG: &[&str] = &[
     "color.ui=false",
 ];
 
-const SCRUBBED_ENV: &[&str] = &[
+/// Variables that point Git at another repository, and `GIT_CONFIG`, which
+/// makes `git config` read that one file in place of every config file.
+const REDIRECT_ENV: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
@@ -35,18 +38,37 @@ const SCRUBBED_ENV: &[&str] = &[
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_NAMESPACE",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_COUNT",
     "GIT_PREFIX",
+    "GIT_CONFIG",
 ];
 
+/// Variables that add config from the environment: `git -c` and
+/// `--config-env` export `GIT_CONFIG_PARAMETERS` to their children, and
+/// `GIT_CONFIG_COUNT` turns on the `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`
+/// pairs. Environment is inherited by every subprocess and CI step, so it
+/// must not widen what residue deletes. `GIT_CONFIG_GLOBAL`,
+/// `GIT_CONFIG_SYSTEM` and `GIT_CONFIG_NOSYSTEM` stay: they choose which
+/// config files Git reads, and residue reads the same files as the user's
+/// own Git.
+const CONFIG_ENV: &[&str] = &["GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"];
+
 fn command(dir: &Path) -> Command {
+    let mut cmd = command_keeping_config_env(dir);
+    for var in CONFIG_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// `command` without removing `CONFIG_ENV`. Only for reporting what the
+/// environment sets; never for a query whose answer residue acts on.
+fn command_keeping_config_env(dir: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(dir);
     for setting in CONFIG {
         cmd.arg("-c").arg(setting);
     }
-    for var in SCRUBBED_ENV {
+    for var in REDIRECT_ENV {
         cmd.env_remove(var);
     }
     cmd.env("GIT_OPTIONAL_LOCKS", "0")
@@ -83,7 +105,10 @@ pub struct Exit {
 }
 
 fn exec(dir: &Path, args: &[&OsStr], timeout: Duration) -> Result<Exit, String> {
-    let mut cmd = command(dir);
+    exec_command(command(dir), args, timeout)
+}
+
+fn exec_command(mut cmd: Command, args: &[&OsStr], timeout: Duration) -> Result<Exit, String> {
     cmd.args(args);
     match run::run(&mut cmd, timeout, MAX_OUTPUT) {
         Ok(out) => Ok(Exit {
@@ -354,13 +379,10 @@ pub fn regenerable_config(dir: &Path) -> Result<Vec<String>, String> {
             exit.stderr
         ));
     }
-    if exit.stdout.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Each value ends in a NUL. An empty value stays in the list so the
-    // caller rejects it rather than silently skipping it.
-    let body = exit.stdout.strip_suffix(&[0]).unwrap_or(&exit.stdout);
-    body.split(|b| *b == 0)
+    // An empty value stays in the list so the caller rejects it rather than
+    // silently skipping it.
+    nul_fields(&exit.stdout)
+        .into_iter()
         .map(|v| {
             String::from_utf8(v.to_vec()).map_err(|_| {
                 format!(
@@ -371,6 +393,81 @@ pub fn regenerable_config(dir: &Path) -> Result<Vec<String>, String> {
             })
         })
         .collect()
+}
+
+/// The fields of `git config --null` output, each of which ends in a NUL.
+/// An empty field (a value set to the empty string) is kept.
+fn nul_fields(out: &[u8]) -> Vec<&[u8]> {
+    if out.is_empty() {
+        return Vec::new();
+    }
+    let body = out.strip_suffix(&[0]).unwrap_or(out);
+    body.split(|b| *b == 0).collect()
+}
+
+/// The `residue.regenerable` values the inherited environment sets, which
+/// residue ignores: `git -c` and `--config-env` (`GIT_CONFIG_PARAMETERS`),
+/// `GIT_CONFIG_COUNT` with `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`, and
+/// the file named by the legacy `GIT_CONFIG`. Git itself parses the
+/// variables, so quoting and key case follow Git's rules. Used only to tell
+/// the user; the rules come from `regenerable_config`. Runs no Git when
+/// none of the variables is set.
+pub fn environment_regenerable() -> Result<Vec<String>, String> {
+    let key = OsStr::new(crate::policy::GIT_CONFIG_KEY);
+    let set = |var: &str| std::env::var_os(var).filter(|v| !v.is_empty());
+    let mut found = Vec::new();
+    if CONFIG_ENV.iter().any(|var| set(var).is_some()) {
+        // `/` so no repository's own config is read or can fail the query.
+        let args = ["config", "--show-scope", "--null", "--get-all"].map(OsStr::new);
+        let exit = exec_command(
+            command_keeping_config_env(Path::new("/")),
+            &[&args[..], &[key]].concat(),
+            QUERY_TIMEOUT,
+        )?;
+        // Pairs of scope and value; the environment is the `command` scope.
+        let fields = config_values(exit, "the environment")?;
+        for pair in fields.chunks(2) {
+            if let [scope, value] = pair {
+                if scope.as_slice() == b"command" {
+                    found.push(String::from_utf8_lossy(value).into_owned());
+                }
+            }
+        }
+    }
+    if let Some(file) = set("GIT_CONFIG") {
+        let file = std::path::absolute(&file).map_err(|e| format!("GIT_CONFIG: {e}"))?;
+        let args = [
+            OsStr::new("config"),
+            OsStr::new("--file"),
+            file.as_os_str(),
+            OsStr::new("--null"),
+            OsStr::new("--get-all"),
+            key,
+        ];
+        let exit = exec(Path::new("/"), &args, QUERY_TIMEOUT)?;
+        let fields = config_values(exit, "the file named by GIT_CONFIG")?;
+        found.extend(
+            fields
+                .iter()
+                .map(|v| String::from_utf8_lossy(v).into_owned()),
+        );
+    }
+    Ok(found)
+}
+
+/// The NUL-separated fields of a `git config --get-all` that may find no
+/// value (exit 1).
+fn config_values(exit: Exit, what: &str) -> Result<Vec<Vec<u8>>, String> {
+    if exit.code == Some(1) {
+        return Ok(Vec::new());
+    }
+    if !exit.success {
+        return Err(format!("git could not read {what}: {}", exit.stderr));
+    }
+    Ok(nul_fields(&exit.stdout)
+        .into_iter()
+        .map(<[u8]>::to_vec)
+        .collect())
 }
 
 pub fn remove_worktree(main: &Path, worktree: &Path) -> Result<(), String> {

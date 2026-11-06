@@ -10,9 +10,9 @@ These are the reasons people trust the tool. Do not weaken them without an expli
 - A worktree is removable only when every check in `inspect::worktree` passes. An `unknown` check blocks, the same as a failed one.
 - Activity has three states (`in_use`, `not_observed`, `unknown`). A probe failure is `unknown`, never `not_observed`.
 - `remove` re-inspects against a fresh activity snapshot right before acting, and skips the worktree on any change.
-- Regenerable rules come only from the built-in list, the user's config file, `--regenerable` and Git config (`residue.regenerable`). Never from a file committed to the repository: a cloned repository must not be able to declare a user's files disposable.
+- Regenerable rules come only from the built-in list, the user's config file, `--regenerable` and Git config files (`residue.regenerable`). Never from a file committed to the repository: a cloned repository must not be able to declare a user's files disposable. Never from the environment (`git -c`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`, the legacy `GIT_CONFIG`): every subprocess inherits it, so it must not widen what residue deletes. `git::environment_regenerable` reports those values on stderr and in `ignored_environment_rules`, so they are never ignored silently.
 - Every string from the filesystem, Git or another process passes through `output::clean` before it reaches a terminal.
-- Git runs through `git::command`: argv only, optional locks off, prompts off, hooks and fsmonitor disabled, inherited `GIT_DIR`-style variables removed.
+- Git runs through `git::command`: argv only, optional locks off, prompts off, hooks and fsmonitor disabled, inherited `GIT_DIR`-style variables, `GIT_CONFIG`, `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT` removed. `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and `GIT_CONFIG_NOSYSTEM` stay, so residue reads the same config files as the user's Git.
 - One dependency (`libc`). Add another only when hand-written code would be riskier.
 
 ## Layout
@@ -46,7 +46,13 @@ Then run the binary on real repositories. Make a scratch repository with worktre
 
 1. Bump `version` in `Cargo.toml`, run `cargo build` to update `Cargo.lock`, and turn `## Unreleased` in `CHANGELOG.md` into a `## X.Y.Z (date)` section (add the section if there is no `## Unreleased`). The release notes come from that section.
 2. Commit, then tag `vX.Y.Z` and push the tag. `.github/workflows/release.yml` builds four targets, attests provenance, and publishes the GitHub release with `SHA256SUMS`. Its last job runs `.github/workflows/packages.yml`, which builds `.deb`, `.rpm` and Arch packages from the two Linux archives, attests them, and adds them to the release with an updated `SHA256SUMS`. To package a release made before that workflow existed, run `gh workflow run packages.yml -f tag=vX.Y.Z`.
-3. Update `Formula/residue.rb` in [whiteheap/homebrew-tap](https://github.com/whiteheap/homebrew-tap) with the new tag in the four URLs and the four checksums from `SHA256SUMS`. The formula has no `version` line: Homebrew reads it from the URL, and `brew audit --strict` rejects a redundant one. Then run `brew install whiteheap/tap/residue`, `brew test whiteheap/tap/residue` and `brew audit --strict --online whiteheap/tap/residue`.
+3. Update `Formula/residue.rb` in [whiteheap/homebrew-tap](https://github.com/whiteheap/homebrew-tap) with the new tag in the four URLs and the four checksums from `SHA256SUMS`. The formula has no `version` line: Homebrew reads it from the URL, and `brew audit --strict` rejects a redundant one. Then run `brew install whiteheap/tap/residue`, `brew test whiteheap/tap/residue` and `brew audit --strict --online whiteheap/tap/residue`. After the tap update, upgrade this machine's install, so the copy we dogfood is always the latest release:
+
+   ```sh
+   brew update && HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew upgrade whiteheap/tap/residue
+   ```
+
+   When residue is not installed, use `brew install` in place of `brew upgrade`, with the same two variables. Use exactly this form: the machine's brew hook allows a tap upgrade only this way. Auto-update and install-time cleanup could change other formulae in the shared `/opt/homebrew`. The formula is one static binary with no `depends_on`, so the upgrade itself changes nothing else in the prefix.
 4. Update the AUR package `residue-bin`, which lets Arch and Omarchy users run `yay -S residue-bin`. It is not on the AUR yet: the first push creates it. Run `packaging/aur/update.sh vX.Y.Z` (needs `gh` and Docker), commit `packaging/aur/`, then push the same `PKGBUILD` and `.SRCINFO` to the AUR. That needs an AUR account with your SSH key:
 
    ```sh

@@ -12,6 +12,7 @@ use crate::activity::{Evidence, Snapshot};
 use crate::fsinfo::{Space, Usage};
 use crate::inspect::{Report, Status, Verdict};
 use crate::json::Json;
+use crate::policy::Policy;
 
 pub const SCHEMA_SCAN: &str = "residue.scan/v1";
 pub const SCHEMA_EXPLAIN: &str = "residue.explain/v1";
@@ -457,4 +458,14 @@ pub fn scan_entry(r: &Report, places: &Places, style: &Style) -> String {
         "",
         style.dim(&notes)
     )
+}
+
+/// `ignored_environment_rules`: the `residue.regenerable` values set through
+/// the environment, which residue ignores. Empty when there are none; null
+/// when Git could not read that environment.
+pub fn ignored_environment_json(policy: &Policy) -> Json {
+    match &policy.ignored_environment {
+        Ok(values) => Json::Arr(values.iter().map(|v| Json::str(v.clone())).collect()),
+        Err(_) => Json::Null,
+    }
 }

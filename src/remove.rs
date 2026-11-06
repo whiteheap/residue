@@ -16,6 +16,7 @@ use crate::git;
 use crate::inspect::{self, Report, Verdict};
 use crate::json::Json;
 use crate::output::{self, Places, Style, clean};
+use crate::policy::Policy;
 
 enum Outcome {
     Removed,
@@ -121,7 +122,7 @@ pub fn remove(options: &Options) -> u8 {
         .iter()
         .all(|i| matches!(i.outcome, Some(Outcome::Removed)));
     if options.json {
-        println!("{}", json(&items, &snapshot, started).render());
+        println!("{}", json(&items, &snapshot, &policy, started).render());
     } else if let Some(why) = declined {
         println!("nothing removed: {}", clean(&why));
     }
@@ -302,7 +303,7 @@ fn outcome_line(item: &Item, outcome: &Outcome, places: &Places) -> String {
     }
 }
 
-fn json(items: &[Item], snapshot: &Snapshot, started: i64) -> Json {
+fn json(items: &[Item], snapshot: &Snapshot, policy: &Policy, started: i64) -> Json {
     let results = items
         .iter()
         .map(|item| {
@@ -333,6 +334,10 @@ fn json(items: &[Item], snapshot: &Snapshot, started: i64) -> Json {
         ("version", Json::str(VERSION)),
         ("generated_at", Json::str(output::rfc3339(started))),
         ("activity", output::activity_json(snapshot)),
+        (
+            "ignored_environment_rules",
+            output::ignored_environment_json(policy),
+        ),
         ("results", Json::Arr(results)),
     ])
 }

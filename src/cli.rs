@@ -36,6 +36,14 @@ Keep a worktree:  git worktree lock --reason \"resume later\" PATH
 Per repository:   git config --add residue.regenerable RULE
 Config file:      ~/.config/residue/regenerable (one RULE per line, every repo)
 Exit status:      0 ok, 1 error, 2 usage, 3 remove refused or skipped a path
+
+Rules come from the built-in list, the config file, --regenerable, and
+residue.regenerable in Git config files: the repository's, the global and
+the system file, including files chosen by GIT_CONFIG_GLOBAL and
+GIT_CONFIG_SYSTEM. residue ignores residue.regenerable set through the
+environment (git -c, GIT_CONFIG_COUNT, GIT_CONFIG_PARAMETERS, GIT_CONFIG)
+and prints a note when it finds one, because an inherited environment must
+not widen what residue deletes.
 ";
 
 #[derive(Default)]

@@ -1,7 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.0.3 (2026-11-07)
 
+Feedback from running 0.0.2 on an agent monorepo: a user set `residue.regenerable` through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`, the environment form of `git -c`, and residue ignored it without a word.
+
+- Decision: residue still ignores `residue.regenerable` set through the environment (`git -c` and `--config-env`, which Git passes on as `GIT_CONFIG_PARAMETERS`; `GIT_CONFIG_COUNT` with its pairs; the legacy `GIT_CONFIG`). Every subprocess and CI step inherits the environment, so it must not widen what residue deletes. `--regenerable` is the explicit rule for one run, and Git config files are the deliberate rule for a repository.
+- It no longer ignores them silently. When the environment sets the key, residue prints a note on stderr naming the values, and points at `--regenerable` and `git config --add residue.regenerable`. Every JSON document gains `ignored_environment_rules`: the ignored values, an empty list when there are none, or null when Git could not read that environment (for example `GIT_CONFIG_COUNT=1` with no `GIT_CONFIG_KEY_0`). Git parses the variables itself, so quoting and key case follow Git. The schemas stay at v1. residue runs no extra Git process when none of the variables is set.
+- Fix: 0.0.2 did not remove the legacy `GIT_CONFIG` variable. It makes `git config` read one file in place of every config file, so an inherited `GIT_CONFIG` replaced the repository's own rules, and a file it named with `residue.regenerable = .env` made a worktree holding `.env` a `candidate`. residue now removes `GIT_CONFIG` from its Git commands and reports the values in that file as ignored. It has no effect on other Git commands.
+- `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and `GIT_CONFIG_NOSYSTEM` are unchanged and documented: they choose which config files Git reads, and residue reads the same files as your Git. A user who relocates the global config keeps its `residue.regenerable` rules, as in 0.0.2. `GIT_CONFIG_NOSYSTEM` skips the system file.
+- `--help` and the README say which sources count. AGENTS.md: after each release, upgrade this machine's Homebrew install.
 - Linux packages on every release, for x86_64 and arm64: `.deb` for Debian and Ubuntu, `.rpm` for Fedora and RHEL, and a pacman package for Arch and Omarchy. Each is attested and listed in `SHA256SUMS`. v0.0.2 has them too.
 - `packaging/aur/PKGBUILD` for the `residue-bin` AUR package.
 

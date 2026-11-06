@@ -152,6 +152,13 @@ git config --get-all residue.regenerable    # list them
 
 Without a scope option, `git config` writes the repository's `.git/config`, which every worktree of the repository shares. residue reads the key with `git config --get-all`, so a value in your global Git config applies to every repository. If a value is invalid, the `ignored` check is `unknown`, so no worktree of that repository is a candidate until you fix it. `explain` names the value.
 
+Only Git config files count: the repository's own config, your global config and the system config, including files you choose with `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM`. `GIT_CONFIG_NOSYSTEM` skips the system file, as it does for Git. residue ignores `residue.regenerable` set through the environment: `git -c` and `--config-env` (which pass it on as `GIT_CONFIG_PARAMETERS`), `GIT_CONFIG_COUNT` with `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>`, and the legacy `GIT_CONFIG`. Every subprocess and CI step inherits the environment, so it must not widen what residue deletes. When the environment sets the key, residue prints a note on stderr and lists the values in the JSON field `ignored_environment_rules`:
+
+```text
+residue: note: ignored residue.regenerable set through the environment (git -c, GIT_CONFIG_COUNT, GIT_CONFIG_PARAMETERS or GIT_CONFIG): "web/.tscache"
+residue: note: residue reads rules only from Git config files, the residue config file and --regenerable. Pass --regenerable RULE for one run, or run `git config --add residue.regenerable RULE` in the repository to keep the rule
+```
+
 residue never reads rules from a file committed to the repository. A repository you clone must not be able to declare your files disposable, and `git clone` never copies Git config.
 
 For every repository on the machine, put one rule per line in `~/.config/residue/regenerable` (or `$XDG_CONFIG_HOME/residue/regenerable`). Lines starting with `#` are comments. For one run, pass `--regenerable RULE`. An invalid rule in the file or on the command line stops residue with exit status 1.
@@ -196,6 +203,8 @@ Each PATH gets one `results[].result`:
 
 For every result except `removed`, `reason` is a sentence that says why.
 
+Every JSON document has `ignored_environment_rules`: the `residue.regenerable` values the environment set and residue ignored, an empty list when there are none, or null when Git could not read that environment. To pass a rule for one run, use `--regenerable`, not `git -c`.
+
 A scan is a snapshot of one moment, `generated_at`. Worktrees created after the scan started are missing from it. Scan again before you act on an old result. `remove` re-checks each path right before it deletes it, so an old scan cannot cause a removal that the current state would refuse.
 
 ## Tested on
@@ -204,11 +213,13 @@ These are the exact platforms and versions that ran. residue has no automated te
 
 | Version | Platform | Git | What ran |
 | --- | --- | --- | --- |
+| 0.0.3 | macOS 26.3.1 (25D771280a), Apple silicon | Apple Git 2.50.1 | Scratch repository with the CONTRIBUTING states plus `.local-dev/*.lock` files: `scan` verdicts identical to 0.0.2 with no rules; `residue.regenerable` set through `GIT_CONFIG_COUNT` (mixed-case key too), `git -c` through a Git alias, and the legacy `GIT_CONFIG` all ignored with the stderr note and `ignored_environment_rules` (0.0.2 made the `.env` worktree a `candidate` under `GIT_CONFIG`; 0.0.3 keeps it); a malformed `GIT_CONFIG_COUNT` giving the "could not check" note and null; an escape character in an ignored value printed escaped; rules in `.git/config`, `$HOME/.gitconfig`, `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` honored, and skipped under `GIT_CONFIG_NOSYSTEM`; `remove --yes` under `git -c residue.regenerable=.env` refusing `.env`, removing a clean worktree (branch kept), exit 3. |
+| 0.0.3 | Ubuntu 24.04.5 LTS, arm64 (Docker, Linux 7.0.14) | 2.43.0 | Static musl binary as a non-root user: the same scratch states; `GIT_CONFIG_COUNT`, `git -c` and legacy `GIT_CONFIG` rules ignored with the note and JSON field; `.git/config` and `GIT_CONFIG_GLOBAL` rules honored; `--regenerable .env` honored; `remove --yes` without a terminal under `git -c` refusing `.env` and removing a clean worktree (branch kept), exit 3. |
 | 0.0.2 | macOS 26.3.1 (25D771280a), Apple silicon | Apple Git 2.50.1 | Scratch repositories: a path rule (`web/.tscache`, `/web/`, `web/.tsc*`) matching; `.local-dev/*.lock` expanding a collapsed `.local-dev/` when every file matched (candidate) and when `server.pid` did not (keep, naming the file); the same rules from `git config residue.regenerable` and from the config file; invalid git config values (`logs/**`, an empty value) giving `unknown`; an unreadable directory inside an expanded entry (`unknown`); 100,001 lock files (kept, over the limit); sizes with hard links counted once in `scan`, `explain` and JSON; `generated_at`; `remove --yes` refusing `.env` and `.vercel/` and removing a clean worktree and an expanded `.local-dev/` while the branches stayed. The 0.0.1 verdicts again: locked, modified, untracked, assume-unchanged, nested repository, rebase in progress, unreferenced detached HEAD, a path with a space. A read-only `scan` of a busy agent monorepo with four linked worktrees: 5.3 s. |
 | 0.0.2 | Ubuntu 24.04.5 LTS, arm64 (Docker, Linux 7.0.14) | 2.43.0 | Static musl binary as a non-root user with `TZ=Europe/Tallinn`: `scan` with a git-config glob rule and a `--regenerable` path rule, `explain` naming the unmatched file, JSON sizes and `generated_at`, local `as of` time, in-use detection through `/proc`, an invalid git config value, `remove --yes` refusing `.env` and removing a clean worktree without a terminal (branch kept), and `remove` without `--yes` and without a terminal removing nothing. |
 | 0.0.1 | macOS 26.3.1 (25D771280a), Apple silicon | Apple Git 2.50.1 | `scan`, `explain` and `remove` on real agent worktrees and on scratch repositories covering every verdict: clean with `node_modules`, `.env`, unreferenced detached HEAD, locked, in use, modified, stale, a path with a space, a path with an escape character, an assume-unchanged edit, a skip-worktree file, a nested repository and a rebase in progress. Removal kept the branches, and the assume-unchanged edit survived. |
 | 0.0.1 | Ubuntu 24.04.5 LTS, arm64 (Docker, Linux 7.0.14) | 2.43.0 | Static musl binary as a non-root user: `scan`, in-use detection through `/proc`, hard-link accounting, and `remove` with and without a terminal. As root on another user's repository, Git refused with "dubious ownership" and residue reported the error instead of guessing. |
-| 0.0.1, 0.0.2 | GitHub Actions `macos-latest`, `ubuntu-24.04` (x86_64), `ubuntu-24.04-arm` | runner Git | Build, then `scan` and `explain` of a temporary worktree. No removal. |
+| 0.0.1 to 0.0.3 | GitHub Actions `macos-latest`, `ubuntu-24.04` (x86_64), `ubuntu-24.04-arm` | runner Git | Build, then `scan` and `explain` of a temporary worktree. No removal. |
 
 Not run: the Intel macOS binary (built by cross-compiling, never executed), FreeBSD, OpenBSD, NetBSD and other Unix systems (no activity probe, so nothing is a candidate), and Windows (not supported).
 

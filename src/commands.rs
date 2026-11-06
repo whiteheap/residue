@@ -11,7 +11,7 @@ use crate::git::{self, Entry};
 use crate::inspect::{self, Report, Verdict};
 use crate::json::Json;
 use crate::output::{self, Places, Style, clean};
-use crate::policy::Policy;
+use crate::policy::{GIT_CONFIG_KEY, Policy};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -22,7 +22,41 @@ pub fn fail(message: &str) -> u8 {
 
 pub fn prepare(options: &Options) -> Result<Policy, String> {
     git::require_version()?;
-    Policy::load(&options.regenerable)
+    let mut policy = Policy::load(&options.regenerable)?;
+    policy.ignored_environment = git::environment_regenerable();
+    note_ignored_environment(&policy.ignored_environment);
+    Ok(policy)
+}
+
+const ENVIRONMENT_SOURCES: &str = "git -c, GIT_CONFIG_COUNT, GIT_CONFIG_PARAMETERS or GIT_CONFIG";
+
+/// residue ignores rules the environment sets (`git::CONFIG_ENV`), and
+/// says so on stderr, in text and JSON mode alike, so a user who set one
+/// learns why it had no effect and what to use instead.
+fn note_ignored_environment(ignored: &Result<Vec<String>, String>) {
+    let instead = format!(
+        "residue reads rules only from Git config files, the residue config file and --regenerable. \
+         Pass --regenerable RULE for one run, or run `git config --add {GIT_CONFIG_KEY} RULE` \
+         in the repository to keep the rule"
+    );
+    match ignored {
+        Ok(values) if values.is_empty() => {}
+        Ok(values) => {
+            let list: Vec<String> = values.iter().map(|v| format!("{v:?}")).collect();
+            eprintln!(
+                "residue: note: ignored {GIT_CONFIG_KEY} set through the environment ({ENVIRONMENT_SOURCES}): {}",
+                clean(&list.join(", "))
+            );
+            eprintln!("residue: note: {instead}");
+        }
+        Err(e) => {
+            eprintln!(
+                "residue: note: could not check the environment ({ENVIRONMENT_SOURCES}) for {GIT_CONFIG_KEY}: {}",
+                clean(e)
+            );
+            eprintln!("residue: note: any value set there is ignored. {instead}");
+        }
+    }
 }
 
 /// `residue 0.0.2 · as of 14:03:12`: the moment the snapshot started.
@@ -104,6 +138,10 @@ pub fn scan(options: &Options) -> u8 {
             (
                 "regenerable_config",
                 Json::opt(policy.config.as_deref(), Json::path),
+            ),
+            (
+                "ignored_environment_rules",
+                output::ignored_environment_json(&policy),
             ),
             ("repositories", Json::Arr(repos)),
             (
@@ -298,6 +336,10 @@ pub fn explain(options: &Options) -> u8 {
             ("version", Json::str(VERSION)),
             ("generated_at", Json::str(output::rfc3339(started))),
             ("activity", output::activity_json(&snapshot)),
+            (
+                "ignored_environment_rules",
+                output::ignored_environment_json(&policy),
+            ),
             ("main_path", Json::path(&target.repo.main.path)),
             ("worktree", output::report_json(&report)),
         ]);
