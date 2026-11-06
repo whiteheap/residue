@@ -2,8 +2,9 @@
 
 ## Unreleased
 
-- Every Unix: the activity probe uses lsof on FreeBSD, NetBSD, DragonFly, illumos and other Unix systems too, not only on macOS. It looks in fixed system locations, never `PATH`. Before, these systems had no probe, so nothing was ever a candidate. residue now also builds on illumos and Solaris, which have no `tm_gmtoff`. OpenBSD still has no probe, because it no longer packages lsof.
-- CI runs `.github/smoke.sh` on macOS, Linux x86_64 and arm64, FreeBSD 14 and NetBSD 10: a clean candidate, a kept `.env`, a worktree a process is using, and a removal that keeps the branch.
+- FreeBSD: an activity probe, from the base system's `procstat -f`. Before, FreeBSD had no probe, so nothing was ever a candidate. A packaged lsof is not used: on FreeBSD 14 it listed processes without resolving their working directories, so a worktree in use came back as a candidate. The procstat parser fails closed: a line it cannot read makes activity `unknown`.
+- residue builds on illumos and Solaris, which have no `tm_gmtoff`. NetBSD, OpenBSD, DragonFly and illumos build but still have no probe, so nothing there is a candidate.
+- CI runs `.github/smoke.sh` on macOS, Linux x86_64 and arm64, and FreeBSD 14 as root and as an ordinary user: a clean candidate, a kept `.env`, a worktree a process is using, and a removal that keeps the branch.
 - Signed dnf and pacman repositories next to the apt one, at https://whiteheap.github.io/residue/rpm and https://whiteheap.github.io/residue/arch: `dnf install residue` on Fedora and RHEL, `pacman -S residue` on Arch and Omarchy, and `dnf upgrade` and `pacman -Syu` keep residue current. Every release updates all three. The `.rpm` files in the dnf repository are signed, and one key signs everything (`packaging/signing-key.asc`).
 
 ## 0.0.4 (2026-11-07)

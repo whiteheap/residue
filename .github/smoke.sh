@@ -13,7 +13,9 @@ residue=$1
 case $residue in /*) ;; *) residue="$PWD/$residue" ;; esac
 S=$(mktemp -d "${TMPDIR:-/tmp}/residue-smoke.XXXXXX")
 busy=
-trap 'if [ -n "$busy" ]; then kill "$busy" 2>/dev/null; wait "$busy" 2>/dev/null; fi; rm -rf "$S"' EXIT
+# `wait` returns the killed process's status; `|| true` keeps it from
+# becoming the script's exit status under `set -e`.
+trap 'if [ -n "$busy" ]; then kill "$busy" 2>/dev/null || true; wait "$busy" 2>/dev/null || true; fi; rm -rf "$S"' EXIT
 
 git init -q -b main "$S/app"
 cd "$S/app"

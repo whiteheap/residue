@@ -38,8 +38,10 @@ jobs:
       - name: Smoke test
         run: sh .github/smoke.sh ./target/release/residue
 
-  # The BSDs run in a virtual machine. lsof comes from their packages, which is
-  # what residue's activity probe uses there.
+  # FreeBSD runs in a virtual machine. residue's probe there is the base
+  # system's procstat, so nothing beyond Rust and Git is installed. The smoke
+  # test runs as root and as an ordinary user, who can inspect only their own
+  # processes.
   freebsd:
     name: freebsd-14
     runs-on: ubuntu-24.04
@@ -49,25 +51,11 @@ jobs:
         with:
           release: "14"
           copyback: false
-          prepare: pkg install -y rust git lsof
+          prepare: pkg install -y rust git
           run: |
+            freebsd-version
             rustc --version
             cargo build --locked --release
             sh .github/smoke.sh ./target/release/residue
-
-  netbsd:
-    name: netbsd-10
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: vmactions/netbsd-vm@5957cf330aef2e6ddc63c604364c99ce2e02b91d # v1.5.3
-        with:
-          release: "10"
-          copyback: false
-          prepare: |
-            /usr/sbin/pkg_add pkgin
-            pkgin -y install rust git lsof
-          run: |
-            rustc --version
-            cargo build --locked --release
-            sh .github/smoke.sh ./target/release/residue
+            pw useradd smoke -m
+            su smoke -c "sh $PWD/.github/smoke.sh $PWD/target/release/residue"

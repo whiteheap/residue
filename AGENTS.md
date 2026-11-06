@@ -43,7 +43,7 @@ cargo build --release
 sh .github/smoke.sh ./target/release/residue
 ```
 
-CI runs the same smoke test on macOS, Linux x86_64 and arm64, and in FreeBSD 14 and NetBSD 10 virtual machines.
+CI runs the same smoke test on macOS, Linux x86_64 and arm64, and in a FreeBSD 14 virtual machine as root and as an ordinary user.
 
 Then run the binary on real repositories. Make a scratch repository with worktrees in the states your change touches; [CONTRIBUTING.md](CONTRIBUTING.md#verify-a-change) has a script that builds one with each common state. The README's "Tested on" table lists the states each version covered. Run `scan`, `explain` and `remove`, and record the exact platform and Git version that ran. For Linux from a Mac: `cargo zigbuild --release --target aarch64-unknown-linux-musl`, then run the binary in an `ubuntu:24.04` container as a non-root user.
 
