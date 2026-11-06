@@ -486,7 +486,7 @@ fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> usize 
                     && w.last_change.is_some_and(|t| now - t >= opts.idle.seconds)
             })
             .collect();
-        eligible.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+        eligible.sort_by_key(|w| std::cmp::Reverse(w.bytes));
         let mut chosen = Vec::new();
         for w in eligible {
             if need == 0 {
