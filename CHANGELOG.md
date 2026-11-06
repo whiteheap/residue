@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Linux packages on every release, for x86_64 and arm64: `.deb` for Debian and Ubuntu, `.rpm` for Fedora and RHEL, and a pacman package for Arch and Omarchy. Each is attested and listed in `SHA256SUMS`. v0.0.2 has them too.
+- `packaging/aur/PKGBUILD` for the `residue-bin` AUR package.
+
 ## 0.0.2 (2026-11-06)
 
 Feedback from running 0.0.1 on a busy agent monorepo: every worktree there held `.local-dev/` lock files, `.cargo/config.toml` and `web/.tscache/`, so nothing was a candidate unless each user added those names to a config file that then applied to every repository.

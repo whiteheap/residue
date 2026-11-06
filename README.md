@@ -31,7 +31,29 @@ Homebrew, on macOS and Linux:
 brew install whiteheap/tap/residue
 ```
 
-Prebuilt binaries for macOS (Apple silicon and Intel) and static Linux (x86_64 and arm64) are on the [releases page](https://github.com/whiteheap/residue/releases). Each archive has a SHA-256 checksum in `SHA256SUMS` and a GitHub build-provenance attestation:
+Debian and Ubuntu:
+
+```sh
+curl -fLO https://github.com/whiteheap/residue/releases/latest/download/residue_amd64.deb
+sudo apt install ./residue_amd64.deb
+```
+
+Fedora and RHEL:
+
+```sh
+sudo dnf install https://github.com/whiteheap/residue/releases/latest/download/residue.x86_64.rpm
+```
+
+Arch Linux, Omarchy and other Arch-based systems:
+
+```sh
+curl -fLO https://github.com/whiteheap/residue/releases/latest/download/residue-x86_64.pkg.tar.zst
+sudo pacman -U ./residue-x86_64.pkg.tar.zst
+```
+
+On arm64, use `residue_arm64.deb`, `residue.aarch64.rpm` or `residue-aarch64.pkg.tar.zst`. Each package installs `/usr/bin/residue` and pulls in Git if it is missing. The packages are not in a package repository yet, so `apt upgrade`, `dnf upgrade` and `pacman -Syu` do not update them: install the new release's package the same way.
+
+Prebuilt binaries for macOS (Apple silicon and Intel) and static Linux (x86_64 and arm64) are on the [releases page](https://github.com/whiteheap/residue/releases). Each archive and package has a SHA-256 checksum in `SHA256SUMS` and a GitHub build-provenance attestation:
 
 ```sh
 gh attestation verify residue-v0.0.2-aarch64-apple-darwin.tar.gz --repo whiteheap/residue

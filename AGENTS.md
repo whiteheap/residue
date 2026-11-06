@@ -30,6 +30,7 @@ These are the reasons people trust the tool. Do not weaken them without an expli
 | `src/discover.rs` | Finding repositories under a root |
 | `src/output.rs`, `src/json.rs` | Terminal text and JSON documents |
 | `src/run.rs` | Child processes with a deadline and an output cap |
+| `packaging/` | Linux packages (`nfpm.yaml`, `linux-packages.sh`) and the AUR package (`aur/`) |
 
 ## Verify a change
 
@@ -43,6 +44,14 @@ Then run the binary on real repositories. Make a scratch repository with worktre
 
 ## Release
 
-1. Bump `version` in `Cargo.toml`, run `cargo build` to update `Cargo.lock`, and add a `## X.Y.Z (date)` section to `CHANGELOG.md`.
-2. Commit, then tag `vX.Y.Z` and push the tag. `.github/workflows/release.yml` builds four targets, attests provenance, and publishes the GitHub release with `SHA256SUMS`.
+1. Bump `version` in `Cargo.toml`, run `cargo build` to update `Cargo.lock`, and turn `## Unreleased` in `CHANGELOG.md` into a `## X.Y.Z (date)` section (add the section if there is no `## Unreleased`). The release notes come from that section.
+2. Commit, then tag `vX.Y.Z` and push the tag. `.github/workflows/release.yml` builds four targets, attests provenance, and publishes the GitHub release with `SHA256SUMS`. Its last job runs `.github/workflows/packages.yml`, which builds `.deb`, `.rpm` and Arch packages from the two Linux archives, attests them, and adds them to the release with an updated `SHA256SUMS`. To package a release made before that workflow existed, run `gh workflow run packages.yml -f tag=vX.Y.Z`.
 3. Update `Formula/residue.rb` in [whiteheap/homebrew-tap](https://github.com/whiteheap/homebrew-tap) with the new tag in the four URLs and the four checksums from `SHA256SUMS`. The formula has no `version` line: Homebrew reads it from the URL, and `brew audit --strict` rejects a redundant one. Then run `brew install whiteheap/tap/residue`, `brew test whiteheap/tap/residue` and `brew audit --strict --online whiteheap/tap/residue`.
+4. Update the AUR package `residue-bin`, which lets Arch and Omarchy users run `yay -S residue-bin`. It is not on the AUR yet: the first push creates it. Run `packaging/aur/update.sh vX.Y.Z` (needs `gh` and Docker), commit `packaging/aur/`, then push the same `PKGBUILD` and `.SRCINFO` to the AUR. That needs an AUR account with your SSH key:
+
+   ```sh
+   git clone ssh://aur@aur.archlinux.org/residue-bin.git /tmp/residue-bin
+   cp packaging/aur/PKGBUILD packaging/aur/.SRCINFO /tmp/residue-bin/
+   git -C /tmp/residue-bin add PKGBUILD .SRCINFO
+   git -C /tmp/residue-bin commit -m "Update to vX.Y.Z" && git -C /tmp/residue-bin push
+   ```

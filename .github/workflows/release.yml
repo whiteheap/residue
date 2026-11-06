@@ -85,3 +85,13 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS \
             --title "residue $GITHUB_REF_NAME" --notes-file notes.md
+
+  packages:
+    needs: publish
+    uses: ./.github/workflows/packages.yml
+    with:
+      tag: ${{ github.ref_name }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
