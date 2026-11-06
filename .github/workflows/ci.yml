@@ -35,3 +35,39 @@ jobs:
           ./target/release/residue scan .
           ./target/release/residue explain "$RUNNER_TEMP/ci-worktree"
           ./target/release/residue scan . --json | jq -e '.schema == "residue.scan/v1" and .summary.linked_worktrees == 1'
+      - name: Smoke test
+        run: sh .github/smoke.sh ./target/release/residue
+
+  # The BSDs run in a virtual machine. lsof comes from their packages, which is
+  # what residue's activity probe uses there.
+  freebsd:
+    name: freebsd-14
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
+        with:
+          release: "14"
+          copyback: false
+          prepare: pkg install -y rust git lsof
+          run: |
+            rustc --version
+            cargo build --locked --release
+            sh .github/smoke.sh ./target/release/residue
+
+  netbsd:
+    name: netbsd-10
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: vmactions/netbsd-vm@5957cf330aef2e6ddc63c604364c99ce2e02b91d # v1.5.3
+        with:
+          release: "10"
+          copyback: false
+          prepare: |
+            /usr/sbin/pkg_add pkgin
+            pkgin -y install rust git lsof
+          run: |
+            rustc --version
+            cargo build --locked --release
+            sh .github/smoke.sh ./target/release/residue

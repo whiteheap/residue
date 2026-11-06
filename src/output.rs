@@ -199,10 +199,34 @@ fn local(seconds: i64) -> Option<(libc::tm, i64)> {
     if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
         return None;
     }
-    // `c_long`, which is i64 on every target residue ships (64-bit macOS
-    // and Linux), so no conversion is needed.
-    let offset: i64 = tm.tm_gmtoff;
+    let offset = utc_offset(&tm, seconds);
     Some((tm, offset))
+}
+
+/// The zone's offset from UTC, in seconds, for the instant `tm` describes.
+#[cfg(not(any(target_os = "illumos", target_os = "solaris")))]
+fn utc_offset(tm: &libc::tm, _seconds: i64) -> i64 {
+    // `c_long`, which is i64 on every 64-bit target residue builds for.
+    tm.tm_gmtoff
+}
+
+/// illumos and Solaris have no `tm_gmtoff`. Read the local civil time as if
+/// it were UTC (Howard Hinnant's days-from-civil); its distance from the real
+/// instant is the offset.
+#[cfg(any(target_os = "illumos", target_os = "solaris"))]
+fn utc_offset(tm: &libc::tm, seconds: i64) -> i64 {
+    let month = i64::from(tm.tm_mon) + 1;
+    let year = i64::from(tm.tm_year) + 1_900 - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let yoe = year - era * 400;
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + i64::from(tm.tm_mday) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let local = days * 86_400
+        + i64::from(tm.tm_hour) * 3_600
+        + i64::from(tm.tm_min) * 60
+        + i64::from(tm.tm_sec);
+    local - seconds
 }
 
 /// `+02:00`, `-05:30`, `+00:00`.

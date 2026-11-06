@@ -111,24 +111,64 @@ fn unavailable(backend: &'static str, reason: &'static str, detail: String) -> S
     }
 }
 
-#[cfg(target_os = "macos")]
+/// macOS, FreeBSD, NetBSD, DragonFly, illumos and every other Unix except
+/// Linux: one lsof snapshot. macOS ships lsof; elsewhere it comes from the
+/// system's packages.
+#[cfg(not(target_os = "linux"))]
 mod platform {
     use super::{Seen, Snapshot, Use, unavailable};
     use crate::run::{self, RunError};
+    use std::path::Path;
     use std::process::Command;
     use std::time::Duration;
 
     const BACKEND: &str = "lsof";
 
+    /// Where lsof lives, in order. Fixed system paths, never `PATH`, so a
+    /// directory early in `PATH` cannot stand in for the probe.
+    #[cfg(target_os = "macos")]
+    const LSOF: &[&str] = &["/usr/sbin/lsof"];
+    #[cfg(not(target_os = "macos"))]
+    const LSOF: &[&str] = &[
+        "/usr/local/sbin/lsof", // FreeBSD and DragonFly packages
+        "/usr/local/bin/lsof",
+        "/usr/pkg/sbin/lsof", // NetBSD pkgsrc
+        "/usr/pkg/bin/lsof",
+        "/opt/local/sbin/lsof", // illumos pkgsrc (SmartOS, OmniOS)
+        "/opt/local/bin/lsof",
+        "/usr/sbin/lsof",
+        "/usr/bin/lsof",
+    ];
+
+    #[cfg(target_os = "macos")]
+    const INSTALL: &str = "";
+    #[cfg(target_os = "freebsd")]
+    const INSTALL: &str = "; install it with `pkg install lsof`";
+    #[cfg(target_os = "netbsd")]
+    const INSTALL: &str = "; install it with `pkgin install lsof`";
+    #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+    const INSTALL: &str = "; install lsof from the system's packages";
+
     pub fn take() -> Snapshot {
-        let mut cmd = Command::new("/usr/sbin/lsof");
+        let Some(lsof) = LSOF.iter().find(|p| Path::new(p).is_file()) else {
+            return unavailable(
+                BACKEND,
+                "probe_missing",
+                format!("lsof not found at {}{INSTALL}", LSOF.join(", ")),
+            );
+        };
+        let mut cmd = Command::new(lsof);
         // -n -P: no DNS or port lookups. -F pcn: machine-readable fields for
         // pid, command and name; lsof adds the fd field on its own.
         cmd.args(["-n", "-P", "-F", "pcn"]).env("LC_ALL", "C");
         let out = match run::run(&mut cmd, Duration::from_secs(30), 512 << 20) {
             Ok(out) => out,
             Err(RunError::NotFound) => {
-                return unavailable(BACKEND, "probe_missing", "/usr/sbin/lsof not found".into());
+                return unavailable(
+                    BACKEND,
+                    "probe_missing",
+                    format!("{lsof} not found{INSTALL}"),
+                );
             }
             Err(RunError::Timeout(d)) => {
                 return unavailable(
@@ -202,7 +242,10 @@ mod platform {
 
     /// The number of running processes, to state how much lsof could see.
     fn count_processes() -> Option<usize> {
-        let mut cmd = Command::new("/bin/ps");
+        let ps = ["/bin/ps", "/usr/bin/ps"]
+            .into_iter()
+            .find(|p| Path::new(p).is_file())?;
+        let mut cmd = Command::new(ps);
         cmd.args(["-A", "-o", "pid="]);
         let out = run::run(&mut cmd, Duration::from_secs(10), 16 << 20).ok()?;
         out.status.success().then(|| {
@@ -286,18 +329,5 @@ mod platform {
                 total: Some(total),
             }),
         }
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-mod platform {
-    use super::{Snapshot, unavailable};
-
-    pub fn take() -> Snapshot {
-        unavailable(
-            "none",
-            "unsupported",
-            "residue has no process probe for this operating system".into(),
-        )
     }
 }
