@@ -1,0 +1,425 @@
+//! `residue scan` and `residue explain`, plus the path lookup `remove` shares.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use crate::activity::Snapshot;
+use crate::cli::Options;
+use crate::discover::{self, Repo};
+use crate::fsinfo::{self, Space};
+use crate::git::{self, Entry};
+use crate::inspect::{self, Report, Verdict};
+use crate::json::Json;
+use crate::output::{self, Places, Style, clean};
+use crate::policy::Policy;
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub fn fail(message: &str) -> u8 {
+    eprintln!("residue: {}", clean(message));
+    1
+}
+
+pub fn prepare(options: &Options) -> Result<Policy, String> {
+    git::require_version()?;
+    Policy::load(&options.regenerable)
+}
+
+pub fn scan(options: &Options) -> u8 {
+    let policy = match prepare(options) {
+        Ok(p) => p,
+        Err(e) => return fail(&e),
+    };
+    let roots = if options.paths.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        options.paths.clone()
+    };
+    let found = discover::find(&roots);
+    let snapshot = Snapshot::take();
+    let jobs: Vec<(&Entry, &Path)> = found
+        .repos
+        .iter()
+        .flat_map(|repo| {
+            repo.linked
+                .iter()
+                .map(move |e| (e, repo.common_dir.as_path()))
+        })
+        .collect();
+    let mut reports = inspect::all(&jobs, &snapshot, &policy).into_iter();
+    let mut grouped: Vec<(&Repo, Vec<Report>, Option<Space>)> = Vec::new();
+    for repo in &found.repos {
+        let mut list: Vec<Report> = reports.by_ref().take(repo.linked.len()).collect();
+        list.sort_by_key(|r| std::cmp::Reverse(r.usage.as_ref().map_or(0, |u| u.allocated)));
+        let space = fsinfo::space(&repo.main.path)
+            .or_else(|_| fsinfo::space(&repo.common_dir))
+            .ok();
+        grouped.push((repo, list, space));
+    }
+    let candidates: Vec<&Report> = grouped
+        .iter()
+        .flat_map(|(_, list, _)| list.iter())
+        .filter(|r| r.verdict == Verdict::Candidate)
+        .collect();
+    let allocated: u64 = candidates
+        .iter()
+        .filter_map(|r| r.usage.as_ref())
+        .map(|u| u.allocated)
+        .sum();
+    let reclaimable: u64 = candidates
+        .iter()
+        .filter_map(|r| r.usage.as_ref())
+        .map(|u| u.reclaimable)
+        .sum();
+    let total = grouped.iter().map(|(_, l, _)| l.len()).sum::<usize>();
+
+    if options.json {
+        let repos = grouped
+            .iter()
+            .map(|(repo, list, space)| {
+                Json::Obj(vec![
+                    ("common_dir", Json::path(&repo.common_dir)),
+                    ("main_path", Json::path(&repo.main.path)),
+                    ("bare", Json::Bool(repo.main.bare)),
+                    ("free_space", Json::opt(space.as_ref(), output::space_json)),
+                    (
+                        "worktrees",
+                        Json::Arr(list.iter().map(output::report_json).collect()),
+                    ),
+                ])
+            })
+            .collect();
+        let doc = Json::Obj(vec![
+            ("schema", Json::str(output::SCHEMA_SCAN)),
+            ("version", Json::str(VERSION)),
+            ("activity", output::activity_json(&snapshot)),
+            (
+                "regenerable_config",
+                Json::opt(policy.config.as_deref(), Json::path),
+            ),
+            ("repositories", Json::Arr(repos)),
+            (
+                "orphans",
+                Json::Arr(
+                    found
+                        .orphans
+                        .iter()
+                        .map(|o| {
+                            Json::Obj(vec![
+                                ("path", Json::path(&o.path)),
+                                ("missing_gitdir", Json::path(&o.gitdir)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "errors",
+                Json::Arr(found.errors.iter().map(|e| Json::str(e.clone())).collect()),
+            ),
+            (
+                "summary",
+                Json::Obj(vec![
+                    ("linked_worktrees", Json::UInt(total as u64)),
+                    ("candidates", Json::UInt(candidates.len() as u64)),
+                    ("candidate_allocated_bytes", Json::UInt(allocated)),
+                    ("candidate_reclaimable_bytes", Json::UInt(reclaimable)),
+                ]),
+            ),
+        ]);
+        println!("{}", doc.render());
+        return 0;
+    }
+
+    let style = Style::stdout();
+    let places = Places::new();
+    let mut out = String::new();
+    out.push_str(&style.dim(&format!(
+        "residue {VERSION} · activity: {}\n",
+        clean(&snapshot.scope())
+    )));
+    for (repo, list, _) in &grouped {
+        let size: u64 = list
+            .iter()
+            .filter_map(|r| r.usage.as_ref())
+            .map(|u| u.allocated)
+            .sum();
+        let kind = if repo.main.bare { " (bare)" } else { "" };
+        out.push('\n');
+        if list.is_empty() {
+            out.push_str(&format!(
+                "{}{kind} · no linked worktrees\n",
+                style.bold(&places.show(&repo.main.path))
+            ));
+            continue;
+        }
+        out.push_str(&format!(
+            "{}{kind} · {} linked worktree{} · {}\n",
+            style.bold(&places.show(&repo.main.path)),
+            list.len(),
+            if list.len() == 1 { "" } else { "s" },
+            output::bytes(size)
+        ));
+        for report in list {
+            out.push_str(&output::scan_entry(report, &places, &style));
+        }
+    }
+    if found.repos.is_empty() && found.errors.is_empty() {
+        out.push_str("\nno Git repositories found\n");
+    }
+    if !found.orphans.is_empty() {
+        out.push_str(
+            "\norphaned checkouts (their Git directory is gone; residue does not remove these):\n",
+        );
+        for o in &found.orphans {
+            out.push_str(&format!(
+                "  {}  {}\n",
+                places.show(&o.path),
+                style.dim(&format!("missing {}", places.show(&o.gitdir)))
+            ));
+        }
+    }
+    if !found.errors.is_empty() {
+        out.push_str("\ncould not inspect:\n");
+        for e in &found.errors {
+            out.push_str(&format!("  {}\n", clean(e)));
+        }
+    }
+    let mut spaces: BTreeMap<u64, (&Repo, Space)> = BTreeMap::new();
+    for (repo, _, space) in &grouped {
+        if let Some(space) = space {
+            spaces.entry(space.device).or_insert((repo, *space));
+        }
+    }
+    if !spaces.is_empty() {
+        out.push('\n');
+    }
+    for (repo, space) in spaces.values() {
+        out.push_str(&format!(
+            "disk  {}  {}\n",
+            output::space_phrase(space),
+            style.dim(&format!("(filesystem of {})", places.show(&repo.main.path)))
+        ));
+    }
+    if total > 0 {
+        out.push_str(&format!(
+            "{} candidate{} of {} linked worktree{} · {} allocated · about {} reclaimable\n",
+            candidates.len(),
+            if candidates.len() == 1 { "" } else { "s" },
+            total,
+            if total == 1 { "" } else { "s" },
+            output::bytes(allocated),
+            output::bytes(reclaimable)
+        ));
+        out.push_str(&style.dim(
+            "next: residue explain PATH  ·  residue remove PATH  ·  keep one: git worktree lock PATH\n",
+        ));
+    }
+    print!("{out}");
+    0
+}
+
+/// A linked worktree named on the command line, with its repository.
+pub struct Target {
+    pub repo: Repo,
+    pub entry: Entry,
+    pub canonical: PathBuf,
+}
+
+/// Resolve PATH to the root of one linked worktree. Refuses the main
+/// checkout, a bare repository, and a directory inside a worktree (so a
+/// mistyped subdirectory can never select the whole checkout).
+pub fn locate(path: &Path) -> Result<Target, String> {
+    let canonical = git::canonical(path)?;
+    let common_dir = git::common_dir(&canonical)
+        .map_err(|e| format!("{}: not inside a Git repository ({e})", path.display()))?;
+    let mut entries = git::worktrees(&canonical)?;
+    let main = entries.remove(0);
+    if !main.bare && git::canonical(&main.path).ok().as_deref() == Some(canonical.as_path()) {
+        return Err(format!(
+            "{} is the main checkout of its repository; residue never removes it",
+            path.display()
+        ));
+    }
+    let position = entries
+        .iter()
+        .position(|e| git::canonical(&e.path).ok().as_deref() == Some(canonical.as_path()));
+    let Some(position) = position else {
+        let top = git::identity(&canonical)
+            .map(|id| id.toplevel)
+            .unwrap_or_else(|_| canonical.clone());
+        return Err(if top != canonical {
+            format!(
+                "{} is inside the checkout {}; pass the worktree root itself",
+                path.display(),
+                top.display()
+            )
+        } else {
+            format!("{} is not a linked worktree", path.display())
+        });
+    };
+    let entry = entries.remove(position);
+    let repo = Repo {
+        common_dir,
+        main,
+        linked: entries,
+    };
+    Ok(Target {
+        repo,
+        entry,
+        canonical,
+    })
+}
+
+pub fn explain(options: &Options) -> u8 {
+    let policy = match prepare(options) {
+        Ok(p) => p,
+        Err(e) => return fail(&e),
+    };
+    let target = match locate(&options.paths[0]) {
+        Ok(t) => t,
+        Err(e) => return fail(&e),
+    };
+    let snapshot = Snapshot::take();
+    let report = inspect::worktree(&target.entry, &target.repo.common_dir, &snapshot, &policy);
+    if options.json {
+        let doc = Json::Obj(vec![
+            ("schema", Json::str(output::SCHEMA_EXPLAIN)),
+            ("version", Json::str(VERSION)),
+            ("activity", output::activity_json(&snapshot)),
+            ("main_path", Json::path(&target.repo.main.path)),
+            ("worktree", output::report_json(&report)),
+        ]);
+        println!("{}", doc.render());
+        return 0;
+    }
+    print!(
+        "{}",
+        explain_text(&report, &target.repo, &Places::new(), &Style::stdout())
+    );
+    0
+}
+
+pub fn explain_text(r: &Report, repo: &Repo, places: &Places, style: &Style) -> String {
+    let mut out = String::new();
+    let row = |out: &mut String, label: &str, value: String| {
+        out.push_str(&format!("{:<11}{}\n", style.dim(label), value));
+    };
+    row(
+        &mut out,
+        "worktree",
+        style.bold(&places.show(r.canonical.as_deref().unwrap_or(&r.entry.path))),
+    );
+    row(&mut out, "repository", places.show(&repo.main.path));
+    let head = r.entry.short_head().unwrap_or("none");
+    row(
+        &mut out,
+        "HEAD",
+        match r.entry.short_branch() {
+            Some(b) => format!("{head} on branch {}", clean(b)),
+            None => format!("{head} (detached)"),
+        },
+    );
+    let blockers = r
+        .checks
+        .iter()
+        .filter(|c| c.status == inspect::Status::Block)
+        .count();
+    let unknowns = r
+        .checks
+        .iter()
+        .filter(|c| c.status == inspect::Status::Unknown)
+        .count();
+    let verdict = match r.verdict {
+        Verdict::Candidate => "every check passed. `residue remove` deletes the directory with `git worktree remove`; the branch and its commits stay.".to_string(),
+        Verdict::Keep => format!(
+            "{} block{} removal.",
+            if blockers == 1 { "1 check".to_string() } else { format!("{blockers} checks") },
+            if blockers == 1 { "s" } else { "" }
+        ),
+        Verdict::Unknown => format!(
+            "residue could not establish {} and keeps the worktree.",
+            if unknowns == 1 { "1 check".to_string() } else { format!("{unknowns} checks") }
+        ),
+        Verdict::Stale => format!(
+            "{}. Only Git metadata remains; `git worktree prune` clears it.",
+            clean(r.stale_reason.as_deref().unwrap_or("stale"))
+        ),
+    };
+    row(
+        &mut out,
+        "verdict",
+        format!("{}: {}", style.verdict(r.verdict, 0), verdict),
+    );
+    if !r.checks.is_empty() {
+        out.push_str("\nchecks\n");
+        for c in &r.checks {
+            out.push_str(&format!(
+                "  {} {:<16}{}\n",
+                style.status(c.status),
+                c.id,
+                clean(&c.detail)
+            ));
+        }
+    }
+    if r.verdict == Verdict::Stale {
+        return out;
+    }
+    out.push_str("\nfacts (never block)\n");
+    let fact = |out: &mut String, label: &str, value: String| {
+        out.push_str(&format!("  {:<24}{}\n", label, value));
+    };
+    fact(
+        &mut out,
+        "local-only commits",
+        match &r.local_commits {
+            Ok(Some(n)) => {
+                format!("{n} (compared with local remote-tracking refs; residue never fetches)")
+            }
+            Ok(None) => "unknown: the repository has no remote-tracking refs".into(),
+            Err(e) => format!("unknown: {}", clean(e)),
+        },
+    );
+    if r.entry.branch.is_some() {
+        fact(
+            &mut out,
+            "upstream",
+            match &r.upstream {
+                Ok(Some(u)) if u.gone => format!("{} (gone from the remote)", clean(&u.name)),
+                Ok(Some(u)) => clean(&u.name),
+                Ok(None) => "none configured".into(),
+                Err(e) => format!("unknown: {}", clean(e)),
+            },
+        );
+    }
+    if let Some(u) = &r.usage {
+        if let Some(m) = u.newest_mtime {
+            fact(
+                &mut out,
+                "newest change on disk",
+                format!("{} ({})", output::date(m), output::age(output::now() - m)),
+            );
+        }
+        fact(&mut out, "size", output::usage_phrase(u));
+        fact(
+            &mut out,
+            "",
+            style.dim("reclaimable excludes files hard-linked from outside; copy-on-write clones are not detected"),
+        );
+    }
+    if !r.ignored.is_empty() {
+        let names: Vec<String> = r
+            .ignored
+            .iter()
+            .map(|i| {
+                format!(
+                    "{} ({})",
+                    clean(&i.path),
+                    if i.regenerable { "regenerable" } else { "kept" }
+                )
+            })
+            .collect();
+        fact(&mut out, "ignored entries", names.join(", "));
+    }
+    out
+}

@@ -1,0 +1,20 @@
+[package]
+name = "residue"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+description = "Find what coding agents left behind on disk, and remove a Git worktree only when nothing in it would be lost."
+license = "MIT"
+repository = "https://github.com/whiteheap/residue"
+readme = "README.md"
+keywords = ["git", "worktree", "disk", "agents", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [".github/"]
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
