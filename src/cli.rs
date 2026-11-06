@@ -15,6 +15,10 @@ Usage:
   residue remove PATH...     Re-check, confirm, then `git worktree remove` each
   residue remove --all PATH...
                              The same for every candidate a scan of PATH finds
+  residue watch ROOT...      Stay running; remove a worktree when its branch
+                             lands or the disk runs low (`residue watch --help`)
+  residue service install ROOT...
+                             Run `residue watch` from login (launchd, systemd)
 
 Options:
   --json                Print one JSON document (scan, explain, remove)

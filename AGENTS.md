@@ -10,6 +10,7 @@ These are the reasons people trust the tool. Do not weaken them without an expli
 - A worktree is removable only when every check in `inspect::worktree` passes. An `unknown` check blocks, the same as a failed one.
 - Activity has three states (`in_use`, `not_observed`, `unknown`). A probe failure is `unknown`, never `not_observed`.
 - `remove` re-inspects against a fresh activity snapshot right before acting, and skips the worktree on any change.
+- `watch` deletes nothing itself. It only chooses which paths to pass to a `residue remove --yes --idle` child process, so every removal it makes is one `remove` would make. It reads `scan --json`, so the JSON schemas are its contract too.
 - `remove --all --yes` (an unattended sweep) refuses to run without `--idle`. `remove` without `--all` takes only worktree paths, never a scan root.
 - The `idle` check's last change is the newest of the checkout's entries, the files directly in the worktree's Git directory, and the timestamp inside the newest HEAD reflog entry (`inspect::last_change`). Never the mtime of anything under `logs/`: `git gc` rewrites every worktree's `logs/HEAD`. A last change residue cannot read is `unknown`.
 - Regenerable rules come only from the built-in list, the user's config file, `--regenerable` and Git config files (`residue.regenerable`). Never from a file committed to the repository: a cloned repository must not be able to declare a user's files disposable. Never from the environment (`git -c`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`, the legacy `GIT_CONFIG`): every subprocess inherits it, so it must not widen what residue deletes. `git::environment_regenerable` reports those values on stderr and in `ignored_environment_rules`, so they are never ignored silently.
@@ -25,13 +26,17 @@ These are the reasons people trust the tool. Do not weaken them without an expli
 | `src/commands.rs` | `scan`, `explain`, and resolving a PATH to one linked worktree |
 | `src/remove.rs` | The remove plan, confirmation, re-check and execution |
 | `src/inspect.rs` | Every check and the verdict |
-| `src/activity.rs` | The process probe (`lsof` on macOS, `/proc` on Linux) |
+| `src/activity.rs` | The process probe (`lsof` on macOS, `/proc` on Linux, `procstat` on FreeBSD) |
 | `src/git.rs` | Hardened Git invocation and porcelain parsers |
 | `src/fsinfo.rs` | Disk usage walk and free space |
 | `src/policy.rs` | Regenerable rules (names and paths) for ignored entries |
 | `src/discover.rs` | Finding repositories under a root |
 | `src/output.rs`, `src/json.rs` | Terminal text and JSON documents |
 | `src/run.rs` | Child processes with a deadline and an output cap |
+| `src/watch.rs` | `residue watch`: when to remove (branch landed, disk low), by running `scan --json` and `remove --yes --idle` |
+| `src/events.rs` | Waiting for file changes: inotify on Linux, kqueue on macOS and the BSDs |
+| `src/jsonread.rs` | Reading back residue's own JSON documents, for `watch` |
+| `src/service.rs` | `residue service`: the launchd agent and the systemd user service that run `watch` |
 | `packaging/` | Linux packages (`nfpm.yaml`, `linux-packages.sh`), the signed apt, dnf and pacman repositories (`apt-repo.sh`, `rpm-repo.sh` with `rpm/residue.repo`, `arch-repo.sh`), their public key (`signing-key.asc`), and the AUR package (`aur/`) |
 
 ## Verify a change
@@ -41,9 +46,10 @@ cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --release
 sh .github/smoke.sh ./target/release/residue
+sh .github/watch-smoke.sh ./target/release/residue
 ```
 
-CI runs the same smoke test on macOS, Linux x86_64 and arm64, and in a FreeBSD 14 virtual machine as root and as an ordinary user.
+CI runs both on macOS, Linux x86_64 and arm64, and in a FreeBSD 14 virtual machine as root and as an ordinary user, and `.github/service-smoke.sh` (install, status, uninstall) on macOS and Linux x86_64.
 
 Then run the binary on real repositories. Make a scratch repository with worktrees in the states your change touches; [CONTRIBUTING.md](CONTRIBUTING.md#verify-a-change) has a script that builds one with each common state. The README's "Tested on" table lists the states each version covered. Run `scan`, `explain` and `remove`, and record the exact platform and Git version that ran. For Linux from a Mac: `cargo zigbuild --release --target aarch64-unknown-linux-musl`, then run the binary in an `ubuntu:24.04` container as a non-root user.
 
