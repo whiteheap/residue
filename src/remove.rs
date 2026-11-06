@@ -7,12 +7,13 @@
 //! confirmation skips that worktree.
 
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::activity::Snapshot;
 use crate::cli::Options;
 use crate::commands::{self, Target, VERSION, fail, locate};
-use crate::git;
+use crate::discover::{self, Repo};
+use crate::git::{self, Entry};
 use crate::inspect::{self, Report, Verdict};
 use crate::json::Json;
 use crate::output::{self, Places, Style, clean};
@@ -53,32 +54,25 @@ pub fn remove(options: &Options) -> u8 {
     };
     let places = Places::new();
     let style = Style::stdout();
-    let mut items: Vec<Item> = Vec::new();
-    for arg in &options.paths {
-        let mut item = Item {
-            arg: arg.clone(),
-            target: None,
-            report: None,
-            outcome: None,
-        };
-        match locate(arg) {
-            Ok(t)
-                if items
-                    .iter()
-                    .any(|i| i.target.as_ref().map(|x| &x.canonical) == Some(&t.canonical)) =>
-            {
-                continue;
-            }
-            Ok(t) => item.target = Some(t),
-            Err(e) => item.outcome = Some(Outcome::Invalid(e)),
-        }
-        items.push(item);
-    }
+    let (mut items, errors) = if options.all {
+        sweep(&options.paths)
+    } else {
+        (named(&options.paths), Vec::new())
+    };
 
     let snapshot = Snapshot::take();
+    let jobs: Vec<(&Entry, &Path)> = items
+        .iter()
+        .filter_map(|i| i.target.as_ref())
+        .map(|t| (&t.entry, t.repo.common_dir.as_path()))
+        .collect();
+    let mut reports = inspect::all(&jobs, &snapshot, &policy).into_iter();
     for item in &mut items {
-        if let Some(t) = &item.target {
-            let report = inspect::worktree(&t.entry, &t.repo.common_dir, &snapshot, &policy);
+        if item.target.is_some() {
+            let Some(report) = reports.next() else {
+                item.outcome = Some(Outcome::Failed("internal: no report".into()));
+                continue;
+            };
             if report.verdict != Verdict::Candidate {
                 item.outcome = Some(Outcome::Refused);
             }
@@ -90,7 +84,18 @@ pub fn remove(options: &Options) -> u8 {
         .filter(|&i| items[i].outcome.is_none())
         .collect();
     if !options.json {
-        print!("{}", plan_text(&items, &ready, started, &places, &style));
+        print!(
+            "{}",
+            plan_text(
+                &items,
+                &ready,
+                &errors,
+                options.all,
+                started,
+                &places,
+                &style
+            )
+        );
     }
 
     let mut declined: Option<String> = None;
@@ -118,22 +123,93 @@ pub fn remove(options: &Options) -> u8 {
         items[i].outcome = Some(outcome);
     }
 
-    let all_removed = items
-        .iter()
-        .all(|i| matches!(i.outcome, Some(Outcome::Removed)));
+    // A sweep never asked for the worktrees it kept, so only a candidate
+    // that was not removed, or a PATH it could not read, makes it fail.
+    let done = items.iter().all(|i| match i.outcome {
+        Some(Outcome::Removed) => true,
+        Some(Outcome::Refused) => options.all,
+        _ => false,
+    }) && errors.is_empty();
     if options.json {
-        println!("{}", json(&items, &snapshot, &policy, started).render());
+        println!(
+            "{}",
+            json(&items, &errors, &snapshot, &policy, started).render()
+        );
     } else if let Some(why) = declined {
         println!("nothing removed: {}", clean(&why));
+    } else if ready.is_empty() && options.all {
+        println!("nothing to remove");
     }
-    if all_removed { 0 } else { 3 }
+    if done { 0 } else { 3 }
+}
+
+/// The worktree PATHs named on the command line, each resolved to one
+/// linked worktree, duplicates dropped.
+fn named(paths: &[PathBuf]) -> Vec<Item> {
+    let mut items: Vec<Item> = Vec::new();
+    for arg in paths {
+        let mut item = Item {
+            arg: arg.clone(),
+            target: None,
+            report: None,
+            outcome: None,
+        };
+        match locate(arg) {
+            Ok(t)
+                if items
+                    .iter()
+                    .any(|i| i.target.as_ref().map(|x| &x.canonical) == Some(&t.canonical)) =>
+            {
+                continue;
+            }
+            Ok(t) => item.target = Some(t),
+            Err(e) => item.outcome = Some(Outcome::Invalid(e)),
+        }
+        items.push(item);
+    }
+    items
+}
+
+/// `--all`: every linked worktree of the repositories a scan of PATH
+/// finds, and the PATHs or repositories it could not read.
+fn sweep(roots: &[PathBuf]) -> (Vec<Item>, Vec<String>) {
+    let found = discover::find(roots);
+    let mut items = Vec::new();
+    for repo in &found.repos {
+        for (i, entry) in repo.linked.iter().enumerate() {
+            let others = repo
+                .linked
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, e)| e.clone())
+                .collect();
+            // A stale entry has no directory to resolve; its report says so.
+            let canonical = git::canonical(&entry.path).unwrap_or_else(|_| entry.path.clone());
+            items.push(Item {
+                arg: entry.path.clone(),
+                target: Some(Target {
+                    repo: Repo {
+                        common_dir: repo.common_dir.clone(),
+                        main: repo.main.clone(),
+                        linked: others,
+                    },
+                    entry: entry.clone(),
+                    canonical,
+                }),
+                report: None,
+                outcome: None,
+            });
+        }
+    }
+    (items, found.errors)
 }
 
 fn confirm(n: usize) -> Result<bool, String> {
     let stdin = io::stdin();
     if !stdin.is_terminal() {
         return Err(
-            "stdin is not a terminal, so residue cannot ask for confirmation; pass --yes only from the session that owns these worktrees and knows its task is finished"
+            "stdin is not a terminal, so residue cannot ask for confirmation; pass --yes only from the session that owns these worktrees and knows its task is finished, or from a scheduled `residue remove --all --idle`"
                 .into(),
         );
     }
@@ -204,6 +280,8 @@ fn execute(item: &Item, policy: &crate::policy::Policy) -> Outcome {
 fn plan_text(
     items: &[Item],
     ready: &[usize],
+    errors: &[String],
+    sweep: bool,
     started: i64,
     places: &Places,
     style: &Style,
@@ -254,7 +332,12 @@ fn plan_text(
     }
     let refused: Vec<&Item> = items.iter().filter(|i| i.outcome.is_some()).collect();
     if !refused.is_empty() {
-        out.push_str(&format!("\n{}\n", style.bold("not removed:")));
+        let title = if sweep {
+            format!("kept ({}):", refused.len())
+        } else {
+            "not removed:".to_string()
+        };
+        out.push_str(&format!("\n{}\n", style.bold(&title)));
         for item in refused {
             let shown = item.target.as_ref().map_or_else(
                 || clean(&item.arg.to_string_lossy()),
@@ -271,6 +354,12 @@ fn plan_text(
             out.push_str(&format!("  {shown}  {}\n", style.dim(&why)));
         }
         out.push_str(&style.dim("  details: residue explain PATH\n"));
+    }
+    if !errors.is_empty() {
+        out.push_str(&format!("\n{}\n", style.bold("could not inspect:")));
+        for e in errors {
+            out.push_str(&format!("  {}\n", clean(e)));
+        }
     }
     out.push('\n');
     out
@@ -303,7 +392,13 @@ fn outcome_line(item: &Item, outcome: &Outcome, places: &Places) -> String {
     }
 }
 
-fn json(items: &[Item], snapshot: &Snapshot, policy: &Policy, started: i64) -> Json {
+fn json(
+    items: &[Item],
+    errors: &[String],
+    snapshot: &Snapshot,
+    policy: &Policy,
+    started: i64,
+) -> Json {
     let results = items
         .iter()
         .map(|item| {
@@ -338,6 +433,12 @@ fn json(items: &[Item], snapshot: &Snapshot, policy: &Policy, started: i64) -> J
             "ignored_environment_rules",
             output::ignored_environment_json(policy),
         ),
+        ("rule_sources", output::policy_sources_json(policy)),
+        ("idle", output::idle_json(policy)),
         ("results", Json::Arr(results)),
+        (
+            "errors",
+            Json::Arr(errors.iter().map(|e| Json::str(e.clone())).collect()),
+        ),
     ])
 }

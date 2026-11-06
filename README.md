@@ -4,7 +4,7 @@ Coding agents leave Git worktrees behind. Each one is a full checkout with its o
 
 ```text
 $ residue scan ~/src/app
-residue 0.0.2 · as of 14:03:12 · activity: lsof inspected 506 of 807 running processes
+residue 0.0.4 · as of 14:03:12 +02:00 · activity: lsof inspected 506 of 807 running processes
 
 ~/src/app · 4 linked worktrees · 5.6 GB
   candidate   2.1 GB  ~/src/app/.worktrees/fix-login  [fix-login]
@@ -60,13 +60,13 @@ On arm64, use `residue.aarch64.rpm` or `residue-aarch64.pkg.tar.zst`. The apt re
 Prebuilt binaries for macOS (Apple silicon and Intel) and static Linux (x86_64 and arm64) are on the [releases page](https://github.com/whiteheap/residue/releases). Each archive and package has a SHA-256 checksum in `SHA256SUMS` and a GitHub build-provenance attestation:
 
 ```sh
-gh attestation verify residue-v0.0.2-aarch64-apple-darwin.tar.gz --repo whiteheap/residue
+gh attestation verify residue-v0.0.4-aarch64-apple-darwin.tar.gz --repo whiteheap/residue
 ```
 
 From source, with Rust 1.85 or later:
 
 ```sh
-cargo install --locked --git https://github.com/whiteheap/residue --tag v0.0.2
+cargo install --locked --git https://github.com/whiteheap/residue --tag v0.0.4
 ```
 
 residue needs `git` 2.36 or later on `PATH`.
@@ -77,11 +77,14 @@ residue needs `git` 2.36 or later on `PATH`.
 residue scan [PATH...]     # every linked worktree of the repositories at or under PATH
 residue explain PATH       # every check for one worktree, and why it passed or failed
 residue remove PATH...     # check again, confirm, then `git worktree remove` each one
+residue remove --all PATH  # the same for every candidate a scan of PATH finds
 ```
 
 `scan` with no PATH looks at the current directory. If PATH is inside a repository, residue scans that repository. Otherwise it searches up to four levels below PATH. The search does not follow symbolic links, does not cross into another filesystem, and skips hidden directories, `node_modules`, `target` and `Library`. Linked worktrees come from Git's own list, so they are found wherever they live.
 
-Add `--json` to any command to get one JSON document (schemas `residue.scan/v1`, `residue.explain/v1`, `residue.remove/v1`). Each document has `generated_at`, the moment residue started reading, in RFC 3339 UTC. The text output shows the same moment in local time in its first line (`as of 14:03:12`).
+Add `--json` to any command to get one JSON document (schemas `residue.scan/v1`, `residue.explain/v1`, `residue.remove/v1`). Each document has `generated_at`, the moment residue started reading, in RFC 3339 UTC. The text output shows the same moment in local time with its UTC offset in its first line (`as of 14:03:12 +02:00`), and every date in the text uses that zone.
+
+Add `--idle DURATION` (`30m`, `12h`, `2d`, `1w`) to any command to also keep every worktree that changed within DURATION. [Run it on a schedule](#run-it-on-a-schedule) explains what counts as a change.
 
 ## What makes a worktree a candidate
 
@@ -92,6 +95,7 @@ residue runs every check below on every linked worktree. A worktree is a **candi
 | `identity` | The path is not the linked worktree Git lists for this repository |
 | `locked` | It is locked with `git worktree lock` |
 | `activity` | A process residue can see has its working directory or an open file inside it |
+| `idle` | Only with `--idle DURATION`: it changed within DURATION, for example `changed 3 hours ago (--idle 2d)` |
 | `tracked_changes` | Any tracked file is staged or modified |
 | `untracked` | Any untracked file or directory exists |
 | `index_flags` | A tracked file is marked assume-unchanged or skip-worktree, so `git status` cannot see edits to it |
@@ -104,7 +108,7 @@ residue runs every check below on every linked worktree. A worktree is a **candi
 | `mount_point` | It contains a mount point |
 | `contents` | residue could not read some of its entries |
 
-Some facts never block, and residue reports each one separately instead of calling a worktree "safe": commits that are on the branch but on no remote-tracking ref, whether the branch's upstream is gone, the newest change on disk, and size. residue does not fetch, so "local-only" means local-only as of your last fetch.
+Some facts never block, and residue reports each one separately instead of calling a worktree "safe": commits that are on the branch but on no remote-tracking ref, whether the branch's upstream is gone, the last change and what made it, and size. residue does not fetch, so "local-only" means local-only as of your last fetch.
 
 ## What removal deletes, and what it keeps
 
@@ -117,7 +121,7 @@ It keeps the branch, every commit, the stash, and every other worktree. residue 
 
 Before it deletes anything, residue prints the plan and asks you to type `yes`. Right before each removal it takes a new process snapshot and runs every check again. It skips the worktree if anything changed: the verdict, HEAD, the branch, a new lock, or the set of ignored files.
 
-If stdin is not a terminal, residue does not delete anything unless you pass `--yes`. Pass `--yes` only from the session that owns the worktree and knows its task is finished, such as an agent's last step or a launcher tearing down a task. Every check still runs. Do not pass `--yes` to a cron job that feeds residue every candidate: an idle session you plan to resume looks exactly like a finished one.
+If stdin is not a terminal, residue does not delete anything unless you pass `--yes`. Pass `--yes` only from the session that owns the worktree and knows its task is finished, such as an agent's last step or a launcher tearing down a task, or from a scheduled `remove --all --idle` as [Run it on a schedule](#run-it-on-a-schedule) describes. Every check still runs. Without `--idle`, a session that is paused looks exactly like a finished one, so `remove --all --yes` refuses to run without it.
 
 ## Keep a worktree
 
@@ -127,11 +131,145 @@ git worktree lock --reason "resume on Monday" PATH
 
 residue treats every lock as final. It is Git's own mechanism, so other tools respect it too.
 
+## Run it on a schedule
+
+A daily sweep keeps leaked worktrees from piling up:
+
+```sh
+residue remove --all --yes --idle 2d ~/src
+```
+
+`--all` treats each PATH as a scan root, the way `scan` does, and removes every candidate it finds. `--idle 2d` keeps every worktree that changed in the last two days. `remove --all --yes` refuses to run without `--idle`.
+
+### Why `--idle` matters
+
+The activity check finds a worktree in use when a process has its working directory or an open file inside it. A coding agent that is waiting for your approval, or for a merge queue, often has neither. Agent harnesses such as Claude Code reset the shell to the main checkout after every command, so between commands no process is inside the worktree. If its work is committed and pushed, every other check passes too. When you run `residue remove` yourself, you see the plan before anything is deleted. A scheduled run has nobody watching, so it needs another sign that someone is still using the worktree: a recent change. Nothing is lost if residue removes it anyway, because the branch and its commits stay. But the paused agent fails on its next command, because its directory is gone.
+
+A worktree's last change is the newest of:
+
+- any file, directory or symbolic link in the checkout, ignored ones included, so an edit, a new or deleted file, or a build writing `target/` counts;
+- the files in the worktree's own Git directory (`.git/worktrees/NAME/`): `index`, `HEAD`, `ORIG_HEAD`, `FETCH_HEAD`, `COMMIT_EDITMSG`. Git writes them on `add`, `commit`, `checkout`, `reset`, `stash`, `fetch` and `pull`;
+- the time recorded in the newest entry of the worktree's HEAD reflog: commits, checkouts, resets, rebases and merges.
+
+residue uses modification times. `explain` and the JSON field `last_change` say which entry set the time, for example `last change  2026-11-07 09:12 +02:00 (5 hours ago; index in its Git directory)`. residue does not use the modification time of the reflog file itself, because `git gc` in any worktree of a repository rewrites every worktree's reflog file. residue's own Git commands never write the index, so a scan never resets the clock.
+
+`--idle` sees writes, not reads. `git status`, `git diff`, `git log`, reading a file and searching the code leave no trace. `git status` rewrites the index only when it has to refresh a file's stat data, which means the file changed. If a session may sit without writing anything for longer than the idle time, lock its worktree:
+
+```sh
+git worktree lock --reason "agent paused, resume Monday" PATH
+```
+
+A lock keeps a worktree through every sweep until you run `git worktree unlock`.
+
+### Preview the next run
+
+Run the same command without `--yes`. residue prints the plan and the reason it keeps each other worktree. Without a terminal it removes nothing:
+
+```sh
+residue remove --all --idle 2d ~/src
+residue scan --idle 2d ~/src     # the same verdicts, as a scan
+```
+
+### macOS: launchd
+
+Save this as `~/Library/LaunchAgents/com.whiteheap.residue.plist`. Replace `YOU` with your user name and `src` with the folder that holds your repositories. launchd does not expand `~`. On an Intel Mac, Homebrew installs to `/usr/local/bin`, so use `/usr/local/bin/residue` and put `/usr/local/bin` first in `PATH`.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.whiteheap.residue</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/residue</string>
+    <string>remove</string>
+    <string>--all</string>
+    <string>--yes</string>
+    <string>--idle</string>
+    <string>2d</string>
+    <string>/Users/YOU/src</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>4</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/YOU/Library/Logs/residue.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOU/Library/Logs/residue.log</string>
+</dict>
+</plist>
+```
+
+`PATH` must find `git`: Homebrew's if you have it, otherwise `/usr/bin/git`. residue runs `lsof` as `/usr/sbin/lsof`. Load the job, run it once now, and read the log:
+
+```sh
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.whiteheap.residue.plist
+launchctl kickstart gui/$(id -u)/com.whiteheap.residue
+cat ~/Library/Logs/residue.log
+```
+
+The job then runs every day at 04:00. If the Mac is asleep then, launchd runs it when the Mac wakes. To stop it: `launchctl bootout gui/$(id -u)/com.whiteheap.residue`, then delete the file.
+
+### Linux: systemd
+
+Save these two files in `~/.config/systemd/user/`. `%h` is your home directory. With Homebrew on Linux, the binary is `/home/linuxbrew/.linuxbrew/bin/residue`.
+
+`residue.service`:
+
+```ini
+[Unit]
+Description=Remove idle Git worktrees with residue
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/residue remove --all --yes --idle 2d %h/src
+```
+
+`residue.timer`:
+
+```ini
+[Unit]
+Description=Run residue every day at 04:00
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now residue.timer
+systemctl --user start residue.service     # run it once now
+journalctl --user -u residue.service       # the log
+```
+
+`Persistent=true` runs a missed sweep at the next boot. A user timer runs only while you are logged in, unless you run `loginctl enable-linger`.
+
+### Exit status of a sweep
+
+`remove --all` exits 0 when it removed every candidate, including when there was none. A worktree it keeps does not make it fail. It exits 3 when a candidate was skipped or Git refused to remove it, or when it could not read part of a PATH. The log names each one.
+
 ## The regenerable list
 
 When `git worktree remove` deletes a clean worktree, it deletes the worktree's ignored files without asking. But being ignored does not make a file disposable: `.env` files, `.vercel/` project links, local databases and scratch notes are usually ignored too. So residue keeps the worktree unless every ignored entry matches a regenerable rule. The built-in rules name dependency and build-output directories that their tools recreate:
 
 `node_modules` `.pnpm-store` `bower_components` `.next` `.nuxt` `.svelte-kit` `.output` `.turbo` `.parcel-cache` `.vite` `.angular` `.eslintcache` `*.tsbuildinfo` `dist` `build` `coverage` `.nyc_output` `target` `.build` `DerivedData` `.gradle` `.dart_tool` `.venv` `venv` `__pycache__` `*.pyc` `.pytest_cache` `.mypy_cache` `.ruff_cache` `.tox` `.nox` `.DS_Store`
+
+Rules apply only to ignored entries, the ones `.gitignore` or `.git/info/exclude` match. An untracked file that is not ignored always keeps the worktree (the `untracked` check), and no rule or `--regenerable` changes that. To let residue delete such a file, ignore it first.
 
 `scan`, `explain` and the `remove` plan show how many files each ignored entry holds and their size, for example `ignored: .env (1 file, 312 B), .vercel/ (2 files, 1.2 KB)`.
 
@@ -154,7 +292,7 @@ git config --add residue.regenerable web/.tscache
 git config --get-all residue.regenerable    # list them
 ```
 
-Without a scope option, `git config` writes the repository's `.git/config`, which every worktree of the repository shares. residue reads the key with `git config --get-all`, so a value in your global Git config applies to every repository. If a value is invalid, the `ignored` check is `unknown`, so no worktree of that repository is a candidate until you fix it. `explain` names the value.
+Without a scope option, `git config` writes the repository's `.git/config`, which every worktree of the repository shares. residue reads the key with `git config --get-all`, so a value in your global Git config applies to every repository. `explain` names the scope and file of each rule, for example `global config (~/.gitconfig) adds ".env"; this repository's config (~/src/app/.git/config) adds "web/.tscache"`, and `git config --show-origin --get-all residue.regenerable` lists the same. In JSON, each worktree's `rule_sources` lists its Git config rules as `{rule, scope, origin}`, and the document's own `rule_sources` lists the rules from the residue config file (`residue_config`) and `--regenerable` (`command_line`). If a value is invalid, the `ignored` check is `unknown`, so no worktree of that repository is a candidate until you fix it. `explain` names the value.
 
 Only Git config files count: the repository's own config, your global config and the system config, including files you choose with `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM`. `GIT_CONFIG_NOSYSTEM` skips the system file, as it does for Git. residue ignores `residue.regenerable` set through the environment: `git -c` and `--config-env` (which pass it on as `GIT_CONFIG_PARAMETERS`), `GIT_CONFIG_COUNT` with `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>`, and the legacy `GIT_CONFIG`. Every subprocess and CI step inherits the environment, so it must not widen what residue deletes. When the environment sets the key, residue prints a note on stderr and lists the values in the JSON field `ignored_environment_rules`:
 
@@ -173,16 +311,16 @@ For every repository on the machine, put one rule per line in `~/.config/residue
 - **Linux**: `/proc/*/cwd`, `/proc/*/exe` and `/proc/*/fd`, for the processes your user can read.
 - **Other Unix systems**: there is no probe. Every worktree reports activity `unknown`, so none is a candidate.
 
-The probe has three answers. `in_use` means a process was seen inside the worktree. `not_observed` means none of the inspected processes was inside it. `unknown` means the probe failed: lsof is missing, it timed out, it failed, or residue could not parse its output. `not_observed` is not proof that a worktree is idle. The probe cannot see processes owned by other users, processes inside containers or virtual machines, processes on other machines that share the disk, or a session that is closed now but that you mean to resume. A process can also open the directory a moment after the snapshot. That is why removal asks a human, and why `--yes` belongs to the session that owns the work.
+The probe has three answers. `in_use` means a process was seen inside the worktree. `not_observed` means none of the inspected processes was inside it. `unknown` means the probe failed: lsof is missing, it timed out, it failed, or residue could not parse its output. `not_observed` is not proof that a worktree is idle. The probe cannot see processes owned by other users, processes inside containers or virtual machines, processes on other machines that share the disk, or a session that is closed now but that you mean to resume. A process can also open the directory a moment after the snapshot. That is why removal asks a human, why `--yes` belongs to the session that owns the work, and why a scheduled sweep needs `--idle`.
 
 ## Exit status
 
 | Code | Meaning |
 | --- | --- |
-| 0 | Success. For `remove`, every PATH was removed |
+| 0 | Success. For `remove`, every PATH was removed. For `remove --all`, every candidate was removed, or there was none |
 | 1 | Error: git missing or too old, unreadable config, unknown PATH for `explain` |
-| 2 | Usage error |
-| 3 | `remove` did not remove at least one PATH: refused, skipped, not confirmed, or failed |
+| 2 | Usage error, including an invalid `--idle` DURATION and `remove --all --yes` without `--idle` |
+| 3 | `remove` did not remove at least one PATH: refused, skipped, not confirmed, or failed. For `remove --all`: a candidate was skipped, not confirmed or failed, or part of a PATH could not be read |
 
 ## For coding agents
 
@@ -205,7 +343,9 @@ Each PATH gets one `results[].result`:
 | `invalid` | PATH is not a linked worktree: the main checkout, a directory inside a worktree, or not in a repository |
 | `not_attempted` | residue stopped before it reached this PATH |
 
-For every result except `removed`, `reason` is a sentence that says why.
+For every result except `removed`, `reason` is a sentence that says why. With `--all`, `results` lists every linked worktree the scan found, and each one it kept is `refused`. `errors` lists the PATHs and repositories it could not read; it is empty without `--all`.
+
+Every JSON document has `idle`: `{"threshold": "2d", "threshold_seconds": 172800}`, or null without `--idle`. Each worktree has `last_change`: `{"unix", "at", "source", "what"}`, where `source` is `files`, `git_dir` or `reflog` and `what` is the entry (`src/main.rs`, `.` for the worktree directory itself), the Git directory file (`index`), or the reflog message (`commit: fix login`). It is null with `last_change_error` set when residue could not read it.
 
 Every JSON document has `ignored_environment_rules`: the `residue.regenerable` values the environment set and residue ignored, an empty list when there are none, or null when Git could not read that environment. To pass a rule for one run, use `--regenerable`, not `git -c`.
 
@@ -217,13 +357,15 @@ These are the exact platforms and versions that ran. residue has no automated te
 
 | Version | Platform | Git | What ran |
 | --- | --- | --- | --- |
+| 0.0.4 | macOS 26.3.1 (25D771280a), Apple silicon | Apple Git 2.50.1 | The CONTRIBUTING states with a pushed `clean` branch: every check id, status and verdict identical to the 0.0.3 release binary without `--idle`. Under `--idle 2d`: the fresh clean pushed worktree kept (`changed just now (--idle 2d)`); `touch -t` on its files and Git directory alone still kept it, by its HEAD reflog; a worktree created and committed with `GIT_COMMITTER_DATE` three days back and its mtimes backdated became a `candidate`, and `remove --all --yes --idle 2d` with no terminal removed it (branch kept, exit 0) and kept the other seven. `git gc` in the main checkout (rewrites `logs/HEAD`), three rounds of `git status`, `git diff` and `git log`, and residue's own scans left a backdated worktree a candidate; a checkout, `git add` and an edit made it `keep`. `remove --yes --idle 2d` on a fresh worktree refused (exit 3). Invalid durations and `remove --all --yes` without `--idle` gave exit 2. Rules from `GIT_CONFIG_GLOBAL` and `.git/config` named by scope and file in text and `rule_sources`; an invalid global value named its file. Header and dates with offsets under `TZ` unset, `UTC`, `Asia/Kolkata` and `America/New_York`. The README LaunchAgent plist loaded with `launchctl bootstrap`, run with `launchctl kickstart` from `/`: it removed the idle worktree and logged absolute paths. |
+| 0.0.4 | Ubuntu 24.04.5 LTS, arm64 (Docker, Linux 7.0.14) | 2.43.0 | Static musl binary as a non-root user: the same states with check ids, statuses and verdicts identical to the 0.0.3 musl binary without `--idle`; the fresh worktree kept under `--idle 2d`, the backdated one a `candidate`, unchanged by three rounds of `git status`, `git diff` and `git log` and by `git gc`; `remove --all --yes --idle 2d` without a terminal removed it (branch kept, exit 0). The README systemd service and timer passed `systemd-analyze verify` in user and system mode (systemd 255). The timer did not run under a live systemd. |
 | 0.0.3 | macOS 26.3.1 (25D771280a), Apple silicon | Apple Git 2.50.1 | Scratch repository with the CONTRIBUTING states plus `.local-dev/*.lock` files: `scan` verdicts identical to 0.0.2 with no rules; `residue.regenerable` set through `GIT_CONFIG_COUNT` (mixed-case key too), `git -c` through a Git alias, and the legacy `GIT_CONFIG` all ignored with the stderr note and `ignored_environment_rules` (0.0.2 made the `.env` worktree a `candidate` under `GIT_CONFIG`; 0.0.3 keeps it); a malformed `GIT_CONFIG_COUNT` giving the "could not check" note and null; an escape character in an ignored value printed escaped; rules in `.git/config`, `$HOME/.gitconfig`, `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` honored, and skipped under `GIT_CONFIG_NOSYSTEM`; `remove --yes` under `git -c residue.regenerable=.env` refusing `.env`, removing a clean worktree (branch kept), exit 3. |
 | 0.0.3 | Ubuntu 24.04.5 LTS, arm64 (Docker, Linux 7.0.14) | 2.43.0 | Static musl binary as a non-root user: the same scratch states; `GIT_CONFIG_COUNT`, `git -c` and legacy `GIT_CONFIG` rules ignored with the note and JSON field; `.git/config` and `GIT_CONFIG_GLOBAL` rules honored; `--regenerable .env` honored; `remove --yes` without a terminal under `git -c` refusing `.env` and removing a clean worktree (branch kept), exit 3. |
 | 0.0.2 | macOS 26.3.1 (25D771280a), Apple silicon | Apple Git 2.50.1 | Scratch repositories: a path rule (`web/.tscache`, `/web/`, `web/.tsc*`) matching; `.local-dev/*.lock` expanding a collapsed `.local-dev/` when every file matched (candidate) and when `server.pid` did not (keep, naming the file); the same rules from `git config residue.regenerable` and from the config file; invalid git config values (`logs/**`, an empty value) giving `unknown`; an unreadable directory inside an expanded entry (`unknown`); 100,001 lock files (kept, over the limit); sizes with hard links counted once in `scan`, `explain` and JSON; `generated_at`; `remove --yes` refusing `.env` and `.vercel/` and removing a clean worktree and an expanded `.local-dev/` while the branches stayed. The 0.0.1 verdicts again: locked, modified, untracked, assume-unchanged, nested repository, rebase in progress, unreferenced detached HEAD, a path with a space. A read-only `scan` of a busy agent monorepo with four linked worktrees: 5.3 s. |
 | 0.0.2 | Ubuntu 24.04.5 LTS, arm64 (Docker, Linux 7.0.14) | 2.43.0 | Static musl binary as a non-root user with `TZ=Europe/Tallinn`: `scan` with a git-config glob rule and a `--regenerable` path rule, `explain` naming the unmatched file, JSON sizes and `generated_at`, local `as of` time, in-use detection through `/proc`, an invalid git config value, `remove --yes` refusing `.env` and removing a clean worktree without a terminal (branch kept), and `remove` without `--yes` and without a terminal removing nothing. |
 | 0.0.1 | macOS 26.3.1 (25D771280a), Apple silicon | Apple Git 2.50.1 | `scan`, `explain` and `remove` on real agent worktrees and on scratch repositories covering every verdict: clean with `node_modules`, `.env`, unreferenced detached HEAD, locked, in use, modified, stale, a path with a space, a path with an escape character, an assume-unchanged edit, a skip-worktree file, a nested repository and a rebase in progress. Removal kept the branches, and the assume-unchanged edit survived. |
 | 0.0.1 | Ubuntu 24.04.5 LTS, arm64 (Docker, Linux 7.0.14) | 2.43.0 | Static musl binary as a non-root user: `scan`, in-use detection through `/proc`, hard-link accounting, and `remove` with and without a terminal. As root on another user's repository, Git refused with "dubious ownership" and residue reported the error instead of guessing. |
-| 0.0.1 to 0.0.3 | GitHub Actions `macos-latest`, `ubuntu-24.04` (x86_64), `ubuntu-24.04-arm` | runner Git | Build, then `scan` and `explain` of a temporary worktree. No removal. |
+| 0.0.1 to 0.0.4 | GitHub Actions `macos-latest`, `ubuntu-24.04` (x86_64), `ubuntu-24.04-arm` | runner Git | Build, then `scan` and `explain` of a temporary worktree. No removal. |
 
 Not run: the Intel macOS binary (built by cross-compiling, never executed), FreeBSD, OpenBSD, NetBSD and other Unix systems (no activity probe, so nothing is a candidate), and Windows (not supported).
 

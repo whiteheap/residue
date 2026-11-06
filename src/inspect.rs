@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use crate::activity::{Evidence, Snapshot};
 use crate::fsinfo::{self, Bucket, Expansion, Usage};
 use crate::git::{self, Entry};
-use crate::policy::{GIT_CONFIG_KEY, Policy, Rules};
+use crate::policy::{GIT_CONFIG_KEY, Policy, RuleSource, Rules};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -137,6 +137,50 @@ fn ignored_examples(items: &[&Ignored], limit: usize, show: fn(&Ignored) -> Stri
     )
 }
 
+/// Which of the three signals set a worktree's last change.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ChangeSource {
+    /// An entry in the checkout: a file, directory or symbolic link,
+    /// ignored ones included.
+    Files,
+    /// A file directly in the worktree's Git directory: `index`, `HEAD`,
+    /// `ORIG_HEAD`, `FETCH_HEAD`, `COMMIT_EDITMSG`.
+    GitDir,
+    /// The newest entry of the HEAD reflog.
+    Reflog,
+}
+
+impl ChangeSource {
+    pub fn code(self) -> &'static str {
+        match self {
+            ChangeSource::Files => "files",
+            ChangeSource::GitDir => "git_dir",
+            ChangeSource::Reflog => "reflog",
+        }
+    }
+}
+
+pub struct LastChange {
+    /// Unix seconds.
+    pub time: i64,
+    pub source: ChangeSource,
+    /// The entry relative to the worktree root (`.` for the root itself),
+    /// the Git directory file name, or the reflog message.
+    pub what: String,
+}
+
+impl LastChange {
+    /// `index in its Git directory`, for messages.
+    pub fn described(&self) -> String {
+        match self.source {
+            ChangeSource::Files if self.what == "." => "the worktree directory".to_string(),
+            ChangeSource::Files => format!("{} in the worktree", self.what),
+            ChangeSource::GitDir => format!("{} in its Git directory", self.what),
+            ChangeSource::Reflog => format!("HEAD reflog: {}", self.what),
+        }
+    }
+}
+
 pub struct Upstream {
     pub name: String,
     pub gone: bool,
@@ -157,6 +201,11 @@ pub struct Report {
     pub local_commits: Result<Option<u64>, String>,
     pub upstream: Result<Option<Upstream>, String>,
     pub usage: Option<Usage>,
+    /// The newest of the three change signals. `Ok(None)` when it was not
+    /// measured (a stale or unidentified worktree).
+    pub last_change: Result<Option<LastChange>, String>,
+    /// This repository's Git config rules, with their source.
+    pub rule_sources: Vec<RuleSource>,
 }
 
 impl Report {
@@ -172,6 +221,8 @@ impl Report {
             local_commits: Ok(None),
             upstream: Ok(None),
             usage: None,
+            last_change: Ok(None),
+            rule_sources: Vec::new(),
         }
     }
 
@@ -318,6 +369,7 @@ pub fn worktree(entry: &Entry, common_dir: &Path, snapshot: &Snapshot, policy: &
         Err(_) => Vec::new(),
     };
     let usage = fsinfo::measure(&canonical, &buckets, &|rel| rules.matches(rel));
+    r.last_change = last_change(&usage, &canonical, &identity.git_dir);
     check_status(&mut r, status, &repo, &rules, &buckets, &usage);
     check_index_flags(&mut r, &canonical);
     check_operation(&mut r, &identity.git_dir);
@@ -325,15 +377,176 @@ pub fn worktree(entry: &Entry, common_dir: &Path, snapshot: &Snapshot, policy: &
     check_head(&mut r, entry, &canonical);
     check_layout(&mut r, &canonical);
     check_size(&mut r, &canonical, usage);
+    if let Some(idle) = &policy.idle {
+        check_idle(&mut r, idle);
+    }
+    r.rule_sources = repo.values;
     gather_facts(&mut r, entry, &canonical);
     r.finish()
+}
+
+/// When this worktree last changed, as the newest of three signals:
+///
+/// - every entry the walk reached in the checkout (files, directories and
+///   symbolic links, ignored output included), so an edit, a new file, a
+///   deletion (its directory's mtime) or a build writing `target/` counts;
+/// - the files directly in the worktree's Git directory: `index` (add,
+///   commit, checkout, reset, stash, and a `git status` that refreshes stale
+///   stat data), `HEAD`, `ORIG_HEAD`, `FETCH_HEAD`, `COMMIT_EDITMSG`. Not
+///   `logs/`: `git gc` in any worktree of the repository rewrites every
+///   worktree's `logs/HEAD` without anyone using it (measured with Git
+///   2.50.1), so its mtime would hold leaked worktrees forever;
+/// - the timestamp written inside the newest HEAD reflog entry, which gc
+///   keeps: commits, checkouts, resets, rebases, merges and pulls.
+///
+/// residue's own Git commands run with optional locks off, so a scan never
+/// writes the index and never resets this clock. Reads (`git diff`, `git
+/// log`, `cat`, an editor that only opens a file) leave no trace in any of
+/// the three. mtime, not ctime: `touch -t`, `tar` and `rsync -a` set mtime
+/// on purpose; atime is noise from backups and searches.
+fn last_change(
+    usage: &io::Result<Usage>,
+    dir: &Path,
+    git_dir: &Path,
+) -> Result<Option<LastChange>, String> {
+    let usage = usage
+        .as_ref()
+        .map_err(|e| format!("cannot walk the worktree: {e}"))?;
+    let mut found: Vec<LastChange> = Vec::new();
+    if let (Some(time), Some(path)) = (usage.newest_mtime, &usage.newest_path) {
+        let what = match path.strip_prefix(dir) {
+            Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+            Ok(rel) => rel.display().to_string(),
+            Err(_) => path.display().to_string(),
+        };
+        found.push(LastChange {
+            time,
+            source: ChangeSource::Files,
+            what,
+        });
+    }
+    let unreadable = |e: io::Error| format!("cannot read {}: {e}", git_dir.display());
+    for item in fs::read_dir(git_dir).map_err(unreadable)? {
+        let item = item.map_err(unreadable)?;
+        let meta = item
+            .metadata()
+            .map_err(|e| format!("cannot read {}: {e}", item.path().display()))?;
+        if meta.is_file() {
+            found.push(LastChange {
+                time: std::os::unix::fs::MetadataExt::mtime(&meta),
+                source: ChangeSource::GitDir,
+                what: item.file_name().to_string_lossy().into_owned(),
+            });
+        }
+    }
+    if let Some((time, message)) = git::reflog_newest(dir)? {
+        found.push(LastChange {
+            time,
+            source: ChangeSource::Reflog,
+            what: message,
+        });
+    }
+    // The first of equal times wins, so a tie names the checkout first.
+    Ok(found
+        .into_iter()
+        .reduce(|a, b| if b.time > a.time { b } else { a }))
+}
+
+/// `--idle`: keep a worktree that changed within the threshold. A failed
+/// check keeps it (`block`); a last change residue could not read is
+/// `unknown`, which keeps it too. Reported right after `activity`, the
+/// other check about whether someone is using the worktree.
+fn check_idle(r: &mut Report, idle: &crate::cli::Idle) {
+    let now = crate::output::now();
+    let (status, short, detail) = match &r.last_change {
+        Ok(Some(c)) => {
+            let ago = crate::output::age(now - c.time);
+            let when = format!("{ago} ({}, {})", crate::output::date(c.time), c.described());
+            if now - c.time < idle.seconds {
+                (
+                    Status::Block,
+                    format!("changed {ago} (--idle {})", idle.text),
+                    format!(
+                        "last changed {when}, within --idle {}; a session may still be using it",
+                        idle.text
+                    ),
+                )
+            } else {
+                (
+                    Status::Pass,
+                    String::new(),
+                    format!("last changed {when}, longer ago than --idle {}", idle.text),
+                )
+            }
+        }
+        Ok(None) => (
+            Status::Unknown,
+            "last change unknown".to_string(),
+            "residue found no time for the last change".to_string(),
+        ),
+        Err(e) => (
+            Status::Unknown,
+            "last change unknown".to_string(),
+            format!("last change unknown: {e}"),
+        ),
+    };
+    let check = Check {
+        id: "idle",
+        status,
+        short,
+        detail,
+    };
+    let at = r
+        .checks
+        .iter()
+        .position(|c| c.id == "activity")
+        .map_or(r.checks.len(), |i| i + 1);
+    r.checks.insert(at, check);
+}
+
+/// `global config (~/.gitconfig) adds ".env"; this repository's config
+/// (/src/app/.git/config) adds "web/.tscache", ".local-dev/*.lock"`:
+/// consecutive rules from one file are grouped, in the order Git read them.
+pub fn describe_sources(sources: &[RuleSource]) -> String {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for s in sources {
+        let name = source_name(s);
+        let rule = format!("{:?}", s.rule);
+        match groups.last_mut() {
+            Some((last, rules)) if *last == name => rules.push(rule),
+            _ => groups.push((name, vec![rule])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(name, rules)| format!("{name} adds {}", rules.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// `global config (~/.gitconfig)`, `this repository's config (...)`.
+pub fn source_name(s: &RuleSource) -> String {
+    let label = match s.scope.as_str() {
+        "local" => "this repository's config".to_string(),
+        "worktree" => "this worktree's config".to_string(),
+        "global" => "global config".to_string(),
+        "system" => "system config".to_string(),
+        "residue_config" => "the residue config file".to_string(),
+        "command_line" => "--regenerable".to_string(),
+        other => format!("{other} config"),
+    };
+    match &s.origin {
+        Some(origin) => format!("{label} ({})", crate::output::home(origin)),
+        None => label,
+    }
 }
 
 /// The rules a repository adds through `git config residue.regenerable`.
 struct RepoRules {
     rules: Rules,
-    /// Every value as read, valid or not, for `explain`.
-    values: Vec<String>,
+    /// Every value as read, valid or not, with its scope and file, for
+    /// `explain` and JSON `rule_sources`.
+    values: Vec<RuleSource>,
     /// An invalid value or a failed read, as (short, detail). It makes the
     /// `ignored` check unknown; it never aborts the scan.
     problem: Option<(String, String)>,
@@ -348,12 +561,14 @@ impl RepoRules {
         };
         match git::regenerable_config(dir) {
             Ok(values) => {
-                for value in &values {
+                for source in &values {
+                    let value = &source.rule;
                     if let Err(e) = repo.rules.add(value) {
                         repo.problem.get_or_insert((
                             format!("invalid {GIT_CONFIG_KEY} {value:?}"),
                             format!(
-                                "git config {GIT_CONFIG_KEY} has an invalid value {value:?}: {e}"
+                                "{GIT_CONFIG_KEY} in {} has an invalid value {value:?}: {e}",
+                                source_name(source)
                             ),
                         ));
                     }
@@ -477,10 +692,9 @@ fn check_status(
     let from_config = if repo.values.is_empty() {
         String::new()
     } else {
-        let values: Vec<String> = repo.values.iter().map(|v| format!("{v:?}")).collect();
         format!(
-            ". This repository's git config {GIT_CONFIG_KEY} adds: {}",
-            values.join(", ")
+            ". Git config {GIT_CONFIG_KEY}: {}",
+            describe_sources(&repo.values)
         )
     };
     let (status, short, detail) = if let Some((short, problem)) = &repo.problem {
@@ -488,7 +702,7 @@ fn check_status(
             Status::Unknown,
             short.clone(),
             format!(
-                "{problem}. Ignored entries cannot be judged until it is fixed (`git config --get-all {GIT_CONFIG_KEY}` lists the values){from_config}"
+                "{problem}. Ignored entries cannot be judged until it is fixed (`git config --show-origin --get-all {GIT_CONFIG_KEY}` lists each value and its file){from_config}"
             ),
         )
     } else if !kept.is_empty() {

@@ -31,6 +31,8 @@ pub struct Usage {
     pub reclaimable: u64,
     pub entries: u64,
     pub newest_mtime: Option<i64>,
+    /// The entry with that mtime (the first one seen, on a tie).
+    pub newest_path: Option<PathBuf>,
     pub unreadable: u64,
     pub first_error: Option<String>,
     pub nested_repos: Vec<PathBuf>,
@@ -106,7 +108,7 @@ pub fn measure(
         .collect();
     let mut walked = vec![0u64; buckets.len()];
     let mut shared: HashMap<(u64, u64), Shared> = HashMap::new();
-    account(&mut usage, &mut shared, &top);
+    account(&mut usage, &mut shared, &top, root);
     let mut stack = vec![(
         root.to_path_buf(),
         Place {
@@ -179,7 +181,7 @@ pub fn measure(
                 usage.mount_points.push(path);
                 continue;
             }
-            let first = account(&mut usage, &mut shared, &meta);
+            let first = account(&mut usage, &mut shared, &meta, &path);
             if let Some(i) = here.bucket {
                 if !meta.is_dir() && first {
                     usage.buckets[i].files += 1;
@@ -235,10 +237,18 @@ fn display(path: &Path, root: &Path) -> String {
 
 /// Add one entry to the totals. Returns false for a hard-linked inode seen
 /// before, so per-bucket counts take each inode once too.
-fn account(usage: &mut Usage, shared: &mut HashMap<(u64, u64), Shared>, meta: &Metadata) -> bool {
+fn account(
+    usage: &mut Usage,
+    shared: &mut HashMap<(u64, u64), Shared>,
+    meta: &Metadata,
+    path: &Path,
+) -> bool {
     usage.entries += 1;
     let mtime = meta.mtime();
-    usage.newest_mtime = Some(usage.newest_mtime.map_or(mtime, |m| m.max(mtime)));
+    if usage.newest_mtime.is_none_or(|m| mtime > m) {
+        usage.newest_mtime = Some(mtime);
+        usage.newest_path = Some(path.to_path_buf());
+    }
     let blocks = meta.blocks().saturating_mul(512);
     if !meta.is_dir() && meta.nlink() > 1 {
         let inode = shared.entry((meta.dev(), meta.ino())).or_insert(Shared {

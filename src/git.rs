@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use crate::policy::RuleSource;
 use crate::run::{self, RunError};
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -358,15 +359,19 @@ pub fn status(dir: &Path) -> Result<Status, String> {
 }
 
 /// The values of `residue.regenerable` in this worktree's git config, in
-/// the order Git reads them. An unset key is an empty list.
-pub fn regenerable_config(dir: &Path) -> Result<Vec<String>, String> {
+/// the order Git reads them, each with the scope and file Git read it from.
+/// An unset key is an empty list.
+pub fn regenerable_config(dir: &Path) -> Result<Vec<RuleSource>, String> {
+    let key = crate::policy::GIT_CONFIG_KEY;
     let exit = git_exit(
         dir,
         &[
             "config",
+            "--show-scope",
+            "--show-origin",
             "--null",
             "--get-all",
-            crate::policy::GIT_CONFIG_KEY,
+            key,
         ],
     )?;
     if exit.code == Some(1) {
@@ -374,25 +379,70 @@ pub fn regenerable_config(dir: &Path) -> Result<Vec<String>, String> {
     }
     if !exit.success {
         return Err(format!(
-            "git config --get-all {} failed: {}",
-            crate::policy::GIT_CONFIG_KEY,
+            "git config --get-all {key} failed: {}",
             exit.stderr
         ));
     }
-    // An empty value stays in the list so the caller rejects it rather than
-    // silently skipping it.
-    nul_fields(&exit.stdout)
-        .into_iter()
-        .map(|v| {
-            String::from_utf8(v.to_vec()).map_err(|_| {
-                format!(
-                    "{} has a value that is not valid UTF-8: {:?}",
-                    crate::policy::GIT_CONFIG_KEY,
-                    String::from_utf8_lossy(v)
-                )
-            })
-        })
-        .collect()
+    // Triples of scope, origin and value. An empty value stays in the list
+    // so the caller rejects it rather than silently skipping it.
+    let fields = nul_fields(&exit.stdout);
+    if fields.len() % 3 != 0 {
+        return Err(format!(
+            "git config --show-scope --show-origin --get-all {key} returned an answer residue cannot read"
+        ));
+    }
+    let text = |v: &[u8]| String::from_utf8_lossy(v).into_owned();
+    let mut sources = Vec::new();
+    let mut fields = fields.into_iter();
+    while let (Some(scope), Some(origin), Some(value)) =
+        (fields.next(), fields.next(), fields.next())
+    {
+        let rule = String::from_utf8(value.to_vec()).map_err(|_| {
+            format!(
+                "{key} has a value that is not valid UTF-8: {:?}",
+                String::from_utf8_lossy(value)
+            )
+        })?;
+        let origin = text(origin);
+        sources.push(RuleSource {
+            rule,
+            scope: text(scope),
+            origin: Some(origin.strip_prefix("file:").unwrap_or(&origin).to_string()),
+        });
+    }
+    Ok(sources)
+}
+
+/// The time of the newest entry in this worktree's HEAD reflog, and its
+/// message (`commit: fix login`), read by Git so any ref backend works.
+/// `None` when the reflog is empty or disabled (`core.logAllRefUpdates`).
+/// The entry's own timestamp, not the log file's mtime: `git gc` in any
+/// worktree of the repository rewrites every worktree's `logs/HEAD`.
+pub fn reflog_newest(dir: &Path) -> Result<Option<(i64, String)>, String> {
+    let out = git(
+        dir,
+        &[
+            "log",
+            "-g",
+            "-1",
+            "--date=unix",
+            "--format=%gd%x00%gs",
+            "HEAD",
+        ],
+    )?;
+    let text = String::from_utf8_lossy(&out);
+    let line = text.trim_end_matches('\n');
+    if line.is_empty() {
+        return Ok(None);
+    }
+    let unreadable = || format!("git log -g printed {:?}", line);
+    let (selector, message) = line.split_once('\0').ok_or_else(unreadable)?;
+    let seconds = selector
+        .strip_prefix("HEAD@{")
+        .and_then(|s| s.strip_suffix('}'))
+        .and_then(|s| s.parse::<i64>().ok())
+        .ok_or_else(unreadable)?;
+    Ok(Some((seconds, message.to_string())))
 }
 
 /// The fields of `git config --null` output, each of which ends in a NUL.

@@ -24,6 +24,7 @@ pub fn prepare(options: &Options) -> Result<Policy, String> {
     git::require_version()?;
     let mut policy = Policy::load(&options.regenerable)?;
     policy.ignored_environment = git::environment_regenerable();
+    policy.idle = options.idle.clone();
     note_ignored_environment(&policy.ignored_environment);
     Ok(policy)
 }
@@ -59,7 +60,7 @@ fn note_ignored_environment(ignored: &Result<Vec<String>, String>) {
     }
 }
 
-/// `residue 0.0.2 · as of 14:03:12`: the moment the snapshot started.
+/// `residue 0.0.4 · as of 14:03:12 +02:00`: the moment the snapshot started.
 /// Worktrees created after it are not in the report.
 pub fn header(started: i64) -> String {
     format!("residue {VERSION} · as of {}", output::clock(started))
@@ -143,6 +144,8 @@ pub fn scan(options: &Options) -> u8 {
                 "ignored_environment_rules",
                 output::ignored_environment_json(&policy),
             ),
+            ("rule_sources", output::policy_sources_json(&policy)),
+            ("idle", output::idle_json(&policy)),
             ("repositories", Json::Arr(repos)),
             (
                 "orphans",
@@ -340,6 +343,8 @@ pub fn explain(options: &Options) -> u8 {
                 "ignored_environment_rules",
                 output::ignored_environment_json(&policy),
             ),
+            ("rule_sources", output::policy_sources_json(&policy)),
+            ("idle", output::idle_json(&policy)),
             ("main_path", Json::path(&target.repo.main.path)),
             ("worktree", output::report_json(&report)),
         ]);
@@ -451,14 +456,21 @@ pub fn explain_text(r: &Report, repo: &Repo, places: &Places, style: &Style) -> 
             },
         );
     }
+    match &r.last_change {
+        Ok(Some(c)) => fact(
+            &mut out,
+            "last change",
+            format!(
+                "{} ({}; {})",
+                output::date(c.time),
+                output::age(output::now() - c.time),
+                clean(&c.described())
+            ),
+        ),
+        Ok(None) => {}
+        Err(e) => fact(&mut out, "last change", format!("unknown: {}", clean(e))),
+    }
     if let Some(u) = &r.usage {
-        if let Some(m) = u.newest_mtime {
-            fact(
-                &mut out,
-                "newest change on disk",
-                format!("{} ({})", output::date(m), output::age(output::now() - m)),
-            );
-        }
         fact(&mut out, "size", output::usage_phrase(u));
         fact(
             &mut out,

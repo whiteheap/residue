@@ -10,9 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::activity::{Evidence, Snapshot};
 use crate::fsinfo::{Space, Usage};
-use crate::inspect::{Report, Status, Verdict};
+use crate::inspect::{LastChange, Report, Status, Verdict};
 use crate::json::Json;
-use crate::policy::Policy;
+use crate::policy::{Policy, RuleSource};
 
 pub const SCHEMA_SCAN: &str = "residue.scan/v1";
 pub const SCHEMA_EXPLAIN: &str = "residue.explain/v1";
@@ -98,7 +98,10 @@ impl Places {
         Places {
             cwd: std::env::current_dir()
                 .ok()
-                .and_then(|d| std::fs::canonicalize(d).ok()),
+                .and_then(|d| std::fs::canonicalize(d).ok())
+                // From `/` (where launchd and systemd start a job) a
+                // relative path would only drop the leading slash.
+                .filter(|d| d.parent().is_some()),
             home: std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .and_then(|h| std::fs::canonicalize(h).ok()),
@@ -182,14 +185,55 @@ fn civil(seconds: i64) -> (i64, i64, i64, i64) {
     (year, month, day, rem)
 }
 
-/// `2026-11-06 21:04 UTC`
+/// Local civil time and the zone's offset from UTC in seconds, or `None`
+/// when the C library cannot convert the time.
+fn local(seconds: i64) -> Option<(libc::tm, i64)> {
+    // `time_t` is inferred from localtime_r's signature rather than named:
+    // the libc crate deprecates the name on musl while its width changes.
+    // It is i64 on every target residue ships, so the cast is the identity.
+    let t = seconds as _;
+    // SAFETY: localtime_r reads `t` and writes into the zeroed struct we
+    // own; both outlive the call. It is the reentrant form, safe across the
+    // threads residue runs.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return None;
+    }
+    // `c_long`, which is i64 on every target residue ships (64-bit macOS
+    // and Linux), so no conversion is needed.
+    let offset: i64 = tm.tm_gmtoff;
+    Some((tm, offset))
+}
+
+/// `+02:00`, `-05:30`, `+00:00`.
+fn offset(seconds: i64) -> String {
+    let sign = if seconds < 0 { '-' } else { '+' };
+    let s = seconds.abs();
+    format!("{sign}{:02}:{:02}", s / 3_600, (s % 3_600) / 60)
+}
+
+/// `2026-11-07 00:23 +02:00`: local time with its UTC offset, the same
+/// zone the header uses. UTC, and says so, when the local time is unknown.
 pub fn date(seconds: i64) -> String {
-    let (year, month, day, rem) = civil(seconds);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
-        rem / 3_600,
-        (rem % 3_600) / 60
-    )
+    match local(seconds) {
+        Some((tm, off)) => format!(
+            "{:04}-{:02}-{:02} {:02}:{:02} {}",
+            i64::from(tm.tm_year) + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            offset(off)
+        ),
+        None => {
+            let (year, month, day, rem) = civil(seconds);
+            format!(
+                "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+                rem / 3_600,
+                (rem % 3_600) / 60
+            )
+        }
+    }
 }
 
 /// RFC 3339 in UTC: `2026-11-06T21:04:05Z`.
@@ -203,30 +247,39 @@ pub fn rfc3339(seconds: i64) -> String {
     )
 }
 
-/// `HH:MM:SS` in the local time zone. If the C library cannot convert the
+/// `HH:MM:SS +02:00` in the local time zone, with its UTC offset so a log
+/// read elsewhere is unambiguous. If the C library cannot convert the
 /// time, the clock is shown in UTC and says so.
 pub fn clock(seconds: i64) -> String {
-    let utc = || {
-        let rem = seconds.rem_euclid(86_400);
-        format!(
-            "{:02}:{:02}:{:02} UTC",
-            rem / 3_600,
-            (rem % 3_600) / 60,
-            rem % 60
-        )
-    };
-    // `time_t` is inferred from localtime_r's signature rather than named:
-    // the libc crate deprecates the name on musl while its width changes.
-    // It is i64 on every target residue ships, so the cast is the identity.
-    let t = seconds as _;
-    // SAFETY: localtime_r reads `t` and writes into the zeroed struct we
-    // own; both outlive the call. It is the reentrant form, safe across the
-    // threads residue runs.
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
-        return utc();
+    match local(seconds) {
+        Some((tm, off)) => format!(
+            "{:02}:{:02}:{:02} {}",
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec,
+            offset(off)
+        ),
+        None => {
+            let rem = seconds.rem_euclid(86_400);
+            format!(
+                "{:02}:{:02}:{:02} UTC",
+                rem / 3_600,
+                (rem % 3_600) / 60,
+                rem % 60
+            )
+        }
     }
-    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
+/// A path with the home directory shown as `~`, for messages.
+pub fn home(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() && h != "/" => match path.strip_prefix(h.trim_end_matches('/')) {
+            Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+            _ => path.to_string(),
+        },
+        _ => path.to_string(),
+    }
 }
 
 /// The facts that never block, one short phrase each, for the scan table.
@@ -250,8 +303,8 @@ pub fn fact_phrases(r: &Report) -> Vec<String> {
             out.push("upstream gone".into());
         }
     }
-    if let Some(m) = r.usage.as_ref().and_then(|u| u.newest_mtime) {
-        out.push(format!("changed {}", age(now() - m)));
+    if let Ok(Some(c)) = &r.last_change {
+        out.push(format!("changed {}", age(now() - c.time)));
     }
     out
 }
@@ -420,6 +473,18 @@ pub fn report_json(r: &Report) -> Json {
         ("upstream_gone", upstream_gone),
         ("upstream_error", upstream_error),
         ("size", Json::opt(r.usage.as_ref(), usage_json)),
+        ("last_change", last_change_json(&r.last_change)),
+        (
+            "last_change_error",
+            match &r.last_change {
+                Err(e) => Json::str(e.clone()),
+                Ok(_) => Json::Null,
+            },
+        ),
+        (
+            "rule_sources",
+            Json::Arr(r.rule_sources.iter().map(rule_source_json).collect()),
+        ),
     ])
 }
 
@@ -468,4 +533,45 @@ pub fn ignored_environment_json(policy: &Policy) -> Json {
         Ok(values) => Json::Arr(values.iter().map(|v| Json::str(v.clone())).collect()),
         Err(_) => Json::Null,
     }
+}
+
+/// `{"unix": 1794003900, "at": "2026-11-06T21:05:00Z", "source": "git_dir",
+/// "what": "index"}`, or null when residue did not or could not measure it.
+fn last_change_json(c: &Result<Option<LastChange>, String>) -> Json {
+    match c {
+        Ok(Some(c)) => Json::Obj(vec![
+            ("unix", Json::Int(c.time)),
+            ("at", Json::str(rfc3339(c.time))),
+            ("source", Json::str(c.source.code())),
+            ("what", Json::str(c.what.clone())),
+        ]),
+        _ => Json::Null,
+    }
+}
+
+pub fn rule_source_json(s: &RuleSource) -> Json {
+    Json::Obj(vec![
+        ("rule", Json::str(s.rule.clone())),
+        ("scope", Json::str(s.scope.clone())),
+        ("origin", Json::opt(s.origin.clone(), Json::Str)),
+    ])
+}
+
+/// `idle`: the `--idle` threshold, or null when the run has none.
+pub fn idle_json(policy: &Policy) -> Json {
+    match &policy.idle {
+        Some(idle) => Json::Obj(vec![
+            ("threshold", Json::str(idle.text.clone())),
+            ("threshold_seconds", Json::Int(idle.seconds)),
+        ]),
+        None => Json::Null,
+    }
+}
+
+/// `rule_sources` at the top of a document: the rules beyond the built-in
+/// list that apply to every repository in this run, from the residue
+/// config file and `--regenerable`. Each worktree's own `rule_sources`
+/// lists the Git config rules of its repository.
+pub fn policy_sources_json(policy: &Policy) -> Json {
+    Json::Arr(policy.sources.iter().map(rule_source_json).collect())
 }

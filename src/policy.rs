@@ -27,6 +27,8 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+use crate::cli::Idle;
+
 pub const DEFAULTS: &[&str] = &[
     // JavaScript and TypeScript
     "node_modules",
@@ -197,13 +199,32 @@ fn glob(pattern: &str, text: &str) -> bool {
     p[pi..].iter().all(|c| *c == '*')
 }
 
+/// Where one rule beyond the built-in list came from, for `explain` and
+/// JSON `rule_sources`.
+#[derive(Clone)]
+pub struct RuleSource {
+    pub rule: String,
+    /// `local`, `worktree`, `global` or `system` for Git config, as Git
+    /// names the scope; `residue_config` for the residue config file;
+    /// `command_line` for `--regenerable`.
+    pub scope: String,
+    /// The file, as Git reports it (`file:/home/me/.gitconfig` becomes
+    /// `/home/me/.gitconfig`); `None` for `--regenerable`.
+    pub origin: Option<String>,
+}
+
 pub struct Policy {
     rules: Rules,
     pub config: Option<PathBuf>,
+    /// Rules from the residue config file and `--regenerable`, with their
+    /// source. Each worktree adds its Git config rules to these.
+    pub sources: Vec<RuleSource>,
     /// `residue.regenerable` values set through the environment, which
     /// residue ignores and reports (`git::environment_regenerable`). An
     /// error when Git could not read that environment.
     pub ignored_environment: Result<Vec<String>, String>,
+    /// `--idle`: keep a worktree changed more recently than this.
+    pub idle: Option<Idle>,
 }
 
 impl Policy {
@@ -213,6 +234,7 @@ impl Policy {
             rules.add(name).map_err(|e| format!("built-in list: {e}"))?;
         }
         let mut config = None;
+        let mut sources = Vec::new();
         if let Some(path) = config_path() {
             match fs::read_to_string(&path) {
                 Ok(text) => {
@@ -224,6 +246,11 @@ impl Policy {
                         rules
                             .add(line)
                             .map_err(|e| format!("{} line {}: {e}", path.display(), n + 1))?;
+                        sources.push(RuleSource {
+                            rule: line.to_string(),
+                            scope: "residue_config".into(),
+                            origin: Some(path.display().to_string()),
+                        });
                     }
                     config = Some(path);
                 }
@@ -235,11 +262,18 @@ impl Policy {
             rules
                 .add(name)
                 .map_err(|e| format!("--regenerable {name}: {e}"))?;
+            sources.push(RuleSource {
+                rule: name.clone(),
+                scope: "command_line".into(),
+                origin: None,
+            });
         }
         Ok(Policy {
             rules,
             config,
+            sources,
             ignored_environment: Ok(Vec::new()),
+            idle: None,
         })
     }
 
