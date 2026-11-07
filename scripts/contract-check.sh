@@ -41,7 +41,7 @@ trap 'rm -rf -- "$work"' EXIT
 # A controlled environment for residue and Git.
 export HOME=$work/home XDG_CONFIG_HOME=$work/home/.config XDG_STATE_HOME=$work/home/.local/state
 export GIT_CONFIG_NOSYSTEM=1 NO_COLOR=1 LC_ALL=C
-unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
 mkdir -p "$HOME"
 git config --global user.name contract-check
 git config --global user.email contract-check@example.invalid

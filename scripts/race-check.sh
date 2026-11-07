@@ -35,6 +35,8 @@ kill_tree() { # PID
 pid=
 trap '[ -n "$pid" ] && kill_tree "$pid"; touch "$work/done" 2>/dev/null; wait 2>/dev/null; rm -rf "$work"' EXIT
 export NO_COLOR=1 GIT_CONFIG_NOSYSTEM=1 HOME=$work/home
+# Only this run's Git config: nothing outside the scratch directory.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
 mkdir -p "$HOME"
 git config --global user.name race-check
 git config --global user.email race-check@example.invalid
