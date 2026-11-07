@@ -10,8 +10,9 @@
 # changed worktree must be skipped: exit status 3, a reason that says what
 # changed since the user confirmed, and the worktree still in place and
 # registered. The control cases change nothing and must be removed (or
-# moved to the trash). Runs on macOS, Linux and FreeBSD; needs bash, git and
-# script.
+# moved to the trash). Runs on macOS, Linux and FreeBSD; needs bash, git,
+# script and pgrep. A run that does not end within 60 s of the answer is
+# stopped with everything it started, and fails.
 set -euo pipefail
 
 bin=${1:-target/release/residue}
@@ -22,7 +23,17 @@ esac
 [ -x "$bin" ] || { echo "race-check: no executable at $bin; run cargo build --release first" >&2; exit 2; }
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/residue-race.XXXXXX")
-trap 'rm -rf "$work"' EXIT
+# Stop a process and everything it started (script, sh, residue).
+# set -e is on: none of these may fail the script.
+kill_tree() { # PID
+    local child
+    for child in $(pgrep -P "$1" 2>/dev/null || true); do
+        kill_tree "$child"
+    done
+    kill -TERM "$1" 2>/dev/null || true
+}
+pid=
+trap '[ -n "$pid" ] && kill_tree "$pid"; touch "$work/done" 2>/dev/null; wait 2>/dev/null; rm -rf "$work"' EXIT
 export NO_COLOR=1 GIT_CONFIG_NOSYSTEM=1 HOME=$work/home
 mkdir -p "$HOME"
 git config --global user.name race-check
@@ -92,9 +103,26 @@ await_prompt() { # out-file
     return 1
 }
 
-finish() { # sets $status: residue's exit status, or "none" without a status line
+finish() { # sets $status: residue's exit status, "none" without a status line, or "timeout"
     touch "$work/type"
+    # Bounded: a run that never ends is stopped with everything it started,
+    # reaped, and reported, instead of holding the suite forever.
+    local i
+    for ((i = 0; i < 600; i++)); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "race-check: residue did not finish within 60 s after the answer; stopped it" >>"$out"
+        kill_tree "$pid"
+        wait "$pid" 2>/dev/null || true
+        touch "$work/done"
+        status=timeout
+        pid=
+        return
+    fi
     wait "$pid" || true
+    pid=
     touch "$work/done"
     status=$(tr -d '\r' <"$out" | sed -n 's/^race-check-status \([0-9][0-9]*\)$/\1/p' | tail -n 1)
     status=${status:-none}
