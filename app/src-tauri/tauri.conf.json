@@ -1,13 +1,12 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "residue",
-  "version": "0.1.0",
-  "identifier": "com.whiteheap.residue-desktop",
+  "identifier": "com.whiteheap.residue",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "sh scripts/fetch-sidecar.sh && pnpm dev",
-    "beforeBuildCommand": "sh scripts/fetch-sidecar.sh && pnpm build"
+    "beforeDevCommand": "sh scripts/sidecar.sh && pnpm dev",
+    "beforeBuildCommand": "sh scripts/sidecar.sh --check && pnpm build"
   },
   "app": {
     "windows": [
@@ -38,7 +37,7 @@
     "shortDescription": "See and reclaim the storage Git worktrees take",
     "copyright": "Copyright (c) 2026 Whiteheap",
     "license": "MIT",
-    "homepage": "https://github.com/whiteheap/residue-desktop",
+    "homepage": "https://github.com/whiteheap/residue",
     "externalBin": [
       "binaries/residue"
     ],

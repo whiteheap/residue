@@ -1,6 +1,0 @@
-# The residue release bundled as the app's sidecar (Tauri externalBin).
-# scripts/fetch-sidecar.sh reads this file. To move to a new release, change
-# the version and copy each archive's checksum from that release's SHA256SUMS.
-version=0.0.6
-sha256_aarch64-apple-darwin=eed079e7d4620469ef14ab52ffc33e30034544a3960e6e8f2a4d7e56d5dc5bd6
-sha256_x86_64-apple-darwin=727a6a403688d291dec00ae5294b5f5fe0a109a7ebd1e40b6b1468c299ce5ee6

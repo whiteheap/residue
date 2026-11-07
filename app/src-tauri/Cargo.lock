@@ -2773,8 +2773,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "residue-desktop"
-version = "0.1.0"
+name = "residue-app"
+version = "0.0.0"
 dependencies = [
  "block2",
  "objc2-app-kit",

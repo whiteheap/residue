@@ -1,6 +1,6 @@
-// The residue CLI's JSON documents, as residue 0.0.6 prints them. These are
-// the contract between the CLI and the window: the window shows them and
-// never decides on its own what is safe to remove.
+// The residue CLI's JSON documents, as the CLI in this repository prints
+// them. These are the contract between the CLI and the window: the window
+// shows them and never decides on its own what is safe to remove.
 
 export type Verdict = "candidate" | "keep" | "unknown" | "stale";
 export type CheckStatus = "pass" | "block" | "unknown";

@@ -2,8 +2,9 @@ node_modules/
 dist/
 src-tauri/target/
 src-tauri/gen/schemas/
-# The residue sidecar: scripts/fetch-sidecar.sh downloads and verifies it.
-# Release binaries are never committed.
+# The residue CLI the app bundles: scripts/sidecar.sh builds it from this
+# repository, or the release places the binaries it publishes. Binaries are
+# never committed.
 src-tauri/binaries/
 .DS_Store
 *.log

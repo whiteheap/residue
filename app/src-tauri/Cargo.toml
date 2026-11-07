@@ -1,16 +1,23 @@
+# The Mac app's own crate. It is not part of the residue CLI's package: the
+# root Cargo.toml excludes app/, and the [workspace] table below keeps this
+# crate its own workspace, so nothing at the root builds or reads it.
+#
+# No version here: the app's version is the CLI's, from the root Cargo.toml,
+# and scripts/tauri.sh passes it to `tauri dev` and `tauri build`.
 [package]
-name = "residue-desktop"
-version = "0.1.0"
-description = "Desktop app for residue: see and reclaim the storage Git worktrees take"
+name = "residue-app"
+description = "The residue Mac app: see and reclaim the storage Git worktrees take"
 authors = ["Whiteheap"]
 license = "MIT"
-repository = "https://github.com/whiteheap/residue-desktop"
+repository = "https://github.com/whiteheap/residue"
 edition = "2024"
 rust-version = "1.90"
 publish = false
 
+[workspace]
+
 [lib]
-name = "residue_desktop_lib"
+name = "residue_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

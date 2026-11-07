@@ -43,8 +43,9 @@ const VALUE_OPTIONS: &[&str] = &["--grace", "--idle", "--min-free", "--fetch-eve
 const FLAG_OPTIONS: &[&str] = &["--no-fetch"];
 
 /// residue's defaults for the options a service does not set, from
-/// `residue watch --help` and `residue --help` of 0.0.6 and of 0.0.7.
-/// Update them with `sidecar.lock` when a release changes one.
+/// `residue watch --help` and `residue --help` of 0.0.6 and of 0.0.7. The CLI
+/// owns them (`src/watch.rs` and `src/cli.rs` at the repository root): a change
+/// to one there updates it here in the same pull request.
 pub const DEFAULT_GRACE: &str = "1h";
 pub const DEFAULT_IDLE: &str = "2d";
 pub const DEFAULT_MIN_FREE: &str = "10";
@@ -183,12 +184,12 @@ pub struct Preview {
 }
 
 /// The preview mode for development builds. With
-/// `RESIDUE_DESKTOP_DEV_SERVICE=preview`, a debug build never runs
+/// `RESIDUE_APP_DEV_SERVICE=preview`, a debug build never runs
 /// `residue service install` or `uninstall`: launchd acts on the user's real
 /// session and the label is shared with any residue service already running.
 /// The switch then shows the command it would run and the output of
 /// `residue watch --once --dry-run`, which removes nothing, and remembers the
-/// pretend state until the app quits. With `RESIDUE_DESKTOP_DEV_AGENT_FILE`
+/// pretend state until the app quits. With `RESIDUE_APP_DEV_AGENT_FILE`
 /// set to a plist as well, the preview starts as if that file were the
 /// installed service; the app only reads it. Release builds ignore both.
 pub struct DevPreview {
@@ -206,8 +207,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 impl DevPreview {
     pub fn from_env() -> Self {
         let enabled = cfg!(debug_assertions)
-            && std::env::var("RESIDUE_DESKTOP_DEV_SERVICE").as_deref() == Ok("preview");
-        let seed = std::env::var_os("RESIDUE_DESKTOP_DEV_AGENT_FILE")
+            && std::env::var("RESIDUE_APP_DEV_SERVICE").as_deref() == Ok("preview");
+        let seed = std::env::var_os("RESIDUE_APP_DEV_AGENT_FILE")
             .filter(|p| enabled && !p.is_empty())
             .map(PathBuf::from);
         DevPreview {

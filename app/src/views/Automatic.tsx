@@ -64,7 +64,7 @@ export function Automatic({
           <section className="notice dev">
             <h2>Development preview</h2>
             <p>
-              RESIDUE_DESKTOP_DEV_SERVICE=preview is set in this debug build. The switch never runs
+              RESIDUE_APP_DEV_SERVICE=preview is set in this debug build. The switch never runs
               residue service install or uninstall: it shows the command it would run and the
               output of residue watch --once --dry-run, which removes nothing.
             </p>

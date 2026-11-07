@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-const MARK: &str = "__RESIDUE_DESKTOP_PATH__";
+const MARK: &str = "__RESIDUE_APP_PATH__";
 
 /// Directories every Mac has, and the usual Homebrew prefixes, added after the
 /// shell's own entries when they exist.

@@ -1,4 +1,4 @@
-//! residue desktop: a window over the residue CLI.
+//! The residue Mac app: a window over the residue CLI.
 //!
 //! Every check, size, removal and restore comes from the bundled `residue`
 //! binary. The commands here run it with explicit arguments and return its
@@ -413,7 +413,7 @@ pub fn run() {
         ])
         .run(tauri::generate_context!());
     if let Err(e) = result {
-        eprintln!("residue desktop: {e}");
+        eprintln!("residue app: {e}");
         std::process::exit(1);
     }
 }

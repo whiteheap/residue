@@ -2,7 +2,7 @@
 //! checking the UI from a terminal that macOS does not allow to record the
 //! screen (where `screencapture` fails with "could not create image").
 //!
-//! Run a debug build with `RESIDUE_DESKTOP_DEV_SNAPSHOT_DIR=DIR`, then write a
+//! Run a debug build with `RESIDUE_APP_DEV_SNAPSHOT_DIR=DIR`, then write a
 //! name into `DIR/request`; the app writes `DIR/NAME.tiff` (Retina scale) and
 //! deletes the request. `sips -s format png DIR/NAME.tiff --out DIR/NAME.png`
 //! converts it. Only macOS debug builds contain this module.
@@ -12,7 +12,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager};
 
 pub fn start(app: &AppHandle) {
-    let Some(dir) = std::env::var_os("RESIDUE_DESKTOP_DEV_SNAPSHOT_DIR").map(PathBuf::from) else {
+    let Some(dir) = std::env::var_os("RESIDUE_APP_DEV_SNAPSHOT_DIR").map(PathBuf::from) else {
         return;
     };
     let app = app.clone();
@@ -20,7 +20,7 @@ pub fn start(app: &AppHandle) {
         loop {
             std::thread::sleep(Duration::from_millis(200));
             if let Err(e) = take_request(&app, &dir) {
-                eprintln!("residue desktop snapshot: {e}");
+                eprintln!("residue app snapshot: {e}");
             }
         }
     });
@@ -63,19 +63,16 @@ fn snapshot(webview: *mut std::ffi::c_void, out: PathBuf) {
             let why = unsafe { error.as_ref() }
                 .map(|e| e.localizedDescription().to_string())
                 .unwrap_or_else(|| "no image and no error".into());
-            eprintln!("residue desktop snapshot: {why}");
+            eprintln!("residue app snapshot: {why}");
             return;
         };
         let Some(tiff) = image.TIFFRepresentation() else {
-            eprintln!("residue desktop snapshot: the image has no TIFF form");
+            eprintln!("residue app snapshot: the image has no TIFF form");
             return;
         };
         match std::fs::write(&out, tiff.to_vec()) {
-            Ok(()) => eprintln!("residue desktop snapshot: wrote {}", out.display()),
-            Err(e) => eprintln!(
-                "residue desktop snapshot: cannot write {}: {e}",
-                out.display()
-            ),
+            Ok(()) => eprintln!("residue app snapshot: wrote {}", out.display()),
+            Err(e) => eprintln!("residue app snapshot: cannot write {}: {e}", out.display()),
         }
     });
     // SAFETY: a nil configuration snapshots the whole visible web view.
