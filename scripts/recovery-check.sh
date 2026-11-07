@@ -36,11 +36,12 @@
 #                  so both have passed every check; the test releases one,
 #                  waits for it to finish, then releases the other (4, and
 #                  4b with --trash, where each made a trash entry first)
-#   part-remove-reflog, part-remove-head
+#   part-remove-reflog, part-remove-head, part-remove-dotgit
 #                  fail `worktree remove ASIDE` after deleting the
 #                  worktree's HEAD reflog, or its HEAD, from its Git
-#                  directory: what Git's own remove leaves when it stops
-#                  at a file it cannot delete (5, 5b)
+#                  directory, or the `.git` file from its checkout: what
+#                  Git's own remove leaves when it stops at a file it
+#                  cannot delete, or is killed during the delete (5, 5b, 5c)
 #
 # A held command waits at most 50 s, and never runs once its residue has
 # exited or the test aborted it. The two removers of scenario 4 start one
@@ -165,11 +166,13 @@ case " \$* " in
     *residue-removing-*part-remove-*)
         # Git's own remove stops at the first file it cannot delete, after
         # the ones the filesystem listed before it: here, the worktree's
-        # HEAD reflog or its HEAD, while Git still lists the worktree.
+        # HEAD reflog or its HEAD, or the checkout's .git file, while Git
+        # still lists the worktree.
         gd=\$("\$real" -C "\$last" rev-parse --absolute-git-dir) || exit 1
         case \$mode in
         *part-remove-reflog*) rm -f "\$gd/logs/HEAD" ;;
         *part-remove-head*) rm -f "\$gd/HEAD" ;;
+        *part-remove-dotgit*) rm -f "\$last/.git" ;;
         esac
         echo "error: recovery-check: the remove stops part way on purpose" >&2
         exit 255
@@ -377,7 +380,7 @@ if [ -n "$partial_probe" ]; then
     elif common_ok; then ok "refused before any move: $(jq -r '.results[0].worktree.activity.detail' "$out")"; fi
     for scenario in stopped-after-move stopped-after-move-restore stopped-after-move-control refused-after-move \
         refused-after-move-control move-back-fails original-taken two-removers two-removers-trash \
-        remove-fails-part-way-reflog remove-fails-part-way-head; do
+        remove-fails-part-way-reflog remove-fails-part-way-head remove-fails-part-way-dotgit; do
         skip_partial "$scenario"
     done
     echo "recovery-check: $passes passed, $failures failed"
@@ -608,12 +611,15 @@ fi
 # --- 5. git worktree remove fails part way ----------------------------------
 # Git deletes the checkout, then its own directory for the worktree, each
 # in the order the filesystem lists the files, and stops at the first it
-# cannot delete. Here it lost its HEAD reflog (5) or its HEAD (5b), still
-# lists the worktree, and kept its files. w holds a commit only its HEAD
+# cannot delete; a kill stops it anywhere. Here it lost its HEAD reflog
+# (5), its HEAD (5b) or the checkout's .git file (5c), still lists the
+# worktree, and kept its other files. w holds a commit only its HEAD
 # reflog names. The removal record must stay, that commit must survive `git
 # gc`, and `residue restore` must bring w back with the commit in its
 # reflog: moved back (5), or recreated once Git's leftovers of a worktree
-# it can no longer use are cleared, as restore says (5b).
+# it can no longer use are cleared, as restore says (5b, 5c). For those
+# two, scan must print only the restore of the record: Git refuses the
+# move back, and `recovery`, which a script may run, deletes nothing.
 part_remove() { # MODE: make the repository and run the failing removal
     make_repo
     setup git -C "$wt" checkout -q --detach
@@ -668,9 +674,27 @@ if part_remove_ok "part of its HEAD reflog is gone"; then
     else ok "the record stays, gc keeps the commit, and restore moves it back with its reflog"; fi
 fi
 
-name=remove-fails-part-way-head
-part_remove part-remove-head
-if part_remove_ok "Git can no longer use it"; then
+# What scan says of w, which Git can no longer use for the reason WHY: the
+# restore of its record, and no move back, in the text and in `recovery`.
+scan_unusable_ok() { # WHY
+    local main entry text left
+    main=$(cd "$repo" && pwd -P)
+    entry=$(cd "$repo/.git/residue-removed" && ls)
+    text=$(cd "$repo" && "$bin" scan 2>&1)
+    left=$(interrupted)
+    if ! grep -qF "Git can no longer use it ($1), so it cannot move it back; restore says what to clear, then recreates it: residue restore $main/.git/residue-removed/$entry" <<<"$text"; then fail "scan does not give the restore of its record: $text"
+    elif grep -qE "put it back|worktree move|or: residue restore" <<<"$text"; then fail "scan still gives a move back Git refuses: $text"
+    elif [ "$(jq -r '.[0].recovery' <<<"$left")" != "residue restore $main/.git/residue-removed/$entry" ]; then fail "scan's recovery: $(jq -r '.[0].recovery' <<<"$left")"
+    elif ! jq -e --arg why "$1" --arg rec "$main/.git/residue-removed/$entry" '.[0].unusable == $why and .[0].removal_record == $rec' <<<"$left" >/dev/null; then fail "scan's interrupted removal: $left"
+    else return 0; fi
+    return 1
+}
+# 5b, 5c: restore refuses, says what to clear, and once it is cleared
+# recreates w.
+part_remove_unusable() { # MODE WHY
+    part_remove "$1"
+    part_remove_ok "${3:-Git can no longer use it}" || return
+    scan_unusable_ok "$2" || return
     restore_w
     main=$(cd "$repo" && pwd -P)
     if [ "$restored" != 1 ]; then fail "restore of a worktree Git cannot use exited $restored, want 1"
@@ -682,9 +706,15 @@ if part_remove_ok "Git can no longer use it"; then
         restore_w
         if ! restored_ok checked_out_branch; then :
         elif [ "$(sums "$wt")" != "$(grep -v '^\./node_modules/' <<<"$w_sum")" ]; then fail "the recreated worktree's tracked files differ"
-        else ok "the record stays, gc keeps the commit, restore says what to clear, then recreates it"; fi
+        else ok "the record stays, gc keeps the commit, scan and restore say what to clear, then restore recreates it"; fi
     fi
-fi
+}
+
+name=remove-fails-part-way-head
+part_remove_unusable part-remove-head "Git reads no HEAD in its Git directory"
+
+name=remove-fails-part-way-dotgit
+part_remove_unusable part-remove-dotgit "its .git file is gone" "its files are gone"
 
 echo "recovery-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]

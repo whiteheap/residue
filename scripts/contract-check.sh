@@ -100,9 +100,10 @@ ok() {
 # A repository with two linked worktrees: .worktrees/w on branch w (one
 # commit of its own, a regenerable node_modules/), and .worktrees/u on
 # branch u, which no scenario names and every scenario must leave alone.
-# With ref_format set, Git stores its refs that way (`--ref-format`).
-make_repo() {
-    repo=$work/$name
+# With ref_format set, Git stores its refs that way (`--ref-format`). DIR,
+# when given, is where the repository goes instead of $work/NAME.
+make_repo() { # [DIR]
+    repo=${1:-$work/$name}
     setup git init -q ${ref_format:+--ref-format="$ref_format"} "$repo"
     printf 'node_modules/\n.env\n' >"$repo/.gitignore"
     echo hello >"$repo/README.md"
@@ -129,6 +130,15 @@ sums() {
 
 registered() { # PATH
     git -C "$repo" worktree list --porcelain | grep -qx "worktree $(cd "$1" 2>/dev/null && pwd -P)"
+}
+
+# Run the rest of the arguments in DIR, then go back: `in_dir DIR run ...`
+# keeps the variables `run` sets.
+in_dir() { # DIR COMMAND...
+    pushd "$1" >/dev/null || exit 2
+    shift
+    "$@"
+    popd >/dev/null || exit 2
 }
 
 # Run residue with a 120-second deadline. Sets $status, $out, $err.
@@ -734,11 +744,49 @@ if [ -z "$partial_probe" ]; then
     elif git -C "$wt" symbolic-ref -q HEAD >/dev/null; then fail "the restored worktree is on a branch"
     elif [ "$(git -C "$wt" rev-parse HEAD)" != "$w_sha" ]; then fail "the restored worktree is not at the recorded HEAD"
     elif common_ok; then ok; fi
+
+    # A name from the home folder is never a search of all of it (on
+    # macOS, a permission prompt for Documents, Desktop and Downloads):
+    # only of the usual code folders in it, the ones `watch` uses. One
+    # record of w is in ~/Documents/app, one in ~/src/app. From the home
+    # folder, the list and `restore w` see only the one in ~/src; once it
+    # is restored, `restore w` finds nothing and names the folders it
+    # searched. Inside ~/Documents, `restore w` still finds that one.
+    name=restore-name-from-home
+    home=$(cd "$HOME" && pwd -P)
+    make_repo "$HOME/Documents/app"
+    remove_w
+    docs=$repo docs_sha=$w_sha
+    make_repo "$HOME/src/app"
+    remove_w
+    (cd "$HOME" && "$bin" restore --json) >"$work/$name.list" 2>"$work/$name.list-err"
+    in_dir "$HOME" run restore --json w
+    if ! jq -e --arg src "$home/src/app/" '(.removed | length) == 1 and (.removed[0].original_path | startswith($src))' "$work/$name.list" >/dev/null; then fail "the list from the home folder: $(head -c 2000 "$work/$name.list")"
+    elif ! grep -qF "residue: note: listed the repositories in the usual code folders in your home folder (src); residue does not search the rest of your home folder" "$work/$name.list-err"; then fail "the list does not say where it looked: $(cat "$work/$name.list-err")"
+    elif [ "$status" != 0 ]; then fail "restore w from the home folder: exit $status, want 0"
+    elif ! restore_ok removed checked_out_branch; then fail "stdout is not one restore document with checkout checked_out_branch"
+    elif [ "$(jq -r .restored "$out")" != "$home/src/app/.worktrees/w" ]; then fail "restored $(jq -r .restored "$out"), want $home/src/app/.worktrees/w"
+    elif ! common_ok; then :
+    else
+        in_dir "$HOME" run restore --json w
+        repo=$docs w_sha=$docs_sha
+        if [ "$status" != 1 ]; then fail "restore w from the home folder, with only ~/Documents holding one: exit $status, want 1"
+        elif [ -s "$out" ]; then fail "stdout is not empty"
+        elif ! grep -qF "residue: nothing named w in the trash or the removal records of the repositories in the usual code folders in your home folder (src), and residue does not search the rest of your home folder; run residue restore inside its repository, or pass the entry's path it lists there" "$err"; then fail "the message does not name where it looked"
+        elif [ "$(records)" != "1 records, 1 refs" ]; then fail "$docs has $(records), want 1 records, 1 refs"
+        else
+            in_dir "$docs" run restore --json w
+            if [ "$status" != 0 ]; then fail "restore w inside ~/Documents/app: exit $status, want 0"
+            elif [ "$(jq -r .restored "$out")" != "$home/Documents/app/.worktrees/w" ]; then fail "restored $(jq -r .restored "$out"), want $home/Documents/app/.worktrees/w"
+            elif common_ok; then ok; fi
+        fi
+    fi
+    rm -rf -- "$HOME/Documents" "$HOME/src"
 else
     for c in record-json record-text record-fail-closed-dir record-fail-closed-ref record-retention \
         record-reflog-pin record-reflog-branch record-reflog-reftable record-unreadable \
         restore-branch-ahead restore-branch-rewritten restore-branch-gone restore-branch-elsewhere \
-        restore-path-occupied restore-detached; do
+        restore-path-occupied restore-detached restore-name-from-home; do
         skip_partial "$c"
     done
 fi

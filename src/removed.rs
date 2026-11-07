@@ -471,17 +471,6 @@ impl Item {
         self.registered.is_some()
     }
 
-    /// An interrupted removal whose HEAD Git can no longer read: a `git
-    /// worktree remove` that failed part way deleted it. Git can neither
-    /// move nor remove that worktree, so restore cannot move it back.
-    pub fn head_gone(&self) -> bool {
-        self.registered.as_ref().is_some_and(|e| {
-            e.head
-                .as_deref()
-                .is_none_or(|h| h.bytes().all(|b| b == b'0'))
-        })
-    }
-
     pub fn age(&self, now: i64) -> Option<i64> {
         self.record.as_ref().ok().map(|r| now - r.removed)
     }
@@ -1213,7 +1202,9 @@ fn move_back(
         // Git then can neither move nor remove it. The record still keeps
         // its HEAD and reflog, so once Git's leftovers are cleared, this
         // restore recreates it.
-        if let Err(why) = git::identity(aside) {
+        // A `.git` file it lost leaves `git rev-parse` to find the repository
+        // above it, so that answer alone does not show it.
+        if let Some(why) = git::identity(aside).err().or_else(|| left.unusable.clone()) {
             let git = format!("git -C {} worktree", output::shell(main));
             let unlock = if ours {
                 format!("run `{git} unlock {}`, ", output::shell(aside))
