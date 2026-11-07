@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Install (#30): one command installs residue and, on macOS and Linux, turns on automatic cleanup: `curl -fsSL https://residue.whiteheap.com/install.sh | sh`. The script (`site/public/install.sh`, POSIX sh) uses Homebrew on macOS, the signed apt, dnf or pacman repository on Linux when it can act as root, and otherwise the release archive, checked against `SHA256SUMS` and, when `gh` is logged in, its build-provenance attestation; it pins the SHA-256 of the signing key it adds. Then it runs `residue service install`, leaves an existing service alone, and prints what it did and how to undo it. `--no-service`, `--archive`, `--prefix`, `--version` and `--dry-run`. Running it again upgrades. CI runs it through Homebrew, apt, dnf, pacman and the archive (macOS, Ubuntu, Alpine, FreeBSD). README and `docs/installation.md` lead with it; Homebrew and the manual channels remain.
+
 ## 0.0.7 (2026-11-08)
 
 - Automatic cleanup in one command (#28): `residue service install` and `residue watch` take no ROOT. Without one they use the usual code folders in the home folder that exist: `~/src`, `~/code`, `~/Code`, `~/dev`, `~/Developer`, `~/projects`, `~/Projects`, `~/repos`, `~/git`, `~/github`, `~/GitHub`, `~/work`, `~/Work` and `~/workspace`, each once (on a case-insensitive filesystem `~/code` and `~/Code` are one folder), and print which. Never the home folder itself, which holds far more than code, and nothing under `Documents`, `Desktop` or `Downloads`, which macOS guards with a permission prompt a background service cannot answer. When none exists, both print one line that names the folders and how to pass a ROOT, and exit 2. A ROOT replaces the list. `service install` never prompts, so an installer can run it, and prints the folders and `residue service uninstall` to turn it off.

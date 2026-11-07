@@ -10,12 +10,14 @@ on:
       - "site/**"
       - ".github/workflows/site.yml"
   pull_request:
-    # check.sh also compares the page with README.md and docs/assets, so a
-    # change to either is checked here before it can leave the site behind.
+    # check.sh also compares the page with README.md and docs/assets, and
+    # install.sh's pinned key hashes with packaging/signing-key.asc, so a
+    # change to any of them is checked here before it can leave the site behind.
     paths:
       - "site/**"
       - "README.md"
       - "docs/assets/**"
+      - "packaging/signing-key.asc"
       - ".github/workflows/site.yml"
   workflow_dispatch:
 

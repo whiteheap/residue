@@ -15,6 +15,8 @@
 # 7. The fonts load from the site itself, with font-display: swap, the 400
 #    weight is preloaded, and the Content Security Policy is the exact one
 #    below.
+# 8. install.sh passes shellcheck (when it is installed), and the signing key
+#    hashes it pins match packaging/signing-key.asc.
 set -u
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -43,6 +45,7 @@ ibm-plex-mono-OFL.txt
 ibm-plex-mono-latin-400-normal.woff2
 ibm-plex-mono-latin-500-normal.woff2
 index.html
+install.sh
 logo-dark.svg
 logo.svg
 style.css
@@ -236,6 +239,43 @@ for page in "$public"/*.html; do
     fail "$(basename "$page") does not preload the 400 weight with $preload"
   fi
 done
+
+# 8. The install script. shellcheck is optional here; CI always runs it.
+install_sh="$public/install.sh"
+if command -v shellcheck >/dev/null 2>&1; then
+  if shellcheck -s sh "$install_sh"; then
+    ok "install.sh passes shellcheck"
+  else
+    fail "install.sh has shellcheck findings above"
+  fi
+else
+  printf 'skip install.sh shellcheck: shellcheck is not installed\n'
+fi
+pinned() { sed -n "s/^$1=\([0-9a-fA-F]*\)$/\1/p" "$install_sh"; }
+key="$root/packaging/signing-key.asc"
+asc_sha=$(sha256 "$key")
+if [ "$asc_sha" = "$(pinned KEY_ASC_SHA256)" ]; then
+  ok "install.sh pins the SHA-256 of packaging/signing-key.asc"
+else
+  fail "install.sh KEY_ASC_SHA256 must be $asc_sha, the SHA-256 of packaging/signing-key.asc"
+fi
+if command -v gpg >/dev/null 2>&1; then
+  gpg --dearmor < "$key" > "$scratch/keyring.gpg"
+  gpg_sha=$(sha256 "$scratch/keyring.gpg")
+  if [ "$gpg_sha" = "$(pinned KEY_GPG_SHA256)" ]; then
+    ok "install.sh pins the SHA-256 of the apt keyring made from it"
+  else
+    fail "install.sh KEY_GPG_SHA256 must be $gpg_sha, the SHA-256 of gpg --dearmor < packaging/signing-key.asc"
+  fi
+  fpr=$(gpg --show-keys --with-colons "$key" | awk -F: '$1 == "fpr" { print $10; exit }')
+  if [ "$fpr" = "$(sed -n 's/^KEY_FPR=//p' "$install_sh")" ]; then
+    ok "install.sh names the fingerprint of packaging/signing-key.asc"
+  else
+    fail "install.sh KEY_FPR must be $fpr, the fingerprint of packaging/signing-key.asc"
+  fi
+else
+  printf 'skip install.sh apt keyring and fingerprint: gpg is not installed\n'
+fi
 
 if [ "$failures" -eq 0 ]; then
   printf 'site check passed\n'

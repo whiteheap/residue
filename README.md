@@ -31,6 +31,14 @@ A repository's linked worktrees are checked, then reported. `scan` and `explain`
 `git` 2.36 or later, on `PATH`.
 
 ```sh
+curl -fsSL https://residue.whiteheap.com/install.sh | sh
+```
+
+It installs residue through Homebrew on macOS, the signed apt, dnf or pacman repository on Linux, or else the checksum-verified release archive, so updates arrive with your other upgrades. On macOS and Linux it then turns on automatic cleanup with `residue service install`; elsewhere it installs residue only. [Read the script](site/public/install.sh) first if you like; [its flags and how to undo it](docs/installation.md#the-install-script) are in Install residue.
+
+Or with Homebrew alone:
+
+```sh
 brew install whiteheap/tap/residue
 ```
 
@@ -277,7 +285,7 @@ The launchd plist, the systemd unit and timer, how to stop them, and the sweep's
 
 | Topic | Where |
 | --- | --- |
-| Apt, dnf, pacman, archives, `cargo install` | [Install residue](docs/installation.md) |
+| The install script, apt, dnf, pacman, archives, `cargo install` | [Install residue](docs/installation.md) |
 | PATH search, `--json` fields, exit codes, regenerable rules | [Command and configuration reference](docs/reference.md) |
 | Default folders, fetching, launchd, systemd, idle clock, sweep exit status | [Automate residue](docs/automation.md) |
 | Platforms, what was not run, CI scripts | [Platforms and testing](docs/platforms-and-testing.md) |

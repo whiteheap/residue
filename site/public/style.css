@@ -385,12 +385,15 @@ pre code::before {
   padding-block-start: 0.5rem;
 }
 
-/* The install command, the hero's one action. The box fits its command and
-   grows to a one-liner of about 60 characters before it wraps; "read the
-   formula" sits beside it, or under it on a narrow screen. */
+/* The install command, the hero's one action. The box fits its command up
+   to the column's width; "read the script" sits beside it, or under it on a
+   narrow screen. */
 .install {
   display: flex;
   flex-wrap: wrap;
+  /* The grid around it sizes items to their content; this keeps the box
+     inside the column so the command scrolls instead. */
+  max-inline-size: 100%;
   align-items: center;
   gap: 0.75rem 1.25rem;
   padding-block-start: 0.5rem;
@@ -400,6 +403,7 @@ pre code::before {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  min-inline-size: 0;
   max-inline-size: 44rem;
   padding-inline-end: 0.375rem;
   border-radius: var(--radius);
@@ -413,9 +417,12 @@ pre code::before {
   background: none;
   box-shadow: none;
   font-size: 0.9375rem;
-  /* A long one-liner wraps on a phone instead of hiding behind a scroll. */
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  /* The command stays on one line and scrolls sideways when the box is
+     narrower, as on a phone: a break inside the URL would read as two
+     commands. min-inline-size lets the flex item shrink so it can scroll. */
+  min-inline-size: 0;
+  white-space: pre;
+  overflow-x: auto;
 }
 
 /* One click selects the whole command, with or without the copy button. */

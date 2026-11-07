@@ -8,7 +8,8 @@
 # /           200, the bytes of index.html, and the Content-Security-Policy
 #             header of public/_headers, exactly
 # /NAME       200, the bytes of site/public/NAME, for every other served file;
-#             with nosniff, a script or a font must also carry its own type
+#             with nosniff, a script or a font must also carry its own type,
+#             and install.sh is text/plain
 # a missing   404, the bytes of 404.html
 #   path
 set -u
@@ -50,6 +51,8 @@ pass() {
         index.html) check=content-security-policy expect=$csp ;;
         *.js) check=content-type expect='text/javascript*' ;;
         *.woff2) check=content-type expect='font/woff2*' ;;
+        # Text, so a browser shows the script instead of downloading it.
+        install.sh) check=content-type expect='text/plain*' ;;
         *) check= ;;
       esac
       if [ -n "$check" ]; then
