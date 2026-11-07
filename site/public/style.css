@@ -367,7 +367,9 @@ pre code::before {
   font-size: var(--text-hero);
   line-height: 1.25;
   letter-spacing: -0.01em;
-  max-inline-size: 23ch;
+  /* Wide enough for "automatically and safely." on one line, so the h1
+     balances into three lines, not four. */
+  max-inline-size: 26ch;
 }
 
 .lede {
