@@ -2,11 +2,17 @@
 
 Back to [Tested on](../README.md#tested-on).
 
-These are the platforms, Git versions, and results from the README table this page replaces. They are records of those runs, not a promise about a platform that is not named.
+These are the platforms, Git versions, and results from the README table this page replaces, including the 0.0.6 rows added on main. They are records of those runs, not a promise about a platform that is not named.
 
-The README used to say that, apart from the smoke test and `scripts/race-check.sh`, residue had no automated test suite. That sentence does not match [What CI runs](#what-ci-runs) later in the same README: CI also runs `scripts/recovery-check.sh`, `scripts/contract-check.sh`, and `.github/service-smoke.sh` on the platforms named there. CHANGELOG.md also records an in-crate verdict-fold test, `cargo test --locked`, on the macOS and Linux runners. This page does not add a pass or a failure beyond those notes.
+The README used to say that, apart from the smoke test and `scripts/race-check.sh`, residue had no automated test suite. That sentence does not match [What CI runs](#what-ci-runs): CI also runs `scripts/recovery-check.sh`, `scripts/contract-check.sh`, and `.github/service-smoke.sh` on the platforms named there, and on NetBSD, OpenBSD and DragonFly `scripts/partial-probe.sh` skips removal cases. CHANGELOG.md also records an in-crate verdict-fold test, `cargo test --locked`, on the macOS and Linux runners. This page does not add a pass or a failure beyond those notes.
 
 ## Release-binary records
+
+### 0.0.6 on macOS 26.3.1, Apple silicon
+
+**Git:** Apple Git 2.50.1
+
+`scan --json` of a working `~/Work` with 23 linked agent worktrees, run at the same moment as the 0.0.5 release binary: every verdict and check status identical on 22; on the 23rd, 0.0.5 saw the 0.0.6 process itself (`in use by residue[PID]`), whose binary was built inside it. lsof inspected 431 of 666 running processes. `scripts/race-check.sh` 10 passed, `scripts/recovery-check.sh` 8 passed, `scripts/contract-check.sh` 17 passed, `.github/smoke.sh` and `.github/watch-smoke.sh` passed.
 
 ### 0.0.5 on macOS 26.3.1 (25D771280a), Apple silicon
 
@@ -68,11 +74,17 @@ Static musl binary as a non-root user with `TZ=Europe/Tallinn`: `scan` with a gi
 
 Static musl binary as a non-root user: `scan`, in-use detection through `/proc`, hard-link accounting, and `remove` with and without a terminal. As root on another user's repository, Git refused with "dubious ownership" and residue reported the error instead of guessing.
 
-### Unreleased on NetBSD 10.2, OpenBSD 7.8, DragonFly 6.4.2 and OmniOS r151054 (illumos), each in a virtual machine on GitHub Actions
+### 0.0.6 on NetBSD 10.2, OpenBSD 7.8, DragonFly 6.4.2 and OmniOS r151054 (illumos), each in a virtual machine on GitHub Actions
 
 **Git:** 2.56.0
 
-Build, `.github/smoke.sh` and `scripts/contract-check.sh` on all four, and `.github/watch-smoke.sh` and `scripts/race-check.sh` on the three BSDs, as root and as an ordinary user. The busy worktree was `in use: sleep[PID]` on each. As an ordinary user the probe inspected 21 of 22 processes on NetBSD and 25 of 26 on DragonFly (their kernels name every process's working directory), and 4 of 40 on OpenBSD and 4 of 52 on illumos (only the user's own).
+Build, `.github/smoke.sh`, `scripts/contract-check.sh` and `scripts/recovery-check.sh` on all four, and `.github/watch-smoke.sh` and `scripts/race-check.sh` on the three BSDs, as root and as an ordinary user. The busy worktree was `in use: sleep[PID]` on each. NetBSD, OpenBSD and DragonFly never offer a worktree for removal on activity grounds: their probe reads working directories, not open files, so activity is `unknown` (`partial_probe`) unless a use is found, and nothing there is a removal candidate. There the clean, idle worktree stayed `unknown` in `scan`, `explain`, `remove --yes`, `remove` under a terminal (no prompt) and `watch` (a landed branch, disk pressure); nothing was moved aside or put in the trash; every case that expects a removal was skipped by name. On illumos, whose probe reads open files, the clean worktree was a candidate and was removed. As an ordinary user the probe inspected 21 of 22 processes on NetBSD and 25 of 26 on DragonFly (their kernels name every process's working directory), and 4 of 40 on OpenBSD and 4 of 52 on illumos (only the user's own).
+
+### 0.0.6 on GitHub Actions `macos-latest`, `ubuntu-24.04` (x86_64), `ubuntu-24.04-arm`, and FreeBSD 14 in a virtual machine
+
+**Git:** runner Git
+
+As 0.0.5, plus `scripts/contract-check.sh` and `scripts/recovery-check.sh` on all four, on FreeBSD as root and as an ordinary user. The release builds FreeBSD x86_64 and aarch64 binaries, each run with `--version` and `.github/smoke.sh` in a FreeBSD 14 virtual machine of its own architecture.
 
 ### 0.0.5 on GitHub Actions `macos-latest`, `ubuntu-24.04` (x86_64), `ubuntu-24.04-arm`, and FreeBSD 14 in a virtual machine
 
@@ -92,7 +104,7 @@ Not run: the Intel macOS binary (built by cross-compiling, never executed), on i
 
 ## What CI runs
 
-CI runs these scripts on every push: on macOS and Linux x86_64 and arm64, and as root and as an ordinary user in FreeBSD 14, NetBSD 10, OpenBSD 7.8 and DragonFly 6.4 virtual machines. An OmniOS (illumos) virtual machine runs the smoke test and the contract and recovery checks, as root and as an ordinary user; not the watch smoke test, because without inotify or kqueue a running `watch` wakes on its five-minute timer, past that test's two-minute limit, and not the race check, because illumos `script` cannot run a command and the base system has no other way to give residue a terminal.
+CI runs these scripts on every push: on macOS and Linux x86_64 and arm64, and as root and as an ordinary user in FreeBSD 14, NetBSD 10, OpenBSD 7.8 and DragonFly 6.4 virtual machines. An OmniOS (illumos) virtual machine runs the smoke test and the contract and recovery checks, as root and as an ordinary user; not the watch smoke test, because without inotify or kqueue a running `watch` wakes on its five-minute timer, past that test's two-minute limit, and not the race check, because illumos `script` cannot run a command and the base system has no other way to give residue a terminal. On NetBSD, OpenBSD and DragonFly nothing is a removal candidate, so each script skips every case that expects a removal or a prompt, naming the case and the reason (`scripts/partial-probe.sh`), and checks instead that the clean, idle worktree is kept as `unknown` for the probe's reason (`partial_probe`), with nothing moved aside or put in the trash. The gate is the system's name, so a residue that offered a removal there would fail it.
 
 - `.github/smoke.sh`: a clean candidate, a kept `.env`, a worktree a process is using, and a removal that keeps the branch.
 - `scripts/race-check.sh`: five changes made while the prompt waits, each skipped; an upstream restored while it waits, kept with and without the trash; and three removals that changed nothing.

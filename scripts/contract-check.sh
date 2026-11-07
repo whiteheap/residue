@@ -30,6 +30,12 @@ case $bin in
 esac
 [ -x "$bin" ] || { echo "contract-check: no executable at $bin; run cargo build --release first" >&2; exit 2; }
 command -v jq >/dev/null || { echo "contract-check: needs jq" >&2; exit 2; }
+# NetBSD, OpenBSD and DragonFly: no worktree is a candidate (see the file).
+# Every case that expects a removal or a prompt is skipped there by name;
+# the kept-unknown cases check what happens instead, and each refusal must
+# name the activity check as well as its own.
+# shellcheck source=SCRIPTDIR/partial-probe.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/partial-probe.sh"
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/residue-contract.XXXXXX") || exit 2
 case $work in
@@ -161,8 +167,27 @@ result() { # INDEX FIELD
     jq -r ".results[$1].$2 // empty" "$out"
 }
 
-failing_checks() { # INDEX: the ids of checks that did not pass, comma-separated
-    jq -r "[.results[$1].worktree.checks[]? | select(.status != \"pass\") | .id] | join(\",\")" "$out"
+failing_checks() { # INDEX: the ids of checks that did not pass, sorted, comma-separated
+    jq -r "[.results[$1].worktree.checks[]? | select(.status != \"pass\") | .id] | sort | join(\",\")" "$out"
+}
+
+# The failing check ids to expect, sorted: CHECK-IDS, plus `activity` where
+# the probe cannot show any worktree unused.
+want_failing() { # CHECK-ID...
+    { printf '%s\n' "$@"; [ -z "$partial_probe" ] || echo activity; } | LC_ALL=C sort | paste -s -d , -
+}
+
+# The activity answer for a worktree no process uses, on a partial probe:
+# unknown, for the probe's reason, in the check and in `activity`.
+partial_unknown() { # INDEX
+    jq -e --argjson i "$1" --arg detail "$partial_probe_detail" '
+        .results[$i].worktree as $w
+        | $w.verdict == "unknown"
+          and $w.activity.state == "unknown"
+          and $w.activity.reason == "partial_probe"
+          and ($w.activity.detail | endswith($detail))
+          and ([$w.checks[] | select(.id == "activity") | .status] == ["unknown"])
+    ' "$out" >/dev/null
 }
 
 # Nothing was removed or moved: w and u are registered with the same bytes,
@@ -190,32 +215,60 @@ common_ok() {
 
 # --- scenarios -------------------------------------------------------------
 
-# 1. Positive control: a clean worktree is removed, JSON and text.
-name=control-json
-make_repo
-run remove --yes --json "$wt"
-if [ "$status" != 0 ]; then fail "exit $status, want 0"
-elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
-elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
-elif [ "$(jq -r '.results[0].reason' "$out")" != null ]; then fail "reason is not null for a removal"
-elif [ -e "$wt" ]; then fail "the worktree is still on disk"
-elif registered "$wt"; then fail "Git still lists the removed worktree"
-elif [ -s "$err" ]; then fail "stderr is not empty"
-elif common_ok; then ok; fi
+# 1. Positive control: a clean worktree is removed, JSON and text. On a
+# partial probe it is kept instead, as unknown for the probe's reason.
+if [ -z "$partial_probe" ]; then
+    name=control-json
+    make_repo
+    run remove --yes --json "$wt"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
+    elif [ "$(jq -r '.results[0].reason' "$out")" != null ]; then fail "reason is not null for a removal"
+    elif [ -e "$wt" ]; then fail "the worktree is still on disk"
+    elif registered "$wt"; then fail "Git still lists the removed worktree"
+    elif [ -s "$err" ]; then fail "stderr is not empty"
+    elif common_ok; then ok; fi
 
-name=control-text
-make_repo
-run remove --yes "$wt"
-if [ "$status" != 0 ]; then fail "exit $status, want 0"
-elif ! grep -q "^removed .*\.worktrees/w (branch w kept)" "$out"; then fail "no 'removed ... (branch w kept)' line"
-elif [ -e "$wt" ]; then fail "the worktree is still on disk"
-elif common_ok; then ok; fi
+    name=control-text
+    make_repo
+    run remove --yes "$wt"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif ! grep -q "^removed .*\.worktrees/w (branch w kept)" "$out"; then fail "no 'removed ... (branch w kept)' line"
+    elif [ -e "$wt" ]; then fail "the worktree is still on disk"
+    elif common_ok; then ok; fi
+else
+    skip_partial control-json
+    skip_partial control-text
+
+    name=kept-unknown-json
+    make_repo
+    before=$(sums "$wt")
+    run remove --yes --json "$wt"
+    if [ "$status" != 3 ]; then fail "exit $status, want 3"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), want refused"
+    elif [ "$(result 0 reason)" != "one or more checks did not pass" ]; then fail "reason: $(result 0 reason)"
+    elif [ "$(failing_checks 0)" != activity ]; then fail "failing checks: $(failing_checks 0), want activity"
+    elif ! partial_unknown 0; then fail "activity is not unknown (partial_probe): $(jq -c '.results[0].worktree.activity' "$out")"
+    elif [ -s "$err" ]; then fail "stderr is not empty"
+    elif untouched "$before"; then ok; fi
+
+    name=kept-unknown-text
+    make_repo
+    before=$(sums "$wt")
+    run remove --yes "$wt"
+    if [ "$status" != 3 ]; then fail "exit $status, want 3"
+    elif ! grep -q -E "worktrees/w +unknown: $partial_probe_short_re" "$out"; then fail "no '.worktrees/w  unknown: $partial_probe_short' line"
+    elif untouched "$before"; then ok; fi
+fi
 
 # 2. Refusals, one cause each: exit 3, refused, the right failing check, and
-# nothing changed.
+# nothing changed. On a partial probe `activity` is unknown too.
 refusal() { # NAME CHECK-ID CHANGE...
     name=$1
-    local check=$2
+    local check
+    check=$(want_failing "$2")
     shift 2
     make_repo
     (cd "$wt" && "$@") >/dev/null 2>&1 || { echo "contract-check: setup failed in $name: $*" >&2; exit 2; }
@@ -260,48 +313,68 @@ invalid invalid-subdirectory SUB "is inside the checkout .*; pass the worktree r
 invalid invalid-missing MISSING "No such file or directory"
 
 # 4. No terminal and no --yes: skipped, nothing removed, in JSON and text.
-name=no-terminal-json
-make_repo
-before=$(sums "$wt")
-run remove --json "$wt"
-if [ "$status" != 3 ]; then fail "exit $status, want 3"
-elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
-elif [ "$(result 0 result)" != skipped ]; then fail "result $(result 0 result), want skipped"
-elif ! result 0 reason | grep -q "stdin is not a terminal"; then fail "reason: $(result 0 reason)"
-elif untouched "$before"; then ok; fi
+# A partial probe leaves nothing to confirm, so there is no prompt to skip.
+if [ -z "$partial_probe" ]; then
+    name=no-terminal-json
+    make_repo
+    before=$(sums "$wt")
+    run remove --json "$wt"
+    if [ "$status" != 3 ]; then fail "exit $status, want 3"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(result 0 result)" != skipped ]; then fail "result $(result 0 result), want skipped"
+    elif ! result 0 reason | grep -q "stdin is not a terminal"; then fail "reason: $(result 0 reason)"
+    elif untouched "$before"; then ok; fi
 
-name=no-terminal-text
-make_repo
-before=$(sums "$wt")
-run remove "$wt"
-if [ "$status" != 3 ]; then fail "exit $status, want 3"
-elif ! grep -q "^nothing removed: stdin is not a terminal" "$out"; then fail "no 'nothing removed: stdin is not a terminal' line"
-elif untouched "$before"; then ok; fi
+    name=no-terminal-text
+    make_repo
+    before=$(sums "$wt")
+    run remove "$wt"
+    if [ "$status" != 3 ]; then fail "exit $status, want 3"
+    elif ! grep -q "^nothing removed: stdin is not a terminal" "$out"; then fail "no 'nothing removed: stdin is not a terminal' line"
+    elif untouched "$before"; then ok; fi
+else
+    skip_partial no-terminal-json
+    skip_partial no-terminal-text
+fi
 
 # 5. Several targets: one result per target, in order; only the clean one
 # goes, and one refusal makes the run exit 3.
-name=mixed-targets
-make_repo
-echo notes >"$repo/.worktrees/u/notes.md"
-u_sum=$(sums "$repo/.worktrees/u")
-run remove --yes --json "$wt" "$repo/.worktrees/u"
-if [ "$status" != 3 ]; then fail "exit $status, want 3"
-elif ! json_ok 2; then fail "stdout is not one valid remove document with 2 results"
-elif [ "$(result 0 result),$(result 1 result)" != "removed,refused" ]; then fail "results $(result 0 result),$(result 1 result), want removed,refused"
-elif [ "$(failing_checks 1)" != untracked ]; then fail "u's failing checks: $(failing_checks 1), want untracked"
-elif [ -e "$wt" ]; then fail "w is still on disk"
-elif common_ok; then ok; fi
+if [ -z "$partial_probe" ]; then
+    name=mixed-targets
+    make_repo
+    echo notes >"$repo/.worktrees/u/notes.md"
+    u_sum=$(sums "$repo/.worktrees/u")
+    run remove --yes --json "$wt" "$repo/.worktrees/u"
+    if [ "$status" != 3 ]; then fail "exit $status, want 3"
+    elif ! json_ok 2; then fail "stdout is not one valid remove document with 2 results"
+    elif [ "$(result 0 result),$(result 1 result)" != "removed,refused" ]; then fail "results $(result 0 result),$(result 1 result), want removed,refused"
+    elif [ "$(failing_checks 1)" != untracked ]; then fail "u's failing checks: $(failing_checks 1), want untracked"
+    elif [ -e "$wt" ]; then fail "w is still on disk"
+    elif common_ok; then ok; fi
+else
+    skip_partial mixed-targets
+fi
 
-# 6. Diagnostics go to stderr, never into the JSON on stdout.
+# 6. Diagnostics go to stderr, never into the JSON on stdout. On a partial
+# probe the worktree is kept (refused, activity unknown) and the note and
+# the document are checked the same way.
 name=stderr-separate
 make_repo
+before=$(sums "$wt")
 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=residue.regenerable GIT_CONFIG_VALUE_0=.env run remove --yes --json "$wt"
-if [ "$status" != 0 ]; then fail "exit $status, want 0"
+if [ -z "$partial_probe" ]; then
+    want_status=0 want_result=removed
+else
+    want_status=3 want_result=refused
+fi
+if [ "$status" != "$want_status" ]; then fail "exit $status, want $want_status"
 elif ! grep -q "residue: note: ignored residue.regenerable set through the environment" "$err"; then fail "no note on stderr"
 elif ! json_ok 1; then fail "stdout is not exactly one valid remove document"
 elif [ "$(jq -r '.ignored_environment_rules | join(",")' "$out")" != .env ]; then fail "ignored_environment_rules: $(jq -c .ignored_environment_rules "$out")"
-elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
-elif common_ok; then ok; fi
+elif [ "$(result 0 result)" != "$want_result" ]; then fail "result $(result 0 result), want $want_result"
+elif [ -z "$partial_probe" ]; then common_ok && ok
+elif ! partial_unknown 0; then fail "activity is not unknown (partial_probe): $(jq -c '.results[0].worktree.activity' "$out")"
+elif untouched "$before"; then ok; fi
 
 # 7. Usage errors: exit 2, a message on stderr, nothing on stdout, nothing
 # removed.

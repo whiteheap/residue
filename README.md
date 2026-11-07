@@ -34,7 +34,7 @@ brew install whiteheap/tap/residue
 
 `~/src/app` in the examples is a repository path. `PATH` is a linked worktree, not a subdirectory inside one.
 
-Signed apt, dnf, and pacman repositories, the key fingerprint, release archives, and `cargo install --locked --git https://github.com/whiteheap/residue --tag v0.0.5` are in [Install residue](docs/installation.md).
+Signed apt, dnf, and pacman repositories, the key fingerprint, release archives, and `cargo install --locked --git https://github.com/whiteheap/residue --tag v0.0.6` are in [Install residue](docs/installation.md).
 
 ## Inspect a worktree
 
@@ -64,7 +64,7 @@ This transcript is an example from the documentation, not a measurement of your 
 
 ```text
 $ residue scan ~/src/app
-residue 0.0.5 · as of 14:03:12 +02:00 · activity: lsof inspected 506 of 807 running processes
+residue 0.0.6 · as of 14:03:12 +02:00 · activity: lsof inspected 506 of 807 running processes
 
 ~/src/app · 4 linked worktrees · 5.6 GB
   candidate   2.1 GB  ~/src/app/.worktrees/fix-login  [fix-login]
@@ -93,7 +93,7 @@ residue runs every check below on every linked worktree. A worktree is a **candi
 | --- | --- |
 | `identity` | The path is not the linked worktree Git lists for this repository |
 | `locked` | It is locked with `git worktree lock` |
-| `activity` | A process residue can see has its working directory or an open file inside it |
+| `activity` | A process residue can see has its working directory or an open file inside it. On NetBSD, OpenBSD and DragonFly, also when no use is found (`unknown`): the probe there does not read open files, so it cannot show a worktree is unused |
 | `idle` | Only with `--idle DURATION`: it changed within DURATION, for example `changed 3 hours ago (--idle 2d)` |
 | `tracked_changes` | Any tracked file is staged or modified |
 | `untracked` | Any untracked file or directory exists |
@@ -267,15 +267,16 @@ Ignored does not mean disposable. An untracked file that is not ignored always k
 - **macOS**: one `lsof` snapshot of the working directories and open files of the processes your user can inspect. residue reports how many processes that covered, for example "lsof inspected 506 of 807 running processes".
 - **Linux**: `/proc/*/cwd`, `/proc/*/exe` and `/proc/*/fd`, for the processes your user can read.
 - **FreeBSD**: one `procstat -f` snapshot from the base system, of the working directories and open files of the processes your user can inspect. procstat is built with the running kernel. A packaged lsof is not used: in testing on FreeBSD 14 it listed processes without resolving their working directories, which would have hidden a worktree in use. A process whose working directory the kernel cannot name does not count as inspected. Every release since 0.0.5 has a FreeBSD x86_64 binary, `residue-vX.Y.Z-x86_64-unknown-freebsd.tar.gz`, and every release since 0.0.6 also has an aarch64 one, `residue-vX.Y.Z-aarch64-unknown-freebsd.tar.gz`, on the [releases page](https://github.com/whiteheap/residue/releases). Each is built from the tag's source, run and smoke-tested in a FreeBSD 14 virtual machine of its own architecture; the aarch64 machine is emulated on an x86_64 runner.
-- **NetBSD, OpenBSD and DragonFly**: the base system's `ps` lists every process, then one sysctl per process asks the kernel for its working directory (`kern.proc_args.PID.cwd` on NetBSD, `kern.proc_cwd.PID` on OpenBSD, `kern.proc.cwd.PID` on DragonFly), and on NetBSD and DragonFly for its executable too. Open files are not read, and every `not_observed` answer says so, for example "sysctl inspected 9 of 41 running processes, working directories only, not open files": a process that works elsewhere but holds a file open inside the worktree is not seen. `fstat` is not used: on NetBSD and OpenBSD it names an open file only by its mount point and inode ("Normally the name cannot be determined", fstat(1)), so it cannot say whether a process is inside a worktree. A process whose working directory the kernel does not name does not count as inspected, and when it names none at all, activity is `unknown`. As an ordinary user, OpenBSD names only your own processes' working directories; NetBSD and DragonFly name every process's by default.
+- **NetBSD, OpenBSD and DragonFly**: the base system's `ps` lists every process, then one sysctl per process asks the kernel for its working directory (`kern.proc_args.PID.cwd` on NetBSD, `kern.proc_cwd.PID` on OpenBSD, `kern.proc.cwd.PID` on DragonFly), and on NetBSD and DragonFly for its executable too. Open files are not read: a process that works elsewhere but holds a file open inside the worktree is not seen. So on these three systems residue never offers a worktree for removal on activity grounds. Activity is `in_use` when the probe finds a process inside the worktree, and `unknown` otherwise, never `not_observed`, so nothing there is a removal candidate and `remove`, `--all` and `watch` remove nothing. `scan` shows such a worktree as `unknown` with `activity unknown (partial_probe)`, its header says what the probe read ("sysctl inspected 9 of 41 running processes, working directories only, not open files"), and `explain` says why: "sysctl reads working directories only, not open files, so it cannot show that no process is using it" (NetBSD and DragonFly: "working directories and executables only"). Remove a worktree there with `git worktree remove`. `fstat` is not used: on NetBSD and OpenBSD it names an open file only by its mount point and inode ("Normally the name cannot be determined", fstat(1)), so it cannot say whether a process is inside a worktree. A process whose working directory the kernel does not name does not count as inspected, and when it names none at all, activity is `unknown`. As an ordinary user, OpenBSD names only your own processes' working directories; NetBSD and DragonFly name every process's by default.
 - **illumos**: `/proc/PID/path/`, which names each process's working directory, every open file descriptor and every mapped object, the executable among them (proc(5)), for the processes your user can inspect. Not `/proc/PID/cwd`, whose readlink yields an empty string. A process whose working directory has no path there does not count as inspected. illumos has no inotify or kqueue, so a running `residue watch` acts on its five-minute timer instead of on change events.
 
 
-The probe has three answers. `in_use` means a process was seen inside the worktree. `not_observed` means none of the inspected processes was inside it. `unknown` means the probe failed: its tool is missing, it timed out, it failed, or residue could not parse its output. On NetBSD, OpenBSD, DragonFly and illumos it is also `unknown` when the probe inspected no process at all.
+The probe has three answers. `in_use` means a process was seen inside the worktree. `not_observed` means none of the inspected processes was inside it. `unknown` means the probe failed: its tool is missing, it timed out, it failed, or residue could not parse its output. On NetBSD, OpenBSD, DragonFly and illumos it is also `unknown` when the probe inspected no process at all. On NetBSD, OpenBSD and DragonFly it is `unknown` whenever no use is found, because a probe that does not read open files cannot show that a worktree is unused. In JSON, each worktree's `activity` is `{"state", "processes", "reason", "detail"}`: `state` is `in_use`, `not_observed` or `unknown`; `processes` lists `{"pid", "command"}` for `in_use` and is empty otherwise; and for `unknown`, `reason` is one of `probe_missing`, `timeout`, `probe_failed`, `parse_error`, `unsupported` or `partial_probe` (the probe found no use and does not read open files), and `detail` says why in words. Both are null otherwise.
 
 `not_observed` is not proof that a worktree is idle. The probe cannot see processes owned by other users, processes inside containers or virtual machines, processes on other machines that share the disk, or a session that is closed now but that you mean to resume.
 
-A process can also open the directory a moment after the snapshot. Residue moves the worktree aside and looks again before it deletes, which narrows that gap but does not close it. That is why removal asks a human, why `--yes` belongs to the session that owns the work, and why a scheduled sweep needs `--idle`.
+A process can also open the directory a moment after the snapshot; residue moves the worktree aside and looks again before it deletes, which narrows that gap but does not close it. That is why removal asks a human, why `--yes` belongs to the session that owns the work, and why a scheduled sweep needs `--idle`.
+
 ### Limits
 
 - **Work landed means the local refs say so.** residue never fetches: a branch deleted on the remote counts once a `git fetch --prune` reaches the local refs, and one that comes back counts once a fetch brings it back. An upstream counts as gone only when its remote-tracking ref is absent. A loose ref that is a dangling symbolic link reads as absent to Git and so to residue, and a `git remote rename` in progress makes its branches look gone until it finishes; `watch` scans only after the refs have been quiet for 20 seconds, at most two minutes.
@@ -290,7 +291,7 @@ A process can also open the directory a moment after the snapshot. Residue moves
 
 The named runs are in [Platforms and testing](docs/platforms-and-testing.md). That page is the record. It is not a promise about a platform it does not name.
 
-In short: release binaries were run on macOS and on Ubuntu arm64, and CI runs the scripts listed there on macOS, Linux x86_64 and arm64, and in FreeBSD 14, NetBSD 10, OpenBSD 7.8, and DragonFly virtual machines, as root and as an ordinary user where that page says so. OmniOS runs the smoke test and the contract and recovery checks, not the watch smoke test and not the race check, for the reasons on that page. The Intel macOS binary was built and not executed. Windows is not supported. NetBSD, OpenBSD, DragonFly, and illumos are not "every Unix": where a probe is missing or partial, the page says what `not_observed` does not cover.
+In short: release binaries were run on macOS, including a 0.0.6 `scan --json` beside the 0.0.5 binary, and on Ubuntu arm64. CI runs the scripts listed there on macOS, Linux x86_64 and arm64, and in FreeBSD 14, NetBSD 10, OpenBSD 7.8, and DragonFly virtual machines, as root and as an ordinary user where that page says so. OmniOS runs the smoke test and the contract and recovery checks, not the watch smoke test and not the race check, for the reasons on that page. The Intel macOS binary was built and not executed. Windows is not supported. On NetBSD, OpenBSD and DragonFly the probe does not read open files, so activity is `unknown` (`partial_probe`) unless a use is found, and `remove`, `--all` and `watch` remove nothing there. illumos reads open files.
 
 ## Where it fits
 

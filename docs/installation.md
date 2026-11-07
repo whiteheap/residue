@@ -46,7 +46,7 @@ gh attestation verify residue_amd64.deb --repo whiteheap/residue
 From source, with Rust 1.85 or later:
 
 ```sh
-cargo install --locked --git https://github.com/whiteheap/residue --tag v0.0.5
+cargo install --locked --git https://github.com/whiteheap/residue --tag v0.0.6
 ```
 
 residue needs `git` 2.36 or later on `PATH`.
