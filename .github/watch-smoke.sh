@@ -24,10 +24,17 @@
 #      A worktree kept that way is not taken as disk pressure in the same
 #      pass; the next pass judges pressure on its own terms.
 # Every branch stays, and nothing goes to the trash: watch deletes.
+# On NetBSD, OpenBSD and DragonFly (scripts/partial-probe.sh) no worktree
+# is a candidate: there it checks that every worktree is `unknown` for the
+# probe's reason and that dry, landed and disk-pressure runs remove none,
+# and skips 1-6 by name.
 set -eu
 
 residue=$1
 case $residue in /*) ;; *) residue="$PWD/$residue" ;; esac
+here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=SCRIPTDIR/../scripts/partial-probe.sh
+. "$here/../scripts/partial-probe.sh"
 S=$(mktemp -d "${TMPDIR:-/tmp}/residue-watch.XXXXXX")
 watcher=
 trap 'if [ -n "$watcher" ]; then kill "$watcher" 2>/dev/null || true; wait "$watcher" 2>/dev/null || true; fi; rm -rf "$S"' EXIT
@@ -68,6 +75,38 @@ age
 git push -q origin --delete fix
 git fetch -q --prune
 age
+
+# NetBSD, OpenBSD and DragonFly (scripts/partial-probe.sh): no worktree is
+# a candidate, so watch must remove none, for a landed branch or for disk
+# pressure, and every case that expects a removal is skipped by name.
+if [ -n "$partial_probe" ]; then
+  out=$("$residue" scan "$S")
+  printf '%s\n' "$out"
+  for name in fix wip local; do
+    printf '%s\n' "$out" | grep -A 1 -E "^ +unknown .*worktrees/$name " | grep -q -E "$partial_probe_short_re" \
+      || fail "$name is not unknown with '$partial_probe_short'"
+  done
+  "$residue" watch --once --dry-run --grace 1m "$S" 2> "$S/log" || fail "dry run failed"
+  ! grep -q "would remove" "$S/log" || fail "dry run would remove a worktree"
+  "$residue" watch --once --grace 1m "$S" 2> "$S/log" || fail "--once failed"
+  ! grep -q "removed " "$S/log" || fail "--once removed a worktree"
+  "$residue" watch --once --min-free 99.9 --idle 1m "$S" 2> "$S/log" || fail "pressure run failed"
+  grep -q "no worktree on it is a candidate unchanged for 1m" "$S/log" || fail "the pressure run did not say no worktree is a candidate"
+  ! grep -q "removed " "$S/log" || fail "the pressure run removed a worktree"
+  for name in fix wip local; do
+    [ -d ".worktrees/$name" ] || fail "$name is gone"
+    git worktree list --porcelain | grep -q "^worktree .*/\.worktrees/$name\$" || fail "$name is no longer registered"
+    git rev-parse --verify -q "$name" > /dev/null || fail "branch $name is gone"
+  done
+  for case in "1. a dry run names the landed fix" "2. --once removes the landed fix" \
+    "3. a running watch removes wip" "4. disk pressure removes local" \
+    "5. the removal child's --only-if-upstream-gone" "6. the child's three upstream reads"; do
+    skip_partial "$case"
+  done
+  echo "watch-smoke: ok (every worktree kept as activity unknown)"
+  exit 0
+fi
+
 "$residue" watch --once --dry-run --grace 1m "$S" 2> "$S/log" || fail "dry run failed"
 grep -q "would remove .*worktrees/fix" "$S/log" || fail "dry run did not name fix"
 [ -d .worktrees/fix ] || fail "dry run removed fix"

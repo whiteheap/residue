@@ -50,7 +50,7 @@ bash scripts/contract-check.sh
 bash scripts/recovery-check.sh
 ```
 
-`cargo test` runs the in-crate tests: pure checks of private decision code on synthetic data, such as the verdict fold in `src/inspect.rs`, with no filesystem, Git or processes. The shell scripts run the release binary against real Git repositories and processes. They test different things and neither replaces the other. CI runs `cargo test` on macOS and both Linux runners, and the shell scripts there and on FreeBSD.
+`cargo test` runs the in-crate tests: pure checks of private decision code on synthetic data, such as the verdict fold in `src/inspect.rs`, with no filesystem, Git or processes. The shell scripts run the release binary against real Git repositories and processes. They test different things and neither replaces the other. CI runs `cargo test` on macOS and both Linux runners, and the shell scripts there and in the FreeBSD, NetBSD, OpenBSD, DragonFly and illumos virtual machines. On NetBSD, OpenBSD and DragonFly nothing is a removal candidate (their probe does not read open files), so the scripts skip every case that expects a removal or a prompt, by name, and check that the clean worktree is kept as `unknown` instead; `scripts/partial-probe.sh` holds that gate. A case you add that expects a removal needs the same gate.
 
 CI also runs `.github/service-smoke.sh`, which installs and removes a real login service; run it only on a machine where no `residue service` of yours is installed.
 

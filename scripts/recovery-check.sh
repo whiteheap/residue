@@ -63,6 +63,8 @@ for tool in jq pgrep; do
     command -v "$tool" >/dev/null || { echo "recovery-check: needs $tool" >&2; exit 2; }
 done
 real_git=$(command -v git) || { echo "recovery-check: needs git" >&2; exit 2; }
+# shellcheck source=SCRIPTDIR/partial-probe.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/partial-probe.sh"
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/residue-recovery.XXXXXX") || exit 2
 case $work in
@@ -315,6 +317,39 @@ common_ok() { # u untouched and branch w still has its commit
 interrupted() { # the interrupted removals scan reports, as JSON
     "$bin" scan --json "$repo" 2>/dev/null | jq -c '[.repositories[].interrupted[]]'
 }
+
+# --- 0. NetBSD, OpenBSD and DragonFly: nothing reaches the move ------------
+# Every scenario below starts from a clean worktree that residue removes.
+# Where the probe cannot show a worktree unused (scripts/partial-probe.sh),
+# that worktree is unknown and no run gets past its checks, so each one is
+# skipped by name. Instead: the same run, with every Git move held, never
+# reaches a move, keeps the worktree as it was, and leaves nothing behind.
+if [ -n "$partial_probe" ]; then
+    name=kept-unknown
+    make_repo
+    echo hold-move >"$work/mode"
+    start "" remove --yes --json "$wt"
+    finish "$pid"
+    out=$work/$name.out
+    reached=$(find "$work" -maxdepth 1 -name 'at-move-*' | head -1)
+    if [ "$status" != 3 ]; then fail "exit $status, want 3"
+    elif [ -n "$reached" ]; then fail "residue reached git worktree move"
+    elif [ "$(jq -r '.results[0].result' "$out")" != refused ]; then fail "result $(jq -r '.results[0].result' "$out"), want refused"
+    elif ! jq -e --arg detail "$partial_probe_detail" '.results[0].worktree.activity | .state == "unknown" and .reason == "partial_probe" and (.detail | endswith($detail))' "$out" >/dev/null; then fail "activity is not unknown (partial_probe): $(jq -c '.results[0].worktree.activity' "$out")"
+    elif [ "$(record "$wt")" != registered ]; then fail "at its path Git has: $(record "$wt")"
+    elif [ "$(sums "$wt")" != "$w_sum" ]; then fail "the worktree's files changed"
+    elif [ -n "$(asides)" ]; then fail "a moved-aside directory exists: $(asides)"
+    elif [ -n "$(ls -A "$repo/.git/residue-trash" 2>/dev/null)" ]; then fail "a trash entry was created"
+    elif [ "$(interrupted)" != "[]" ]; then fail "scan lists an interrupted removal: $(interrupted)"
+    elif common_ok; then ok "refused before any move: $(jq -r '.results[0].worktree.activity.detail' "$out")"; fi
+    for scenario in stopped-after-move stopped-after-move-control refused-after-move \
+        refused-after-move-control move-back-fails original-taken two-removers two-removers-trash; do
+        skip_partial "$scenario"
+    done
+    echo "recovery-check: $passes passed, $failures failed"
+    [ "$failures" -eq 0 ]
+    exit
+fi
 
 # --- 1. Stopped after the move, before the deletion ------------------------
 name=stopped-after-move
