@@ -44,6 +44,7 @@ A fetch changes only remote-tracking refs. It is never a reason to remove: it on
 ```text
 2026-11-07T18:41:14Z residue watch: fetched ~/src/app: origin/fix-login is gone from the remote
 2026-11-07T18:41:17Z residue watch: removed ~/src/app/.worktrees/fix-login (8.2 KB): its upstream branch origin/fix-login was deleted and it was unchanged for 1h; restore: residue restore /Users/me/src/app/.git/residue-removed/fix-login-20261107T184117Z
+2026-11-07T18:41:17Z residue watch: freed about 8.2 KB (residue has freed about 14.2 GB on this machine since 2026-10-02)
 ```
 
 `--no-fetch` turns it off. Then `watch` sees a deleted branch after your own `git fetch --prune`; `git config --global fetch.prune true` makes every fetch prune. `scan`, `explain` and `remove` never fetch.
@@ -53,11 +54,11 @@ A fetch changes only remote-tracking refs. It is never a reason to remove: it on
 ```sh
 residue watch --once --dry-run             # what it would remove right now
 residue service install --dry-run          # a service that only logs what it would remove
-residue service status                     # is it running, what it watches, the last lines of its log
+residue service status                     # is it running, what it watches, what it freed, the last lines of its log
 residue service uninstall
 ```
 
-A dry run still fetches; add `--no-fetch` to leave the refs alone too. The log is `~/Library/Logs/residue/watch.log` on macOS and `journalctl --user -u residue-watch` on Linux. A Linux user service stops when you log out unless you run `loginctl enable-linger "$USER"` once. On other systems, `residue service install` prints the `residue watch` command to run from your system's service manager. [Why `--idle` matters](#why---idle-matters) explains what counts as a change, and why a paused agent session needs a wait. If you would rather sweep at a fixed time, see [Run it on a schedule](#run-it-on-a-schedule).
+A dry run still fetches; add `--no-fetch` to leave the refs alone too. The log is `~/Library/Logs/residue/watch.log` on macOS and `journalctl --user -u residue-watch` on Linux. After each removal it logs what the removal freed and the total for this machine, with the UTC date, like the log's own times. `residue service status` has a `freed:` line: what automatic cleanup freed in the last seven days and when it last removed a worktree, such as `freed: about 2.1 GB from 4 worktrees in the last 7 days; automatic cleanup last removed one 2026-11-07 04:12 +02:00 (5 hours ago)`. `residue stats` has the rest; [Stats](reference.md#stats) says how it is counted. A Linux user service stops when you log out unless you run `loginctl enable-linger "$USER"` once. On other systems, `residue service install` prints the `residue watch` command to run from your system's service manager. [Why `--idle` matters](#why---idle-matters) explains what counts as a change, and why a paused agent session needs a wait. If you would rather sweep at a fixed time, see [Run it on a schedule](#run-it-on-a-schedule).
 
 ## Run it on a schedule
 

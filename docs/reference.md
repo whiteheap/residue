@@ -67,9 +67,9 @@ For every repository on the machine, put one rule per line in `~/.config/residue
 
 | Code | Meaning |
 | --- | --- |
-| 0 | Success. For `remove`, every PATH was removed or moved to the trash and every expired trash entry was purged. For `remove --all`, the same for every candidate, or there was none. A removal record `remove` could not read or forget never changes the status: it is a warning on stderr and in `warnings`. For `restore`, the worktree is back, or the trash and the removal records were listed; an entry it could not read is listed with its `error` |
-| 1 | Error: git missing or too old, unreadable config, unknown PATH for `explain`, an ENTRY that `restore` cannot find or put back (its branch checked out elsewhere, something at its path, more than one entry by that name), an ENTRY path that is gone where the nearest folder that exists is the home folder or above it, an ENTRY path with no entry in the repositories at or under the nearest folder that exists, when the current directory is the home folder or above it, or a repository, trash or removal-record folder `restore` could not list |
-| 2 | Usage error, including an invalid `--idle`, `--keep-trash` or `--keep-removed` DURATION, `--trash` with `--no-trash`, `remove --all --yes` without `--idle`, `--only-if-upstream-gone` with `--all` or outside `remove`, `--keep-removed` or `--removal-reason` outside `remove`, a `--removal-reason` other than `watch-landed` or `watch-low-disk`, and `--to` outside `restore` or without an ENTRY |
+| 0 | Success. For `remove`, every PATH was removed or moved to the trash and every expired trash entry was purged. For `remove --all`, the same for every candidate, or there was none. A removal record `remove` could not read or forget, or a [stats ledger](#stats) it could not write, never changes the status: it is a warning on stderr and in `warnings`. For `restore`, the worktree is back, or the trash and the removal records were listed; an entry it could not read is listed with its `error`. For `stats`, the report was printed |
+| 1 | Error: git missing or too old, unreadable config, unknown PATH for `explain`, an ENTRY that `restore` cannot find or put back (its branch checked out elsewhere, something at its path, more than one entry by that name), an ENTRY path that is gone where the nearest folder that exists is the home folder or above it, an ENTRY path with no entry in the repositories at or under the nearest folder that exists, when the current directory is the home folder or above it, a repository, trash or removal-record folder `restore` could not list, or a stats ledger `stats` could not read (a missing one is empty) |
+| 2 | Usage error, including an invalid `--idle`, `--keep-trash` or `--keep-removed` DURATION, `--trash` with `--no-trash`, `remove --all --yes` without `--idle`, `--only-if-upstream-gone` with `--all` or outside `remove`, `--keep-removed` or `--removal-reason` outside `remove`, a `--removal-reason` other than `watch-landed` or `watch-low-disk`, `--to` outside `restore` or without an ENTRY, and `residue stats` with anything but `--json` |
 | 3 | `remove` did not remove or trash at least one PATH: refused, skipped (including a removal record it could not write, so nothing was deleted), not confirmed, or failed. For `remove --all`: a candidate was skipped, not confirmed or failed, or part of a PATH could not be read. For both: an expired trash entry was skipped or failed, or a trash record could not be read |
 
 ## For coding agents
@@ -94,11 +94,13 @@ Each PATH gets one `results[].result`:
 | `invalid` | PATH is not a linked worktree residue may remove: the main checkout, a directory inside a worktree, not in a repository, in the trash, or left under a hidden name by an interrupted run |
 | `not_attempted` | residue stopped before it reached this PATH |
 
-For every result except `removed` and `trashed`, `reason` is a sentence that says why. With `--all`, `results` lists every linked worktree the scan found, and each one it kept is `refused`. `errors` lists the PATHs, repositories and trash records it could not read. `warnings` lists the removal records it could not read or forget, which it also prints on stderr as `residue: warning: ...`; they never change the exit status.
+For every result except `removed` and `trashed`, `reason` is a sentence that says why. With `--all`, `results` lists every linked worktree the scan found, and each one it kept is `refused`. `errors` lists the PATHs, repositories and trash records it could not read. `warnings` lists the removal records it could not read or forget, and a stats ledger it could not write, which it also prints on stderr as `residue: warning: ...`; they never change the exit status.
 
 A remove document also has `trash`, `{"enabled": true, "keep": "7d", "keep_seconds": 604800}`, and `purged`: one object per trash entry the run purged or meant to purge, with `result` (`purged`, `kept` when a check failed, `skipped`, `failed`, `not_attempted`), `reason`, `entry` (the entry as `residue restore --json` lists it), `worktree` (its checks) and `removal_record` (the record a purge wrote, or null).
 
 It also has `removal_records`, `{"reason": "remove", "by": "remove", "keep": "30d", "keep_seconds": 2592000}`: the reason the run's records name (`remove`, `sweep` for `--all`, `watch_landed`, `watch_low_disk`; a purge's record says `trash_purge`), the command they name as the one that removed the worktree (`by`: `remove` for `residue remove PATH`, `sweep` for `remove --all`, `watch` for the run `residue watch` starts; a purge's record names the run that purged it), and `--keep-removed`. And `forgotten`: one object per removal record older than `--keep-removed` that the run forgot or meant to, with `result` (`forgotten`, `skipped`, `failed`, `not_attempted`), `reason` and `entry` (the record as `residue restore --json` lists it). Forgetting deletes the record and its refs in one transaction, only while each still names the commit the record names. A record it could not forget is `failed` here and a warning in `warnings`; it never changes the exit status. A directory with no `info` and no ref, left by a run stopped while it wrote one, is forgotten once it is an hour old. Once a record is forgotten, a commit only its refs held is left to `git gc`: [Restore a removed worktree](../README.md#restore-a-removed-worktree) says when that matters.
+
+Its last field is `stats`, what the run freed and the total so far: [in a remove run](#in-a-remove-run).
 
 `residue restore --json` prints `residue.restore/v1`:
 
@@ -121,3 +123,70 @@ Every scan, explain and remove document has `idle`: `{"threshold": "2d", "thresh
 Every scan, explain and remove document has `ignored_environment_rules`: the `residue.regenerable` values the environment set and residue ignored, an empty list when there are none, or null when Git could not read that environment. To pass a rule for one run, use `--regenerable`, not `git -c`.
 
 A scan is a snapshot of one moment, `generated_at`. Worktrees created after the scan started are missing from it. Scan again before you act on an old result. `remove` re-checks each path right before it deletes it, so an old scan cannot cause a removal that the current state would refuse.
+
+## Stats
+
+`residue stats` shows how much disk residue has freed on this machine: all time, the last 30 days and the last 7, each split by the command that freed it (`residue remove PATH`, a `remove --all` sweep, `watch`, or a line that does not say), the repositories that freed the most, what went into the trash and what is in it now, and how many worktrees were restored. It reads only its [ledger](#the-ledger) and, for what is in the trash now, the trash folders of the repositories the ledger names. It takes only `--json`, and exits 0, or 1 when it cannot read the ledger; a ledger that does not exist yet is an empty one.
+
+Every size is an estimate: the `reclaimable` size residue measured before the removal, the number the removal record keeps. APFS snapshots, clones and hard links can keep some of the space. A move into the trash frees nothing until a remove run purges the entry, so it is counted on its own, and the purge counts as freed. A restore never subtracts from what was freed; it is counted on its own.
+
+### The ledger
+
+On macOS, `~/Library/Application Support/residue/ledger.jsonl`, whatever `XDG_STATE_HOME` says, so a terminal, the launchd agent and an app find the same file. Elsewhere, `$XDG_STATE_HOME/residue/ledger.jsonl` when `XDG_STATE_HOME` is an absolute path, and `~/.local/state/residue/ledger.jsonl` otherwise. residue creates the folder with mode 0700 and the file with mode 0600. There is one per user, and nothing in it leaves the machine.
+
+Each line is one JSON object, one event:
+
+| Key | Value |
+| --- | --- |
+| `v` | `1`, the line format |
+| `at` | Unix seconds: when the run wrote the line, right after the deletion, move or restore; on a seeded line, the time the record or trash entry names |
+| `event` | `freed`: a deletion (`remove --no-trash`, `watch`, a sweep with `--no-trash`, or the trash's purge). `trashed`: a move into the trash. `restored`: `residue restore` put a worktree back |
+| `by` | `remove`, `sweep` or `watch`, as the removal record names the command. Absent on a `restored` line, and on a `trashed` line taken from a trash entry |
+| `reason` | As the record's `reason`: `remove`, `sweep`, `watch_landed`, `watch_low_disk` or `trash_purge` |
+| `from` | On a `restored` line: `trash`, `removed` or `interrupted` |
+| `bytes` | The reclaimable size. Absent when unknown: the line counts as a worktree and 0 bytes |
+| `repo` | The repository's Git common directory |
+| `worktree` | The worktree's directory name. Dropped from a line that would otherwise be 512 bytes or longer |
+| `entry` | The removal record or trash entry, `NAME-STAMP` |
+| `seeded` | `true` on a line taken from a removal record or a trash entry, not written by the run that removed it |
+
+When it is written:
+
+- `remove` appends a line for each worktree it deleted, purged or moved into the trash, once `git worktree remove` or the move succeeded, and nothing for a preview or a run nobody confirmed.
+- `restore` appends a `restored` line.
+- Seeding: before it acts, a `remove` that will delete or move something, `restore`, and `scan` without `--json` add a `seeded` line for each removal record and trash entry of the repositories they read that the ledger lacks. Not added: a record that `--keep-removed` forgot or a restore took back, removals by residue 0.0.6 or earlier (which wrote no record), an interrupted removal (nothing was deleted), a record whose run may still be going (its process is running and the record is under an hour old), a trash entry whose worktree is gone, and repositories none of those commands reads again. `scan --json`, `explain`, `watch` itself and `stats` never write the ledger; `watch`'s `remove` child does.
+
+Each line is appended with one `write(2)` to the file opened with `O_APPEND`, so runs at the same time (a `watch` child and a terminal) append whole lines and never overwrite each other on a local filesystem; NFS does not promise that. Each event counts once, by `event`, `repo` and `entry`: a removal its run recorded and a later run seeded is one removal. A line residue cannot read, such as one cut short by a full disk, is skipped and counted (`skipped_lines`).
+
+The ledger never decides anything. A ledger residue cannot read or write never changes a removal or a restore: `remove` prints `residue: warning: the stats ledger is not up to date (...); this does not change what was removed` on stderr, lists it in `warnings` and `stats.error`, and exits as it would have. `restore` adds it to its `notes`, or, when it only lists, prints it as a warning. To start over, delete the file; the next run that reads a repository adds its removal records and trash entries again.
+
+### In a remove run
+
+A run that deleted or moved something ends with one line: `freed about 812 MB (residue has freed about 14.2 GB on this machine since 2026-10-02)`, or `moved about 812 MB to the trash, freed once a remove run purges it after 7d (...)`, or both joined by `and`. The date is local. Its `remove --json` document ends with `stats`:
+
+| Field | Value |
+| --- | --- |
+| `freed_bytes`, `freed_worktrees` | What this run deleted and purged |
+| `trashed_bytes`, `trashed_worktrees` | What this run moved into the trash |
+| `total_freed_bytes`, `total_freed_worktrees` | Everything freed in the ledger after this run, or null when the run freed and moved nothing or residue could not read or write the ledger |
+| `since` | The ledger's earliest line, as an RFC 3339 time, or null as above |
+| `ledger` | The ledger's path, or null when the run wrote nothing |
+| `error` | Why the ledger is not up to date, which is also in `warnings`, or null |
+
+A preview has `stats` with zeros and nulls. The `watch` log names what each removal freed: `residue watch: freed about 812 MB (residue has freed about 14.2 GB on this machine since 2026-10-02)`, with the UTC date, as the log's own times are UTC. `scan` at a terminal ends with `residue has freed about 14.2 GB on this machine since 2026-10-02, from 31 worktrees; about 2.1 GB in the last 7 days · residue stats` once anything was freed. On macOS and Linux, `residue service status` shows a `freed:` line for automatic cleanup: what `watch` freed in the last seven days and when it last removed a worktree.
+
+### `residue stats --json`
+
+`residue.stats/v1`:
+
+- `schema`, `version`, `generated_at`, and `ledger`, the ledger's path.
+- `since`: the ledger's earliest line, or null for an empty ledger.
+- `freed`: `all_time`, `last_30_days` and `last_7_days`, each `{"bytes", "worktrees", "by"}`, where `by` is `{"remove", "sweep", "watch", "other"}`, each `{"bytes", "worktrees"}`; `other` counts lines with no `by`. The windows end at `generated_at`.
+- `weeks`: twelve `{"start", "end", "bytes", "worktrees"}`, oldest first, seven days each, the last ending at `generated_at`. A line dated later, from a clock that has since moved back, counts in the last.
+- `repositories`: every repository with a `freed` line, most bytes first: `{"path", "common_dir", "bytes", "worktrees", "last_freed_at"}`. `path` is the folder that holds `.git`, or the Git directory itself for a bare repository.
+- `trashed`: `{"bytes", "worktrees"}` moved into the trash, all time.
+- `trash_now`: `{"entries", "bytes", "repositories"}`, the trash entries that hold a worktree now, read from the trash folders of the repositories the ledger names.
+- `restored`: `{"worktrees", "from_trash", "from_removal_records"}`.
+- `last_freed_at`: `{"all", "remove", "sweep", "watch", "other"}`, each a time or null.
+- `skipped_lines`: lines it could not read.
+- `errors`: trash folders it could not list.

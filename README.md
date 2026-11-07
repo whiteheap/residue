@@ -222,6 +222,24 @@ Every `remove` run forgets the records older than `--keep-removed DURATION` (def
 
 What `--keep-removed` can lose: forgetting a record deletes its refs, so a commit one of them was the last holder of becomes unreachable, and the next `git gc` deletes it. Usually that is nothing, because the branch still has the commits. It is not nothing for a branch deleted after the removal, such as one deleted after a squash merge, or for work only the worktree's reflog held: there the record is the last holder, and `--keep-removed` is the only grace period. Restore what you want before then, or put it on a branch. Tools that read every ref, such as `git log --all` and `git push --mirror`, see `refs/residue/removed/` and `refs/residue/reflog/`.
 
+### How much space it freed
+
+A `remove` that deletes something ends with what it freed and what residue has freed on this machine so far:
+
+```text
+removed .worktrees/fix-login (branch fix-login kept); about 812 MB reclaimable; restore: residue restore /Users/me/src/app/.git/residue-removed/fix-login-20261107T040000Z
+freed about 812 MB (residue has freed about 14.2 GB on this machine since 2026-10-02)
+```
+
+A move into the trash frees nothing yet, and the line says so: the space counts once a remove run purges the entry. A preview, or a run that removes nothing, prints no such line. `scan` ends with the total, the `watch` log says what each removal freed, and `residue service status` shows what automatic cleanup freed in the last seven days.
+
+```sh
+residue stats          # all time, the last 7 and 30 days, by command and by repository, and the trash
+residue stats --json   # the same as residue.stats/v1
+```
+
+The numbers come from a ledger, one line per deletion, purge, move into the trash and restore: `~/Library/Application Support/residue/ledger.jsonl` on macOS, `$XDG_STATE_HOME/residue/ledger.jsonl` (by default `~/.local/state/residue/`) elsewhere. Nothing in it leaves the machine. Each size is the `reclaimable` estimate residue measured before the removal; APFS snapshots, clones and hard links can keep some of the space. A restore does not subtract from what was freed; `stats` counts restores on their own line. The ledger never decides anything: residue writes to it only after a deletion, and a ledger it cannot write is a warning that changes neither the removal nor the exit status. A removal the ledger lacks, such as one from before it existed, is added from its removal record while the record lasts. The format and the JSON are in the [reference](docs/reference.md#stats).
+
 ## Automate cleanup
 
 Turn it on with one command:
@@ -287,6 +305,7 @@ The launchd plist, the systemd unit and timer, how to stop them, and the sweep's
 | --- | --- |
 | The install script, apt, dnf, pacman, archives, `cargo install` | [Install residue](docs/installation.md) |
 | PATH search, `--json` fields, exit codes, regenerable rules | [Command and configuration reference](docs/reference.md) |
+| `residue stats`, the ledger and its JSON | [Stats](docs/reference.md#stats) |
 | Default folders, fetching, launchd, systemd, idle clock, sweep exit status | [Automate residue](docs/automation.md) |
 | Platforms, what was not run, CI scripts | [Platforms and testing](docs/platforms-and-testing.md) |
 

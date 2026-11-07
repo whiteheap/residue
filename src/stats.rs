@@ -24,12 +24,15 @@
 //! to decide what to remove. Nothing in it leaves the machine.
 //!
 //! A writer appends each line with one `write(2)` to a file opened with
-//! `O_APPEND`, so lines from runs at the same time (a `watch` child and a
-//! terminal) never overwrite each other, and keeps it under 512 bytes, the
-//! smallest `PIPE_BUF` of residue's platforms. A reader skips and counts a
-//! line it cannot read, and counts each event once by its repository and
-//! entry: a removal its own run recorded and a later run seeded from its
-//! removal record is one removal.
+//! `O_APPEND`, for which POSIX allows no other change to the file between
+//! finding its end and the write, so lines from runs at the same time (a
+//! `watch` child and a terminal) never overwrite each other on a local
+//! filesystem; NFS does not keep that promise. Each line stays under 512
+//! bytes, the smallest `PIPE_BUF` of residue's platforms; POSIX makes that
+//! a whole write for pipes only, so on a file it only keeps lines short. A
+//! reader skips and counts a line it cannot read, and counts each event
+//! once by its repository and entry: a removal its own run recorded and a
+//! later run seeded from its removal record is one removal.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, OpenOptions};
