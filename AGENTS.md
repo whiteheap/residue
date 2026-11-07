@@ -42,7 +42,7 @@ These are the reasons people trust the tool. Do not weaken them without an expli
 | `scripts/race-check.sh` | The race check: changes a worktree while the release binary's prompt waits, under a pseudo-terminal |
 | `scripts/partial-probe.sh` | Sourced by the five test scripts: `$partial_probe` on NetBSD, OpenBSD and DragonFly, where nothing is a candidate, and the named reason each removal-expecting case is skipped with |
 | `packaging/` | Linux packages (`nfpm.yaml`, `linux-packages.sh`), the signed apt, dnf and pacman repositories (`apt-repo.sh`, `rpm-repo.sh` with `rpm/residue.repo`, `arch-repo.sh`), their public key (`signing-key.asc`), and the AUR package (`aur/`) |
-| `site/` | The one-page website: static HTML and CSS in `site/public/`, its Cloudflare Workers Static Assets config, and `site/check.sh`. Prepared, not published; `site/README.md` has the checks and the publish steps. The README stays the contract: commands on the page are copied from it |
+| `site/` | The one-page website: static HTML and CSS in `site/public/`, its Cloudflare Workers Static Assets config, `site/check.sh` and `site/smoke.sh`. Live at https://residue.whiteheap.com: `.github/workflows/site.yml` checks it on pull requests and deploys it when a change to `site/` lands on `main`; `site/README.md` has the checks, the token and the manual fallback. The README stays the contract: commands on the page are copied from it |
 
 ## Verify a change
 
