@@ -8,6 +8,7 @@ One static page that introduces residue and sends readers to the [README](../REA
 | `public/404.html` | The page for an unknown path, served with status 404 |
 | `public/style.css` | All styles. System fonts, grays only, light and dark from the reader's setting |
 | `public/logo.svg`, `public/how-it-works.svg` and their `-dark.svg` pair | Copies of `docs/assets/`, the owner. Each page picks the dark one with `<picture>` when the reader's setting is dark. `logo.svg` is also the favicon |
+| `public/whiteheap-mark-black.svg`, `public/whiteheap-mark-white.svg` | The Whiteheap mark beside "by whiteheap" in the header: black on light, white on dark. Copies of `brand/whiteheap-mark-black.svg` and `brand/whiteheap-mark-white.svg` in [whiteheap/whiteheap.com](https://github.com/whiteheap/whiteheap.com), the owner (taken at 3431501); copy them again when the brand kit changes |
 | `public/_headers` | Response headers: Content Security Policy, `nosniff`, no framing, referrer and permissions policies. Cloudflare applies it and does not serve it |
 | `wrangler.jsonc` | The Worker: assets only, no script, `public/` as the only upload, 404 page, the Custom Domain `residue.whiteheap.com`, workers.dev and preview URLs off |
 | `check.sh` | The static checks below |
