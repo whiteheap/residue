@@ -44,6 +44,12 @@ Options:
   --keep-trash DURATION remove: purge trash entries older than DURATION
                         (default 7d). Every remove run purges, after the same
                         confirmation; the purge is what frees the disk
+  --only-if-upstream-gone
+                        remove: keep any worktree whose branch's upstream is
+                        not gone, as the local refs show it at the plan,
+                        right before the move and right before the deletion
+                        (residue never fetches). `residue watch` passes it
+                        for a branch that landed
   --regenerable RULE    Also treat ignored entries matching RULE as regenerable
                         output that removal may delete. A NAME or *.ext matches
                         at any depth; a PATH with a slash is anchored at the
@@ -140,6 +146,10 @@ pub struct Options {
     pub trash: Option<bool>,
     pub keep_trash: Option<Span>,
     pub regenerable: Vec<String>,
+    /// `--only-if-upstream-gone`: remove only worktrees whose branch has an
+    /// upstream that the local refs show as gone, checked at the plan, right
+    /// before the move and right before the deletion.
+    pub only_if_upstream_gone: bool,
 }
 
 impl Options {
@@ -209,6 +219,10 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
                         options.all = true;
                         continue;
                     }
+                    "--only-if-upstream-gone" => {
+                        options.only_if_upstream_gone = true;
+                        continue;
+                    }
                     "--trash" => {
                         set_trash(&mut options, true)?;
                         continue;
@@ -271,6 +285,14 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
         return Err(
             "--all applies only to `residue remove`; `residue scan` already reports every worktree"
                 .into(),
+        );
+    }
+    if options.only_if_upstream_gone && kind != "remove" {
+        return Err("--only-if-upstream-gone applies only to `residue remove`".into());
+    }
+    if options.only_if_upstream_gone && options.all {
+        return Err(
+            "--only-if-upstream-gone takes worktree PATHs, not --all: name each worktree, such as the paths `residue scan --json` reports with upstream_gone true".into(),
         );
     }
     if kind != "remove" {

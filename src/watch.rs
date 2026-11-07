@@ -17,6 +17,12 @@
 //! run purges it, and nothing would purge the trash of a repository where
 //! watch removes nothing more.
 //!
+//! A removal because work landed also passes `--only-if-upstream-gone`, so
+//! the child checks the reason itself, from fresh local refs, at its plan,
+//! right before the move and right before the deletion: an upstream that
+//! is back by then keeps the worktree. A disk-pressure removal does not need the upstream gone,
+//! and does not pass it.
+//!
 //! It wakes on: a change under a repository's `refs/remotes`, `packed-refs`
 //! or `reftable` (a fetch or prune); the moment a waiting worktree passes
 //! `--grace` or `--idle`; a filesystem dropping below `--min-free` (free
@@ -49,7 +55,8 @@ It removes a linked worktree of a repository at or under ROOT when:
                    worktrees unchanged for --idle go, largest first, until
                    free space is 5 points above --min-free
 
-Each removal is `residue remove --yes --idle --no-trash`: every check runs,
+Each removal is `residue remove --yes --idle --no-trash`, with
+--only-if-upstream-gone when its branch landed: every check runs,
 and runs again right before the deletion. It deletes rather than using the
 trash, and purges that repository's trash entries older than 7 days.
 Branches and commits are always kept.
@@ -320,6 +327,8 @@ struct Worktree {
     path: String,
     verdict: String,
     upstream: Option<String>,
+    /// Its upstream is a remote-tracking ref that is gone: the branch was
+    /// deleted on a remote, as after a merged pull request.
     upstream_gone: bool,
     last_change: Option<i64>,
     bytes: u64,
@@ -397,7 +406,10 @@ fn scan(exe: &Path, opts: &Options) -> Result<Snapshot, ScanError> {
                     .unwrap_or("")
                     .to_string(),
                 upstream: w.get("upstream").and_then(Value::str).map(str::to_string),
-                upstream_gone: w.get("upstream_gone").and_then(Value::bool) == Some(true),
+                upstream_gone: w.get("upstream_gone").and_then(Value::bool) == Some(true)
+                    && w.get("upstream_ref")
+                        .and_then(Value::str)
+                        .is_some_and(|r| r.starts_with("refs/remotes/")),
                 last_change: w
                     .get("last_change")
                     .and_then(|c| c.get("unix"))
@@ -454,6 +466,10 @@ fn percent(free: u64, total: u64) -> f64 {
 fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> usize {
     let now = output::now();
     let mut removed = 0;
+    // Worktrees already handed to a landed removal. If the child keeps one
+    // (its upstream came back, say), this pass does not retry it as a
+    // disk-pressure removal under another reason: the next scan judges
+    // pressure on its own terms.
     let mut tried: HashSet<&str> = HashSet::new();
 
     let landed: Vec<&Worktree> = snap
@@ -465,13 +481,20 @@ fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> usize 
         tried.insert(&w.path);
     }
     if !landed.is_empty() {
-        removed += remove(exe, opts, &landed, &opts.grace, |w| {
-            format!(
-                "its upstream branch {} was deleted and it was unchanged for {}",
-                w.upstream.as_deref().unwrap_or("(unknown)"),
-                opts.grace.text
-            )
-        });
+        removed += remove(
+            exe,
+            opts,
+            &landed,
+            &opts.grace,
+            /* require_upstream_gone */ true,
+            |w| {
+                format!(
+                    "its upstream branch {} was deleted and it was unchanged for {}",
+                    w.upstream.as_deref().unwrap_or("(unknown)"),
+                    opts.grace.text
+                )
+            },
+        );
     }
 
     for (dev, sample, free, total) in filesystems(snap) {
@@ -515,24 +538,33 @@ fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> usize 
             continue;
         }
         state.pressure_notes.remove(&dev);
-        removed += remove(exe, opts, &chosen, &opts.idle, |_| {
-            format!(
-                "free space on its filesystem is {pct:.1}%, below {}%, and it was unchanged for {}",
-                opts.min_free, opts.idle.text
-            )
-        });
+        removed += remove(
+            exe,
+            opts,
+            &chosen,
+            &opts.idle,
+            /* require_upstream_gone */ false,
+            |_| {
+                format!(
+                    "free space on its filesystem is {pct:.1}%, below {}%, and it was unchanged for {}",
+                    opts.min_free, opts.idle.text
+                )
+            },
+        );
     }
     removed
 }
 
 /// Remove `worktrees` with `residue remove --yes --idle SPAN --no-trash`,
-/// and log each result and each trash entry the run purged. Returns how
-/// many were removed.
+/// plus `--only-if-upstream-gone` when they were chosen because their work
+/// landed, and log each result and each trash entry the run purged.
+/// Returns how many were removed.
 fn remove(
     exe: &Path,
     opts: &Options,
     worktrees: &[&Worktree],
     span: &Span,
+    require_upstream_gone: bool,
     why: impl Fn(&Worktree) -> String,
 ) -> usize {
     if opts.dry_run {
@@ -555,6 +587,9 @@ fn remove(
         "--idle",
         &span.text,
     ]);
+    if require_upstream_gone {
+        cmd.arg("--only-if-upstream-gone");
+    }
     for w in worktrees {
         cmd.arg(&w.path);
     }

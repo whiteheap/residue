@@ -478,10 +478,15 @@ pub fn report_json(r: &Report) -> Json {
         Ok(n) => (Json::opt(*n, Json::UInt), Json::Null),
         Err(err) => (Json::Null, Json::str(err.clone())),
     };
-    let (upstream, upstream_gone, upstream_error) = match &r.upstream {
-        Ok(Some(u)) => (Json::str(u.name.clone()), Json::Bool(u.gone), Json::Null),
-        Ok(None) => (Json::Null, Json::Null, Json::Null),
-        Err(err) => (Json::Null, Json::Null, Json::str(err.clone())),
+    let (upstream, upstream_ref, upstream_gone, upstream_error) = match &r.upstream {
+        Ok(Some(u)) => (
+            Json::str(u.name.clone()),
+            Json::str(u.full.clone()),
+            Json::Bool(u.gone),
+            Json::Null,
+        ),
+        Ok(None) => (Json::Null, Json::Null, Json::Null, Json::Null),
+        Err(err) => (Json::Null, Json::Null, Json::Null, Json::str(err.clone())),
     };
     Json::Obj(vec![
         ("path", Json::path(&e.path)),
@@ -534,6 +539,7 @@ pub fn report_json(r: &Report) -> Json {
         ("local_only_commits", local_commits),
         ("local_only_commits_error", local_commits_error),
         ("upstream", upstream),
+        ("upstream_ref", upstream_ref),
         ("upstream_gone", upstream_gone),
         ("upstream_error", upstream_error),
         ("size", Json::opt(r.usage.as_ref(), usage_json)),

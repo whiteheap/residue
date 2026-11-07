@@ -182,8 +182,20 @@ impl LastChange {
 }
 
 pub struct Upstream {
+    /// As Git abbreviates it, such as `origin/fix`.
     pub name: String,
+    /// The full refname, such as `refs/remotes/origin/fix`, or
+    /// `refs/heads/main` for a local upstream.
+    pub full: String,
     pub gone: bool,
+}
+
+impl Upstream {
+    /// A remote-tracking ref, so `gone` means the branch was deleted on a
+    /// remote. A local upstream that is gone is a deleted local branch.
+    pub fn remote(&self) -> bool {
+        self.full.starts_with("refs/remotes/")
+    }
 }
 
 pub struct Report {
@@ -1090,23 +1102,63 @@ fn local_commits(dir: &Path) -> Result<Option<u64>, String> {
         .map_err(|_| format!("git rev-list --count printed {:?}", text.trim()))
 }
 
-fn upstream(dir: &Path, branch: &str) -> Result<Option<Upstream>, String> {
+/// The upstream of `branch` as the local refs show it: `Ok(None)` when it
+/// has none. `remove --only-if-upstream-gone` reads it again right before
+/// the deletion.
+pub fn upstream(dir: &Path, branch: &str) -> Result<Option<Upstream>, String> {
     let out = git::git(
         dir,
         &[
             "for-each-ref",
-            "--format=%(upstream:short)%00%(upstream:track)",
+            "--format=%(upstream)%00%(upstream:short)%00%(upstream:track)",
             branch,
         ],
     )?;
     let text = String::from_utf8_lossy(&out);
     let line = text.lines().next().unwrap_or("");
-    match line.split_once('\0') {
-        Some((name, track)) if !name.is_empty() => Ok(Some(Upstream {
-            name: name.to_string(),
-            gone: track.contains("gone"),
-        })),
-        _ => Ok(None),
+    let mut fields = line.split('\0');
+    let (Some(full), Some(name), Some(track)) = (fields.next(), fields.next(), fields.next())
+    else {
+        return Ok(None);
+    };
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let gone = track.contains("gone") && ref_absent(dir, full, name)?;
+    Ok(Some(Upstream {
+        name: name.to_string(),
+        full: full.to_string(),
+        gone,
+    }))
+}
+
+/// Git marks an upstream `[gone]` when its ref is missing, and also when
+/// the ref exists but does not resolve to a commit: it names another kind
+/// of object, or it is a symbolic ref to a missing ref. Only a missing ref
+/// is a branch deleted on the remote, so anything else is an error, which
+/// `--only-if-upstream-gone` treats as unknown and keeps the worktree.
+fn ref_absent(dir: &Path, full: &str, name: &str) -> Result<bool, String> {
+    if !full.starts_with("refs/") {
+        return Err(format!(
+            "Git marks the upstream {name} gone without naming its ref"
+        ));
+    }
+    let symbolic = git::git_exit(dir, &["symbolic-ref", "-q", full])?;
+    if symbolic.code != Some(1) {
+        return Err(format!(
+            "Git marks the upstream {name} gone, but {full} is a symbolic ref or cannot be read"
+        ));
+    }
+    let shown = git::git_exit(dir, &["show-ref", "--verify", "--quiet", full])?;
+    match shown.code {
+        Some(1) => Ok(true),
+        Some(0) => Err(format!(
+            "Git marks the upstream {name} gone, but {full} exists: it does not resolve to a commit, or it came back just now"
+        )),
+        _ => Err(format!(
+            "could not check whether {full} exists: {}",
+            shown.stderr.trim()
+        )),
     }
 }
 

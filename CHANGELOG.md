@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Fix (#7): `watch` chose a worktree because its upstream branch was gone, but the removal child did not know why, so an upstream that came back between the scan and the removal did not keep the worktree. `remove --only-if-upstream-gone` now carries that reason: the child removes a worktree only when the local refs show its branch's upstream gone, checked at the plan, in the re-check right before the move, and after the move right before the deletion. An upstream that exists, no upstream, a detached HEAD or a failed lookup keeps the worktree, with the reason in JSON and the text output, and exit status 3. `watch` passes it for work-landed removals only. Manual `remove` and disk-pressure removals are unchanged. residue still never fetches, so a remote change that has not reached the local refs is not seen. `--only-if-upstream-gone` with `--all`, or outside `remove`, is a usage error.
+- The third read comes after the move aside and the re-measure, which can take seconds on a large worktree. If the upstream is back by then, the worktree goes back in place. Every way the requirement keeps a worktree, including a failed lookup, is `skipped`.
+- Work landed now needs a remote-tracking upstream. A local upstream (`branch.NAME.remote` set to `.`) whose branch was deleted made a worktree look landed; `--only-if-upstream-gone` keeps it, and `watch` no longer picks it. `scan --json` and `explain --json` gain `upstream_ref`, the upstream's full refname (`refs/remotes/origin/fix`), and `watch` reads it.
+- Fix: an upstream counted as gone whenever Git marked it `[gone]`, which Git also does when the ref exists but does not resolve to a commit (it names a tree, or it is a symbolic ref to a missing ref). It now counts as gone only when its ref is absent; anything else is a lookup error. `scan`'s `upstream_gone` follows, so `watch` no longer picks such a worktree, and `--only-if-upstream-gone` keeps it.
+
 ## 0.0.5 (2026-11-07)
 
 Deletes what you saw, or nothing, and makes a scheduled sweep reversible. Until 0.0.4, `remove` re-ran the checks right before acting, but it compared the verdict, HEAD, branch, lock and the set of ignored entries, not what they held. Measured with `scripts/race-check.sh` against the 0.0.4 release binary: a file added inside `node_modules/` while the prompt waited was deleted with the worktree (exit 0). And a scheduled sweep that took a paused agent's worktree took it for good.

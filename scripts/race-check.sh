@@ -120,16 +120,29 @@ make_repo() {
     echo x >"$wt/node_modules/a.js"
 }
 
+# The same, with a bare remote that had branch w and deleted it, then a
+# fetch --prune: w's upstream is gone, as after a merged pull request.
+make_landed_repo() {
+    make_repo
+    git init -q --bare "$work/$name.git"
+    git -C "$repo" remote add origin "$work/$name.git"
+    git -C "$repo" push -q origin HEAD
+    git -C "$wt" push -q -u origin w
+    git -C "$repo" push -q origin --delete w
+    git -C "$repo" fetch -q --prune origin
+}
+
 registered() {
     git -C "$repo" worktree list --porcelain | grep -qx "worktree $(cd "$wt" && pwd -P)"
 }
 
 # One case: NAME, the change to make while the prompt waits, the text the
-# output must contain, then extra residue flags.
+# output must contain, then extra residue flags. $setup builds the
+# repository (make_repo unless set).
 run_case() {
     name=$1 change=$2 expect=$3
     shift 3
-    make_repo
+    ${setup:-make_repo}
     out=$work/$name.out
     start "$out" remove "$@" "$wt"
     if ! await_prompt "$out"; then
@@ -155,6 +168,10 @@ run_case() {
         grep -q "$expect" "$out" || { fail "no line matching: $expect"; return; }
         [ -d "$wt" ] || { fail "the worktree is gone"; return; }
         registered || { fail "Git no longer lists the worktree at $wt"; return; }
+        if [ -n "$(ls -A "$repo/.git/residue-trash" 2>/dev/null)" ]; then
+            fail "a trash entry was left behind"
+            return
+        fi
         ;;
     esac
     echo "ok   $name: $(grep -E '^(removed|moved|skipped|failed) ' "$out" | tr -d '\r' | head -1)"
@@ -169,6 +186,11 @@ run_case ignored 'echo y >node_modules/b.js' 'skipped .*node_modules/ changed si
 run_case commit 'git commit -q --allow-empty -m later' 'skipped .*HEAD changed since you confirmed'
 run_case control-trash ':' '^moved .*\.worktrees/w to the trash' --trash
 run_case ignored-trash 'echo yy >node_modules/a.js' 'skipped .*node_modules/ changed since you confirmed' --trash
+# --only-if-upstream-gone, what `residue watch` passes for a branch that
+# landed: an upstream that comes back while the prompt waits keeps it.
+setup=make_landed_repo run_case landed-control ':' '^removed .*\.worktrees/w' --only-if-upstream-gone
+setup=make_landed_repo run_case landed-upstream-back 'git update-ref refs/remotes/origin/w HEAD' 'skipped .*changed since you confirmed: its upstream origin/w exists in the local refs' --only-if-upstream-gone
+setup=make_landed_repo run_case landed-upstream-back-trash 'git update-ref refs/remotes/origin/w HEAD' 'skipped .*its upstream origin/w exists in the local refs' --only-if-upstream-gone --trash
 
 echo "race-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]

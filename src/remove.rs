@@ -230,6 +230,9 @@ struct Mode {
     since: &'static str,
     /// `--all`: the PATHs are scan roots.
     sweep: bool,
+    /// `--only-if-upstream-gone`, checked at the plan, in the re-check and
+    /// after the move.
+    only_if_upstream_gone: bool,
     started: i64,
 }
 
@@ -248,6 +251,7 @@ pub fn remove(options: &Options) -> u8 {
             "you confirmed"
         },
         sweep: options.all,
+        only_if_upstream_gone: options.only_if_upstream_gone,
         started,
     };
     let places = Places::new();
@@ -275,6 +279,13 @@ pub fn remove(options: &Options) -> u8 {
             };
             if report.verdict != Verdict::Candidate {
                 item.outcome = Some(Outcome::Refused);
+            } else if mode.only_if_upstream_gone {
+                if let Err(unmet) = upstream_gone(&report) {
+                    item.outcome = Some(Outcome::Skipped(format!(
+                        "--only-if-upstream-gone: {}",
+                        unmet.text()
+                    )));
+                }
             }
             item.report = Some(report);
         }
@@ -592,9 +603,67 @@ fn confirm(worktrees: usize, purges: usize, trash: bool) -> Result<bool, String>
     Ok(answer.trim().eq_ignore_ascii_case("yes"))
 }
 
+/// Why `--only-if-upstream-gone` keeps a worktree: the local refs say its
+/// upstream is not gone, or residue could not read them.
+enum Unmet {
+    NotGone(String),
+    Unreadable(String),
+}
+
+impl Unmet {
+    fn text(&self) -> &str {
+        match self {
+            Unmet::NotGone(why) | Unmet::Unreadable(why) => why,
+        }
+    }
+}
+
+/// `--only-if-upstream-gone`: `Ok` only when the local refs show that the
+/// branch's upstream is a remote-tracking ref and that it is gone. A
+/// detached HEAD, a branch with no upstream, a local upstream, an upstream
+/// that exists, and a lookup that failed all keep the worktree. residue never fetches, so this is the remote as of
+/// the last fetch.
+fn judge_upstream(
+    branch: Option<&str>,
+    upstream: &Result<Option<inspect::Upstream>, String>,
+) -> Result<(), Unmet> {
+    let Some(branch) = branch else {
+        return Err(Unmet::NotGone(
+            "it is on a detached HEAD, which has no upstream".into(),
+        ));
+    };
+    match upstream {
+        Ok(Some(u)) if u.gone && u.remote() => Ok(()),
+        Ok(Some(u)) if u.gone => Err(Unmet::NotGone(format!(
+            "its upstream {} is a local branch, not a remote-tracking ref, so its deletion is not work that landed",
+            clean(&u.name)
+        ))),
+        Ok(Some(u)) => Err(Unmet::NotGone(format!(
+            "its upstream {} exists in the local refs",
+            clean(&u.name)
+        ))),
+        Ok(None) => Err(Unmet::NotGone(format!(
+            "branch {} has no upstream",
+            clean(branch)
+        ))),
+        Err(e) => Err(Unmet::Unreadable(format!(
+            "residue could not read the upstream of branch {}: {}",
+            clean(branch),
+            clean(e)
+        ))),
+    }
+}
+
+/// `judge_upstream` on what a report recorded.
+fn upstream_gone(report: &Report) -> Result<(), Unmet> {
+    judge_upstream(report.entry.short_branch(), &report.upstream)
+}
+
 /// The worktree at `path` as Git lists it now, judged again against a
 /// fresh snapshot and compared with the plan's report. `Ok` when nothing
 /// changed. `ours` is a lock residue placed itself, which does not count.
+/// With `only_if_upstream_gone`, the fresh report must also still show the
+/// branch's upstream gone.
 fn recheck(
     path: &Path,
     common_dir: &Path,
@@ -602,6 +671,7 @@ fn recheck(
     policy: &Policy,
     since: &str,
     ours: Option<&str>,
+    only_if_upstream_gone: bool,
 ) -> Result<Entry, Outcome> {
     let fresh = git::worktrees(path).map_err(Outcome::Failed)?;
     let listed = fresh
@@ -633,6 +703,12 @@ fn recheck(
         .map_err(|e| Outcome::Skipped(format!("residue could not measure it again: {e}")))?;
     if let Some(why) = planned.changed(measured, since) {
         return Err(Outcome::Skipped(why));
+    }
+    if only_if_upstream_gone {
+        upstream_gone(&now).map_err(|unmet| match unmet {
+            Unmet::NotGone(why) => Outcome::Skipped(format!("changed since {since}: {why}")),
+            Unmet::Unreadable(why) => Outcome::Skipped(format!("--only-if-upstream-gone: {why}")),
+        })?;
     }
     Ok(listed.clone())
 }
@@ -692,7 +768,8 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
         before,
         policy,
         since,
-        None,
+        /* ours */ None,
+        mode.only_if_upstream_gone,
     ) {
         Ok(l) => l,
         Err(outcome) => return outcome,
@@ -769,7 +846,14 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
     if let Err(e) = git::lock_worktree(&main, &dest, reason) {
         return moved.put_back(false, &format!("could not lock it: {e}"));
     }
-    if let Err(why) = verify_moved(&dest, before, policy, since, reason) {
+    if let Err(why) = verify_moved(
+        &dest,
+        before,
+        policy,
+        since,
+        reason,
+        mode.only_if_upstream_gone,
+    ) {
         return moved.put_back(true, &why);
     }
     if let Some(entry) = entry {
@@ -851,6 +935,7 @@ fn verify_moved(
     policy: &Policy,
     since: &str,
     reason: &str,
+    only_if_upstream_gone: bool,
 ) -> Result<(), String> {
     let list = git::worktrees(dest)?;
     let listed = list
@@ -892,10 +977,22 @@ fn verify_moved(
     let now = planned
         .again(dest, listed.head.clone(), policy)
         .map_err(|e| format!("cannot measure it after moving it aside: {e}"))?;
-    match planned.changed(&now, since) {
-        Some(why) => Err(why),
-        None => Ok(()),
+    if let Some(why) = planned.changed(&now, since) {
+        return Err(why);
     }
+    // Measuring again can take seconds on a large worktree, so read the
+    // upstream once more, last, right before the deletion.
+    if only_if_upstream_gone {
+        let live = match &listed.branch {
+            Some(branch) => inspect::upstream(dest, branch),
+            None => Ok(None),
+        };
+        judge_upstream(listed.short_branch(), &live).map_err(|unmet| match unmet {
+            Unmet::NotGone(why) => format!("changed after residue moved it aside: {why}"),
+            Unmet::Unreadable(why) => format!("--only-if-upstream-gone: {why}"),
+        })?;
+    }
+    Ok(())
 }
 
 /// Re-check one expired trash entry, then delete it with `git worktree
@@ -913,6 +1010,7 @@ fn purge(p: &Purge, policy: &Policy, mode: &Mode) -> Outcome {
             policy,
             mode.since,
             Some(trash::LOCK),
+            /* only_if_upstream_gone */ false,
         ) {
             return outcome;
         }
@@ -1017,7 +1115,7 @@ fn plan_text(
                 |t| places.show(&t.canonical),
             );
             let why = match (&item.outcome, &item.report) {
-                (Some(Outcome::Invalid(e)), _) => clean(e),
+                (Some(Outcome::Invalid(e) | Outcome::Skipped(e)), _) => clean(e),
                 (_, Some(r)) => refusal(r),
                 _ => String::new(),
             };
