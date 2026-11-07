@@ -743,5 +743,219 @@ else
     done
 fi
 
+# 9. Stats: each removal, move into the trash, purge and restore adds a
+# line to the stats ledger, `remove --json` reports what it freed in
+# `stats`, and `residue stats --json` (residue.stats/v1) adds them up. A
+# ledger residue cannot read or write is a warning that never changes a
+# removal; a damaged line is skipped and counted; a run seeds the ledger
+# from the removal records it lacks, once each. Each case starts from an
+# empty ledger.
+ledger=$("$bin" stats --json 2>/dev/null | jq -r '.ledger // empty' 2>/dev/null)
+case $ledger in
+"$HOME"/*) ;;
+*) ledger= ;;
+esac
+reset_ledger() {
+    [ -z "$ledger" ] || rm -rf -- "$ledger"
+}
+# The ledger's lines as compact JSON, one per line.
+ledger_lines() {
+    jq -c . "$ledger" 2>/dev/null
+}
+# stdout is exactly one residue.stats/v1 document with every field.
+stats_ok() {
+    jq -e -s '
+        length == 1 and (.[0] |
+            .schema == "residue.stats/v1"
+            and (.version | type) == "string"
+            and (.generated_at | type) == "string"
+            and (.ledger | type) == "string"
+            and ((.since | type) == "string" or .since == null)
+            and ([.freed.all_time, .freed.last_30_days, .freed.last_7_days][]
+                | (.bytes | type) == "number" and (.worktrees | type) == "number"
+                  and (.by | keys) == ["other", "remove", "sweep", "watch"])
+            and (.weeks | length) == 12
+            and (.repositories | type) == "array"
+            and (.trashed.worktrees | type) == "number"
+            and (.trash_now.entries | type) == "number"
+            and (.restored.worktrees | type) == "number"
+            and (.last_freed_at | keys) == ["all", "other", "remove", "sweep", "watch"]
+            and (.skipped_lines | type) == "number"
+            and (.errors | type) == "array")
+    ' "$out" >/dev/null
+}
+# Run `residue stats --json` into $work/$name.stats, with nothing on
+# stderr; `jq -e JQ-ARGS...` on it must hold.
+stats_has() { # [--arg NAME VALUE]... FILTER
+    "$bin" stats --json >"$work/$name.stats" 2>"$work/$name.stats.err" \
+        && [ ! -s "$work/$name.stats.err" ] \
+        && jq -e "$@" "$work/$name.stats" >/dev/null
+}
+stats_show() {
+    jq -c '{freed: .freed.all_time, trashed, trash_now, restored, skipped_lines, errors}' "$work/$name.stats" 2>/dev/null
+}
+
+# On every platform: an empty ledger, then damaged lines.
+name=stats-empty
+reset_ledger
+run stats --json
+if [ -z "$ledger" ]; then fail "residue stats --json does not name a ledger under HOME"
+elif [ "$status" != 0 ]; then fail "exit $status, want 0"
+elif ! stats_ok; then fail "stdout is not one valid residue.stats/v1 document"
+elif ! jq -e '.since == null and .freed.all_time.worktrees == 0 and .skipped_lines == 0 and .repositories == []' "$out" >/dev/null; then fail "an empty ledger reports something: $(jq -c . "$out")"
+elif [ -s "$err" ]; then fail "stderr is not empty"
+else
+    run stats
+    if [ "$status" != 0 ]; then fail "text: exit $status, want 0"
+    elif ! grep -q "^residue has not freed any space on this machine yet\.$" "$out"; then fail "text: no 'has not freed any space' line"
+    elif [ -e "$ledger" ]; then fail "reading the stats created the ledger"
+    else ok; fi
+fi
+
+name=stats-damaged-line
+reset_ledger
+if [ -n "$ledger" ]; then
+    mkdir -p "$(dirname "$ledger")" || exit 2
+    {
+        echo '{"v":1,"at":1767225600,"event":"freed","by":"watch","reason":"watch_landed","bytes":1000,"repo":"/r/.git","entry":"a-20260101T000000Z"}'
+        echo 'not json'
+        echo '{"v":1,"at":1767225600,"event":"freed","by":"watch","reason":"watch_landed","bytes":1000,"repo":"/r/.git","entry":"a-20260101T000000Z","seeded":true}'
+        printf '{"v":1,"at":1767225601,"event":"fre'
+    } >"$ledger" || exit 2
+fi
+run stats --json
+if [ "$status" != 0 ]; then fail "exit $status, want 0"
+elif ! stats_ok; then fail "stdout is not one valid residue.stats/v1 document"
+elif ! jq -e '.skipped_lines == 2 and .freed.all_time == {"bytes": 1000, "worktrees": 1, "by": {"remove": {"bytes": 0, "worktrees": 0}, "sweep": {"bytes": 0, "worktrees": 0}, "watch": {"bytes": 1000, "worktrees": 1}, "other": {"bytes": 0, "worktrees": 0}}} and .since == "2026-01-01T00:00:00Z"' "$out" >/dev/null; then fail "want 1 worktree once and 2 skipped lines: $(jq -c '{freed: .freed.all_time, skipped_lines, since}' "$out")"
+elif [ -s "$err" ]; then fail "stderr is not empty"
+else
+    run stats
+    if ! grep -q "skipped 2 lines it could not read" "$out"; then fail "text: the skipped lines are not counted"
+    else ok; fi
+fi
+
+if [ -z "$partial_probe" ]; then
+    name=stats-remove-json
+    make_repo
+    reset_ledger
+    run remove --yes --json "$wt"
+    entry=$(basename "$(result 0 removal_record)")
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif ! jq -e --arg ledger "$ledger" '
+            .stats as $s | .results[0].worktree.size.reclaimable_bytes as $r
+            | $s.freed_worktrees == 1 and $s.freed_bytes == $r
+              and $s.trashed_worktrees == 0 and $s.trashed_bytes == 0
+              and $s.total_freed_worktrees == 1 and $s.total_freed_bytes == $r
+              and ($s.since | type) == "string" and $s.ledger == $ledger and $s.error == null
+        ' "$out" >/dev/null; then fail "stats: $(jq -c .stats "$out")"
+    elif [ -s "$err" ]; then fail "stderr is not empty"
+    elif ! ledger_lines | jq -e -s --arg entry "$entry" --arg repo "$(cd "$repo/.git" && pwd -P)" '
+            length == 1 and (.[0] | .v == 1 and .event == "freed" and .by == "remove"
+              and .reason == "remove" and .entry == $entry and .repo == $repo
+              and .worktree == "w" and (.seeded | not))
+        ' >/dev/null; then fail "the ledger: $(cat "$ledger" 2>/dev/null)"
+    elif ! stats_has --arg path "$(cd "$repo" && pwd -P)" '.freed.all_time.worktrees == 1 and .freed.all_time.by.remove.worktrees == 1 and .freed.last_7_days.worktrees == 1 and .weeks[11].worktrees == 1 and .repositories[0].path == $path and .last_freed_at.remove != null'; then fail "residue stats: $(stats_show) $(jq -c .repositories "$work/$name.stats" 2>/dev/null)"
+    elif common_ok; then ok; fi
+
+    name=stats-trash-and-purge
+    make_repo
+    reset_ledger
+    run remove --yes --json --trash "$wt"
+    entry=$(result 0 trash_entry)
+    if [ "$status" != 0 ] || [ "$(result 0 result)" != trashed ]; then fail "remove --trash: exit $status, $(result 0 result)"
+    elif ! jq -e '.stats | .trashed_worktrees == 1 and .trashed_bytes > 0 and .freed_worktrees == 0 and .total_freed_worktrees == 0' "$out" >/dev/null; then fail "remove --trash stats: $(jq -c .stats "$out")"
+    elif ! stats_has '.trashed.worktrees == 1 and .trash_now.entries == 1 and .trash_now.repositories == 1 and .freed.all_time.worktrees == 0'; then fail "residue stats after the move: $(stats_show)"
+    else
+        sed 's/^trashed [0-9]* .*/trashed 1767225600 2026-01-01T00:00:00Z/' "$entry/info" >"$work/$name.info" && cat "$work/$name.info" >"$entry/info" || exit 2
+        setup git -C "$repo" worktree add -q "$repo/.worktrees/x" -b x
+        run remove --yes --json --no-trash --keep-trash 1d "$repo/.worktrees/x"
+        if [ "$status" != 0 ]; then fail "remove x and purge: exit $status, want 0"
+        elif [ "$(jq -r '[.purged[].result] | join(",")' "$out")" != purged ]; then fail "purged: $(jq -c '[.purged[] | {result, reason}]' "$out")"
+        elif ! jq -e '.stats | .freed_worktrees == 2 and .trashed_worktrees == 0 and .total_freed_worktrees == 2' "$out" >/dev/null; then fail "purge stats: $(jq -c .stats "$out")"
+        elif ! ledger_lines | jq -e -s '[.[] | select(.event == "freed") | .reason] | sort == ["remove", "trash_purge"]' >/dev/null; then fail "the ledger: $(cat "$ledger" 2>/dev/null)"
+        elif ! stats_has '.freed.all_time.worktrees == 2 and .trashed.worktrees == 1 and .trash_now.entries == 0'; then fail "residue stats after the purge: $(stats_show)"
+        elif [ -s "$err" ]; then fail "stderr is not empty"
+        elif common_ok; then ok; fi
+    fi
+
+    name=stats-restore
+    make_repo
+    reset_ledger
+    remove_w
+    run restore --json "$wt"
+    if [ "$status" != 0 ]; then fail "restore: exit $status, want 0"
+    elif ! restore_ok removed checked_out_branch; then fail "stdout is not one restore document"
+    elif [ -s "$err" ]; then fail "stderr is not empty"
+    elif ! ledger_lines | jq -e -s '[.[].event] == ["freed", "restored"] and .[1].from == "removed" and .[1].entry == .[0].entry' >/dev/null; then fail "the ledger: $(cat "$ledger" 2>/dev/null)"
+    elif ! stats_has '.restored == {"worktrees": 1, "from_trash": 0, "from_removal_records": 1} and .freed.all_time.worktrees == 1'; then fail "residue stats: $(stats_show)"
+    elif common_ok; then ok; fi
+
+    # A removal record the ledger lacks (a ledger that was lost, or one a
+    # run could not write) is seeded by the next scan, once.
+    name=stats-seed
+    make_repo
+    reset_ledger
+    remove_w
+    reset_ledger
+    run scan "$repo"
+    first=$status
+    scan_tail=$(tail -n 1 "$out")
+    run scan "$repo"
+    if [ "$first" != 0 ] || [ "$status" != 0 ]; then fail "scan: exit $first and $status, want 0"
+    elif [ -s "$err" ]; then fail "stderr is not empty"
+    elif ! grep -q "^residue has freed about .* on this machine since [0-9-]*, from 1 worktree; about .* in the last 7 days · residue stats\$" <<<"$scan_tail"; then fail "scan does not end with the totals: $scan_tail"
+    elif ! ledger_lines | jq -e -s 'length == 1 and (.[0] | .event == "freed" and .seeded == true and .by == "remove" and .reason == "remove" and .bytes > 0)' >/dev/null; then fail "the ledger: $(cat "$ledger" 2>/dev/null)"
+    elif ! stats_has '.freed.all_time.worktrees == 1'; then fail "residue stats: $(stats_show)"
+    else
+        run scan --json "$repo"
+        if [ "$status" != 0 ] || ! jq -e 'has("stats") | not' "$out" >/dev/null; then fail "scan --json changed"
+        elif common_ok; then ok; fi
+    fi
+
+    # A ledger residue cannot write never changes a removal: the PATH is
+    # removed, exit 0, nothing in `errors`, a warning on stderr and in
+    # stats.error.
+    name=stats-unwritable-ledger
+    make_repo
+    reset_ledger
+    [ -z "$ledger" ] || mkdir -p "$ledger" || exit 2
+    run remove --yes --json "$wt"
+    if [ -z "$ledger" ]; then fail "residue stats --json does not name a ledger under HOME"
+    elif [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
+    elif [ -e "$wt" ] || registered "$wt"; then fail "the worktree is still there"
+    elif ! jq -e '.errors == [] and (.stats | .freed_worktrees == 1 and .total_freed_bytes == null and (.error | test("stats ledger")))' "$out" >/dev/null; then fail "errors and stats: $(jq -c '{errors, stats}' "$out")"
+    elif ! grep -q "^residue: warning: the stats ledger is not up to date" "$err"; then fail "no warning on stderr"
+    elif common_ok; then ok; fi
+    rmdir "$ledger" 2>/dev/null
+
+    # Text: the run ends with what it freed and the total; a run that
+    # removes nothing says nothing about the ledger.
+    name=stats-text
+    make_repo
+    reset_ledger
+    setup git -C "$repo" worktree add -q "$repo/.worktrees/x" -b x
+    run remove "$repo/.worktrees/x"
+    preview=$out
+    mv "$preview" "$work/$name.preview" || exit 2
+    run remove --yes "$wt"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif grep -q "freed" "$work/$name.preview"; then fail "a run that removed nothing printed a freed line"
+    elif ! tail -n 1 "$out" | grep -q -E '^freed about [0-9.]+ [KMG]?B \(residue has freed about [0-9.]+ [KMG]?B on this machine since [0-9]{4}-[0-9]{2}-[0-9]{2}\)$'; then fail "the last line is not the freed line: $(tail -n 1 "$out")"
+    elif [ "$(ledger_lines | wc -l | tr -d ' ')" != 1 ]; then fail "the ledger has $(ledger_lines | wc -l | tr -d ' ') lines, want 1"
+    else
+        run stats
+        if [ "$status" != 0 ]; then fail "stats: exit $status"
+        elif ! grep -q "^freed on this machine since " "$out" || ! grep -q "residue remove (by hand) .* 1 worktree" "$out"; then fail "stats text"
+        elif ! grep -q "^Sizes are estimates" "$out"; then fail "stats text does not say the sizes are estimates"
+        elif common_ok; then ok; fi
+    fi
+else
+    for c in stats-remove-json stats-trash-and-purge stats-restore stats-seed stats-unwritable-ledger stats-text; do
+        skip_partial "$c"
+    done
+fi
+
 echo "contract-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]
