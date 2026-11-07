@@ -224,22 +224,23 @@ What `--keep-removed` can lose: forgetting a record deletes its refs, so a commi
 
 ## Automate cleanup
 
-Turn it on with one command:
+`residue watch` removes a worktree when its work landed, or when the disk is low and it has sat idle ([Reclaim storage automatically](#reclaim-storage-automatically)). These removals delete: they do not use the trash. Branches, commits and locked worktrees stay. `watch` runs only when you start it or install it as a service; `scan` never starts it.
+
+See what it would remove right now:
+
+```sh
+residue watch --once --dry-run
+```
+
+Then turn it on:
 
 ```sh
 residue service install
 ```
 
-That starts `residue watch` now and at every login (launchd on macOS, systemd --user on Linux). With no ROOT it watches the usual code folders in your home folder that exist, and prints which: `~/src`, `~/code`, `~/Code`, `~/dev`, `~/Developer`, `~/projects`, `~/Projects`, `~/repos`, `~/git`, `~/github`, `~/GitHub`, `~/work`, `~/Work` and `~/workspace`. Name folders to watch only those: `residue service install ~/src`. `residue service uninstall` turns it off. One `watch` runs per user. While none is installed or running, `residue scan` at a terminal ends with a one-line reminder of this command.
+That starts `residue watch` now and at every login (launchd on macOS, systemd --user on Linux). With no folder named, both commands use the usual code folders in your home folder that exist, and print which: `~/src`, `~/code`, `~/Code`, `~/dev`, `~/Developer`, `~/projects`, `~/Projects`, `~/repos`, `~/git`, `~/github`, `~/GitHub`, `~/work`, `~/Work` and `~/workspace`. If your code lives elsewhere, name its folder, which replaces the list: `residue watch --once --dry-run ~/src`, then `residue service install ~/src`. `residue service uninstall` turns it off. One `watch` runs per user. While none is installed or running, `residue scan` at a terminal ends with a one-line reminder of `residue service install`.
 
-Try the dry run before anything is removed:
-
-```sh
-residue watch --once --dry-run
-residue service install --dry-run
-```
-
-The first prints what it would remove right now (for one folder: `residue watch --once --dry-run ~/src`); the second installs a service that only logs it. A dry run still fetches (below); add `--no-fetch` to leave the refs alone too.
+To try the service itself before it removes anything, `residue service install --dry-run` installs one that only logs what it would remove. A dry run still fetches (below); add `--no-fetch` to leave the refs alone too.
 
 <a id="reclaim-storage-automatically"></a>
 

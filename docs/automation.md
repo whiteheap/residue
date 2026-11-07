@@ -4,6 +4,8 @@ Back to [Automate cleanup](../README.md#automate-cleanup). `residue watch` delet
 
 ## Reclaim storage automatically
 
+See what it would remove right now with `residue watch --once --dry-run` ([Try it first](#try-it-first)), then turn it on:
+
 ```sh
 residue service install
 ```
