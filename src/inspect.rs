@@ -223,6 +223,11 @@ pub struct Report {
     /// What `remove` compares right before it acts. An error when residue
     /// could not record it, which keeps the worktree.
     pub fingerprint: Result<Fingerprint, String>,
+    /// `residue restore` put it back (`removed::MARKER` in its Git
+    /// directory), so `watch`'s landed-work rule never removes it again.
+    /// An error when residue could not read the mark, which counts as
+    /// marked for that rule.
+    pub restored: Result<Option<crate::removed::Mark>, String>,
 }
 
 impl Report {
@@ -241,6 +246,7 @@ impl Report {
             last_change: Ok(None),
             rule_sources: Vec::new(),
             fingerprint: Err("not measured".into()),
+            restored: Ok(None),
         }
     }
 
@@ -366,6 +372,7 @@ pub fn worktree(entry: &Entry, common_dir: &Path, snapshot: &Snapshot, policy: &
         "identity",
         "the directory is the linked worktree Git lists for this repository",
     );
+    r.restored = crate::removed::marked(&identity.git_dir);
 
     check_lock(&mut r, entry);
     check_activity(&mut r, &canonical, snapshot);

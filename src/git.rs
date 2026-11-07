@@ -109,9 +109,19 @@ fn exec(dir: &Path, args: &[&OsStr], timeout: Duration) -> Result<Exit, String> 
     exec_command(command(dir), args, timeout)
 }
 
-fn exec_command(mut cmd: Command, args: &[&OsStr], timeout: Duration) -> Result<Exit, String> {
+fn exec_command(cmd: Command, args: &[&OsStr], timeout: Duration) -> Result<Exit, String> {
+    exec_input(cmd, args, None, timeout)
+}
+
+/// [`exec_command`] with `input` on git's standard input.
+fn exec_input(
+    mut cmd: Command,
+    args: &[&OsStr],
+    input: Option<Vec<u8>>,
+    timeout: Duration,
+) -> Result<Exit, String> {
     cmd.args(args);
-    match run::run(&mut cmd, timeout, MAX_OUTPUT) {
+    match run::run_with_input(&mut cmd, input, timeout, MAX_OUTPUT) {
         Ok(out) => Ok(Exit {
             success: out.status.success(),
             code: out.status.code(),
@@ -740,6 +750,45 @@ pub fn fetch(dir: &Path, remote: &str) -> Result<(), String> {
     }
 }
 
+/// How `add_worktree` checks out the new worktree. Never `--force`: Git
+/// refuses a branch checked out elsewhere, an existing branch for `-b`,
+/// and a path that is not empty.
+pub enum Checkout<'a> {
+    /// `git worktree add PATH BRANCH`: the existing local branch.
+    Branch(&'a str),
+    /// `git worktree add -b BRANCH PATH COMMIT`: a new branch at COMMIT.
+    NewBranch(&'a str, &'a str),
+    /// `git worktree add --detach PATH COMMIT`.
+    Detached(&'a str),
+}
+
+/// `git worktree add`, from `main`, with a checkout's time limit.
+pub fn add_worktree(main: &Path, path: &Path, checkout: &Checkout) -> Result<(), String> {
+    let mut args = vec![OsStr::new("worktree"), OsStr::new("add")];
+    match checkout {
+        Checkout::Branch(branch) => args.extend([path.as_os_str(), OsStr::new(branch)]),
+        Checkout::NewBranch(branch, commit) => args.extend([
+            OsStr::new("-b"),
+            OsStr::new(branch),
+            path.as_os_str(),
+            OsStr::new(commit),
+        ]),
+        Checkout::Detached(commit) => {
+            args.extend([OsStr::new("--detach"), path.as_os_str(), OsStr::new(commit)]);
+        }
+    }
+    let exit = exec(main, &args, REMOVE_TIMEOUT)?;
+    if exit.success {
+        Ok(())
+    } else {
+        Err(format!(
+            "git worktree add refused (exit {}): {}",
+            exit.code.map_or("signal".to_string(), |c| c.to_string()),
+            exit.stderr
+        ))
+    }
+}
+
 /// Whether `core.sshCommand` is set for `dir`. When Git cannot answer,
 /// assume it is, so residue does not replace a command the user chose.
 fn ssh_command_configured(dir: &Path) -> bool {
@@ -765,4 +814,180 @@ fn new_session(cmd: &mut Command) {
             Ok(())
         });
     }
+}
+
+/// The commit `name` (a full ref name or an object name) resolves to, or
+/// `None` when it names no commit in this repository: `rev-parse --verify
+/// --quiet` exits 1 for that, and anything else is an error.
+pub fn commit_of(dir: &Path, name: &str) -> Result<Option<String>, String> {
+    let exit = git_exit(
+        dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &format!("{name}^{{commit}}"),
+        ],
+    )?;
+    match exit.code {
+        Some(0) => Ok(Some(
+            String::from_utf8_lossy(&exit.stdout).trim().to_string(),
+        )),
+        Some(1) => Ok(None),
+        _ => Err(format!(
+            "git rev-parse --verify {name} failed: {}",
+            exit.stderr
+        )),
+    }
+}
+
+/// The ref `full` exists, whatever it points at.
+pub fn ref_exists(dir: &Path, full: &str) -> Result<bool, String> {
+    let exit = git_exit(dir, &["show-ref", "--verify", "--quiet", full])?;
+    match exit.code {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git show-ref --verify {full} failed: {}",
+            exit.stderr
+        )),
+    }
+}
+
+/// `ancestor` is `descendant` or one of its ancestors.
+pub fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
+    let exit = git_exit(dir, &["merge-base", "--is-ancestor", ancestor, descendant])?;
+    match exit.code {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git merge-base --is-ancestor failed: {}",
+            exit.stderr
+        )),
+    }
+}
+
+/// One change in a [`change_refs`] transaction.
+pub enum RefChange<'a> {
+    /// Create the ref at a commit; Git refuses when it already exists, so
+    /// residue never overwrites one.
+    Create { name: &'a str, commit: &'a str },
+    /// Delete the ref only while it points at this commit; Git refuses when
+    /// it points anywhere else or does not exist.
+    Delete { name: &'a str, commit: &'a str },
+}
+
+/// Apply `changes` with `git update-ref --stdin`: one transaction, so all
+/// of them happen or none. The refs are synced to disk: `core.fsync`
+/// adds `reference` to the platform default (Git 2.36 documents that a
+/// value starts from the default and adds to it), and `core.fsyncMethod`
+/// `fsync` flushes the drive's cache on macOS, where Git's default does not.
+pub fn change_refs(dir: &Path, changes: &[RefChange]) -> Result<(), String> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let mut input = String::new();
+    for change in changes {
+        let line = match change {
+            RefChange::Create { name, commit } => format!("create {name} {commit}\n"),
+            RefChange::Delete { name, commit } => format!("delete {name} {commit}\n"),
+        };
+        input.push_str(&line);
+    }
+    let args = [
+        "-c",
+        "core.fsync=reference",
+        "-c",
+        "core.fsyncMethod=fsync",
+        "update-ref",
+        "--no-deref",
+        "--stdin",
+    ];
+    let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+    let exit = exec_input(command(dir), &args, Some(input.into_bytes()), QUERY_TIMEOUT)?;
+    if exit.success {
+        Ok(())
+    } else {
+        Err(format!("git update-ref refused: {}", exit.stderr))
+    }
+}
+
+/// The refs matching `patterns` (`refs/x/NAME` matches itself and refs
+/// below it, never `refs/x/NAME-2`), with the object each points at.
+pub fn refs_named(dir: &Path, patterns: &[&str]) -> Result<Vec<(String, String)>, String> {
+    let mut args = vec!["for-each-ref", "--format=%(refname) %(objectname)"];
+    args.extend_from_slice(patterns);
+    let out = git(dir, &args)?;
+    let mut refs = Vec::new();
+    for line in lines(&out) {
+        let line = String::from_utf8_lossy(line);
+        let (name, oid) = line
+            .rsplit_once(' ')
+            .ok_or_else(|| format!("git for-each-ref printed {line:?}"))?;
+        refs.push((name.to_string(), oid.to_string()));
+    }
+    Ok(refs)
+}
+
+/// The commits the HEAD reflog of the worktree at `dir` names, newest
+/// first, as Git reads them, for a reflog that is no file (reftable): each
+/// entry's new value, in lowercase. A worktree with no HEAD reflog answers
+/// with none. A commit Git no longer has is left out (`--ignore-missing`).
+pub fn head_reflog_commits(dir: &Path) -> Result<Vec<String>, String> {
+    let out = git(
+        dir,
+        &["rev-list", "--ignore-missing", "--walk-reflogs", "HEAD"],
+    )?;
+    Ok(lines(&out)
+        .into_iter()
+        .map(|l| String::from_utf8_lossy(l).to_ascii_lowercase())
+        .collect())
+}
+
+/// Those of `commits` that no ref outside `refs/residue/` and no
+/// worktree's HEAD reaches. The commits go in on standard input, before
+/// `--not`, so their number is not bounded by the command line. A commit
+/// Git no longer has is left out (`--ignore-missing`): there is nothing
+/// left of it to keep.
+pub fn unreferenced(dir: &Path, commits: &[&str]) -> Result<Vec<String>, String> {
+    if commits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let args = [
+        "rev-list",
+        "--ignore-missing",
+        "--stdin",
+        "--not",
+        "--exclude=refs/residue/*",
+        "--all",
+    ];
+    let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+    let mut input = commits.join("\n");
+    input.push('\n');
+    let exit = exec_input(command(dir), &args, Some(input.into_bytes()), QUERY_TIMEOUT)?;
+    if !exit.success {
+        return Err(format!("git rev-list --not --all failed: {}", exit.stderr));
+    }
+    let unreached: std::collections::HashSet<&[u8]> = lines(&exit.stdout).into_iter().collect();
+    Ok(commits
+        .iter()
+        .filter(|c| unreached.contains(c.as_bytes()))
+        .map(|c| (*c).to_string())
+        .collect())
+}
+
+/// The fewest of `commits` that reach all of them: `git merge-base
+/// --independent`.
+pub fn independent(dir: &Path, commits: &[String]) -> Result<Vec<String>, String> {
+    if commits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = vec!["merge-base", "--independent"];
+    args.extend(commits.iter().map(String::as_str));
+    let out = git(dir, &args)?;
+    Ok(lines(&out)
+        .into_iter()
+        .map(|l| String::from_utf8_lossy(l).into_owned())
+        .collect())
 }

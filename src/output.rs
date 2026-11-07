@@ -370,6 +370,14 @@ pub fn fact_phrases(r: &Report) -> Vec<String> {
     if let Ok(Some(c)) = &r.last_change {
         out.push(format!("changed {}", age(now() - c.time)));
     }
+    match &r.restored {
+        Ok(Some(m)) => out.push(match m.at {
+            Some(at) => format!("restored {}", age(now() - at)),
+            None => "restored".into(),
+        }),
+        Ok(None) => {}
+        Err(_) => out.push("restore mark unreadable".into()),
+    }
     out
 }
 
@@ -488,6 +496,7 @@ pub fn report_json(r: &Report) -> Json {
         Ok(None) => (Json::Null, Json::Null, Json::Null, Json::Null),
         Err(err) => (Json::Null, Json::Null, Json::Null, Json::str(err.clone())),
     };
+    let (restored, restored_error) = crate::removed::mark_json(&r.restored);
     Json::Obj(vec![
         ("path", Json::path(&e.path)),
         (
@@ -555,6 +564,8 @@ pub fn report_json(r: &Report) -> Json {
             "rule_sources",
             Json::Arr(r.rule_sources.iter().map(rule_source_json).collect()),
         ),
+        ("restored", restored),
+        ("restored_error", restored_error),
     ])
 }
 

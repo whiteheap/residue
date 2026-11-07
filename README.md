@@ -16,7 +16,7 @@ Website: [residue.whiteheap.com](https://residue.whiteheap.com)
   <img src="docs/assets/how-it-works.png" width="500" alt="Chart. A repository leads to its linked worktrees, then checks, then a report. Read only ends at scan and explain, which read and stop. A separate arrow, you or watch, enters remove, then fresh checks. The left arrow from fresh checks ends at stays when a check blocks, is unknown, or the worktree changed. A different pair of arrows, only when every check passes, goes to git remove without --force or to the trash for restore. The block path does not continue to deletion.">
 </picture>
 
-A repository's linked worktrees are checked, then reported. `scan` and `explain` only read that report and stop. `remove` is separate: you run it, or `watch` chooses paths for it. From fresh checks, a block, an unknown, or a change keeps the worktree. Only when every check passes does `git worktree remove` delete it, without `--force`, or the trash hold it for `restore`. A pass is not a guarantee, and age alone does not mean inactive.
+A repository's linked worktrees are checked, then reported. `scan` and `explain` only read that report and stop. `remove` is separate: you run it, or `watch` chooses paths for it. From fresh checks, a block, an unknown, or a change keeps the worktree. Only when every check passes does `git worktree remove` delete it, without `--force`, after residue writes the record `restore` recreates it from; or the trash holds it for `restore`. A pass is not a guarantee, and age alone does not mean inactive.
 
 [Install](#install) · [Inspect](#inspect-a-worktree) · [Remove](#remove-a-worktree) · [Automate](#automate-cleanup) · [Reference](#reference)
 
@@ -83,7 +83,7 @@ disk  41 GB free of 494 GB (8%)  (filesystem of ~/src/app)
 next: residue explain PATH  ·  residue remove PATH  ·  keep one: git worktree lock PATH
 ```
 
-A removal that does not pass exits 3 and leaves the directory in place. A removal that does pass leaves the branch. With `--trash`, `residue restore` puts the worktree back until the purge. That is not true of a delete that was already partial when residue was killed: see [What removal deletes, and what it keeps](#what-removal-deletes-and-what-it-keeps).
+A removal that does not pass exits 3 and leaves the directory in place. A removal that does pass leaves the branch and a removal record: for 30 days, `residue restore` recreates the worktree at its path, on its branch and HEAD. With `--trash`, `residue restore` puts the worktree itself back, every file included, until the purge. That is not true of a delete that was already partial when residue was killed: see [What removal deletes, and what it keeps](#what-removal-deletes-and-what-it-keeps).
 
 With no PATH, `scan` uses the current directory. A PATH inside a repository selects that repository. Any other directory is searched four levels down, without following symbolic links or crossing filesystems, and without entering hidden directories, `node_modules`, `target`, or `Library`. Linked worktrees come from Git's list. `--json` and `--idle` are in the [command reference](docs/reference.md#where-a-path-applies).
 
@@ -126,7 +126,7 @@ residue remove PATH
 - the checked-out tracked files. Every one of them is committed, because the `tracked_changes` check passed.
 - the ignored entries the plan lists, with their file counts and sizes, for example `node_modules/ (41530 files, 816 MB)`. Every one of them matches a regenerable rule.
 
-It keeps the branch, every commit, the stash, and every other worktree. residue never deletes a branch, never kills a process, and never lifts a lock it did not set.
+It keeps the branch, every commit, the stash, and every other worktree. residue never deletes a branch, never kills a process, and never lifts a lock it did not set. It also writes a removal record before it deletes, so `residue restore` can recreate the worktree: see [Restore a removed worktree](#restore-a-removed-worktree).
 
 Before it deletes anything, residue prints the plan and asks you to type `yes`. The plan records what it showed you for each worktree: HEAD, the branch, the lock, the staged, modified and untracked files, the file count, size and newest modification time of every ignored entry, and the modification times of the worktree's index and HEAD reflog. Right before each removal, residue takes a new process snapshot, runs every check again, and compares. Any difference skips the worktree, and the reason names it:
 
@@ -148,7 +148,7 @@ interrupted removals (a residue run moved these aside to delete them and stopped
     put it back: git -C /Users/me/src/app worktree unlock /Users/me/src/app/.worktrees/.fix-login.residue-removing-4242 && git -C /Users/me/src/app worktree move /Users/me/src/app/.worktrees/.fix-login.residue-removing-4242 /Users/me/src/app/.worktrees/fix-login
 ```
 
-If its directory is already gone, the command clears Git's record with `git worktree remove` instead. If the process that moved it still runs, the line says so: it may still be removing it. residue never removes a worktree under a hidden name, by sweep or by PATH, so nothing touches it until you recover it.
+If its directory is already gone, the command clears Git's record with `git worktree remove` instead. If the process that moved it still runs, the line says so: it may still be removing it. residue never removes a worktree under a hidden name, by sweep or by PATH, so nothing touches it until you recover it. A run that stopped after it wrote the removal record adds a second line, `or: residue restore RECORD`, which moves the worktree back the same way.
 
 If stdin is not a terminal, residue does not delete anything unless you pass `--yes`. Pass `--yes` only from the session that owns the worktree and knows its task is finished, such as an agent's last step or a launcher tearing down a task, or from a scheduled `remove --all --idle` as [Run it on a schedule](#run-it-on-a-schedule) describes. Every check still runs. Without `--idle`, a session that is paused looks exactly like a finished one, so `remove --all --yes` refuses to run without it.
 ### Keep a worktree
@@ -180,6 +180,40 @@ A trashed worktree is locked with the reason `residue: in trash`, and `git workt
 
 The trash does not free disk space: a trashed worktree takes all the space it took before. The purge frees it. Every `remove` run purges the trash entries older than `--keep-trash DURATION` (default `7d`) in the repositories it covers, and lists them in its plan before you confirm. The purge runs every check on each entry again, except `--idle`, since `--keep-trash` is the trash's only clock, and deletes it with `git worktree remove`, without `--force`. An entry that someone changed in the trash stays, and the run says why. A preview, or a run you do not confirm, purges nothing.
 
+### Restore a removed worktree
+
+Every deletion leaves a removal record: `remove`, `remove --no-trash`, a sweep, `watch`, and the trash purge. The line that reports the removal ends with the command that brings it back:
+
+```text
+removed .worktrees/fix-login (branch fix-login kept); about 812 MB reclaimable; restore: residue restore /Users/me/src/app/.git/residue-removed/fix-login-20261107T040000Z
+```
+
+```sh
+residue restore               # list trash entries and removal records, newest first
+residue restore fix-login     # recreate one: its name, the worktree's name or branch, or a path
+residue restore --to ~/src/app/.worktrees/fix-login-2 fix-login
+```
+
+A record is a directory in `residue-removed/` in the repository's Git common directory, `fix-login-20261107T040000Z/`, with an `info` file: the original path, the branch, HEAD, the upstream, why it was removed and by which command (`remove`, a `remove --all` sweep, or `watch`), when, its size, and the ignored entries the deletion took. Beside it are copies of the worktree's HEAD reflog (`HEAD.reflog`) and its `config.worktree`, when it has them. A ref, `refs/residue/removed/fix-login-20261107T040000Z`, keeps the HEAD commit, so a deleted branch, an expired reflog or `git gc` cannot lose it. The commits the worktree's own HEAD reflog names that no branch, tag, remote-tracking ref or other worktree's HEAD reaches, such as work committed on a detached HEAD that was then checked out away from, or the commit before an amend, get refs under `refs/residue/reflog/fix-login-20261107T040000Z/`, at the fewest commits that reach them all: `git worktree remove` deletes that reflog, and without the refs `git gc` would delete them. A branch's own reflog naming such a commit does not count, because `git branch -D` deletes it with the branch. A reftable repository has no `logs/HEAD` file to copy: residue asks Git for the commits that reflog names and pins them all the same, and since restore cannot write that reflog back, the record stays until `--keep-removed`. residue writes the record and syncs it to disk after it moves the worktree aside and before its last check (the purge, after its re-check), and writes the refs in one `git update-ref` transaction, all or none. If the record cannot be written, or the last check fails, residue moves the worktree back and deletes nothing. If `git worktree remove` then fails, residue drops the record only while nothing of the worktree is gone: Git still lists it and can still use it, its files are there, and its HEAD, HEAD reflog and `config.worktree` are as recorded. Otherwise Git deleted part of it, and the reason says so and ends with the restore command: `Git still lists it at PATH, but part of its HEAD reflog is gone; its removal record keeps its HEAD and reflog: residue restore RECORD`. The worktree stays under its hidden name; residue does not move a worktree Git deleted part of.
+
+`residue restore` recreates the worktree with `git worktree add`, never `--force`, and never moves an existing branch:
+
+| The branch now | restore |
+| --- | --- |
+| at the recorded HEAD, or ahead of it | checks the branch out |
+| rewritten, so it no longer contains the recorded HEAD | creates `BRANCH-restored` at the recorded HEAD; the branch stays as it is |
+| deleted | creates it again at the recorded HEAD |
+| checked out in another worktree | refuses, and names that worktree |
+| none: the worktree was on a detached HEAD | restores it detached at the recorded HEAD |
+
+It refuses when something exists at the path; `--to PATH` restores somewhere else. The tracked files come back as they were committed. The ignored files the deletion took, such as `node_modules/`, do not: restore lists them, and the project's install or build makes them again. The new worktree gets the saved HEAD reflog back, with the commits only it held. An interrupted removal, whose record names a worktree still under its hidden name, is moved back instead, and gets the saved HEAD reflog and `config.worktree` back if Git deleted them. If Git can no longer use it, because the failed removal deleted part of its Git directory, restore cannot move it back and says how to clear it: delete the hidden directory, run `git worktree prune`, and run the same restore again, which then recreates it. Either way, restore drops the record and its refs only once the worktree's HEAD contains the recorded HEAD and its own HEAD reflog names every commit the reflog refs keep. If not, for example because the branch moved while restore ran, the record stays and restore says why.
+
+A restored worktree is never removed again by `watch` because its branch landed: you wanted it back after it landed. `residue remove PATH`, a sweep and `watch`'s low-disk rule still can.
+
+Every `remove` run forgets the records older than `--keep-removed DURATION` (default `30d`) in the repositories it covers, after the same confirmation: it deletes the record and its refs in one transaction, only while each ref still names the commit the record names, and never a ref residue did not write. A record residue cannot read or forget is a warning on stderr and in the JSON `warnings`, never in `errors`, and never changes the exit status. A directory with no `info` and no ref, left by a run stopped while it wrote one, is cleared once it is an hour old. A record is small: the info file and the copied reflog, usually a few kilobytes.
+
+What `--keep-removed` can lose: forgetting a record deletes its refs, so a commit one of them was the last holder of becomes unreachable, and the next `git gc` deletes it. Usually that is nothing, because the branch still has the commits. It is not nothing for a branch deleted after the removal, such as one deleted after a squash merge, or for work only the worktree's reflog held: there the record is the last holder, and `--keep-removed` is the only grace period. Restore what you want before then, or put it on a branch. Tools that read every ref, such as `git log --all` and `git push --mirror`, see `refs/residue/removed/` and `refs/residue/reflog/`.
+
 ## Automate cleanup
 
 Turn it on with one command:
@@ -208,7 +242,7 @@ The first prints what it would remove right now (for one folder: `residue watch 
 - **The work landed.** The upstream branch is gone in the local refs, and the worktree has not changed for `--grace` (default one hour). `watch` runs `residue remove --yes --idle --no-trash --only-if-upstream-gone`. The child reads those refs at the plan, again before the move aside, and again after the move. If the upstream is back, there is no upstream, the HEAD is detached, the upstream is local (`.`), or the ref exists but does not resolve to a commit, the worktree stays.
 - **The disk is low.** Free space on that filesystem is below `--min-free` (default 10%). Worktrees unchanged for `--idle` (default two days) go, largest first, until free space is five points above the threshold. The child is `residue remove --yes --idle --no-trash` without `--only-if-upstream-gone`.
 
-Both delete. They do not use the trash. The same run still purges that repository's trash entries older than seven days. Branches, commits, and locked worktrees stay. `scan` never starts `watch`.
+Both delete. They do not use the trash. The same run still purges that repository's trash entries older than seven days. Branches, commits, and locked worktrees stay. Each removal leaves a removal record, and its log line ends with the command that brings the worktree back, `restore: residue restore RECORD`. A worktree you restore is never removed again because its work landed; disk pressure still removes it. `scan` never starts `watch`.
 
 To see a branch deleted on the remote, `watch` fetches: about every 30 minutes (`--fetch-every`), `git fetch --prune --no-tags` for each remote that a worktree's branch tracks. The fetch never prompts. It runs without a terminal, and SSH runs with `BatchMode=yes` unless you set your own SSH command, so a fetch that needs a password or a passphrase fails, is logged, and changes nothing. A fetch changes only remote-tracking refs and writes no `FETCH_HEAD`, so it does not reset a worktree's idle clock. It is never a reason to remove: it only refreshes the refs the checks read. `--no-fetch` turns it off; then a deleted branch counts after your own `git fetch --prune`.
 
@@ -264,6 +298,8 @@ Ignored does not mean disposable. An untracked file that is not ignored always k
 
 **A file showed up while the prompt was waiting. Is it deleted?** No. `remove` compares a fresh record with the plan and skips the worktree, naming the difference. In 0.0.4 a file added under `node_modules/` during that wait was deleted with the worktree. From 0.0.5 that case is a skip.
 
+**residue removed a worktree I still wanted. Can I get it back?** Yes, for 30 days: `residue restore` lists what it can bring back, and `residue restore NAME` recreates the worktree at its path, on its branch and HEAD. The log or remove line names the exact command. The ignored files the removal deleted, such as `node_modules/`, are not kept. `watch` never removes a restored worktree again because its work landed. [Restore a removed worktree](#restore-a-removed-worktree).
+
 **`watch` removed a worktree after the upstream branch came back.** That was fixed. For a landed branch, `watch` runs `remove --only-if-upstream-gone`, and the child checks the local refs at the plan, again before the move aside, and again after the move. If the upstream is back, the worktree stays. The child does not fetch, so it judges what is in the local refs at that moment.
 
 **Which folders does `watch` use without a ROOT?** Those of `~/src`, `~/code`, `~/Code`, `~/dev`, `~/Developer`, `~/projects`, `~/Projects`, `~/repos`, `~/git`, `~/github`, `~/GitHub`, `~/work`, `~/Work` and `~/workspace` that exist, each searched like any ROOT: four levels deep, on one filesystem, without following symbolic links. Never your home folder itself, which holds far more than code, and nothing under `Documents`, `Desktop` or `Downloads`, which macOS guards with a permission prompt. If none exists, `watch` and `service install` say so in one line and exit 2; name a folder then. `service install` writes the folders it found into the service, so the service watches the same ones at every start; run it again to pick up a folder created since.
@@ -298,7 +334,7 @@ A process can also open the directory a moment after the snapshot; residue moves
 - **Work landed means the local refs say so.** `scan`, `explain` and `remove` never fetch, and `watch` fetches each repository about every 30 minutes: a branch deleted on the remote counts once a fetch with prune, `watch`'s own or yours, reaches the local refs, and one that comes back counts once a fetch brings it back. An upstream counts as gone only when its remote-tracking ref is absent. A loose ref that is a dangling symbolic link reads as absent to Git and so to residue, and a `git remote rename` in progress makes its branches look gone until it finishes; `watch` scans only after the refs have been quiet for 20 seconds, at most two minutes.
 - **Freed space is an estimate.** residue counts each hard-linked file once and excludes files that also have links outside the worktree (such as pnpm's store). It cannot see APFS or Btrfs clones, snapshots, or deleted files a process still holds open, so the space actually freed can be smaller.
 - **residue reads every entry of every worktree it inspects.** That walk is the check behind `nested_repo`, `mount_point` and `contents`, and the sizes come from the same walk. So there is no option to skip it. On a 1.0 GB worktree with 46,572 entries (macOS, Apple silicon, warm cache), `residue explain` took 0.65 to 0.83 s, and `git worktree remove` of an identical copy took 2.7 to 3.0 s.
-- **The last check is not the deletion.** residue moves a worktree aside and checks it again before Git deletes it, which leaves a window from that check to the end of the deletion. A process that opens the hidden directory by its new name, or one the probe cannot see, can write into it then, and the write is deleted with it. [What removal deletes](#what-removal-deletes-and-what-it-keeps) has the detail. A sweep uses the trash, so what it takes by mistake stays restorable until the purge.
+- **The last check is not the deletion.** residue moves a worktree aside and checks it again before Git deletes it, which leaves a window from that check to the end of the deletion. A process that opens the hidden directory by its new name, or one the probe cannot see, can write into it then, and the write is deleted with it. [What removal deletes](#what-removal-deletes-and-what-it-keeps) has the detail. A removal record brings back the committed state, not such a write. A sweep uses the trash, so what it takes by mistake stays restorable, every file included, until the purge.
 - **residue only handles linked worktrees.** It does not touch package-manager stores, Docker build cache or toolchain caches. Use their own commands, which know what is safe: `pnpm store prune`, `docker builder prune`, `npm cache verify`, `go clean -cache`, `uv cache prune`.
 - **Stale entries are reported, not cleaned.** For a worktree whose directory is already gone, residue reports the leftover Git metadata as `stale` and tells you to run `git worktree prune`. For an orphaned checkout whose repository is gone, residue lists it and leaves it alone.
 - **residue is not a security boundary.** It runs as you, and assumes the other processes running as you are not trying to fool it.

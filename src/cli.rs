@@ -4,6 +4,8 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use crate::removed::Reason;
+
 pub const HELP: &str = "\
 residue: find what coding agents left behind on disk, and remove a Git
 worktree only when nothing in it would be lost.
@@ -12,14 +14,16 @@ Usage:
   residue [scan] [PATH...]   Report the linked worktrees of each repository at
                              or under PATH (default: the current directory)
   residue explain PATH       Show every check for one linked worktree
-  residue remove PATH...     Confirm, re-check, move aside, check again, then
-                             `git worktree remove` each (or keep it in the trash)
+  residue remove PATH...     Confirm, re-check, move aside, check again, write a
+                             removal record, then `git worktree remove` each
+                             (or keep it in the trash)
   residue remove --all PATH...
                              The same for every candidate a scan of PATH finds
-  residue restore [ENTRY]    List the trash of the repositories at or under the
-                             current directory, or put one ENTRY back (its name
-                             from the list, the worktree's name or branch, or a
-                             path)
+  residue restore [ENTRY]    List what residue can put back in the repositories
+                             at or under the current directory (trash entries
+                             and removal records), or put one ENTRY back (its
+                             name from the list, the worktree's name or branch,
+                             or a path)
   residue watch [ROOT...]    Stay running; remove a worktree when its branch
                              lands or the disk runs low. Without a ROOT, the
                              usual code folders (`residue watch --help`)
@@ -45,6 +49,14 @@ Options:
   --keep-trash DURATION remove: purge trash entries older than DURATION
                         (default 7d). Every remove run purges, after the same
                         confirmation; the purge is what frees the disk
+  --keep-removed DURATION
+                        remove: forget removal records older than DURATION
+                        (default 30d), after the same confirmation. Only the
+                        record and its ref go; branches stay
+  --removal-reason watch-landed|watch-low-disk
+                        remove: the reason its removal records name.
+                        `residue watch` passes it
+  --to PATH             restore: put the worktree at PATH, not where it was
   --only-if-upstream-gone
                         remove: keep any worktree whose branch's upstream is
                         not gone, as the local refs show it at the plan,
@@ -65,6 +77,16 @@ ignored files outside the regenerable list. It never deletes branches, never
 kills processes and never passes --force to Git. Right before it deletes, it
 moves the worktree aside and checks again; anything that changed since you
 confirmed keeps it.
+
+Every deletion first writes a removal record (GIT_COMMON_DIR/residue-removed)
+and refs that keep its HEAD commit (refs/residue/removed/NAME) and the
+commits only its reflog held (refs/residue/reflog/NAME/); if they cannot be
+written, nothing is deleted. `residue restore` recreates the
+worktree from it at its path, on its branch and HEAD, for 30 days
+(--keep-removed). Ignored files it deleted, such as node_modules, are not
+kept: the project's install or build makes them again. A restored worktree
+is never removed again because its branch landed; `residue remove` and low
+disk still can.
 
 Keep a worktree:  git worktree lock --reason \"resume later\" PATH
 Per repository:   git config --add residue.regenerable RULE
@@ -135,6 +157,8 @@ impl Span {
 
 /// How long the trash keeps an entry when `--keep-trash` is not given.
 pub const DEFAULT_KEEP_TRASH: &str = "7d";
+/// How long a removal record is kept when `--keep-removed` is not given.
+pub const DEFAULT_KEEP_REMOVED: &str = "30d";
 
 #[derive(Default)]
 pub struct Options {
@@ -146,11 +170,17 @@ pub struct Options {
     /// `--trash` (`Some(true)`) or `--no-trash` (`Some(false)`).
     pub trash: Option<bool>,
     pub keep_trash: Option<Span>,
+    pub keep_removed: Option<Span>,
     pub regenerable: Vec<String>,
     /// `--only-if-upstream-gone`: remove only worktrees whose branch has an
     /// upstream that the local refs show as gone, checked at the plan, right
     /// before the move and right before the deletion.
     pub only_if_upstream_gone: bool,
+    /// `--removal-reason`: why `residue watch` asked for this removal, as
+    /// each removal record says it.
+    pub removal_reason: Option<Reason>,
+    /// `restore --to PATH`: where to recreate the worktree.
+    pub to: Option<PathBuf>,
 }
 
 impl Options {
@@ -165,6 +195,13 @@ impl Options {
         self.keep_trash.clone().unwrap_or_else(|| Span {
             seconds: 7 * 86_400,
             text: DEFAULT_KEEP_TRASH.to_string(),
+        })
+    }
+
+    pub fn keep_removed(&self) -> Span {
+        self.keep_removed.clone().unwrap_or_else(|| Span {
+            seconds: 30 * 86_400,
+            text: DEFAULT_KEEP_REMOVED.to_string(),
         })
     }
 }
@@ -259,6 +296,45 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
                             Some(Span::parse("--keep-trash", &text["--keep-trash=".len()..])?);
                         continue;
                     }
+                    "--keep-removed" => {
+                        let value = args
+                            .next()
+                            .ok_or("--keep-removed needs a DURATION (7d, 30d, 12w)")?;
+                        options.keep_removed = Some(Span::parse(
+                            "--keep-removed",
+                            &utf8(value, "--keep-removed DURATION")?,
+                        )?);
+                        continue;
+                    }
+                    _ if text.starts_with("--keep-removed=") => {
+                        options.keep_removed = Some(Span::parse(
+                            "--keep-removed",
+                            &text["--keep-removed=".len()..],
+                        )?);
+                        continue;
+                    }
+                    "--removal-reason" => {
+                        let value = args
+                            .next()
+                            .ok_or("--removal-reason needs watch-landed or watch-low-disk")?;
+                        options.removal_reason =
+                            Some(removal_reason(&utf8(value, "--removal-reason REASON")?)?);
+                        continue;
+                    }
+                    _ if text.starts_with("--removal-reason=") => {
+                        options.removal_reason =
+                            Some(removal_reason(&text["--removal-reason=".len()..])?);
+                        continue;
+                    }
+                    "--to" => {
+                        let value = args.next().ok_or("--to needs a PATH")?;
+                        options.to = Some(PathBuf::from(value));
+                        continue;
+                    }
+                    _ if text.starts_with("--to=") => {
+                        options.to = Some(PathBuf::from(&text["--to=".len()..]));
+                        continue;
+                    }
                     "--regenerable" => {
                         let value = args.next().ok_or("--regenerable needs a RULE")?;
                         options.regenerable.push(utf8(value, "--regenerable RULE")?);
@@ -306,9 +382,21 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
         if options.keep_trash.is_some() {
             return Err("--keep-trash applies only to `residue remove`".into());
         }
+        if options.keep_removed.is_some() {
+            return Err("--keep-removed applies only to `residue remove`".into());
+        }
+        if options.removal_reason.is_some() {
+            return Err("--removal-reason applies only to `residue remove`".into());
+        }
+    }
+    if options.to.is_some() && kind != "restore" {
+        return Err("--to applies only to `residue restore ENTRY`".into());
     }
     if kind == "restore" && (options.idle.is_some() || !options.regenerable.is_empty()) {
-        return Err("`residue restore` takes only --json and an ENTRY".into());
+        return Err("`residue restore` takes only --json, --to PATH and an ENTRY".into());
+    }
+    if kind == "restore" && options.to.is_some() && options.paths.is_empty() {
+        return Err("--to needs an ENTRY to restore; run `residue restore` to list them".into());
     }
     match kind.as_str() {
         "explain" if options.paths.len() != 1 => {
@@ -331,6 +419,18 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
         ),
         "remove" => Ok(Command::Remove(options)),
         _ => Ok(Command::Scan(options)),
+    }
+}
+
+/// `--removal-reason`: only the reasons `residue watch` gives; a person's
+/// own `remove` records `remove` or `sweep` by itself.
+fn removal_reason(text: &str) -> Result<Reason, String> {
+    match text {
+        "watch-landed" => Ok(Reason::WatchLanded),
+        "watch-low-disk" => Ok(Reason::WatchLowDisk),
+        _ => Err(format!(
+            "--removal-reason {text:?}: use watch-landed or watch-low-disk"
+        )),
     }
 }
 

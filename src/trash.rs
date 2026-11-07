@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 use crate::git::{self, Entry};
 use crate::json::Json;
-use crate::output::{self, Places, Style, clean};
+use crate::output;
 
 pub const DIR: &str = "residue-trash";
 /// The lock reason on every worktree in the trash.
@@ -247,6 +247,11 @@ pub fn create(common_dir: &Path, record: &Record) -> Result<PathBuf, String> {
         if n > 1 {
             entry_name.push(format!("-{n}"));
         }
+        // Trash entries and removal records share one list in `residue
+        // restore`, so a name a record already has is skipped.
+        if fs::symlink_metadata(crate::removed::root(common_dir).join(&entry_name)).is_ok() {
+            continue;
+        }
         let entry = root.join(&entry_name);
         match fs::create_dir(&entry) {
             Ok(()) => {}
@@ -284,14 +289,28 @@ pub fn discard(entry: &Path) -> Result<(), String> {
     }
     fs::remove_dir(entry).map_err(|e| format!("cannot remove {}: {e}", entry.display()))?;
     if let Some(root) = entry.parent() {
-        match fs::remove_dir(root) {
-            Ok(()) => {}
-            // Other entries are still in the trash.
-            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
-            Err(e) => return Err(format!("cannot remove {}: {e}", root.display())),
-        }
+        // Other entries may still be in the trash.
+        remove_dir_if_empty(root).map_err(|e| format!("cannot remove {}: {e}", root.display()))?;
     }
     Ok(())
+}
+
+/// Remove a directory if it is empty; one that still has entries stays and
+/// is not an error. POSIX lets rmdir(2) report a non-empty directory as
+/// ENOTEMPTY or EEXIST, and illumos uses EEXIST, which Rust calls
+/// `AlreadyExists`. rmdir never reports EEXIST for anything else.
+pub fn remove_dir_if_empty(dir: &Path) -> io::Result<()> {
+    match fs::remove_dir(dir) {
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::AlreadyExists
+            ) =>
+        {
+            Ok(())
+        }
+        other => other,
+    }
 }
 
 /// The lock on a trashed worktree is residue's own, so residue may lift it.
@@ -299,10 +318,10 @@ pub fn locked_by_residue(entry: &Entry) -> bool {
     entry.locked.as_deref() == Some(LOCK)
 }
 
-/// Put one entry's worktree back where it was, re-registered by `git
-/// worktree move`, and drop the entry. Returns the restored path, and a
-/// note when the record stays behind (the next purge clears it).
-pub fn restore(item: &Item) -> Result<(PathBuf, Option<String>), String> {
+/// Put one entry's worktree back where it was, or at `to`, re-registered
+/// by `git worktree move`, and drop the entry. Returns the restored path,
+/// and a note when the record stays behind (the next purge clears it).
+pub fn restore(item: &Item, to: Option<&Path>) -> Result<(PathBuf, Option<String>), String> {
     let record = item.record.as_ref().map_err(|e| e.clone())?;
     let worktree = item
         .worktree
@@ -330,18 +349,18 @@ pub fn restore(item: &Item) -> Result<(PathBuf, Option<String>), String> {
         }
         _ => {}
     }
-    let original = &record.original;
-    match fs::symlink_metadata(original) {
+    let dest = to.unwrap_or(&record.original);
+    match fs::symlink_metadata(dest) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Ok(_) => {
             return Err(format!(
-                "{} exists again; move it away first, then restore",
-                original.display()
+                "{} exists; move it away first, or restore somewhere else with --to PATH",
+                dest.display()
             ));
         }
-        Err(e) => return Err(format!("cannot check {}: {e}", original.display())),
+        Err(e) => return Err(format!("cannot check {}: {e}", dest.display())),
     }
-    let parent = original.parent().ok_or("the original path has no parent")?;
+    let parent = dest.parent().ok_or("the destination has no parent")?;
     fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     let here = fs::symlink_metadata(worktree)
         .map_err(|e| format!("{}: {e}", worktree.display()))?
@@ -360,7 +379,7 @@ pub fn restore(item: &Item) -> Result<(PathBuf, Option<String>), String> {
     if was_locked {
         git::unlock_worktree(main, worktree)?;
     }
-    if let Err(e) = git::move_worktree(main, worktree, original) {
+    if let Err(e) = git::move_worktree(main, worktree, dest) {
         if was_locked {
             if let Err(relock) = git::lock_worktree(main, worktree, LOCK) {
                 return Err(format!("{e}; and could not lock it again: {relock}"));
@@ -371,7 +390,7 @@ pub fn restore(item: &Item) -> Result<(PathBuf, Option<String>), String> {
     let note = discard(&item.dir)
         .err()
         .map(|e| format!("could not remove the trash record ({e}); the next remove run clears it"));
-    Ok((original.clone(), note))
+    Ok((dest.to_path_buf(), note))
 }
 
 /// Delete one entry's worktree with `git worktree remove` (no `--force`)
@@ -404,203 +423,10 @@ pub fn purge(item: &Item) -> Result<(), String> {
     discard(&item.dir)
 }
 
-// ---------------------------------------------------------------- restore
-
-/// `residue restore [ENTRY]`.
-pub fn command(options: &crate::cli::Options) -> u8 {
-    let started = output::now();
-    if let Err(e) = git::require_version() {
-        return crate::commands::fail(&e);
-    }
-    let places = Places::new();
-    let Some(wanted) = options.paths.first() else {
-        let (items, errors) = gather(&[PathBuf::from(".")]);
-        if options.json {
-            println!("{}", list_json(&items, &errors, started, None).render());
-        } else {
-            print!("{}", list_text(&items, &errors, started, &places));
-        }
-        return if errors.is_empty() { 0 } else { 1 };
-    };
-    // A path names its repository directly, from any directory; a name is
-    // looked up in the repositories at or under this one.
-    let mut gathered = None;
-    if fs::symlink_metadata(wanted).is_ok() {
-        let (items, errors) = gather(std::slice::from_ref(wanted));
-        if let Ok(i) = choose(&items, wanted) {
-            gathered = Some((items, errors, i));
-        }
-    }
-    let (items, errors, chosen) = match gathered {
-        Some(g) => g,
-        None => {
-            let (items, errors) = gather(&[PathBuf::from(".")]);
-            match choose(&items, wanted) {
-                Ok(i) => (items, errors, i),
-                Err(e) => return crate::commands::fail(&e),
-            }
-        }
-    };
-    let item = &items[chosen];
-    match restore(item) {
-        Ok((path, note)) => {
-            if let Some(note) = &note {
-                eprintln!("residue: note: {}", clean(note));
-            }
-            if options.json {
-                println!(
-                    "{}",
-                    list_json(std::slice::from_ref(item), &errors, started, Some(&path)).render()
-                );
-            } else {
-                let branch = item
-                    .record
-                    .as_ref()
-                    .ok()
-                    .and_then(|r| r.branch.as_deref())
-                    .map(|b| format!(" [{}]", clean(b.strip_prefix("refs/heads/").unwrap_or(b))))
-                    .unwrap_or_default();
-                println!("restored {}{branch} from the trash", places.show(&path));
-            }
-            0
-        }
-        Err(e) => crate::commands::fail(&format!("cannot restore {}: {e}", item.name)),
-    }
-}
-
-/// The trash entries of the repositories at or under `roots`.
-fn gather(roots: &[PathBuf]) -> (Vec<Item>, Vec<String>) {
-    let found = crate::discover::find(roots);
-    let mut items: Vec<Item> = Vec::new();
-    let mut errors = found.errors;
-    for repo in &found.repos {
-        match list(&repo.common_dir, &repo.command_dir(), &repo.trash) {
-            Ok(list) => items.extend(list),
-            Err(e) => errors.push(e),
-        }
-    }
-    (items, errors)
-}
-
-/// The entry ENTRY names: an entry name from the list; the directory name
-/// or the branch of the worktree it holds, when only one entry matches; or
-/// the path of an entry or of the worktree inside it.
-fn choose(items: &[Item], wanted: &Path) -> Result<usize, String> {
-    let shown = wanted.display();
-    if let Ok(path) = git::canonical(wanted) {
-        if let Some(i) = items.iter().position(|i| {
-            git::canonical(&i.dir).ok().as_deref() == Some(path.as_path())
-                || i.worktree.as_deref() == Some(path.as_path())
-        }) {
-            return Ok(i);
-        }
-    }
-    let text = wanted.as_os_str();
-    if let Some(i) = items
-        .iter()
-        .position(|i| i.name.as_bytes() == text.as_bytes())
-    {
-        return Ok(i);
-    }
-    let by_name: Vec<usize> = (0..items.len())
-        .filter(|&i| {
-            items[i].record.as_ref().is_ok_and(|r| {
-                r.original.file_name() == Some(text)
-                    || r.branch
-                        .as_deref()
-                        .map(|b| b.strip_prefix("refs/heads/").unwrap_or(b))
-                        == text.to_str()
-            })
-        })
-        .collect();
-    match by_name.as_slice() {
-        [one] => Ok(*one),
-        [] => Err(format!(
-            "no trash entry named {shown} in the repositories at or under the current directory; `residue restore` lists them"
-        )),
-        many => {
-            let names: Vec<&str> = many.iter().map(|&i| items[i].name.as_str()).collect();
-            Err(format!(
-                "{shown} names {} trash entries ({}); pass the entry name",
-                many.len(),
-                names.join(", ")
-            ))
-        }
-    }
-}
-
-fn list_text(items: &[Item], errors: &[String], started: i64, places: &Places) -> String {
-    let style = Style::stdout();
-    let now = output::now();
-    let mut out = style.dim(&format!("{}\n", crate::commands::header(started)));
-    if items.is_empty() {
-        out.push_str("\nthe trash is empty\n");
-    }
-    let mut last_common: Option<&Path> = None;
-    for item in items {
-        if last_common != Some(item.common_dir.as_path()) {
-            out.push_str(&format!(
-                "\n{}\n",
-                style.bold(&format!("trash of {}", places.show(&item.command_dir)))
-            ));
-            last_common = Some(&item.common_dir);
-        }
-        out.push_str(&format!("  {}\n", style.bold(&clean(&item.name))));
-        match &item.record {
-            Ok(r) => {
-                let branch = r
-                    .branch
-                    .as_deref()
-                    .map(|b| format!("  [{}]", clean(b.strip_prefix("refs/heads/").unwrap_or(b))))
-                    .unwrap_or_else(|| {
-                        r.head
-                            .as_deref()
-                            .map(|h| format!("  (detached {})", &h[..h.len().min(12)]))
-                            .unwrap_or_default()
-                    });
-                let size = r
-                    .allocated
-                    .map(|b| format!(" · {}", output::bytes(b)))
-                    .unwrap_or_default();
-                out.push_str(&format!(
-                    "    was {}{}\n    {}\n",
-                    places.show(&r.original),
-                    style.dim(&branch),
-                    style.dim(&format!(
-                        "trashed {} ({}){size}{}",
-                        output::date(r.trashed),
-                        output::age(now - r.trashed),
-                        if item.is_empty_record() {
-                            " · holds no worktree; the next purge clears it"
-                        } else {
-                            ""
-                        }
-                    ))
-                ));
-            }
-            Err(e) => out.push_str(&format!(
-                "    {}\n",
-                style.dim(&format!("unreadable: {}", clean(e)))
-            )),
-        }
-    }
-    if !errors.is_empty() {
-        out.push_str("\ncould not inspect:\n");
-        for e in errors {
-            out.push_str(&format!("  {}\n", clean(e)));
-        }
-    }
-    if !items.is_empty() {
-        out.push_str(&style.dim(
-            "\nput one back: residue restore NAME  ·  a remove run purges entries older than --keep-trash (default 7d)\n",
-        ));
-    }
-    out
-}
-
 pub fn item_json(item: &Item) -> Json {
     let record = item.record.as_ref().ok();
     Json::Obj(vec![
+        ("kind", Json::str("trash")),
         ("entry", Json::str(item.name.clone())),
         ("entry_path", Json::path(&item.dir)),
         (
@@ -638,20 +464,6 @@ pub fn item_json(item: &Item) -> Json {
                 Err(e) => Json::str(e.clone()),
                 Ok(_) => Json::Null,
             },
-        ),
-    ])
-}
-
-fn list_json(items: &[Item], errors: &[String], started: i64, restored: Option<&Path>) -> Json {
-    Json::Obj(vec![
-        ("schema", Json::str(output::SCHEMA_RESTORE)),
-        ("version", Json::str(crate::commands::VERSION)),
-        ("generated_at", Json::str(output::rfc3339(started))),
-        ("restored", Json::opt(restored, Json::path)),
-        ("trash", Json::Arr(items.iter().map(item_json).collect())),
-        (
-            "errors",
-            Json::Arr(errors.iter().map(|e| Json::str(e.clone())).collect()),
         ),
     ])
 }

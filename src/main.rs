@@ -14,6 +14,8 @@ mod jsonread;
 mod output;
 mod policy;
 mod remove;
+mod removed;
+mod restore;
 mod run;
 mod service;
 mod trash;
@@ -49,7 +51,7 @@ fn main() -> ExitCode {
         cli::Command::Scan(options) => commands::scan(&options),
         cli::Command::Explain(options) => commands::explain(&options),
         cli::Command::Remove(options) => remove::remove(&options),
-        cli::Command::Restore(options) => trash::command(&options),
+        cli::Command::Restore(options) => restore::command(&options),
     };
     ExitCode::from(code)
 }
