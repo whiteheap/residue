@@ -4,7 +4,10 @@
 //! command and matched against each worktree. The answer has three states,
 //! never two: a process was seen using the directory (`in_use`), none of
 //! the processes the probe could inspect was (`not_observed`), or the probe
-//! failed and nothing is known (`unknown`). `not_observed` is not proof of
+//! failed or reads too little to show that none was (`unknown`). A probe
+//! that does not read open files (`Seen::limits`) can show a use, never its
+//! absence, so where it finds none the answer is `unknown`, which keeps the
+//! worktree. `not_observed` is not proof of
 //! inactivity: processes owned by other users, in containers or on other
 //! machines are outside what a same-user probe can see, and a process can
 //! open the directory a moment later.
@@ -15,7 +18,9 @@ use std::path::Path;
 #[derive(Clone)]
 pub struct Unavailable {
     /// Stable reason code: `probe_missing`, `timeout`, `probe_failed`,
-    /// `parse_error` or `unsupported`.
+    /// `parse_error`, `unsupported`, or `partial_probe` (the probe found no
+    /// use but does not read open files, so it cannot show the directory
+    /// is unused).
     pub reason: &'static str,
     pub detail: String,
 }
@@ -31,7 +36,10 @@ pub struct Seen {
     pub inspected: usize,
     pub total: Option<usize>,
     /// What the backend reads of each process, when that is less than its
-    /// working directory and open files. Said in every `not_observed` answer.
+    /// working directory and open files. When set, a directory with a use
+    /// is `in_use` and one without is `unknown` (`partial_probe`), never
+    /// `not_observed`: a process can hold a file open inside it while its
+    /// working directory is elsewhere.
     pub limits: Option<&'static str>,
 }
 
@@ -78,15 +86,27 @@ impl Snapshot {
                 hits.push((item.pid, item.command.clone()));
             }
         }
-        if hits.is_empty() {
-            Evidence::NotObserved
-        } else {
+        if !hits.is_empty() {
             hits.sort();
-            Evidence::InUse(hits)
+            return Evidence::InUse(hits);
+        }
+        match seen.limits {
+            None => Evidence::NotObserved,
+            // Finding no use is evidence of no use only when the probe
+            // reads open files too; this one does not, so it cannot show
+            // that the directory is unused.
+            Some(limits) => Evidence::Unknown(Unavailable {
+                reason: "partial_probe",
+                detail: format!(
+                    "{} reads {limits}, so it cannot show that no process is using it",
+                    self.backend
+                ),
+            }),
         }
     }
 
-    /// What a `not_observed` answer covers, in words.
+    /// What the snapshot covers, in words: the header of `scan` and
+    /// `explain`, and every `not_observed` answer.
     pub fn scope(&self) -> String {
         match &self.state {
             Ok(seen) => {
@@ -486,7 +506,8 @@ mod platform {
 /// stand in: on NetBSD and OpenBSD it names an open file only by mount
 /// point and inode ("Normally the name cannot be determined", fstat(1)), so
 /// it cannot say whether a process is inside a worktree. Open files are not
-/// read, and every `not_observed` answer says so.
+/// read, so `limits` is set: a worktree with no use found is `unknown`,
+/// never `not_observed`, and nothing here is a removal candidate.
 #[cfg(any(target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))]
 mod platform {
     use super::{Seen, Snapshot, Use, unavailable};
@@ -818,5 +839,70 @@ mod platform {
             "unsupported",
             "residue has no process probe for this operating system".into(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The activity decision for one directory, on synthetic snapshots: a
+    //! probe that reads open files may answer `not_observed`; one that does
+    //! not (`limits`) answers `in_use` or `unknown`, never `not_observed`.
+
+    use super::{Evidence, Seen, Snapshot, Use};
+    use std::path::Path;
+
+    fn snapshot(limits: Option<&'static str>) -> Snapshot {
+        Snapshot {
+            backend: "test",
+            state: Ok(Seen {
+                uses: vec![Use {
+                    pid: 1,
+                    command: "sleep".into(),
+                    path: b"/w/busy/src".to_vec(),
+                }],
+                inspected: 1,
+                total: Some(1),
+                limits,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_full_probe_finding_no_use_is_not_observed() {
+        let e = snapshot(None).evidence(Path::new("/w/idle"));
+        assert_eq!(e.code(), "not_observed");
+    }
+
+    #[test]
+    fn a_partial_probe_finding_no_use_is_unknown() {
+        let s = snapshot(Some("working directories only, not open files"));
+        let Evidence::Unknown(u) = s.evidence(Path::new("/w/idle")) else {
+            panic!("a partial probe with no use found must be unknown");
+        };
+        assert_eq!(u.reason, "partial_probe");
+        assert_eq!(
+            u.detail,
+            "test reads working directories only, not open files, so it cannot show that no process is using it"
+        );
+    }
+
+    #[test]
+    fn a_use_is_in_use_with_either_probe() {
+        for limits in [None, Some("working directories only, not open files")] {
+            let Evidence::InUse(procs) = snapshot(limits).evidence(Path::new("/w/busy")) else {
+                panic!("a use inside the directory must be in_use");
+            };
+            assert_eq!(procs, vec![(1, "sleep".to_string())]);
+        }
+    }
+
+    #[test]
+    fn a_sibling_with_a_shared_prefix_is_not_a_use() {
+        let s = snapshot(Some("working directories only, not open files"));
+        assert_eq!(s.evidence(Path::new("/w/bus")).code(), "unknown");
+        assert_eq!(
+            snapshot(None).evidence(Path::new("/w/bus")).code(),
+            "not_observed"
+        );
     }
 }

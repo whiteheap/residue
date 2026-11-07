@@ -2,7 +2,10 @@
 # End-to-end check of a residue binary on the machine it runs on. CI runs it
 # on every platform residue supports. It builds a scratch repository, checks
 # three verdicts (one of them needs the activity probe to see a process),
-# then removes the candidate and checks that its branch stayed.
+# then removes the candidate and checks that its branch stayed. On NetBSD,
+# OpenBSD and DragonFly (scripts/partial-probe.sh) the clean worktree is no
+# candidate: it must be `unknown`, for the probe's reason, and `remove` must
+# keep it.
 #
 #   sh .github/smoke.sh PATH/TO/residue
 #
@@ -11,6 +14,9 @@ set -eu
 
 residue=$1
 case $residue in /*) ;; *) residue="$PWD/$residue" ;; esac
+here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=SCRIPTDIR/../scripts/partial-probe.sh
+. "$here/../scripts/partial-probe.sh"
 S=$(mktemp -d "${TMPDIR:-/tmp}/residue-smoke.XXXXXX")
 busy=
 # `wait` returns the killed process's status; `|| true` keeps it from
@@ -48,11 +54,34 @@ expect() {
     exit 1
   fi
 }
-expect 'candidate .*worktrees/clean'
 expect 'keep .*worktrees/env'
 expect 'in use: sleep\['
 
-"$residue" remove --yes .worktrees/clean
-test ! -e .worktrees/clean
+if [ -z "$partial_probe" ]; then
+  expect 'candidate .*worktrees/clean'
+  "$residue" remove --yes .worktrees/clean
+  test ! -e .worktrees/clean
+  git rev-parse --verify -q clean > /dev/null
+  echo "smoke: ok"
+  exit 0
+fi
+
+# The probe found no use of clean, and cannot show it is unused.
+skip_partial "remove the candidate"
+expect 'unknown .*worktrees/clean'
+expect "$partial_probe_short_re"
+out=$("$residue" explain .worktrees/clean)
+printf '%s\n' "$out"
+expect '^verdict +unknown'
+expect "^ +unknown +activity +activity unknown: .*$partial_probe_detail \(partial_probe\)"
+set +e
+out=$("$residue" remove --yes .worktrees/clean)
+st=$?
+set -e
+printf '%s\n' "$out"
+[ "$st" = 3 ] || { echo "smoke: remove of clean exited $st, want 3" >&2; exit 1; }
+expect "worktrees/clean +unknown: $partial_probe_short_re"
+test -d .worktrees/clean
+git worktree list --porcelain | grep -q "^worktree .*/\.worktrees/clean\$"
 git rev-parse --verify -q clean > /dev/null
-echo "smoke: ok"
+echo "smoke: ok (clean kept as activity unknown)"

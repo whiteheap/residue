@@ -10,9 +10,14 @@
 # changed worktree must be skipped: exit status 3, a reason that says what
 # changed since the user confirmed, and the worktree still in place and
 # registered. The control cases change nothing and must be removed (or
-# moved to the trash). Runs on macOS, Linux and FreeBSD; needs bash, git,
+# moved to the trash). Runs on macOS, Linux and the BSDs; needs bash, git,
 # script and pgrep. A run that does not end within 60 s of the answer is
 # stopped with everything it started, and fails.
+#
+# On NetBSD, OpenBSD and DragonFly (scripts/partial-probe.sh) no worktree
+# is a candidate, so no prompt appears and every case is skipped by name.
+# There the check is instead that `remove` under a terminal keeps the clean
+# worktree as `unknown` for the probe's reason, without asking.
 set -euo pipefail
 
 bin=${1:-target/release/residue}
@@ -21,6 +26,8 @@ case $bin in
 *) bin=$PWD/$bin ;;
 esac
 [ -x "$bin" ] || { echo "race-check: no executable at $bin; run cargo build --release first" >&2; exit 2; }
+# shellcheck source=SCRIPTDIR/partial-probe.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/partial-probe.sh"
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/residue-race.XXXXXX")
 # Stop a process and everything it started (script, sh, residue).
@@ -172,6 +179,10 @@ registered() {
 run_case() {
     name=$1 change=$2 expect=$3
     shift 3
+    if [ -n "$partial_probe" ]; then
+        skip_partial "$name"
+        return
+    fi
     ${setup:-make_repo}
     out=$work/$name.out
     start "$out" remove "$@" "$wt"
@@ -208,7 +219,38 @@ run_case() {
     passes=$((passes + 1))
 }
 
+# NetBSD, OpenBSD and DragonFly: the clean worktree the cases start from is
+# `unknown` there, so `remove` under a terminal must keep it without a
+# prompt, exit 3, and name the probe's reason.
+partial_case() {
+    name=kept-unknown
+    make_repo
+    out=$work/$name.out
+    start "$out" remove "$wt"
+    if await_prompt "$out"; then
+        finish
+        fail "residue asked to remove a worktree its probe cannot show unused"
+        return
+    fi
+    finish
+    [ "$status" = 3 ] || { fail "exit $status, want 3"; return; }
+    tr -d '\r' <"$out" | grep -q -E "worktrees/w +unknown: $partial_probe_short_re" || { fail "no line matching: worktrees/w unknown: $partial_probe_short"; return; }
+    [ -d "$wt" ] || { fail "the worktree is gone"; return; }
+    registered || { fail "Git no longer lists the worktree at $wt"; return; }
+    local leftover
+    for leftover in "$repo"/.worktrees/.*.residue-removing-*; do
+        [ ! -e "$leftover" ] || { fail "$leftover was left behind"; return; }
+    done
+    if [ -n "$(ls -A "$repo/.git/residue-trash" 2>/dev/null)" ]; then
+        fail "a trash entry was left behind"
+        return
+    fi
+    echo "ok   $name: $(tr -d '\r' <"$out" | grep -E 'worktrees/w +unknown' | sed 's/^ *//' | head -1)"
+    passes=$((passes + 1))
+}
+
 "$bin" --version
+[ -z "$partial_probe" ] || partial_case
 run_case control ':' '^removed .*\.worktrees/w'
 run_case untracked 'echo notes >notes.md' 'skipped .*changed since you confirmed: 1 untracked'
 run_case modified 'echo edit >>README.md' 'skipped .*changed since you confirmed: 1 change'
