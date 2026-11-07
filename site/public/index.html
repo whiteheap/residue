@@ -14,7 +14,10 @@
   <body>
     <header class="site-header wrap">
       <a class="wordmark" href="/">
-        <img src="/logo.svg" alt="" width="28" height="31">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="/logo-dark.svg">
+          <img src="/logo.svg" alt="" width="28" height="28">
+        </picture>
         residue
       </a>
       <nav aria-label="Project">
@@ -34,7 +37,10 @@
             <a class="button" href="https://github.com/whiteheap/residue">View source</a>
           </p>
         </div>
-        <img class="diagram" src="/how-it-works.svg" width="420" height="420" alt="Chart. A repository leads to its linked worktrees, then checks, then a report. Read only ends at scan and explain, which read and stop. A separate arrow, you or watch, enters remove, then fresh checks. Block, unknown, or changed leads to stays. All pass leads to git remove without --force, or to the trash for restore. Scan does not lead to deletion.">
+        <picture class="diagram">
+          <source media="(prefers-color-scheme: dark)" srcset="/how-it-works-dark.svg">
+          <img src="/how-it-works.svg" width="420" height="504" alt="Chart. A repository leads to its linked worktrees, then checks, then a report. Read only ends at scan and explain, which read and stop. A separate arrow, you or watch, enters remove, then fresh checks. The left arrow from fresh checks ends at stays when a check blocks, is unknown, or the worktree changed. A different pair of arrows, only when every check passes, goes to git remove without --force or to the trash for restore. The block path does not continue to deletion.">
+        </picture>
       </section>
 
       <section id="install" class="section wrap" aria-labelledby="install-title">

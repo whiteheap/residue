@@ -171,7 +171,7 @@ pre {
   text-decoration: none;
 }
 
-.wordmark img {
+.wordmark picture {
   flex: none;
   inline-size: 1.75rem;
 }
@@ -265,7 +265,8 @@ pre {
   }
 }
 
-/* Drawn at 420 by 420; never wider, so its labels stay at their drawn size. */
+/* Shown at 420 by 504 (drawn at 500 by 600); never wider, so its labels stay
+   at that size. A light and a dark drawing, picked by the reader's setting. */
 .diagram {
   flex: 0 1 26.25rem;
   margin-inline: auto;

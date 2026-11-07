@@ -7,7 +7,7 @@ One static page that introduces residue and sends readers to the [README](../REA
 | `public/index.html` | The page: copy, commands and links |
 | `public/404.html` | The page for an unknown path, served with status 404 |
 | `public/style.css` | All styles. System fonts, grays only, light and dark from the reader's setting |
-| `public/logo.svg`, `public/how-it-works.svg` | Copies of `docs/assets/`, the owner. Also the favicon |
+| `public/logo.svg`, `public/how-it-works.svg` and their `-dark.svg` pair | Copies of `docs/assets/`, the owner. Each page picks the dark one with `<picture>` when the reader's setting is dark. `logo.svg` is also the favicon |
 | `public/_headers` | Response headers: Content Security Policy, `nosniff`, no framing, referrer and permissions policies. Cloudflare applies it and does not serve it |
 | `wrangler.jsonc` | The Worker: assets only, no script, `public/` as the only upload, 404 page, workers.dev on, preview URLs off |
 | `check.sh` | The static checks below |
@@ -19,7 +19,7 @@ No JavaScript, no web font, no analytics, no cookies, no forms, nothing loaded f
 - Every command on the page is copied exactly from the README, and so is the minimum Git version. If the README changes one, change the page in the same pull request.
 - Link to README sections for detail instead of copying flag tables, install alternatives or release notes. Do not add a version number: the page links to the latest release instead.
 - The caveat section stays visible and keeps its four points: residue deletes directories, the activity probe cannot see everything, a write can still land after the last check, reclaimable space is an estimate. The README's "What removal deletes" and "Limits" are their owners.
-- After a change to `docs/assets/logo.svg` or `how-it-works.svg`, copy it again: `cp docs/assets/logo.svg docs/assets/how-it-works.svg site/public/`.
+- After a change to the logo or the chart in `docs/assets/`, light or dark, copy all four again: `cp docs/assets/logo.svg docs/assets/logo-dark.svg docs/assets/how-it-works.svg docs/assets/how-it-works-dark.svg site/public/`.
 - A new file in `public/` is published. Add it to the allowlist in `check.sh` on purpose, or keep it out of `public/`.
 
 ## Check it

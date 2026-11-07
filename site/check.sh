@@ -3,7 +3,8 @@
 # Reads files only; needs no network and no Cloudflare account.
 #
 # 1. site/public holds only the files the site serves.
-# 2. The logo and the chart are byte-identical to docs/assets, their owner.
+# 2. The logo and the chart, light and dark, are byte-identical to
+#    docs/assets, their owner.
 # 3. Every command on the page appears verbatim in README.md, and so does the
 #    minimum Git version.
 # 4. Every local path and #fragment the pages link to exists.
@@ -30,8 +31,10 @@ ok() {
 # 1. The publish directory allowlist.
 expected='404.html
 _headers
+how-it-works-dark.svg
 how-it-works.svg
 index.html
+logo-dark.svg
 logo.svg
 style.css'
 actual=$(cd "$public" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)
@@ -44,7 +47,7 @@ else
 fi
 
 # 2. Copies of the README artwork.
-for asset in logo.svg how-it-works.svg; do
+for asset in logo.svg logo-dark.svg how-it-works.svg how-it-works-dark.svg; do
   if cmp -s "$root/docs/assets/$asset" "$public/$asset"; then
     ok "$asset matches docs/assets/$asset"
   else
