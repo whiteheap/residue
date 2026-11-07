@@ -12,6 +12,8 @@ use crate::inspect::{self, Report, Verdict};
 use crate::json::Json;
 use crate::output::{self, Places, Style, clean};
 use crate::policy::{GIT_CONFIG_KEY, Policy};
+use crate::remove::{self, Leftover};
+use crate::trash;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -89,18 +91,35 @@ pub fn scan(options: &Options) -> u8 {
         })
         .collect();
     let mut reports = inspect::all(&jobs, &snapshot, &policy).into_iter();
-    let mut grouped: Vec<(&Repo, Vec<Report>, Option<Space>)> = Vec::new();
+    let mut errors = found.errors.clone();
+    let mut grouped: Vec<Group> = Vec::new();
     for repo in &found.repos {
         let mut list: Vec<Report> = reports.by_ref().take(repo.linked.len()).collect();
         list.sort_by_key(|r| std::cmp::Reverse(r.usage.as_ref().map_or(0, |u| u.allocated)));
         let space = fsinfo::space(&repo.main.path)
             .or_else(|_| fsinfo::space(&repo.common_dir))
             .ok();
-        grouped.push((repo, list, space));
+        let trash =
+            trash::list(&repo.common_dir, &repo.command_dir(), &repo.trash).unwrap_or_else(|e| {
+                errors.push(e);
+                Vec::new()
+            });
+        let leftovers = repo
+            .interrupted
+            .iter()
+            .filter_map(|e| Leftover::of(e, &repo.command_dir()))
+            .collect();
+        grouped.push(Group {
+            repo,
+            list,
+            space,
+            trash,
+            leftovers,
+        });
     }
     let candidates: Vec<&Report> = grouped
         .iter()
-        .flat_map(|(_, list, _)| list.iter())
+        .flat_map(|g| g.list.iter())
         .filter(|r| r.verdict == Verdict::Candidate)
         .collect();
     let allocated: u64 = candidates
@@ -113,20 +132,33 @@ pub fn scan(options: &Options) -> u8 {
         .filter_map(|r| r.usage.as_ref())
         .map(|u| u.reclaimable)
         .sum();
-    let total = grouped.iter().map(|(_, l, _)| l.len()).sum::<usize>();
+    let total = grouped.iter().map(|g| g.list.len()).sum::<usize>();
+    let trashed = grouped.iter().map(|g| g.trash.len()).sum::<usize>();
+    let leftovers: Vec<&Leftover> = grouped.iter().flat_map(|g| g.leftovers.iter()).collect();
 
     if options.json {
         let repos = grouped
             .iter()
-            .map(|(repo, list, space)| {
+            .map(|g| {
                 Json::Obj(vec![
-                    ("common_dir", Json::path(&repo.common_dir)),
-                    ("main_path", Json::path(&repo.main.path)),
-                    ("bare", Json::Bool(repo.main.bare)),
-                    ("free_space", Json::opt(space.as_ref(), output::space_json)),
+                    ("common_dir", Json::path(&g.repo.common_dir)),
+                    ("main_path", Json::path(&g.repo.main.path)),
+                    ("bare", Json::Bool(g.repo.main.bare)),
+                    (
+                        "free_space",
+                        Json::opt(g.space.as_ref(), output::space_json),
+                    ),
                     (
                         "worktrees",
-                        Json::Arr(list.iter().map(output::report_json).collect()),
+                        Json::Arr(g.list.iter().map(output::report_json).collect()),
+                    ),
+                    (
+                        "trash",
+                        Json::Arr(g.trash.iter().map(trash::item_json).collect()),
+                    ),
+                    (
+                        "interrupted",
+                        Json::Arr(g.leftovers.iter().map(Leftover::json).collect()),
                     ),
                 ])
             })
@@ -164,7 +196,7 @@ pub fn scan(options: &Options) -> u8 {
             ),
             (
                 "errors",
-                Json::Arr(found.errors.iter().map(|e| Json::str(e.clone())).collect()),
+                Json::Arr(errors.iter().map(|e| Json::str(e.clone())).collect()),
             ),
             (
                 "summary",
@@ -173,6 +205,8 @@ pub fn scan(options: &Options) -> u8 {
                     ("candidates", Json::UInt(candidates.len() as u64)),
                     ("candidate_allocated_bytes", Json::UInt(allocated)),
                     ("candidate_reclaimable_bytes", Json::UInt(reclaimable)),
+                    ("trash_entries", Json::UInt(trashed as u64)),
+                    ("interrupted_removals", Json::UInt(leftovers.len() as u64)),
                 ]),
             ),
         ]);
@@ -188,34 +222,57 @@ pub fn scan(options: &Options) -> u8 {
         header(started),
         clean(&snapshot.scope())
     )));
-    for (repo, list, _) in &grouped {
-        let size: u64 = list
+    for g in &grouped {
+        let size: u64 = g
+            .list
             .iter()
             .filter_map(|r| r.usage.as_ref())
             .map(|u| u.allocated)
             .sum();
-        let kind = if repo.main.bare { " (bare)" } else { "" };
+        let kind = if g.repo.main.bare { " (bare)" } else { "" };
         out.push('\n');
-        if list.is_empty() {
+        if g.list.is_empty() {
             out.push_str(&format!(
                 "{}{kind} · no linked worktrees\n",
-                style.bold(&places.show(&repo.main.path))
+                style.bold(&places.show(&g.repo.main.path))
             ));
-            continue;
+        } else {
+            out.push_str(&format!(
+                "{}{kind} · {} linked worktree{} · {}\n",
+                style.bold(&places.show(&g.repo.main.path)),
+                g.list.len(),
+                if g.list.len() == 1 { "" } else { "s" },
+                output::bytes(size)
+            ));
         }
-        out.push_str(&format!(
-            "{}{kind} · {} linked worktree{} · {}\n",
-            style.bold(&places.show(&repo.main.path)),
-            list.len(),
-            if list.len() == 1 { "" } else { "s" },
-            output::bytes(size)
-        ));
-        for report in list {
+        for report in &g.list {
             out.push_str(&output::scan_entry(report, &places, &style));
         }
+        if !g.trash.is_empty() {
+            let bytes: u64 = g
+                .trash
+                .iter()
+                .filter_map(|i| i.record.as_ref().ok().and_then(|r| r.allocated))
+                .sum();
+            out.push_str(&format!(
+                "  {}\n",
+                style.dim(&format!(
+                    "trash: {} entr{} · {} · list or restore: residue restore · a remove run purges entries older than --keep-trash",
+                    g.trash.len(),
+                    if g.trash.len() == 1 { "y" } else { "ies" },
+                    output::bytes(bytes)
+                ))
+            ));
+        }
     }
-    if found.repos.is_empty() && found.errors.is_empty() {
+    if found.repos.is_empty() && errors.is_empty() {
         out.push_str("\nno Git repositories found\n");
+    }
+    if !leftovers.is_empty() {
+        out.push_str(&format!("\n{}\n", remove::LEFTOVER_TITLE));
+        for l in &leftovers {
+            out.push_str(&l.text(&places, &style));
+        }
     }
     if !found.orphans.is_empty() {
         out.push_str(
@@ -229,16 +286,16 @@ pub fn scan(options: &Options) -> u8 {
             ));
         }
     }
-    if !found.errors.is_empty() {
+    if !errors.is_empty() {
         out.push_str("\ncould not inspect:\n");
-        for e in &found.errors {
+        for e in &errors {
             out.push_str(&format!("  {}\n", clean(e)));
         }
     }
     let mut spaces: BTreeMap<u64, (&Repo, Space)> = BTreeMap::new();
-    for (repo, _, space) in &grouped {
-        if let Some(space) = space {
-            spaces.entry(space.device).or_insert((repo, *space));
+    for g in &grouped {
+        if let Some(space) = g.space {
+            spaces.entry(space.device).or_insert((g.repo, space));
         }
     }
     if !spaces.is_empty() {
@@ -267,6 +324,16 @@ pub fn scan(options: &Options) -> u8 {
     }
     print!("{out}");
     0
+}
+
+/// One repository of a scan: its judged worktrees, free space, trash and
+/// interrupted removals.
+struct Group<'a> {
+    repo: &'a Repo,
+    list: Vec<Report>,
+    space: Option<Space>,
+    trash: Vec<trash::Item>,
+    leftovers: Vec<Leftover>,
 }
 
 /// A linked worktree named on the command line, with its repository.
@@ -309,11 +376,7 @@ pub fn locate(path: &Path) -> Result<Target, String> {
         });
     };
     let entry = entries.remove(position);
-    let repo = Repo {
-        common_dir,
-        main,
-        linked: entries,
-    };
+    let repo = Repo::new(common_dir, main, entries);
     Ok(Target {
         repo,
         entry,

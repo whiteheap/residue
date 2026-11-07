@@ -9,9 +9,13 @@
 //! the target.
 //!
 //! watch decides with `residue scan --json` and removes with `residue remove
-//! --yes --idle`, both run as child processes of this same binary. Every
-//! check, and the re-check right before a deletion, is exactly `remove`'s:
-//! watch only chooses when to ask. It never fetches.
+//! --yes --idle --no-trash`, both run as child processes of this same
+//! binary. Every check, and the re-check right before a deletion, is exactly
+//! `remove`'s: watch only chooses when to ask. It never fetches. It deletes
+//! rather than using the trash, which `--idle` would turn on: freeing the
+//! disk is its job, a trashed worktree keeps every byte until a later remove
+//! run purges it, and nothing would purge the trash of a repository where
+//! watch removes nothing more.
 //!
 //! It wakes on: a change under a repository's `refs/remotes`, `packed-refs`
 //! or `reftable` (a fetch or prune); the moment a waiting worktree passes
@@ -45,8 +49,10 @@ It removes a linked worktree of a repository at or under ROOT when:
                    worktrees unchanged for --idle go, largest first, until
                    free space is 5 points above --min-free
 
-Each removal is `residue remove --yes --idle`: every check runs, and runs
-again right before the deletion. Branches and commits are always kept.
+Each removal is `residue remove --yes --idle --no-trash`: every check runs,
+and runs again right before the deletion. It deletes rather than using the
+trash, and purges that repository's trash entries older than 7 days.
+Branches and commits are always kept.
 residue never fetches, so a deleted upstream is noticed after your next
 `git fetch --prune` (`git config --global fetch.prune true` makes that the
 default).
@@ -519,8 +525,9 @@ fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> usize 
     removed
 }
 
-/// Remove `worktrees` with `residue remove --yes --idle SPAN`, and log each
-/// result. Returns how many were removed.
+/// Remove `worktrees` with `residue remove --yes --idle SPAN --no-trash`,
+/// and log each result and each trash entry the run purged. Returns how
+/// many were removed.
 fn remove(
     exe: &Path,
     opts: &Options,
@@ -540,7 +547,14 @@ fn remove(
         return 0;
     }
     let mut cmd = Command::new(exe);
-    cmd.args(["remove", "--yes", "--json", "--idle", &span.text]);
+    cmd.args([
+        "remove",
+        "--yes",
+        "--json",
+        "--no-trash",
+        "--idle",
+        &span.text,
+    ]);
     for w in worktrees {
         cmd.arg(&w.path);
     }
@@ -567,14 +581,26 @@ fn remove(
     for result in doc.get("results").map(Value::items).unwrap_or(&[]) {
         let path = result.get("path").and_then(Value::str).unwrap_or("");
         let w = worktrees.iter().find(|w| w.path == path);
+        let size = w.map(|w| output::bytes(w.bytes)).unwrap_or_default();
+        let reason = w.map(|w| why(w)).unwrap_or_default();
         match result.get("result").and_then(Value::str) {
             Some("removed") => {
                 removed += 1;
-                let size = w.map(|w| output::bytes(w.bytes)).unwrap_or_default();
-                let reason = w.map(|w| why(w)).unwrap_or_default();
                 log(&format!(
                     "removed {} ({size}): {reason}",
                     output::home(path)
+                ));
+            }
+            // --no-trash makes this unreachable today; if a remove run ever
+            // trashes instead, the worktree is gone from its path all the
+            // same, and the log says where it went.
+            Some("trashed") => {
+                removed += 1;
+                let entry = result.get("trash_entry").and_then(Value::str).unwrap_or("");
+                log(&format!(
+                    "moved {} to the trash ({size}): {reason}; put it back with: residue restore {}",
+                    output::home(path),
+                    output::shell(Path::new(entry))
                 ));
             }
             other => {
@@ -585,6 +611,34 @@ fn remove(
                 log(&format!(
                     "kept {} ({}): {reason}",
                     output::home(path),
+                    other.unwrap_or("unknown result")
+                ));
+            }
+        }
+    }
+    // The same run purges the trash entries older than --keep-trash in the
+    // repositories of these worktrees; say which, so the log accounts for
+    // every byte it freed.
+    for purge in doc.get("purged").map(Value::items).unwrap_or(&[]) {
+        let entry = purge.get("entry");
+        let name = entry
+            .and_then(|e| e.get("entry"))
+            .and_then(Value::str)
+            .unwrap_or("(unnamed entry)");
+        let was = entry
+            .and_then(|e| e.get("original_path"))
+            .and_then(Value::str)
+            .map(|p| format!(" (was {})", output::home(p)))
+            .unwrap_or_default();
+        match purge.get("result").and_then(Value::str) {
+            Some("purged") => log(&format!("purged {name} from the trash{was}")),
+            other => {
+                let reason = purge
+                    .get("reason")
+                    .and_then(Value::str)
+                    .unwrap_or("no reason given");
+                log(&format!(
+                    "kept {name} in the trash{was} ({}): {reason}",
                     other.unwrap_or("unknown result")
                 ));
             }

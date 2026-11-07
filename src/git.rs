@@ -554,3 +554,66 @@ pub fn hidden_from_status(dir: &Path) -> Result<Vec<String>, String> {
     }
     Ok(hidden)
 }
+
+/// Run one `git worktree` subcommand that changes state, from `main` (the
+/// main checkout or the bare repository), and turn a refusal into an error
+/// that quotes Git.
+fn worktree_change(main: &Path, args: &[&OsStr]) -> Result<(), String> {
+    let exit = exec(main, args, QUERY_TIMEOUT)?;
+    if exit.success {
+        Ok(())
+    } else {
+        let words: Vec<String> = args
+            .iter()
+            .take(2)
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        Err(format!(
+            "git {} refused (exit {}): {}",
+            words.join(" "),
+            exit.code.map_or("signal".to_string(), |c| c.to_string()),
+            exit.stderr
+        ))
+    }
+}
+
+/// `git worktree move FROM TO`: one rename(2) by Git, which updates only
+/// this worktree's record. Git refuses a locked worktree, a destination
+/// that exists, and a move to another filesystem (it never copies).
+pub fn move_worktree(main: &Path, from: &Path, to: &Path) -> Result<(), String> {
+    worktree_change(
+        main,
+        &[
+            OsStr::new("worktree"),
+            OsStr::new("move"),
+            from.as_os_str(),
+            to.as_os_str(),
+        ],
+    )
+}
+
+pub fn lock_worktree(main: &Path, worktree: &Path, reason: &str) -> Result<(), String> {
+    worktree_change(
+        main,
+        &[
+            OsStr::new("worktree"),
+            OsStr::new("lock"),
+            OsStr::new("--reason"),
+            OsStr::new(reason),
+            worktree.as_os_str(),
+        ],
+    )
+}
+
+/// Only for a lock residue placed itself (`remove::REMOVING`,
+/// `trash::LOCK`); residue never unlocks anyone else's.
+pub fn unlock_worktree(main: &Path, worktree: &Path) -> Result<(), String> {
+    worktree_change(
+        main,
+        &[
+            OsStr::new("worktree"),
+            OsStr::new("unlock"),
+            worktree.as_os_str(),
+        ],
+    )
+}

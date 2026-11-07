@@ -17,6 +17,7 @@ use crate::policy::{Policy, RuleSource};
 pub const SCHEMA_SCAN: &str = "residue.scan/v1";
 pub const SCHEMA_EXPLAIN: &str = "residue.explain/v1";
 pub const SCHEMA_REMOVE: &str = "residue.remove/v1";
+pub const SCHEMA_RESTORE: &str = "residue.restore/v1";
 
 pub struct Style {
     on: bool,
@@ -144,6 +145,19 @@ pub fn bytes(n: u64) -> String {
     }
 }
 
+/// `1,204,331`: every digit, grouped in threes, for counts a reader compares.
+pub fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 pub fn count(n: u64) -> String {
     match n {
         0..=9_999 => n.to_string(),
@@ -269,6 +283,32 @@ pub fn rfc3339(seconds: i64) -> String {
         (rem % 3_600) / 60,
         rem % 60
     )
+}
+
+/// `20261107T040000Z`: UTC, for names that sort by time.
+pub fn stamp(seconds: i64) -> String {
+    let (year, month, day, rem) = civil(seconds);
+    format!(
+        "{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z",
+        rem / 3_600,
+        (rem % 3_600) / 60,
+        rem % 60
+    )
+}
+
+/// A path as a shell word: unchanged when it holds only characters no
+/// shell treats specially, otherwise in single quotes.
+pub fn shell(path: &Path) -> String {
+    let text = clean(&path.to_string_lossy());
+    let plain = !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"@%_+=:,./-".contains(&b));
+    if plain {
+        text
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
 }
 
 /// `HH:MM:SS +02:00` in the local time zone, with its UTC offset so a log
@@ -593,9 +633,9 @@ pub fn idle_json(policy: &Policy) -> Json {
 }
 
 /// `rule_sources` at the top of a document: the rules beyond the built-in
-/// list that apply to every repository in this run, from the residue
-/// config file and `--regenerable`. Each worktree's own `rule_sources`
-/// lists the Git config rules of its repository.
+/// list that apply to every repository in this run, from `--regenerable`
+/// and the residue config file. Each worktree's own `rule_sources` is its
+/// effective list: these, then its repository's Git config rules.
 pub fn policy_sources_json(policy: &Policy) -> Json {
     Json::Arr(policy.sources.iter().map(rule_source_json).collect())
 }

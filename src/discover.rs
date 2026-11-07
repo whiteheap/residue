@@ -21,7 +21,49 @@ pub struct Repo {
     pub common_dir: PathBuf,
     /// The main worktree, or the bare repository directory.
     pub main: Entry,
+    /// The linked worktrees residue judges: every one Git lists except the
+    /// two kinds residue moved aside itself, below.
     pub linked: Vec<Entry>,
+    /// Worktrees in this repository's trash (`trash::DIR`).
+    pub trash: Vec<Entry>,
+    /// Worktrees a `remove` moved aside to delete and then never finished
+    /// (`.NAME.residue-removing-PID`): residue was stopped partway.
+    pub interrupted: Vec<Entry>,
+}
+
+impl Repo {
+    /// Sort Git's list of linked worktrees into the three kinds.
+    pub fn new(common_dir: PathBuf, main: Entry, entries: Vec<Entry>) -> Repo {
+        let trash_root = crate::trash::root(&common_dir);
+        let mut repo = Repo {
+            common_dir,
+            main,
+            linked: Vec::new(),
+            trash: Vec::new(),
+            interrupted: Vec::new(),
+        };
+        for entry in entries {
+            let path = git::canonical(&entry.path).unwrap_or_else(|_| entry.path.clone());
+            if path.starts_with(&trash_root) {
+                repo.trash.push(entry);
+            } else if crate::remove::original_of(&entry.path).is_some() {
+                repo.interrupted.push(entry);
+            } else {
+                repo.linked.push(entry);
+            }
+        }
+        repo
+    }
+
+    /// Where to run `git worktree` commands: the main checkout, or the
+    /// common directory when the main checkout is gone or bare.
+    pub fn command_dir(&self) -> PathBuf {
+        if self.main.path.exists() {
+            self.main.path.clone()
+        } else {
+            self.common_dir.clone()
+        }
+    }
 }
 
 /// A checkout whose `.git` file points at a Git directory that no longer
@@ -72,11 +114,7 @@ pub fn find(roots: &[PathBuf]) -> Found {
         match git::worktrees(&dir) {
             Ok(mut entries) => {
                 let main = entries.remove(0);
-                found.repos.push(Repo {
-                    common_dir,
-                    main,
-                    linked: entries,
-                });
+                found.repos.push(Repo::new(common_dir, main, entries));
             }
             Err(e) => found.errors.push(format!("{}: {e}", dir.display())),
         }

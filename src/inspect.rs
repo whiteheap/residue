@@ -204,8 +204,13 @@ pub struct Report {
     /// The newest of the three change signals. `Ok(None)` when it was not
     /// measured (a stale or unidentified worktree).
     pub last_change: Result<Option<LastChange>, String>,
-    /// This repository's Git config rules, with their source.
+    /// Every rule beyond the built-in list that applies to this worktree,
+    /// with its source: `--regenerable`, the residue config file, then Git
+    /// config in the order Git read it.
     pub rule_sources: Vec<RuleSource>,
+    /// What `remove` compares right before it acts. An error when residue
+    /// could not record it, which keeps the worktree.
+    pub fingerprint: Result<Fingerprint, String>,
 }
 
 impl Report {
@@ -223,6 +228,7 @@ impl Report {
             usage: None,
             last_change: Ok(None),
             rule_sources: Vec::new(),
+            fingerprint: Err("not measured".into()),
         }
     }
 
@@ -358,18 +364,15 @@ pub fn worktree(entry: &Entry, common_dir: &Path, snapshot: &Snapshot, policy: &
     let repo = RepoRules::read(&canonical);
     let rules = policy.with(&repo.rules);
     let buckets: Vec<Bucket> = match &status {
-        Ok(s) => s
-            .ignored
-            .iter()
-            .map(|(text, rel)| Bucket {
-                rel: rel.clone(),
-                expand: text.ends_with('/') && !rules.matches(text) && rules.reaches_inside(text),
-            })
-            .collect(),
+        Ok(s) => buckets_for(s, &rules),
         Err(_) => Vec::new(),
     };
     let usage = fsinfo::measure(&canonical, &buckets, &|rel| rules.matches(rel));
     r.last_change = last_change(&usage, &canonical, &identity.git_dir);
+    r.fingerprint = match &status {
+        Ok(s) => Fingerprint::of(entry.head.clone(), &identity.git_dir, s, &usage),
+        Err(e) => Err(e.clone()),
+    };
     check_status(&mut r, status, &repo, &rules, &buckets, &usage);
     check_index_flags(&mut r, &canonical);
     check_operation(&mut r, &identity.git_dir);
@@ -380,7 +383,7 @@ pub fn worktree(entry: &Entry, common_dir: &Path, snapshot: &Snapshot, policy: &
     if let Some(idle) = &policy.idle {
         check_idle(&mut r, idle);
     }
-    r.rule_sources = repo.values;
+    r.rule_sources = effective_sources(policy, repo.values);
     gather_facts(&mut r, entry, &canonical);
     r.finish()
 }
@@ -456,7 +459,7 @@ fn last_change(
 /// check keeps it (`block`); a last change residue could not read is
 /// `unknown`, which keeps it too. Reported right after `activity`, the
 /// other check about whether someone is using the worktree.
-fn check_idle(r: &mut Report, idle: &crate::cli::Idle) {
+fn check_idle(r: &mut Report, idle: &crate::cli::Span) {
     let now = crate::output::now();
     let (status, short, detail) = match &r.last_change {
         Ok(Some(c)) => {
@@ -1142,4 +1145,215 @@ pub fn all(jobs: &[(&Entry, &Path)], snapshot: &Snapshot, policy: &Policy) -> Ve
     // A worker that panicked re-raises its panic when the scope ends, so
     // every slot is filled by the time we get here.
     slots.into_iter().flatten().collect()
+}
+
+/// One walk bucket per ignored entry. A collapsed directory that no rule
+/// matches but a path rule reaches into is judged entry by entry.
+fn buckets_for(status: &git::Status, rules: &Rules) -> Vec<Bucket> {
+    status
+        .ignored
+        .iter()
+        .map(|(text, rel)| Bucket {
+            rel: rel.clone(),
+            expand: text.ends_with('/') && !rules.matches(text) && rules.reaches_inside(text),
+        })
+        .collect()
+}
+
+/// The rules beyond the built-in list that apply to one worktree, each with
+/// its source: `--regenerable` first, then the residue config file, then
+/// the repository's Git config rules in the order Git read them (system,
+/// global, local, worktree). Rules add up, so no source overrides another:
+/// a rule given twice is listed once per source, the most explicit first.
+fn effective_sources(policy: &Policy, repo: Vec<RuleSource>) -> Vec<RuleSource> {
+    policy.sources.iter().cloned().chain(repo).collect()
+}
+
+/// A modification time: seconds and nanoseconds.
+pub type Stamp = (i64, i64);
+
+/// What `remove` saw of one worktree when it made the plan. It is compared
+/// with the worktree's state right before the worktree is moved aside, and
+/// again after, so residue deletes what the plan showed or nothing.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Fingerprint {
+    /// The worktree's own Git directory (`.git/worktrees/NAME`). It stays
+    /// where it is when the checkout is moved.
+    pub git_dir: PathBuf,
+    pub head: Option<String>,
+    /// `index` and `logs/HEAD` in the Git directory; `None` when absent.
+    /// `logs/HEAD` is fine here, unlike for `--idle`: a `git gc` between
+    /// plan and removal only makes residue skip, never delete.
+    pub index: Option<Stamp>,
+    pub reflog: Option<Stamp>,
+    pub tracked: Vec<String>,
+    pub untracked: Vec<String>,
+    pub ignored: Vec<Print>,
+}
+
+/// One ignored entry as the walk measured it. `None` when the walk did not
+/// reach it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Print {
+    pub path: String,
+    pub files: Option<u64>,
+    pub bytes: Option<u64>,
+    pub newest: Option<Stamp>,
+}
+
+fn stamp(path: &Path) -> Result<Option<Stamp>, String> {
+    use std::os::unix::fs::MetadataExt;
+    match fs::symlink_metadata(path) {
+        Ok(m) => Ok(Some((m.mtime(), m.mtime_nsec()))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+    }
+}
+
+impl Fingerprint {
+    fn of(
+        head: Option<String>,
+        git_dir: &Path,
+        status: &git::Status,
+        usage: &io::Result<Usage>,
+    ) -> Result<Fingerprint, String> {
+        let usage = usage
+            .as_ref()
+            .map_err(|e| format!("cannot walk the worktree: {e}"))?;
+        let ignored = status
+            .ignored
+            .iter()
+            .enumerate()
+            .map(|(i, (path, _))| {
+                let b = usage.buckets.get(i).filter(|b| b.seen);
+                Print {
+                    path: path.clone(),
+                    files: b.map(|b| b.files),
+                    bytes: b.map(|b| b.bytes),
+                    newest: b.and_then(|b| b.newest),
+                }
+            })
+            .collect();
+        Ok(Fingerprint {
+            git_dir: git_dir.to_path_buf(),
+            head,
+            index: stamp(&git_dir.join("index"))?,
+            reflog: stamp(&git_dir.join("logs").join("HEAD"))?,
+            tracked: status.tracked.clone(),
+            untracked: status.untracked.clone(),
+            ignored,
+        })
+    }
+
+    /// The same measurement taken again at `dir`, the worktree's directory
+    /// now (after a move, its new path), with `head` as Git lists it there.
+    pub fn again(
+        &self,
+        dir: &Path,
+        head: Option<String>,
+        policy: &Policy,
+    ) -> Result<Fingerprint, String> {
+        let status = git::status(dir)?;
+        let repo = RepoRules::read(dir);
+        if let Some((_, problem)) = &repo.problem {
+            return Err(problem.clone());
+        }
+        let rules = policy.with(&repo.rules);
+        let buckets = buckets_for(&status, &rules);
+        let usage = fsinfo::measure(dir, &buckets, &|rel| rules.matches(rel));
+        Fingerprint::of(head, &self.git_dir, &status, &usage)
+    }
+
+    /// The first difference from `now`, as a sentence that names what
+    /// changed, such as `node_modules/ changed since you confirmed (1204 ->
+    /// 1388 files)`. `since` is `you confirmed` or `the plan`.
+    pub fn changed(&self, now: &Fingerprint, since: &str) -> Option<String> {
+        if self == now {
+            return None;
+        }
+        let short = |h: &Option<String>| {
+            h.as_deref()
+                .map_or("none".to_string(), |h| h[..h.len().min(12)].to_string())
+        };
+        if self.head != now.head {
+            return Some(format!(
+                "HEAD changed since {since} ({} -> {})",
+                short(&self.head),
+                short(&now.head)
+            ));
+        }
+        if self.tracked != now.tracked {
+            return Some(format!(
+                "tracked files changed since {since} (now {} staged or modified: {})",
+                now.tracked.len(),
+                examples(&now.tracked, 3)
+            ));
+        }
+        if self.untracked != now.untracked {
+            return Some(format!(
+                "untracked files changed since {since} (now {}: {})",
+                plural(now.untracked.len(), "entry", "entries"),
+                examples(&now.untracked, 3)
+            ));
+        }
+        for before in &self.ignored {
+            let Some(after) = now.ignored.iter().find(|p| p.path == before.path) else {
+                return Some(format!("{} disappeared since {since}", before.path));
+            };
+            if before == after {
+                continue;
+            }
+            let detail = match (before.files, after.files, before.bytes, after.bytes) {
+                (Some(a), Some(b), _, _) if a != b => {
+                    format!(
+                        "{} -> {} files",
+                        crate::output::grouped(a),
+                        crate::output::grouped(b)
+                    )
+                }
+                (_, _, Some(a), Some(b)) if a != b => {
+                    format!(
+                        "{} -> {} bytes",
+                        crate::output::grouped(a),
+                        crate::output::grouped(b)
+                    )
+                }
+                (Some(_), None, _, _) => "the walk no longer reaches it".to_string(),
+                _ => match after.newest {
+                    Some((secs, _)) => {
+                        format!("same size, modified at {}", crate::output::clock(secs))
+                    }
+                    None => "modified".to_string(),
+                },
+            };
+            return Some(format!("{} changed since {since} ({detail})", before.path));
+        }
+        if let Some(added) = now
+            .ignored
+            .iter()
+            .find(|p| !self.ignored.iter().any(|b| b.path == p.path))
+        {
+            return Some(format!(
+                "ignored {} appeared since {since}",
+                match (added.files, added.bytes) {
+                    (Some(f), Some(b)) => format!(
+                        "{} ({}, {})",
+                        added.path,
+                        plural(f as usize, "file", "files"),
+                        crate::output::bytes(b)
+                    ),
+                    _ => added.path.clone(),
+                }
+            ));
+        }
+        if self.index != now.index {
+            return Some(format!(
+                "its index changed since {since} (git add, commit, reset, checkout, or a git status that refreshed it)"
+            ));
+        }
+        if self.reflog != now.reflog {
+            return Some(format!("its HEAD reflog changed since {since}"));
+        }
+        Some(format!("its Git directory changed since {since}"))
+    }
 }

@@ -12,7 +12,7 @@
 #   3. A running watch notices `wip`'s upstream being deleted (a fetch
 #      --prune, no polling) and removes it within two minutes.
 #   4. --min-free 99.9 (disk pressure) removes the idle `local`.
-# Every branch stays.
+# Every branch stays, and nothing goes to the trash: watch deletes.
 set -eu
 
 residue=$1
@@ -66,6 +66,7 @@ grep -q "would remove .*worktrees/fix" "$S/log" || fail "dry run did not name fi
 grep -q "removed .*worktrees/fix" "$S/log" || fail "fix was not removed"
 [ ! -e .worktrees/fix ] || fail "fix still exists"
 [ -d .worktrees/wip ] && [ -d .worktrees/local ] || fail "removed more than fix"
+[ ! -e .git/residue-trash ] || fail "watch moved fix to the trash instead of deleting it"
 
 # 3. A running watch reacts to wip's upstream being pruned.
 "$residue" watch --grace 1m "$S" 2> "$S/log" &
@@ -90,6 +91,7 @@ echo "watch-smoke: running watch removed wip after ${i}s"
 "$residue" watch --once --min-free 99.9 --idle 1m "$S" 2> "$S/log" || fail "pressure run failed"
 grep -q "removed .*worktrees/local" "$S/log" || fail "pressure did not remove local"
 [ ! -e .worktrees/local ] || fail "local still exists"
+[ ! -e .git/residue-trash ] || fail "watch moved local to the trash instead of deleting it"
 
 for b in fix wip local; do
   git rev-parse --verify -q "$b" > /dev/null || fail "branch $b is gone"

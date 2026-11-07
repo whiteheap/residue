@@ -16,7 +16,7 @@ If residue removed, or would remove, a worktree holding uncommitted, untracked o
 
 Open an issue before you start on anything larger than a small fix, so we can agree on the behavior first.
 
-[AGENTS.md](AGENTS.md#invariants) lists the invariants: deletion only through `git worktree remove` without `--force`, an `unknown` check blocks like a failed one, three activity states, a fresh re-check before every removal, and one dependency. A change that weakens one of them needs an explicit decision recorded in [CHANGELOG.md](CHANGELOG.md), so raise it in an issue first.
+[AGENTS.md](AGENTS.md#invariants) lists the invariants: deletion only through `git worktree remove` without `--force`, an `unknown` check blocks like a failed one, three activity states, a fresh re-check before every removal and again after the move aside, and one dependency. A change that weakens one of them needs an explicit decision recorded in [CHANGELOG.md](CHANGELOG.md), so raise it in an issue first.
 
 To add a name to the regenerable list, open a pull request that names the tool that recreates the directory and links to its documentation. A name belongs on the list only when deleting it loses nothing that the tool cannot rebuild. A lock file or cache that belongs to one project does not go on the built-in list: that project adds it with `git config --add residue.regenerable PATH`.
 
@@ -42,9 +42,16 @@ Run what CI runs:
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked --release
+sh .github/smoke.sh ./target/release/residue
+sh .github/watch-smoke.sh ./target/release/residue
+bash scripts/race-check.sh
 ```
 
-residue has no automated test suite yet, so every change is also checked by running the release binary on real repositories. This script builds a scratch repository with one linked worktree in each common state. Save it as `~/scratch.sh` and run `bash ~/scratch.sh`:
+CI also runs `.github/service-smoke.sh`, which installs and removes a real login service; run it only on a machine where no `residue service` of yours is installed.
+
+`scripts/race-check.sh` is the race check. For each case it builds a scratch repository with one candidate worktree, starts the release binary's `remove` under a pseudo-terminal (`script`), waits for the prompt, and then changes the worktree: an untracked file, an edit to a tracked file, a new file inside the ignored `node_modules/`, or a new commit, with and without `--trash`. Then it types `yes` and checks for exit status 3, a `changed since you confirmed` reason, and the worktree still in place and registered. Two control cases change nothing and must be removed or moved to the trash. It takes under 15 seconds, needs only bash, git and `script`, cleans up after itself, and takes another binary as its argument: `bash scripts/race-check.sh /path/to/residue`. Run it for any change to `remove`, the checks or the walk, and add a case when you add a way for a worktree to change.
+
+Beyond the smoke tests and the race check, residue has no automated test suite, so every change is also checked by running the release binary on real repositories. This script builds a scratch repository with one linked worktree in each common state. Save it as `~/scratch.sh` and run `bash ~/scratch.sh`:
 
 ```sh
 set -eu
@@ -125,7 +132,7 @@ Then run `bash /scratch.sh` and the same `residue` commands, without the `./targ
 4. In the pull request description, list the exact platform, OS version and Git version you ran, and which commands you ran on which worktree states. If you covered a platform or state the README's "Tested on" table does not list, update the table.
 5. CI must pass on macOS and both Linux runners.
 
-Check ids (`ignored`, `activity`, ...) and the JSON fields under `residue.scan/v1`, `residue.explain/v1` and `residue.remove/v1` are a contract with scripts and coding agents. Add new fields and check ids freely. Do not rename or remove existing ones.
+Check ids (`ignored`, `activity`, ...) and the JSON fields under `residue.scan/v1`, `residue.explain/v1`, `residue.remove/v1` and `residue.restore/v1` are a contract with scripts and coding agents. Add new fields and check ids freely. Do not rename or remove existing ones.
 
 Add a dependency only when hand-written code would be riskier, and say why in the pull request.
 
