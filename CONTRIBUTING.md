@@ -34,6 +34,8 @@ cargo build
 
 [AGENTS.md](AGENTS.md#layout) maps each source file to what it owns. The [README](README.md) is the user contract: if your change alters what residue does, update the README in the same pull request.
 
+The Mac app is in `app/`, with its own setup and checks in [app/README.md](app/README.md) and rules in [app/AGENTS.md](app/AGENTS.md). It bundles the CLI from your checkout, so a change to a JSON document or a `watch` option is checked there too.
+
 ## Verify a change
 
 Run what CI runs:
@@ -137,7 +139,7 @@ Then run `bash /scratch.sh` and the same `residue` commands, without the `./targ
 4. In the pull request description, list the exact platform, OS version and Git version you ran, and which commands you ran on which worktree states. If you covered a platform or state [docs/platforms-and-testing.md](docs/platforms-and-testing.md) does not list, add it there and adjust the short summary under the README's "Tested on" heading.
 5. CI must pass on macOS and both Linux runners.
 
-Check ids (`ignored`, `activity`, ...) and the JSON fields under `residue.scan/v1`, `residue.explain/v1`, `residue.remove/v1` and `residue.restore/v1` are a contract with scripts and coding agents. Add new fields and check ids freely. Do not rename or remove existing ones.
+Check ids (`ignored`, `activity`, ...) and the JSON fields under `residue.scan/v1`, `residue.explain/v1`, `residue.remove/v1` and `residue.restore/v1` are a contract with scripts, coding agents and the Mac app. Add new fields and check ids freely. Do not rename or remove existing ones.
 
 Add a dependency only when hand-written code would be riskier, and say why in the pull request.
 

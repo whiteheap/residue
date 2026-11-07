@@ -1,0 +1,56 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "residue",
+  "identifier": "com.whiteheap.residue",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "sh scripts/sidecar.sh && pnpm dev",
+    "beforeBuildCommand": "sh scripts/sidecar.sh --check && pnpm build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "residue",
+        "width": 1180,
+        "height": 780,
+        "minWidth": 760,
+        "minHeight": 520,
+        "resizable": true,
+        "backgroundColor": "#000000",
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "app",
+      "dmg"
+    ],
+    "category": "DeveloperTool",
+    "shortDescription": "See and reclaim the storage Git worktrees take",
+    "copyright": "Copyright (c) 2026 Whiteheap",
+    "license": "MIT",
+    "homepage": "https://github.com/whiteheap/residue",
+    "externalBin": [
+      "binaries/residue"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.png"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "13.0",
+      "signingIdentity": "-"
+    }
+  }
+}

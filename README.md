@@ -18,7 +18,7 @@ Website: [residue.whiteheap.com](https://residue.whiteheap.com)
 
 A repository's linked worktrees are checked, then reported. `scan` and `explain` only read that report and stop. `remove` is separate: you run it, or `watch` chooses paths for it. From fresh checks, a block, an unknown, or a change keeps the worktree. Only when every check passes does `git worktree remove` delete it, without `--force`, after residue writes the record `restore` recreates it from; or the trash holds it for `restore`. A pass is not a guarantee, and age alone does not mean inactive.
 
-[Install](#install) · [Inspect](#inspect-a-worktree) · [Remove](#remove-a-worktree) · [Automate](#automate-cleanup) · [Reference](#reference)
+[Install](#install) · [Inspect](#inspect-a-worktree) · [Remove](#remove-a-worktree) · [Automate](#automate-cleanup) · [Mac app](#mac-app) · [Reference](#reference)
 
 <a id="what-it-does"></a>
 <a id="when-to-reach-for-it"></a>
@@ -44,7 +44,7 @@ brew install whiteheap/tap/residue
 
 `~/src/app` in the examples is a repository path. `PATH` is a linked worktree, not a subdirectory inside one.
 
-Signed apt, dnf, and pacman repositories, the key fingerprint, release archives, and `cargo install --locked --git https://github.com/whiteheap/residue --tag v0.0.7` are in [Install residue](docs/installation.md).
+Signed apt, dnf, and pacman repositories, the key fingerprint, release archives, and `cargo install --locked --git https://github.com/whiteheap/residue --tag v0.0.7 residue` are in [Install residue](docs/installation.md). On a Mac, the [Mac app](#mac-app) shows the same in a window, with residue inside.
 
 ## Inspect a worktree
 
@@ -299,6 +299,31 @@ git worktree lock --reason "agent paused, resume Monday" PATH
 ```
 
 The launchd plist, the systemd unit and timer, how to stop them, and the sweep's exit status are in [Automate residue](docs/automation.md#run-it-on-a-schedule).
+
+## Mac app
+
+The Mac app is residue in a window. It lists the linked worktrees under your code folders with their size and verdict, shows why each one is kept, moves the ones that can go to the trash, restores them, and turns automatic cleanup on or off. Every check, size and removal comes from the residue binary inside the app, which is this release's own residue, with the same version.
+
+Download [residue-macos.dmg](https://github.com/whiteheap/residue/releases/latest/download/residue-macos.dmg), open it, and drag residue to Applications. Every release from 0.0.8 on has it, and the link always serves the latest one. It needs macOS 13 or later, and runs natively on Apple silicon and Intel.
+
+### First launch
+
+The app is signed ad hoc, not with an Apple Developer ID, and it is not notarized yet. macOS blocks it the first time you open it. To open it once, and from then on like any other app:
+
+1. Open residue from Applications. macOS says it could not verify the app. Click **Done**.
+2. Open **System Settings > Privacy & Security**, scroll down to **Security**, and click **Open Anyway** next to the message about residue. The button is there for about an hour after you tried to open the app.
+3. macOS asks again: click **Open**, and enter your login password if it asks.
+
+Control-click > Open no longer skips this step: since macOS 15, Apple requires the Privacy & Security setting. Apple's own steps: [Open a Mac app from an unknown developer](https://support.apple.com/guide/mac-help/open-a-mac-app-from-an-unknown-developer-mh40616/mac) and [Safely open apps on your Mac](https://support.apple.com/en-us/102445). The DMG is in the release's `SHA256SUMS` and has a build-provenance attestation, like the archives: `gh attestation verify residue-macos.dmg --repo whiteheap/residue`.
+
+### What the app runs
+
+- **Removal** always uses the trash (`residue remove --trash`), and nothing moves until you confirm the plan residue shows. The Restore screen lists the trash and puts a worktree back, every file included, until a later removal or automatic cleanup in that repository purges trash entries older than 7 days. The branch and its commits always stay.
+- **Removal records** are not in the app yet. The purge, and every deletion by automatic cleanup, leaves one, so for 30 days `residue restore` in a terminal recreates the worktree on its branch and HEAD, without its ignored files: [Restore a removed worktree](#restore-a-removed-worktree).
+- **Automatic cleanup** is `residue service install FOLDERS` and `residue service uninstall`: the same `com.whiteheap.residue.watch` service as [Automate cleanup](#automate-cleanup), so the app shows a service you installed from a terminal, and the other way round. It deletes instead of using the trash; the app says so before you turn it on.
+- The service records the binary that installed it, so the app never installs it from the copy inside the app. It uses a `residue` you installed that is at least as new as the app's, such as `/opt/homebrew/bin/residue`, or else a copy at `~/Library/Application Support/com.whiteheap.residue/bin/residue`, which stays when the app moves or is deleted. The Automatic cleanup screen shows which binary the service runs and the command that turns it off from a terminal. Deleting the app leaves the service running.
+
+Building and changing the app: [app/README.md](app/README.md).
 
 ## Reference
 

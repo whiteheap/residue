@@ -143,11 +143,12 @@ jobs:
       - name: Checksums
         run: |
           # Every archive already listed (release.yml's four, and a FreeBSD one
-          # from an earlier run), except those this run rebuilt, then
+          # from an earlier run) and the Mac app (release.yml's
+          # residue-macos.dmg), except those this run rebuilt, then
           # everything this run built. A re-run replaces lines, never doubles.
           (cd pkgs && ls) > "$RUNNER_TEMP/built"
           {
-            grep -E '\.tar\.gz$' dist/SHA256SUMS | awk 'NR == FNR { built[$0]; next } !($2 in built)' "$RUNNER_TEMP/built" -
+            grep -E '\.(tar\.gz|dmg)$' dist/SHA256SUMS | awk 'NR == FNR { built[$0]; next } !($2 in built)' "$RUNNER_TEMP/built" -
             (cd pkgs && sha256sum -- *)
           } > SHA256SUMS
           cat SHA256SUMS
