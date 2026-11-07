@@ -966,6 +966,14 @@ fn remove(
             }
         }
     }
+    // What it could not read, a removal record it could not read or forget
+    // among them: warnings, which never fail the run, so the log is the
+    // only place a service user sees them.
+    for error in doc.get("errors").map(Value::items).unwrap_or(&[]) {
+        if let Some(e) = error.str() {
+            log(&format!("residue remove: {e}"));
+        }
+    }
     removed
 }
 

@@ -277,12 +277,12 @@ pub fn scan(options: &Options) -> u8 {
                 ))
             ));
         }
-        if !g.records.is_empty() {
+        let restorable = g.records.iter().filter(|i| i.record.is_ok()).count();
+        if restorable > 0 {
             out.push_str(&format!(
                 "  {}\n",
                 style.dim(&format!(
-                    "removed: {} restorable · list or restore: residue restore · a remove run forgets records older than --keep-removed",
-                    g.records.len()
+                    "removed: {restorable} restorable · list or restore: residue restore · a remove run forgets records older than --keep-removed"
                 ))
             ));
         }

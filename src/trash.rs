@@ -247,6 +247,11 @@ pub fn create(common_dir: &Path, record: &Record) -> Result<PathBuf, String> {
         if n > 1 {
             entry_name.push(format!("-{n}"));
         }
+        // Trash entries and removal records share one list in `residue
+        // restore`, so a name a record already has is skipped.
+        if fs::symlink_metadata(crate::removed::root(common_dir).join(&entry_name)).is_ok() {
+            continue;
+        }
         let entry = root.join(&entry_name);
         match fs::create_dir(&entry) {
             Ok(()) => {}

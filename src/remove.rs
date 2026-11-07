@@ -34,7 +34,7 @@ use crate::inspect::{self, Report, Verdict};
 use crate::json::Json;
 use crate::output::{self, Places, Style, clean};
 use crate::policy::Policy;
-use crate::removed::{self, Reason};
+use crate::removed::{self, By, Reason};
 use crate::trash;
 
 /// The lock reason on a worktree residue has moved aside to delete.
@@ -249,6 +249,9 @@ struct Mode {
     keep_removed: Span,
     /// Why this run removes, as each removal record says it.
     reason: Reason,
+    /// The command this run is, as each removal record says it: `watch`'s
+    /// child is the run with `--removal-reason`.
+    by: By,
     started: i64,
 }
 
@@ -274,6 +277,11 @@ pub fn remove(options: &Options) -> u8 {
         } else {
             Reason::Remove
         }),
+        by: match (options.removal_reason, options.all) {
+            (Some(_), _) => By::Watch,
+            (None, true) => By::Sweep,
+            (None, false) => By::Remove,
+        },
         started,
     };
     let places = Places::new();
@@ -320,7 +328,13 @@ pub fn remove(options: &Options) -> u8 {
     let mut purge_policy = policy.clone();
     purge_policy.idle = None;
     let mut purges = expired(&repos, &mode.keep, started, &mut errors);
-    let mut forgets = expired_records(&repos, &mode.keep_removed, started, &mut errors);
+    // Problems with removal records: reported, in JSON `errors` and on
+    // stderr, but never the exit status. A record is about a worktree
+    // already gone, and a run that removed its PATHs did what it was
+    // asked; otherwise one bad record would fail every run in its
+    // repository.
+    let mut notices: Vec<String> = Vec::new();
+    let mut forgets = expired_records(&repos, &mode.keep_removed, started, &mut notices);
     let judged: Vec<Entry> = purges
         .iter()
         .filter_map(|p| p.item.registered.as_ref().map(as_judged))
@@ -404,7 +418,13 @@ pub fn remove(options: &Options) -> u8 {
         }
         let outcome = match removed::forget(&f.item) {
             Ok(()) => Outcome::Removed(None),
-            Err(e) => Outcome::Failed(e),
+            Err(e) => {
+                notices.push(format!(
+                    "could not forget the removal record {}: {e}",
+                    f.item.dir.display()
+                ));
+                Outcome::Failed(e)
+            }
         };
         if !options.json {
             println!("{}", forget_line(&f.item, &outcome, &places));
@@ -415,7 +435,8 @@ pub fn remove(options: &Options) -> u8 {
     // A sweep never asked for the worktrees it kept, so only a candidate
     // that was not removed, or a PATH it could not read, makes it fail.
     // The same holds for the trash: an entry the plan kept does not fail
-    // the run, an entry it meant to purge and did not does.
+    // the run, an entry it meant to purge and did not does. A removal
+    // record it could not read or forget is a notice, never a failure.
     let done = items.iter().all(|i| match &i.outcome {
         Some(o) if o.done() => true,
         Some(Outcome::Refused) => options.all,
@@ -425,15 +446,16 @@ pub fn remove(options: &Options) -> u8 {
             p.outcome,
             Some(Outcome::Removed(_)) | Some(Outcome::Refused)
         )
-    }) && forgets
-        .iter()
-        .all(|f| matches!(f.outcome, Some(Outcome::Removed(_))))
-        && errors.is_empty();
+    }) && errors.is_empty();
+    for notice in &notices {
+        eprintln!("residue: warning: {}", clean(notice));
+    }
     if options.json {
+        let reported: Vec<String> = errors.iter().chain(&notices).cloned().collect();
         println!(
             "{}",
             json(
-                &items, &purges, &forgets, &errors, &snapshot, &policy, &mode
+                &items, &purges, &forgets, &reported, &snapshot, &policy, &mode
             )
             .render()
         );
@@ -472,18 +494,30 @@ fn repos_of(items: &[Item]) -> Vec<Repo> {
     repos
 }
 
-/// The removal records of these repositories at least `keep` old. A record
-/// of an interrupted removal is never forgotten: its worktree is still
-/// there, and `residue restore` is how it goes back. An unreadable record
-/// is never forgotten either, since residue cannot tell which ref it names.
-fn expired_records(repos: &[Repo], keep: &Span, now: i64, errors: &mut Vec<String>) -> Vec<Forget> {
+/// The removal records of these repositories at least `keep` old, and the
+/// entries with no `info` old enough to clear. A record of an interrupted
+/// removal is never forgotten: its worktree is still there, and `residue
+/// restore` is how it goes back. An unreadable record is never forgotten
+/// either, since residue cannot tell which refs are its own; it goes into
+/// `notices`.
+fn expired_records(
+    repos: &[Repo],
+    keep: &Span,
+    now: i64,
+    notices: &mut Vec<String>,
+) -> Vec<Forget> {
     let mut out = Vec::new();
     for repo in repos {
         match removed::of_repo(repo) {
             Ok(list) => {
                 for item in list {
                     match &item.record {
-                        Err(e) => errors.push(format!("removal record: {e}")),
+                        Err(_) if item.clearable(now) => out.push(Forget {
+                            item,
+                            outcome: None,
+                        }),
+                        Err(_) if item.incomplete => {}
+                        Err(e) => notices.push(format!("removal record: {e}")),
                         Ok(_) if item.interrupted() => {}
                         Ok(_) if item.age(now).is_some_and(|a| a >= keep.seconds) => {
                             out.push(Forget {
@@ -495,7 +529,7 @@ fn expired_records(repos: &[Repo], keep: &Span, now: i64, errors: &mut Vec<Strin
                     }
                 }
             }
-            Err(e) => errors.push(e),
+            Err(e) => notices.push(format!("removal records: {e}")),
         }
     }
     out
@@ -958,22 +992,27 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
     if let Err(e) = git::lock_worktree(&main, &dest, reason) {
         return moved.put_back(false, &format!("could not lock it: {e}"));
     }
-    if let Err(why) = verify_moved(
-        &dest,
-        before,
-        policy,
-        since,
-        reason,
-        mode.only_if_upstream_gone,
-    ) {
-        return moved.put_back(true, &why);
+    let check = || {
+        verify_moved(
+            &dest,
+            before,
+            policy,
+            since,
+            reason,
+            mode.only_if_upstream_gone,
+        )
+    };
+    if let Some(entry) = &entry {
+        return match check() {
+            Ok(()) => Outcome::Trashed(entry.clone()),
+            Err(why) => moved.put_back(true, &why),
+        };
     }
-    if let Some(entry) = entry {
-        return Outcome::Trashed(entry);
-    }
-    // The record and its ref come after the last check and before the
-    // deletion; without them residue deletes nothing.
-    let record = removal_record(original, &dest, &listed, before, mode.reason);
+    // The record and its refs come before the last check, so writing and
+    // syncing them does not widen the time between that check and the
+    // deletion; if the check fails, they are undone. Without them residue
+    // deletes nothing.
+    let record = removal_record(original, &dest, &listed, before, mode.reason, mode.by);
     let git_dir = before
         .fingerprint
         .as_ref()
@@ -988,12 +1027,20 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
             );
         }
     };
+    if let Err(why) = check() {
+        let outcome = moved.put_back(true, &why);
+        return settle(&written, &main, &[original, &dest], outcome);
+    }
     if let Err(e) = git::unlock_worktree(&main, &dest) {
         let outcome = moved.put_back(true, &format!("could not unlock it: {e}"));
         return settle(&written, &main, &[original, &dest], outcome);
     }
     match git::remove_worktree(&main, &dest) {
         Ok(()) => Outcome::Removed(Some(written.dir)),
+        // Git deletes the checkout before its own record, so a failure can
+        // come after the files are gone: then there is nothing to move
+        // back, and the record is how the worktree comes back.
+        Err(e) if !checkout_present(&dest) => settle(&written, &main, &[&dest], Outcome::Failed(e)),
         Err(e) => {
             let outcome = match moved.put_back(false, &e) {
                 Outcome::Skipped(why) => Outcome::Failed(why),
@@ -1005,13 +1052,15 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
 }
 
 /// What the removal record keeps of a worktree about to be deleted at
-/// `aside`: `listed` is Git's entry for it, `before` the plan's report.
+/// `aside`: `listed` is Git's entry for it, `before` the plan's report,
+/// `by` the command this run is.
 fn removal_record(
     original: &Path,
     aside: &Path,
     listed: &Entry,
     before: &Report,
     reason: Reason,
+    by: By,
 ) -> removed::Record {
     removed::Record {
         original: original.to_path_buf(),
@@ -1025,6 +1074,7 @@ fn removal_record(
             .and_then(Option::as_ref)
             .map(|u| u.full.clone()),
         reason: reason.code().to_string(),
+        by: Some(by.code().to_string()),
         removed: output::now(),
         allocated: before.usage.as_ref().map(|u| u.allocated),
         reclaimable: before.usage.as_ref().map(|u| u.reclaimable),
@@ -1039,35 +1089,44 @@ fn removal_record(
             .collect(),
         pid: Some(std::process::id()),
         version: Some(VERSION.to_string()),
+        // `removed::create` finds them, right before it writes the record.
+        kept: Vec::new(),
     }
 }
 
+/// A worktree's checkout is there: its directory, with the `.git` file
+/// that ties it to its Git directory.
+fn checkout_present(path: &Path) -> bool {
+    fs::symlink_metadata(path.join(".git")).is_ok_and(|m| m.is_file())
+}
+
 /// After a deletion that did not complete: while Git still lists the
-/// worktree at one of `paths`, nothing of it is gone that the worktree
-/// does not still hold (Git deletes the checkout before its own record,
-/// and drops that record even when the delete fails partway), so its
-/// removal record is dropped. Otherwise the record stays: it is how the
-/// worktree comes back.
+/// worktree at one of `paths` and its checkout is there, nothing of it is
+/// gone, so its removal record is dropped. Otherwise the record stays: it
+/// is how the worktree comes back. Git deletes the checkout before its own
+/// record, so it can list a worktree whose files are already gone.
 fn settle(written: &removed::Written, main: &Path, paths: &[&Path], outcome: Outcome) -> Outcome {
     let listed = git::worktrees(main).map(|list| {
-        list.iter().any(|e| {
-            paths
-                .iter()
-                .any(|p| e.path == *p || git::canonical(&e.path).ok().as_deref() == Some(*p))
+        paths.iter().copied().find(|p| {
+            list.iter()
+                .any(|e| e.path == *p || git::canonical(&e.path).ok().as_deref() == Some(*p))
         })
     });
+    let restore = output::shell(&written.dir);
     let note = match listed {
-        Ok(true) => match written.undo() {
+        Ok(Some(at)) if checkout_present(at) => match written.undo() {
             Ok(()) => return outcome,
             Err(e) => format!("its removal record stays ({e})"),
         },
-        Ok(false) => format!(
-            "Git no longer lists it, so part of it may be gone; its removal record keeps its HEAD: residue restore {}",
-            output::shell(&written.dir)
+        Ok(Some(at)) => format!(
+            "Git still lists it at {}, but its files are gone; its removal record keeps its HEAD: residue restore {restore}",
+            at.display()
+        ),
+        Ok(None) => format!(
+            "Git no longer lists it, so part of it may be gone; its removal record keeps its HEAD: residue restore {restore}"
         ),
         Err(e) => format!(
-            "residue could not list the worktrees to tell whether any of it is gone ({e}); its removal record keeps its HEAD: residue restore {}",
-            output::shell(&written.dir)
+            "residue could not list the worktrees to tell whether any of it is gone ({e}); its removal record keeps its HEAD: residue restore {restore}"
         ),
     };
     match outcome {
@@ -1235,6 +1294,7 @@ fn purge(p: &Purge, policy: &Policy, mode: &Mode) -> Outcome {
         &listed,
         before,
         Reason::TrashPurge,
+        mode.by,
     );
     let git_dir = before
         .fingerprint
@@ -1663,6 +1723,7 @@ fn json(
             "removal_records",
             Json::Obj(vec![
                 ("reason", Json::str(mode.reason.code())),
+                ("by", Json::str(mode.by.code())),
                 ("keep", Json::str(mode.keep_removed.text.clone())),
                 ("keep_seconds", Json::Int(mode.keep_removed.seconds)),
             ]),

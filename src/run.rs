@@ -4,7 +4,7 @@
 //! [`run`], so a hung or chatty child can never hang residue itself.
 
 use std::fmt;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -45,9 +45,24 @@ struct Stream {
 }
 
 pub fn run(cmd: &mut Command, timeout: Duration, max_output: usize) -> Result<Captured, RunError> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    run_with_input(cmd, None, timeout, max_output)
+}
+
+/// [`run`], with `input` written to the child's standard input, which is
+/// then closed. Without input, standard input is `/dev/null`.
+pub fn run_with_input(
+    cmd: &mut Command,
+    input: Option<Vec<u8>>,
+    timeout: Duration,
+    max_output: usize,
+) -> Result<Captured, RunError> {
+    cmd.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
             RunError::NotFound
@@ -55,6 +70,13 @@ pub fn run(cmd: &mut Command, timeout: Duration, max_output: usize) -> Result<Ca
             RunError::Spawn(e)
         }
     })?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        // On its own thread, so a child that writes a lot before it reads
+        // cannot deadlock against this one. A write error means the child
+        // closed its input early, which it does only when it exits; its exit
+        // status, which the caller checks, carries that failure.
+        thread::spawn(move || drop(stdin.write_all(&input)));
+    }
     let stdout = drain(child.stdout.take(), max_output);
     let stderr = drain(child.stderr.take(), max_output);
     let deadline = Instant::now() + timeout;

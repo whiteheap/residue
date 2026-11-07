@@ -6,26 +6,49 @@
 //! `GIT_COMMON_DIR/residue-removed/NAME-STAMP/info`, next to the trash, and
 //! a ref, `refs/residue/removed/NAME-STAMP`, at the worktree's HEAD. The
 //! record holds where the worktree was, its branch, HEAD and upstream, why
-//! it was removed, and the ignored entries the deletion took. The ref keeps
-//! the commits reachable after the branch is deleted (as after a merge), so
-//! `git gc` cannot drop them. Both are written after the last check and
-//! before `git worktree remove`; if either cannot be written, nothing is
-//! deleted.
+//! it was removed and by which command (`by`), and the ignored entries the
+//! deletion took. The ref keeps the commits reachable after the branch is
+//! deleted (as after a merge), so `git gc` cannot drop them.
+//!
+//! The worktree's own Git directory holds commits too: its HEAD reflog
+//! (`logs/HEAD`) names every commit it was at, and Git keeps those while
+//! the worktree exists. A commit made on a detached HEAD and then left, or
+//! the commits before a rebase or an amend, can have no other holder. So
+//! the record also keeps a copy of `logs/HEAD`, and one ref,
+//! `refs/residue/reflog/NAME-STAMP/N`, at each of the fewest commits that
+//! reach every commit only that reflog held. Worktree-private refs and an
+//! operation in progress already keep a worktree from removal
+//! (`inspect`), so the reflog is all the Git directory adds.
+//!
+//! A removal writes the record and its refs after it moves the worktree
+//! aside and before its check at the new path, which drops them again
+//! when it fails; the purge writes them after its re-check. Both write
+//! them before `git worktree remove`, and if any of it cannot be written,
+//! nothing is deleted. `info` is written under another name, synced and
+//! renamed into place, the directories are synced, and the refs are made
+//! in one transaction with `core.fsync=reference`, so neither is ever half
+//! there after a crash.
 //!
 //! `residue restore NAME` recreates the worktree at its path with `git
 //! worktree add`, never `--force`, and never moves a branch that exists:
 //! the branch at the recorded HEAD or ahead of it is checked out, a branch
 //! that is gone is recreated there, and a branch that no longer contains
 //! the recorded HEAD keeps its commits while a new branch is made at the
-//! recorded HEAD. Ignored entries, such as `node_modules/`, are not
-//! restored; the project's own install makes them again.
+//! recorded HEAD. The recorded reflog goes back in front of the new one.
+//! Ignored entries, such as `node_modules/`, are not restored; the
+//! project's own install makes them again. The record and its refs are
+//! dropped only once the restored worktree holds everything they held.
 //!
-//! A record and its ref expire after `--keep-removed` (default 30 days):
-//! every remove run that purges the trash forgets them too, after the same
-//! confirmation. residue deletes a ref only under `refs/residue/removed/`,
-//! only the one a record names, and only while it still points at the
-//! recorded HEAD.
+//! A record and its refs expire after `--keep-removed` (default 30 days):
+//! every remove run forgets them too, after the same confirmation. residue
+//! deletes a ref only under `refs/residue/`, only one a record names, and
+//! only while it still points where the record says. Once they are gone, a
+//! commit only they held (a branch deleted after a squash merge, work only
+//! the reflog held) is left to `git gc`: `--keep-removed` is its grace
+//! period. A record residue cannot read or forget is a warning, never a
+//! failed run.
 
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Write};
@@ -33,19 +56,32 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use crate::git::{self, Checkout, Entry};
+use crate::git::{self, Checkout, Entry, RefChange};
 use crate::json::Json;
 use crate::output;
 
 pub const DIR: &str = "residue-removed";
-/// Where the refs that keep removed worktrees' commits live.
+/// Where the refs that keep removed worktrees' HEADs live.
 pub const REF_PREFIX: &str = "refs/residue/removed/";
+/// Where the refs that keep the commits only a removed worktree's reflog
+/// held live: `refs/residue/reflog/ENTRY/N`.
+pub const REFLOG_PREFIX: &str = "refs/residue/reflog/";
 /// The file residue writes into a restored worktree's own Git directory:
 /// `watch`'s landed-work rule never removes that worktree again.
 pub const MARKER: &str = "residue-restored";
 const INFO: &str = "info";
+/// `info` is written here first and then renamed, so `info` is whole or
+/// absent.
+const INFO_NEW: &str = "info.new";
 /// A copy of the worktree's own `config.worktree`, when it had one.
 const CONFIG: &str = "config.worktree";
+/// A copy of the worktree's HEAD reflog, `logs/HEAD` in its Git directory,
+/// when it had one (Git's files ref backend keeps it there).
+const REFLOG: &str = "HEAD.reflog";
+/// An entry with no `info` (the run that made it stopped first) and no ref
+/// is cleared once its directory is this old, in seconds: a run writing
+/// one takes milliseconds, so an hour cannot catch one at work.
+pub const INCOMPLETE_AFTER: i64 = 3600;
 
 pub fn root(common_dir: &Path) -> PathBuf {
     common_dir.join(DIR)
@@ -89,6 +125,30 @@ impl Reason {
             "watch_low_disk" => "by residue watch: the disk was low".into(),
             "trash_purge" => "from the trash, by its purge after --keep-trash".into(),
             other => format!("({other})"),
+        }
+    }
+}
+
+/// Which residue command removed a worktree: the run that wrote the
+/// record. A trash purge's record names the run that purged the entry, so
+/// what was freed by hand and what automatic cleanup freed stay apart.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum By {
+    /// `residue remove PATH...`.
+    Remove,
+    /// `residue remove --all`, by hand or from a scheduler.
+    Sweep,
+    /// `residue watch`: the `remove` run it starts.
+    Watch,
+}
+
+impl By {
+    /// The code in `info` (`by remove`) and in JSON.
+    pub fn code(self) -> &'static str {
+        match self {
+            By::Remove => "remove",
+            By::Sweep => "sweep",
+            By::Watch => "watch",
         }
     }
 }
@@ -139,6 +199,9 @@ pub struct Record {
     pub upstream: Option<String>,
     /// [`Reason::code`], or a code a later version wrote.
     pub reason: String,
+    /// [`By::code`], or a code a later version wrote; `None` for a record
+    /// written before residue named the command.
+    pub by: Option<String>,
     /// Unix seconds.
     pub removed: i64,
     pub allocated: Option<u64>,
@@ -148,6 +211,9 @@ pub struct Record {
     /// The residue process that wrote it.
     pub pid: Option<u32>,
     pub version: Option<String>,
+    /// The fewest commits that reach every commit only the worktree's own
+    /// reflog held; the Nth has the ref `refs/residue/reflog/ENTRY/N`.
+    pub kept: Vec<String>,
 }
 
 /// `\` and newline escaped, so one value is one line whatever its bytes.
@@ -206,6 +272,9 @@ impl Record {
         }
         line("ref", format!("{REF_PREFIX}{name}").as_bytes());
         line("reason", self.reason.as_bytes());
+        if let Some(by) = &self.by {
+            line("by", by.as_bytes());
+        }
         line(
             "removed",
             format!("{} {}", self.removed, output::rfc3339(self.removed)).as_bytes(),
@@ -229,6 +298,9 @@ impl Record {
         if let Some(v) = &self.version {
             line("version", v.as_bytes());
         }
+        for k in &self.kept {
+            line("kept", k.as_bytes());
+        }
         out
     }
 
@@ -240,12 +312,14 @@ impl Record {
             head: String::new(),
             upstream: None,
             reason: String::new(),
+            by: None,
             removed: 0,
             allocated: None,
             reclaimable: None,
             gone: Vec::new(),
             pid: None,
             version: None,
+            kept: Vec::new(),
         };
         let (mut original, mut aside, mut removed) = (None, None, None);
         for line in bytes.split(|b| *b == b'\n') {
@@ -272,6 +346,7 @@ impl Record {
                 b"head" => record.head = text(),
                 b"upstream" => record.upstream = Some(text()),
                 b"reason" => record.reason = text(),
+                b"by" => record.by = Some(text()),
                 b"removed" => removed = Some(number("removed")?),
                 b"allocated" => record.allocated = number("allocated")?.try_into().ok(),
                 b"reclaimable" => record.reclaimable = number("reclaimable")?.try_into().ok(),
@@ -291,6 +366,13 @@ impl Record {
                 }
                 b"pid" => record.pid = text().parse().ok(),
                 b"version" => record.version = Some(text()),
+                b"kept" => {
+                    let commit = text();
+                    if !is_object_id(&commit) {
+                        return Err("a kept line is not an object name".into());
+                    }
+                    record.kept.push(commit);
+                }
                 // `ref` is derived from the entry name; keys a later
                 // version adds carry nothing this one needs.
                 _ => {}
@@ -352,7 +434,7 @@ fn entry_base(original: &Path) -> String {
 
 /// One record in a repository.
 pub struct Item {
-    /// The entry directory's name, also the ref's last component:
+    /// The entry directory's name, also the last part of its refs' names:
     /// `fix-login-20261107T040000Z`.
     pub name: String,
     pub dir: PathBuf,
@@ -360,6 +442,16 @@ pub struct Item {
     /// Where to run `git worktree` commands for this repository.
     pub command_dir: PathBuf,
     pub record: Result<Record, String>,
+    /// The entry has no `info`: the run that made it stopped before writing
+    /// it, so it never deleted anything.
+    pub incomplete: bool,
+    /// The entry holds a copy of the worktree's `config.worktree`, as it
+    /// did when it was listed.
+    pub worktree_config: bool,
+    /// The entry holds a copy of the worktree's HEAD reflog.
+    pub head_reflog: bool,
+    /// When the entry directory last changed, in Unix seconds.
+    pub modified: Option<i64>,
     /// Git still lists the worktree where the deletion started: the run
     /// stopped before it finished (an interrupted removal), so nothing of
     /// it is gone that Git's own record does not keep.
@@ -386,6 +478,22 @@ impl Item {
             "removed"
         }
     }
+
+    /// An entry with no `info` that a remove run may clear: old enough that
+    /// no run can still be writing it. Its refs are checked when it goes.
+    pub fn clearable(&self, now: i64) -> bool {
+        self.incomplete && self.modified.is_some_and(|m| now - m >= INCOMPLETE_AFTER)
+    }
+}
+
+/// The refs a record has: its HEAD's, then one for each kept commit, each
+/// with the commit it must point at.
+fn refs_of(name: &str, head: &str, kept: &[String]) -> Vec<(String, String)> {
+    let mut refs = vec![(format!("{REF_PREFIX}{name}"), head.to_string())];
+    for (i, commit) in kept.iter().enumerate() {
+        refs.push((format!("{REFLOG_PREFIX}{name}/{}", i + 1), commit.clone()));
+    }
+    refs
 }
 
 /// The records of the repository at `common_dir`, oldest first. `listed`
@@ -409,19 +517,26 @@ pub fn list(common_dir: &Path, command_dir: &Path, listed: &[&Entry]) -> Result<
     for child in listing {
         let child = child.map_err(|e| format!("{}: {e}", root.display()))?;
         let dir = child.path();
-        let is_dir = child
-            .file_type()
-            .map_err(|e| format!("{}: {e}", dir.display()))?
-            .is_dir();
+        let meta = child
+            .metadata()
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
         let name = child.file_name().to_string_lossy().into_owned();
-        if !is_dir || name.starts_with('.') {
+        if !meta.is_dir() || name.starts_with('.') {
             continue;
         }
-        let record = match fs::read(dir.join(INFO)) {
-            Ok(bytes) => {
-                Record::parse(&bytes).map_err(|e| format!("{}: {e}", dir.join(INFO).display()))
-            }
-            Err(e) => Err(format!("{}: {e}", dir.join(INFO).display())),
+        let (record, incomplete) = match fs::read(dir.join(INFO)) {
+            Ok(bytes) => (
+                Record::parse(&bytes).map_err(|e| format!("{}: {e}", dir.join(INFO).display())),
+                false,
+            ),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (
+                Err(format!(
+                    "{}: it has no info; the run that made it stopped before it deleted anything",
+                    dir.display()
+                )),
+                true,
+            ),
+            Err(e) => (Err(format!("{}: {e}", dir.join(INFO).display())), false),
         };
         let registered = record.as_ref().ok().and_then(|r| {
             listed
@@ -434,11 +549,15 @@ pub fn list(common_dir: &Path, command_dir: &Path, listed: &[&Entry]) -> Result<
         });
         items.push(Item {
             name,
-            dir,
             common_dir: common_dir.to_path_buf(),
             command_dir: command_dir.to_path_buf(),
             record,
+            incomplete,
+            worktree_config: dir.join(CONFIG).is_file(),
+            head_reflog: dir.join(REFLOG).is_file(),
+            modified: Some(meta.mtime()),
             registered,
+            dir,
         });
     }
     items.sort_by_key(|i| {
@@ -455,20 +574,27 @@ pub struct Written {
     pub name: String,
     pub dir: PathBuf,
     head: String,
+    kept: Vec<String>,
     command_dir: PathBuf,
 }
 
 impl Written {
-    /// Drop the record and its ref: the worktree was not deleted after all.
+    /// Drop the record and its refs: the worktree was not deleted after
+    /// all.
     pub fn undo(&self) -> Result<(), String> {
-        drop_record(&self.command_dir, &self.name, &self.dir, &self.head)
+        drop_record(
+            &self.command_dir,
+            &self.name,
+            &self.dir,
+            &refs_of(&self.name, &self.head, &self.kept),
+        )
     }
 }
 
-/// Write the record for a worktree about to be deleted, then its ref. If
-/// either fails, neither is left, and the caller must not delete.
-/// `git_dir` is the worktree's own Git directory, whose `config.worktree`,
-/// if any, the record keeps a copy of.
+/// Write the record for the worktree at `record.aside`, about to be
+/// deleted, then its refs. If any of it fails, none of it is left, and the
+/// caller must not delete. `git_dir` is the worktree's own Git directory,
+/// whose `config.worktree` and HEAD reflog the record keeps copies of.
 pub fn create(
     common_dir: &Path,
     command_dir: &Path,
@@ -481,14 +607,20 @@ pub fn create(
             record.head
         ));
     }
-    let config = match git_dir.map(|d| fs::read(d.join(CONFIG))) {
-        None => None,
-        Some(Ok(bytes)) => Some(bytes),
-        Some(Err(e)) if e.kind() == io::ErrorKind::NotFound => None,
-        Some(Err(e)) => return Err(format!("cannot read its config.worktree: {e}")),
-    };
+    let config = read_if_present(git_dir.map(|d| d.join(CONFIG)))
+        .map_err(|e| format!("cannot read its config.worktree: {e}"))?;
+    let reflog = read_if_present(git_dir.map(|d| d.join("logs").join("HEAD")))
+        .map_err(|e| format!("cannot read its HEAD reflog: {e}"))?;
+    let mut record = record.clone();
+    record.kept = reflog_only(&record.aside, command_dir)
+        .map_err(|e| format!("cannot tell which commits only its reflog holds: {e}"))?;
     let root = root(common_dir);
-    fs::create_dir_all(&root).map_err(|e| format!("cannot create {}: {e}", root.display()))?;
+    let new_root = match fs::create_dir(&root) {
+        Ok(()) => true,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
+        Err(e) => return Err(format!("cannot create {}: {e}", root.display())),
+    };
+    let trash_root = crate::trash::root(common_dir);
     let base = entry_base(&record.original);
     let stamp = output::stamp(record.removed);
     for n in 1..100 {
@@ -497,6 +629,11 @@ pub fn create(
         } else {
             format!("{base}-{stamp}-{n}")
         };
+        // Trash entries and records share one list in `residue restore`,
+        // so a name either already has is skipped.
+        if fs::symlink_metadata(trash_root.join(&name)).is_ok() {
+            continue;
+        }
         let dir = root.join(&name);
         match fs::create_dir(&dir) {
             Ok(()) => {}
@@ -507,28 +644,40 @@ pub fn create(
             Ok(()) => message,
             Err(more) => format!("{message}; {more}"),
         };
-        if let Err(e) = write_new(&dir.join(INFO), &record.render(&name)) {
-            return Err(give_up(format!(
-                "cannot write {}: {e}",
-                dir.join(INFO).display()
-            )));
-        }
+        let mut files = Vec::new();
         if let Some(bytes) = &config {
-            if let Err(e) = write_new(&dir.join(CONFIG), bytes) {
-                return Err(give_up(format!(
-                    "cannot write {}: {e}",
-                    dir.join(CONFIG).display()
-                )));
-            }
+            files.push((CONFIG, bytes.as_slice()));
         }
-        let full = format!("{REF_PREFIX}{name}");
-        if let Err(e) = git::create_ref(command_dir, &full, &record.head) {
-            return Err(give_up(format!("cannot create the ref {full}: {e}")));
+        if let Some(bytes) = &reflog {
+            files.push((REFLOG, bytes.as_slice()));
+        }
+        let info = record.render(&name);
+        if let Err(e) = write_entry(&dir, &files, &info) {
+            return Err(give_up(e));
+        }
+        let synced = sync_dir(&root).and_then(|()| {
+            if new_root {
+                sync_dir(common_dir)
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(e) = synced {
+            return Err(give_up(e));
+        }
+        let refs = refs_of(&name, &record.head, &record.kept);
+        let creates: Vec<RefChange> = refs
+            .iter()
+            .map(|(name, commit)| RefChange::Create { name, commit })
+            .collect();
+        if let Err(e) = git::change_refs(command_dir, &creates) {
+            return Err(give_up(format!("cannot create its refs: {e}")));
         }
         return Ok(Written {
             name,
             dir,
             head: record.head.clone(),
+            kept: record.kept.clone(),
             command_dir: command_dir.to_path_buf(),
         });
     }
@@ -538,15 +687,78 @@ pub fn create(
     ))
 }
 
+/// The file at `path`, `None` when there is no path or no file.
+fn read_if_present(path: Option<PathBuf>) -> io::Result<Option<Vec<u8>>> {
+    match path.map(fs::read) {
+        None => Ok(None),
+        Some(Ok(bytes)) => Ok(Some(bytes)),
+        Some(Err(e)) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Some(Err(e)) => Err(e),
+    }
+}
+
+/// The copies first, then `info`, written as `info.new` and renamed, then
+/// the directory synced: an entry with `info` has every copy it names.
+fn write_entry(dir: &Path, files: &[(&str, &[u8])], info: &[u8]) -> Result<(), String> {
+    for (file, bytes) in files {
+        write_new(&dir.join(file), bytes)
+            .map_err(|e| format!("cannot write {}: {e}", dir.join(file).display()))?;
+    }
+    let staged = dir.join(INFO_NEW);
+    write_new(&staged, info).map_err(|e| format!("cannot write {}: {e}", staged.display()))?;
+    fs::rename(&staged, dir.join(INFO))
+        .map_err(|e| format!("cannot rename {}: {e}", staged.display()))?;
+    sync_dir(dir)
+}
+
+/// The commits only the worktree at `worktree` holds through its own
+/// reflog: its reflogs name them, no shared reflog and not the main
+/// worktree's does, and no ref outside `refs/residue/` and no worktree's
+/// HEAD reaches them (the record's own ref keeps its HEAD). Of those, the
+/// fewest that reach them all, so one ref each keeps every one. `main` is
+/// where Git commands for the repository run.
+fn reflog_only(worktree: &Path, main: &Path) -> Result<Vec<String>, String> {
+    let mine = git::reflog_commits(worktree)?;
+    if mine.is_empty() {
+        return Ok(Vec::new());
+    }
+    let shared: HashSet<String> = git::reflog_commits(main)?.into_iter().collect();
+    let only: Vec<&str> = mine
+        .iter()
+        .filter(|c| !shared.contains(*c))
+        .map(String::as_str)
+        .collect();
+    let lost = git::unreferenced(main, &only)?;
+    git::independent(main, &lost)
+}
+
 fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::File::create_new(path).and_then(|mut f| f.write_all(bytes).and_then(|()| f.sync_all()))
+}
+
+/// Sync a directory, so entries just made or renamed in it survive a power
+/// loss. A filesystem that cannot sync a directory (some network and FUSE
+/// ones answer EINVAL, ENOTSUP or EBADF) is not an error: POSIX leaves a
+/// directory's sync to the filesystem, and the files themselves are synced.
+fn sync_dir(dir: &Path) -> Result<(), String> {
+    match fs::File::open(dir).and_then(|f| f.sync_all()) {
+        Ok(()) => Ok(()),
+        Err(e)
+            if e.raw_os_error().is_some_and(|code| {
+                [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP, libc::EBADF].contains(&code)
+            }) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(format!("cannot sync {}: {e}", dir.display())),
+    }
 }
 
 /// Remove an entry's files and its now empty directory, and the records
 /// directory once it is empty. Never recursive: anything else left in the
 /// entry stays, and the error says so.
 fn discard(dir: &Path) -> Result<(), String> {
-    for file in [INFO, CONFIG] {
+    for file in [INFO, INFO_NEW, CONFIG, REFLOG] {
         match fs::remove_file(dir.join(file)) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -561,23 +773,63 @@ fn discard(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The ref first, only while it points at `head`, then the files: a record
-/// left without its ref is forgotten again later, a ref left without its
-/// record would never be.
-fn drop_record(command_dir: &Path, name: &str, dir: &Path, head: &str) -> Result<(), String> {
-    let full = format!("{REF_PREFIX}{name}");
-    git::delete_ref(command_dir, &full, head)
-        .map_err(|e| format!("cannot delete the ref {full}: {e}"))?;
+/// The refs first, then the files: a record left without its refs is
+/// forgotten again later, a ref left without its record never would be.
+/// `expected` is every ref the record has, with its commit. Each of them
+/// that exists is deleted, in one transaction, only while it points at its
+/// commit; a ref under the record's names that it does not list, or one
+/// that points elsewhere, keeps the record and its refs as they are.
+fn drop_record(
+    command_dir: &Path,
+    name: &str,
+    dir: &Path,
+    expected: &[(String, String)],
+) -> Result<(), String> {
+    let patterns = [
+        format!("{REF_PREFIX}{name}"),
+        format!("{REFLOG_PREFIX}{name}"),
+    ];
+    let patterns: Vec<&str> = patterns.iter().map(String::as_str).collect();
+    let found = git::refs_named(command_dir, &patterns)?;
+    let mut deletes = Vec::new();
+    for (ref_name, now) in &found {
+        match expected.iter().find(|(r, _)| r == ref_name) {
+            Some((_, commit)) if commit == now => deletes.push(RefChange::Delete {
+                name: ref_name,
+                commit,
+            }),
+            Some((_, commit)) => {
+                return Err(format!(
+                    "the ref {ref_name} points at {now}, not at the recorded {commit}, so residue leaves it and the record"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "the ref {ref_name} is not one the record names, so residue leaves it and the record"
+                ));
+            }
+        }
+    }
+    git::change_refs(command_dir, &deletes).map_err(|e| format!("cannot delete its refs: {e}"))?;
     discard(dir)
 }
 
-/// Forget one record: its ref, then its files. An unreadable record is
-/// never forgotten, since residue cannot tell which ref it would delete.
+/// Forget one record: its refs, then its files. An unreadable record is
+/// never forgotten, since residue cannot tell which refs are its own; an
+/// entry with no `info` has no refs of its own, so it goes only while it
+/// has none.
 pub fn forget(item: &Item) -> Result<(), String> {
-    let record = item.record.as_ref().map_err(|e| e.clone())?;
-    drop_record(&item.command_dir, &item.name, &item.dir, &record.head)
+    match &item.record {
+        Ok(r) => drop_record(
+            &item.command_dir,
+            &item.name,
+            &item.dir,
+            &refs_of(&item.name, &r.head, &r.kept),
+        ),
+        Err(_) if item.incomplete => drop_record(&item.command_dir, &item.name, &item.dir, &[]),
+        Err(e) => Err(e.clone()),
+    }
 }
-
 // ---------------------------------------------------------------- restore
 
 /// How `restore` brought a worktree back.
@@ -647,8 +899,9 @@ fn whereabouts(entry: &Entry, main: &Entry, trash_root: &Path) -> String {
 }
 
 /// Bring back the worktree one record describes, at `to` or where it was,
-/// then drop the record and its ref. `listed` is every worktree Git lists
-/// for the repository, the main one first.
+/// then drop the record and its refs once the worktree holds all they
+/// held. `listed` is every worktree Git lists for the repository, the main
+/// one first.
 pub fn restore(item: &Item, to: Option<&Path>, listed: &[Entry]) -> Result<Restored, String> {
     let record = item.record.as_ref().map_err(|e| e.clone())?;
     let dest = to.unwrap_or(&record.original);
@@ -662,14 +915,14 @@ pub fn restore(item: &Item, to: Option<&Path>, listed: &[Entry]) -> Result<Resto
         }
         Err(e) => return Err(format!("cannot check {}: {e}", dest.display())),
     }
-    let restored = match &item.registered {
+    let mut restored = match &item.registered {
         Some(registered) => move_back(item, record, registered, dest)?,
         None => recreate(item, record, dest, listed)?,
     };
-    let mut restored = restored;
-    // A recreated worktree's config.worktree is only in the record until
-    // it is back in the Git directory; until then the record stays.
-    let config_kept = item.registered.is_some() || !item.dir.join(CONFIG).exists();
+    // A worktree moved back kept its own Git directory. A recreated one
+    // has a new one: until the recorded config.worktree and reflog are in
+    // it, and it holds the commits the refs keep, the record stays.
+    let recreated = item.registered.is_none();
     let mut keep_record = false;
     match git::identity(&restored.path) {
         Ok(id) => {
@@ -678,13 +931,18 @@ pub fn restore(item: &Item, to: Option<&Path>, listed: &[Entry]) -> Result<Resto
                     "could not mark it as restored ({e}); `residue watch` may remove it again once its upstream is gone: lock it with `git worktree lock` to keep it"
                 ));
             }
-            if item.registered.is_none() {
-                match restore_config(&item.dir, &id.git_dir) {
-                    Ok(None) => {}
-                    Ok(Some(note)) => restored.notes.push(note),
-                    Err(note) => {
-                        restored.notes.push(note);
-                        keep_record = true;
+            if recreated {
+                for step in [
+                    restore_config(&item.dir, &id.git_dir),
+                    restore_reflog(&item.dir, &id.git_dir),
+                ] {
+                    match step {
+                        Ok(None) => {}
+                        Ok(Some(note)) => restored.notes.push(note),
+                        Err(note) => {
+                            restored.notes.push(note);
+                            keep_record = true;
+                        }
                     }
                 }
             }
@@ -693,12 +951,18 @@ pub fn restore(item: &Item, to: Option<&Path>, listed: &[Entry]) -> Result<Resto
             restored.notes.push(format!(
                 "could not find its Git directory to mark it as restored ({e}); `residue watch` may remove it again once its upstream is gone: lock it with `git worktree lock` to keep it"
             ));
-            keep_record = !config_kept;
+            keep_record = recreated && (item.worktree_config || item.head_reflog);
+        }
+    }
+    if recreated && !keep_record {
+        if let Err(note) = holds(record, &restored.path, &mut restored.how) {
+            restored.notes.push(note);
+            keep_record = true;
         }
     }
     if keep_record {
         restored.notes.push(format!(
-            "the removal record stays at {}, with its config.worktree; a remove run forgets it after --keep-removed",
+            "the removal record stays at {}, with its refs, so nothing it keeps is lost; a remove run forgets it after --keep-removed",
             item.dir.display()
         ));
     } else if let Err(e) = forget(item) {
@@ -707,6 +971,47 @@ pub fn restore(item: &Item, to: Option<&Path>, listed: &[Entry]) -> Result<Resto
         ));
     }
     Ok(restored)
+}
+
+/// The restored worktree at `path` holds what the record's refs keep: its
+/// HEAD contains the recorded HEAD (a branch moved between the check and
+/// `git worktree add` would not), and its reflogs name every kept commit.
+/// A branch checkout's tip in `how` becomes the HEAD it found, so the
+/// report says where the worktree is. `Err` is a note saying what it lacks.
+fn holds(record: &Record, path: &Path, how: &mut How) -> Result<(), String> {
+    let short = |c: &str| c[..c.len().min(12)].to_string();
+    let mut check = || -> Result<Option<String>, String> {
+        let now = git::commit_of(path, "HEAD")?.ok_or("it has no HEAD commit")?;
+        if let How::Branch { tip } = how {
+            tip.clone_from(&now);
+        }
+        if !git::is_ancestor(path, &record.head, &now)? {
+            return Ok(Some(format!(
+                "it is at {}, which does not contain the recorded HEAD {}: its branch moved while residue restored it, and the record's ref still holds {}",
+                short(&now),
+                short(&record.head),
+                short(&record.head)
+            )));
+        }
+        if record.kept.is_empty() {
+            return Ok(None);
+        }
+        let named: HashSet<String> = git::reflog_commits(path)?.into_iter().collect();
+        let missing = record.kept.iter().filter(|k| !named.contains(*k)).count();
+        Ok((missing > 0).then(|| {
+            format!(
+                "its reflog does not name {missing} of the {} commits only the old reflog held",
+                record.kept.len()
+            )
+        }))
+    };
+    match check() {
+        Ok(None) => Ok(()),
+        Ok(Some(lack)) => Err(lack),
+        Err(e) => Err(format!(
+            "could not check that it holds what the record keeps ({e})"
+        )),
+    }
 }
 
 /// A worktree an interrupted run left where the deletion started: move it
@@ -917,6 +1222,49 @@ fn restore_config(entry_dir: &Path, git_dir: &Path) -> Result<Option<String>, St
     }
 }
 
+/// Put the recorded HEAD reflog back, in front of the entry `git worktree
+/// add` wrote, so `git reflog` in the restored worktree shows its history
+/// and Git keeps the commits only that reflog held. The whole file is
+/// written under another name and renamed into place. `Err` when it is not
+/// back, so the record, which still holds it, must stay.
+fn restore_reflog(entry_dir: &Path, git_dir: &Path) -> Result<Option<String>, String> {
+    let mut bytes = match fs::read(entry_dir.join(REFLOG)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("could not read its recorded HEAD reflog: {e}")),
+    };
+    let logs = git_dir.join("logs");
+    let target = logs.join("HEAD");
+    let fail = |e: String| format!("could not put back its HEAD reflog ({e})");
+    match fs::read(&target) {
+        Ok(now) => {
+            if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+                bytes.push(b'\n');
+            }
+            bytes.extend_from_slice(&now);
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(fail(format!("{}: {e}", target.display()))),
+    }
+    fs::create_dir_all(&logs).map_err(|e| fail(format!("{}: {e}", logs.display())))?;
+    let staged = logs.join("HEAD.residue-new");
+    match fs::remove_file(&staged) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(fail(format!("{}: {e}", staged.display()))),
+    }
+    write_new(&staged, &bytes).map_err(|e| fail(format!("{}: {e}", staged.display())))?;
+    if let Err(e) = fs::rename(&staged, &target) {
+        let left = fs::remove_file(&staged)
+            .err()
+            .map(|r| format!("; {} is left: {r}", staged.display()))
+            .unwrap_or_default();
+        return Err(fail(format!("{}: {e}{left}", target.display())));
+    }
+    sync_dir(&logs).map_err(fail)?;
+    Ok(None)
+}
+
 // ---------------------------------------------------------------- marker
 
 /// When and from what `residue restore` put a worktree back.
@@ -1008,6 +1356,7 @@ pub fn item_json(item: &Item) -> Json {
             Json::opt(r.and_then(|r| r.upstream.clone()), Json::Str),
         ),
         ("reason", Json::opt(r.map(|r| r.reason.clone()), Json::Str)),
+        ("by", Json::opt(r.and_then(|r| r.by.clone()), Json::Str)),
         (
             "removed_at",
             Json::opt(r.map(|r| r.removed), |t| Json::str(output::rfc3339(t))),
@@ -1024,10 +1373,24 @@ pub fn item_json(item: &Item) -> Json {
             "not_kept",
             Json::Arr(r.map_or_else(Vec::new, |r| r.gone.iter().map(Gone::json).collect())),
         ),
+        ("worktree_config", Json::Bool(item.worktree_config)),
+        ("head_reflog", Json::Bool(item.head_reflog)),
         (
-            "worktree_config",
-            Json::Bool(item.dir.join(CONFIG).is_file()),
+            "reflog_refs",
+            Json::Arr(r.map_or_else(Vec::new, |r| {
+                refs_of(&item.name, &r.head, &r.kept)
+                    .into_iter()
+                    .skip(1)
+                    .map(|(name, commit)| {
+                        Json::Obj(vec![
+                            ("ref", Json::str(name)),
+                            ("commit", Json::str(commit)),
+                        ])
+                    })
+                    .collect()
+            })),
         ),
+        ("incomplete", Json::Bool(item.incomplete)),
         (
             "pid",
             Json::opt(r.and_then(|r| r.pid), |p| Json::UInt(u64::from(p))),
@@ -1058,6 +1421,7 @@ mod tests {
             head: "0f607062a2d10dfb8bc578c32a96c976609da819".into(),
             upstream: Some("refs/remotes/origin/fix".into()),
             reason: Reason::WatchLanded.code().into(),
+            by: Some(By::Watch.code().into()),
             removed: 1_794_000_000,
             allocated: Some(4096),
             reclaimable: Some(2048),
@@ -1075,6 +1439,10 @@ mod tests {
             ],
             pid: Some(42),
             version: Some("0.0.7".into()),
+            kept: vec![
+                "1f607062a2d10dfb8bc578c32a96c976609da819".into(),
+                "2f607062a2d10dfb8bc578c32a96c976609da819".into(),
+            ],
         }
     }
 
@@ -1083,6 +1451,17 @@ mod tests {
         let r = sample();
         let back = Record::parse(&r.render("fix_login_new-20261107T040000Z")).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn a_record_without_a_by_line_still_reads() {
+        let r = Record {
+            by: None,
+            ..sample()
+        };
+        let text = r.render("fix-20261107T040000Z");
+        assert!(!text.split(|b| *b == b'\n').any(|l| l.starts_with(b"by ")));
+        assert_eq!(Record::parse(&text).unwrap(), r);
     }
 
     #[test]

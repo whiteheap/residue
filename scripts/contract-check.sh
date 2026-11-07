@@ -471,14 +471,14 @@ if [ -z "$partial_probe" ]; then
     if [ "$status" != 0 ]; then fail "exit $status, want 0"
     elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
     elif [ ! -f "$record/info" ]; then fail "removal_record '$record' has no info file"
-    elif [ "$(jq -r '.removal_records.reason' "$out")" != remove ]; then fail "removal_records.reason: $(jq -c .removal_records "$out")"
+    elif [ "$(jq -r '.removal_records.reason + " " + .removal_records.by' "$out")" != "remove remove" ]; then fail "removal_records: $(jq -c .removal_records "$out")"
     elif [ "$(records)" != "1 records, 1 refs" ]; then fail "$(records), want 1 records, 1 refs"
     elif [ "$(git -C "$repo" for-each-ref --format='%(objectname)' refs/residue/removed/)" != "$w_sha" ]; then fail "the ref does not pin w's HEAD"
     elif ! (cd "$repo" && "$bin" restore --json) >"$work/$name.list" 2>"$err"; then fail "restore --json (the list) failed"
     elif ! jq -e --arg sha "$w_sha" '
             .schema == "residue.restore/v1" and .restored == null and .restore == null
             and .trash == [] and (.removed | length) == 1
-            and (.removed[0] | .kind == "removed" and .state == "removed" and .reason == "remove"
+            and (.removed[0] | .kind == "removed" and .state == "removed" and .reason == "remove" and .by == "remove"
                  and .branch == "refs/heads/w" and .head == $sha
                  and (.original_path | endswith("/.worktrees/w"))
                  and (.ref | startswith("refs/residue/removed/"))
@@ -553,6 +553,61 @@ if [ -z "$partial_probe" ]; then
     elif [ "$(git -C "$repo" for-each-ref --format='%(objectname)' refs/residue/removed/)" != "$(git -C "$repo" rev-parse x)" ]; then fail "the ref left is not x's"
     elif common_ok; then ok; fi
 
+    # A commit only the worktree's own HEAD reflog holds: the removal pins
+    # it under refs/residue/reflog/, `git gc --prune=now` keeps it, and the
+    # restored worktree's reflog names it before the pin goes.
+    name=record-reflog-pin
+    make_repo
+    setup git -C "$wt" checkout -q --detach
+    setup git -C "$wt" commit -q --allow-empty -m lone
+    lone=$(git -C "$wt" rev-parse HEAD) || exit 2
+    setup git -C "$wt" checkout -q --detach "$w_sha"
+    run remove --yes --json "$wt"
+    entry=$(basename "$(result 0 removal_record)")
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
+    elif [ "$(git -C "$repo" for-each-ref --format='%(refname) %(objectname)' refs/residue/reflog/)" != "refs/residue/reflog/$entry/1 $lone" ]; then fail "the reflog pin: $(git -C "$repo" for-each-ref refs/residue/reflog/)"
+    elif ! git -C "$repo" gc -q --prune=now >/dev/null 2>&1; then fail "git gc failed"
+    elif [ "$(git -C "$repo" cat-file -t "$lone" 2>/dev/null)" != commit ]; then fail "gc lost the commit only the reflog held"
+    elif ! (cd "$repo" && "$bin" restore --json) >"$work/$name.list" 2>"$err"; then fail "restore --json (the list) failed"
+    elif ! jq -e --arg lone "$lone" --arg ref "refs/residue/reflog/$entry/1" '
+            .removed[0] | .head_reflog == true and .incomplete == false
+            and .reflog_refs == [{"ref": $ref, "commit": $lone}]
+        ' "$work/$name.list" >/dev/null; then fail "the list: $(jq -c '.removed[0] | {head_reflog, reflog_refs, incomplete}' "$work/$name.list")"
+    else
+        run restore --json "$wt"
+        if [ "$status" != 0 ]; then fail "restore: exit $status, want 0"
+        elif ! restore_ok removed detached; then fail "stdout is not one restore document with checkout detached"
+        elif ! grep -qx "$lone" <<<"$(git -C "$wt" reflog --format=%H)"; then fail "the restored worktree's reflog does not name the lone commit"
+        elif [ "$(records)" != "0 records, 0 refs" ]; then fail "$(records) after the restore, want 0 records, 0 refs"
+        elif [ -s "$err" ]; then fail "stderr is not empty"
+        elif common_ok; then ok; fi
+    fi
+
+    # A record residue cannot read or forget never fails a removal: the
+    # PATH is removed, exit 0, and the problem is in `errors` and on
+    # stderr. An entry with no info (a run stopped while writing it) and no
+    # ref, an hour old, is cleared; a fresh one is left alone.
+    name=record-unreadable
+    make_repo
+    remove_w
+    rr=$repo/.git/residue-removed
+    mkdir "$rr/bad-20260101T000000Z" "$rr/half-20260101T000000Z" "$rr/fresh-20260101T000000Z" || exit 2
+    printf 'path /x\n' >"$rr/bad-20260101T000000Z/info" || exit 2
+    echo partial >"$rr/half-20260101T000000Z/info.new" || exit 2
+    touch -t 202601010000 "$rr/half-20260101T000000Z" || exit 2
+    setup git -C "$repo" worktree add -q "$repo/.worktrees/x" -b x
+    run remove --yes --json "$repo/.worktrees/x"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
+    elif ! jq -e '.errors | length == 1 and (.[0] | contains("bad-20260101T000000Z"))' "$out" >/dev/null; then fail "errors: $(jq -c .errors "$out")"
+    elif ! grep -q '^residue: warning: removal record: .*bad-20260101T000000Z' "$err"; then fail "no warning on stderr"
+    elif [ "$(jq -r '[.forgotten[] | .result + " " + .entry.entry] | join(",")' "$out")" != "forgotten half-20260101T000000Z" ]; then fail "forgotten: $(jq -c '[.forgotten[] | {result, reason}]' "$out")"
+    elif [ -e "$rr/half-20260101T000000Z" ]; then fail "the hour-old entry with no info is still there"
+    elif [ ! -d "$rr/fresh-20260101T000000Z" ] || [ ! -f "$rr/bad-20260101T000000Z/info" ]; then fail "a fresh or unreadable entry was cleared"
+    elif [ "$(records)" != "4 records, 2 refs" ]; then fail "$(records), want 4 records, 2 refs"
+    elif common_ok; then ok; fi
+
     # Branch and path cases: restore never moves an existing branch and
     # never overwrites a path.
     ahead() {
@@ -617,6 +672,7 @@ if [ -z "$partial_probe" ]; then
     elif common_ok; then ok; fi
 else
     for c in record-json record-text record-fail-closed-dir record-fail-closed-ref record-retention \
+        record-reflog-pin record-unreadable \
         restore-branch-ahead restore-branch-rewritten restore-branch-gone restore-branch-elsewhere \
         restore-path-occupied restore-detached; do
         skip_partial "$c"

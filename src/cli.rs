@@ -79,8 +79,9 @@ moves the worktree aside and checks again; anything that changed since you
 confirmed keeps it.
 
 Every deletion first writes a removal record (GIT_COMMON_DIR/residue-removed)
-and a ref, refs/residue/removed/NAME, that keeps its HEAD commit; if either
-cannot be written, nothing is deleted. `residue restore` recreates the
+and refs that keep its HEAD commit (refs/residue/removed/NAME) and the
+commits only its reflog held (refs/residue/reflog/NAME/); if they cannot be
+written, nothing is deleted. `residue restore` recreates the
 worktree from it at its path, on its branch and HEAD, for 30 days
 (--keep-removed). Ignored files it deleted, such as node_modules, are not
 kept: the project's install or build makes them again. A restored worktree

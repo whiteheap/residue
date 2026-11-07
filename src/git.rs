@@ -109,9 +109,19 @@ fn exec(dir: &Path, args: &[&OsStr], timeout: Duration) -> Result<Exit, String> 
     exec_command(command(dir), args, timeout)
 }
 
-fn exec_command(mut cmd: Command, args: &[&OsStr], timeout: Duration) -> Result<Exit, String> {
+fn exec_command(cmd: Command, args: &[&OsStr], timeout: Duration) -> Result<Exit, String> {
+    exec_input(cmd, args, None, timeout)
+}
+
+/// [`exec_command`] with `input` on git's standard input.
+fn exec_input(
+    mut cmd: Command,
+    args: &[&OsStr],
+    input: Option<Vec<u8>>,
+    timeout: Duration,
+) -> Result<Exit, String> {
     cmd.args(args);
-    match run::run(&mut cmd, timeout, MAX_OUTPUT) {
+    match run::run_with_input(&mut cmd, input, timeout, MAX_OUTPUT) {
         Ok(out) => Ok(Exit {
             success: out.status.success(),
             code: out.status.code(),
@@ -858,18 +868,131 @@ pub fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result<bool,
     }
 }
 
-/// Create the ref `full` at `commit`. The empty old value makes Git refuse
-/// when the ref already exists, so residue never overwrites one.
-pub fn create_ref(dir: &Path, full: &str, commit: &str) -> Result<(), String> {
-    git(dir, &["update-ref", "--no-deref", full, commit, ""]).map(|_| ())
+/// One change in a [`change_refs`] transaction.
+pub enum RefChange<'a> {
+    /// Create the ref at a commit; Git refuses when it already exists, so
+    /// residue never overwrites one.
+    Create { name: &'a str, commit: &'a str },
+    /// Delete the ref only while it points at this commit; Git refuses when
+    /// it points anywhere else or does not exist.
+    Delete { name: &'a str, commit: &'a str },
 }
 
-/// Delete the ref `full` only while it points at `commit`: with the old
-/// value given, Git refuses when it points anywhere else. `Ok(false)` when
-/// it does not exist.
-pub fn delete_ref(dir: &Path, full: &str, commit: &str) -> Result<bool, String> {
-    if !ref_exists(dir, full)? {
-        return Ok(false);
+/// Apply `changes` with `git update-ref --stdin`: one transaction, so all
+/// of them happen or none. The refs are synced to disk: `core.fsync`
+/// adds `reference` to the platform default (Git 2.36 documents that a
+/// value starts from the default and adds to it), and `core.fsyncMethod`
+/// `fsync` flushes the drive's cache on macOS, where Git's default does not.
+pub fn change_refs(dir: &Path, changes: &[RefChange]) -> Result<(), String> {
+    if changes.is_empty() {
+        return Ok(());
     }
-    git(dir, &["update-ref", "--no-deref", "-d", full, commit]).map(|_| true)
+    let mut input = String::new();
+    for change in changes {
+        let line = match change {
+            RefChange::Create { name, commit } => format!("create {name} {commit}\n"),
+            RefChange::Delete { name, commit } => format!("delete {name} {commit}\n"),
+        };
+        input.push_str(&line);
+    }
+    let args = [
+        "-c",
+        "core.fsync=reference",
+        "-c",
+        "core.fsyncMethod=fsync",
+        "update-ref",
+        "--no-deref",
+        "--stdin",
+    ];
+    let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+    let exit = exec_input(command(dir), &args, Some(input.into_bytes()), QUERY_TIMEOUT)?;
+    if exit.success {
+        Ok(())
+    } else {
+        Err(format!("git update-ref refused: {}", exit.stderr))
+    }
+}
+
+/// The refs matching `patterns` (`refs/x/NAME` matches itself and refs
+/// below it, never `refs/x/NAME-2`), with the object each points at.
+pub fn refs_named(dir: &Path, patterns: &[&str]) -> Result<Vec<(String, String)>, String> {
+    let mut args = vec!["for-each-ref", "--format=%(refname) %(objectname)"];
+    args.extend_from_slice(patterns);
+    let out = git(dir, &args)?;
+    let mut refs = Vec::new();
+    for line in lines(&out) {
+        let line = String::from_utf8_lossy(line);
+        let (name, oid) = line
+            .rsplit_once(' ')
+            .ok_or_else(|| format!("git for-each-ref printed {line:?}"))?;
+        refs.push((name.to_string(), oid.to_string()));
+    }
+    Ok(refs)
+}
+
+/// Every commit the reflogs read from `dir` name, the old and the new value
+/// of each entry: its own worktree's (`HEAD`) and the shared ones
+/// (branches, remote-tracking refs). Commits Git has already pruned are
+/// skipped. `--stdin` with no input lets a repository without any reflog
+/// answer with nothing rather than a usage error (Git 2.36 checks
+/// `read_from_stdin` for that).
+pub fn reflog_commits(dir: &Path) -> Result<Vec<String>, String> {
+    let out = git(
+        dir,
+        &[
+            "rev-list",
+            "--no-walk=unsorted",
+            "--single-worktree",
+            "--reflog",
+            "--stdin",
+        ],
+    )?;
+    Ok(lines(&out)
+        .into_iter()
+        .map(|l| String::from_utf8_lossy(l).into_owned())
+        .collect())
+}
+
+/// Those of `commits` that no ref outside `refs/residue/` and no
+/// worktree's HEAD reaches. The commits go in on standard input, before
+/// `--not`, so their number is not bounded by the command line.
+pub fn unreferenced(dir: &Path, commits: &[&str]) -> Result<Vec<String>, String> {
+    if commits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let args = [
+        "rev-list",
+        "--stdin",
+        "--not",
+        "--exclude=refs/residue/*",
+        "--all",
+    ];
+    let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+    let mut input = commits.join("\n");
+    input.push('\n');
+    let exit = exec_input(command(dir), &args, Some(input.into_bytes()), QUERY_TIMEOUT)?;
+    if !exit.success {
+        return Err(format!("git rev-list --not --all failed: {}", exit.stderr));
+    }
+    let unreached: std::collections::HashSet<&[u8]> = lines(&exit.stdout).into_iter().collect();
+    Ok(commits
+        .iter()
+        .filter(|c| unreached.contains(c.as_bytes()))
+        .map(|c| (*c).to_string())
+        .collect())
+}
+
+/// The fewest of `commits` that reach all of them: `git merge-base
+/// --independent`.
+pub fn independent(dir: &Path, commits: &[String]) -> Result<Vec<String>, String> {
+    if commits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = vec!["merge-base", "--independent"];
+    args.extend(commits.iter().map(String::as_str));
+    let out = git(dir, &args)?;
+    Ok(lines(&out)
+        .into_iter()
+        .map(|l| String::from_utf8_lossy(l).into_owned())
+        .collect())
 }

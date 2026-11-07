@@ -51,19 +51,30 @@ pub fn command(options: &Options) -> u8 {
     // the worktree it names is gone; a name is looked up in the
     // repositories at or under this one.
     let mut chosen = None;
-    if let Some(root) = repository_of(wanted) {
-        let found = gather(&[root]);
-        if let Ok(pick) = choose(&found, wanted) {
-            chosen = Some((found, pick));
+    let mut unsearched = None;
+    match repository_of(wanted) {
+        Ok(Some(root)) => {
+            let found = gather(&[root]);
+            if let Ok(pick) = choose(&found, wanted) {
+                chosen = Some((found, pick));
+            }
         }
+        Ok(None) => {}
+        Err(e) => unsearched = Some(e),
     }
     let (found, pick) = match chosen {
         Some(c) => c,
         None => {
+            if let Some(e) = unsearched
+                .as_ref()
+                .filter(|_| at_or_above_home(Path::new(".")))
+            {
+                return fail(e);
+            }
             let found = gather(&[PathBuf::from(".")]);
             match choose(&found, wanted) {
                 Ok(pick) => (found, pick),
-                Err(e) => return fail(&e),
+                Err(e) => return fail(&unsearched.unwrap_or(e)),
             }
         }
     };
@@ -97,19 +108,51 @@ pub fn command(options: &Options) -> u8 {
 
 /// For an ENTRY given as a path, a directory to look for its repository
 /// in: the path itself, or for a worktree that is gone, the nearest
-/// directory above it that exists.
-fn repository_of(wanted: &Path) -> Option<PathBuf> {
-    if std::fs::symlink_metadata(wanted).is_ok() {
-        return Some(wanted.to_path_buf());
+/// directory above it that exists (the current one for a relative path
+/// none of whose folders exists). Never the home folder or a directory
+/// above it: from there the search would read every folder under it,
+/// Documents and Desktop among them, which macOS guards with a permission
+/// prompt. `Err`, asking for the repository, when that is the only place
+/// left to look.
+fn repository_of(wanted: &Path) -> Result<Option<PathBuf>, String> {
+    let exists = std::fs::symlink_metadata(wanted).is_ok();
+    let dir = if exists {
+        wanted.to_path_buf()
+    } else {
+        if wanted.components().count() < 2 && !wanted.is_absolute() {
+            return Ok(None);
+        }
+        wanted
+            .ancestors()
+            .skip(1)
+            .find(|a| !a.as_os_str().is_empty() && a.is_dir())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    };
+    if at_or_above_home(&dir) {
+        return Err(if exists {
+            format!(
+                "{} is your home folder or a folder above it, which residue does not search; run residue restore inside a repository, or pass an entry's path",
+                wanted.display()
+            )
+        } else {
+            format!(
+                "{} is gone, and residue does not search your home folder or the folders above it for it; run residue restore inside its repository, or pass the entry name it lists there",
+                wanted.display()
+            )
+        });
     }
-    if wanted.components().count() < 2 && !wanted.is_absolute() {
-        return None;
-    }
-    wanted
-        .ancestors()
-        .skip(1)
-        .find(|a| !a.as_os_str().is_empty() && a.is_dir())
-        .map(Path::to_path_buf)
+    Ok(Some(dir))
+}
+
+/// `dir` is the home folder, `/`, or a directory above the home folder.
+fn at_or_above_home(dir: &Path) -> bool {
+    let Ok(dir) = git::canonical(dir) else {
+        return false;
+    };
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .and_then(|h| git::canonical(Path::new(&h)).ok());
+    dir.parent().is_none() || home.is_some_and(|h| h.starts_with(&dir))
 }
 
 /// `path` made absolute against a directory that exists: its parent
@@ -185,19 +228,40 @@ fn choose(found: &Found, wanted: &Path) -> Result<Pick, String> {
         }
     }
     let text = wanted.as_os_str();
-    if let Some(i) = found
+    // New entries never share a name across the two kinds; two
+    // repositories under the current directory can still both have one.
+    let named: Vec<Pick> = found
         .trash
         .iter()
-        .position(|i| i.name.as_bytes() == text.as_encoded_bytes())
-    {
-        return Ok(Pick::Trash(i));
-    }
-    if let Some(i) = found
-        .removed
-        .iter()
-        .position(|i| i.name.as_bytes() == text.as_encoded_bytes())
-    {
-        return Ok(Pick::Removed(i));
+        .enumerate()
+        .filter(|(_, i)| i.name.as_bytes() == text.as_encoded_bytes())
+        .map(|(i, _)| Pick::Trash(i))
+        .chain(
+            found
+                .removed
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| i.name.as_bytes() == text.as_encoded_bytes())
+                .map(|(i, _)| Pick::Removed(i)),
+        )
+        .collect();
+    match named.as_slice() {
+        [one] => return Ok(*one),
+        [] => {}
+        many => {
+            let paths: Vec<String> = many
+                .iter()
+                .map(|p| match *p {
+                    Pick::Trash(i) => found.trash[i].dir.display().to_string(),
+                    Pick::Removed(i) => found.removed[i].dir.display().to_string(),
+                })
+                .collect();
+            return Err(format!(
+                "{shown} names {} entries ({}); pass the entry's path",
+                many.len(),
+                paths.join(", ")
+            ));
+        }
     }
     // The path the worktree had, when ENTRY looks like a path.
     let mut matches: Vec<Pick> = Vec::new();
@@ -340,7 +404,7 @@ fn how_text(done: &Done) -> String {
             format!("on branch {branch}, at {head} as it was")
         }
         How::Branch { tip } => format!(
-            "on branch {branch}, which has moved ahead of {head} to {}",
+            "on branch {branch}, which has moved on from {head} to {}",
             short(tip)
         ),
         How::Recreated => format!("branch {branch} was gone; created it again at {head}"),

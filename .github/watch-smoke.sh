@@ -434,6 +434,7 @@ grep -q "removed .*worktrees/back (.*): its upstream branch origin/back was dele
   || fail "8: the removal line has no 'restore: residue restore RECORD'"
 record=$(sed -n 's/^.*; restore: residue restore //p' "$S/log" | head -n 1)
 [ -f "$record/info" ] || fail "8: the record $record has no info file"
+grep -qx 'by watch' "$record/info" || fail "8: the record does not say watch removed it"
 [ "$(git for-each-ref --format='%(objectname)' refs/residue/removed/)" = "$back_sha" ] || fail "8: no ref pins back's HEAD"
 "$residue" restore "$record" > "$S/restore.out" || fail "8: restore failed: $(cat "$S/restore.out")"
 grep -q "^restored .*worktrees/back from the removal record back-" "$S/restore.out" || fail "8: no 'restored' line: $(cat "$S/restore.out")"
