@@ -2,8 +2,9 @@
 # End-to-end check of a residue binary on the machine it runs on. CI runs it
 # on every platform residue supports. It builds a scratch repository, checks
 # three verdicts (one of them needs the activity probe to see a process),
-# then removes the candidate, checks that its branch stayed, and restores
-# it from its removal record. On NetBSD, OpenBSD and DragonFly
+# then removes the candidate, checks that its branch stayed, restores it
+# from its removal record, and reads both back from `residue stats`, in a
+# scratch home folder. On NetBSD, OpenBSD and DragonFly
 # (scripts/partial-probe.sh) the clean worktree is no candidate: it must
 # be `unknown`, for the probe's reason, and `remove` must keep it.
 #
@@ -23,6 +24,12 @@ busy=
 # becoming the script's exit status under `set -e`. illumos rm refuses a
 # directory above the working directory, hence the `cd /`.
 trap 'if [ -n "$busy" ]; then kill "$busy" 2>/dev/null || true; wait "$busy" 2>/dev/null || true; fi; cd /; rm -rf "$S"' EXIT
+# A scratch home folder: the stats ledger residue writes is in it, never
+# the caller's.
+HOME="$S/home"
+XDG_STATE_HOME="$S/home/.local/state"
+export HOME XDG_STATE_HOME
+mkdir -p "$HOME"
 
 git init -q -b main "$S/app"
 cd "$S/app"
@@ -59,13 +66,20 @@ expect 'in use: sleep\['
 
 if [ -z "$partial_probe" ]; then
   expect 'candidate .*worktrees/clean'
-  "$residue" remove --yes .worktrees/clean
+  out=$("$residue" remove --yes .worktrees/clean)
+  printf '%s\n' "$out"
+  # It ends with what it freed and the total in the stats ledger.
+  expect '^freed about .* \(residue has freed about .* on this machine since [0-9][0-9-]*\)$'
   test ! -e .worktrees/clean
   git rev-parse --verify -q clean > /dev/null
   # Its removal record brings it back, on its branch.
   "$residue" restore clean
   test -f .worktrees/clean/README.md
   [ "$(git -C .worktrees/clean symbolic-ref HEAD)" = refs/heads/clean ]
+  out=$("$residue" stats --json)
+  expect '^[{]"schema":"residue\.stats/v1",'
+  expect '"freed":[{]"all_time":[{]"bytes":[0-9]+,"worktrees":1,'
+  expect '"restored":[{]"worktrees":1,'
   echo "smoke: ok"
   exit 0
 fi
@@ -88,4 +102,7 @@ expect "worktrees/clean +unknown: $partial_probe_short_re"
 test -d .worktrees/clean
 git worktree list --porcelain | grep -q "^worktree .*/\.worktrees/clean\$"
 git rev-parse --verify -q clean > /dev/null
+# Nothing was freed, so the stats have nothing.
+out=$("$residue" stats --json)
+expect '"freed":[{]"all_time":[{]"bytes":0,"worktrees":0,'
 echo "smoke: ok (clean kept as activity unknown)"

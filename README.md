@@ -222,24 +222,43 @@ Every `remove` run forgets the records older than `--keep-removed DURATION` (def
 
 What `--keep-removed` can lose: forgetting a record deletes its refs, so a commit one of them was the last holder of becomes unreachable, and the next `git gc` deletes it. Usually that is nothing, because the branch still has the commits. It is not nothing for a branch deleted after the removal, such as one deleted after a squash merge, or for work only the worktree's reflog held: there the record is the last holder, and `--keep-removed` is the only grace period. Restore what you want before then, or put it on a branch. Tools that read every ref, such as `git log --all` and `git push --mirror`, see `refs/residue/removed/` and `refs/residue/reflog/`.
 
+### How much space it freed
+
+A `remove` that deletes something ends with what it freed and what residue has freed on this machine so far:
+
+```text
+removed .worktrees/fix-login (branch fix-login kept); about 812 MB reclaimable; restore: residue restore /Users/me/src/app/.git/residue-removed/fix-login-20261107T040000Z
+freed about 812 MB (residue has freed about 14.2 GB on this machine since 2026-10-02)
+```
+
+A move into the trash frees nothing yet, and the line says so: the space counts once a remove run purges the entry. A preview, or a run that removes nothing, prints no such line. `scan` ends with the total, the `watch` log says what each removal freed, and `residue service status` shows what automatic cleanup freed in the last seven days.
+
+```sh
+residue stats          # all time, the last 7 and 30 days, by command and by repository, and the trash
+residue stats --json   # the same as residue.stats/v1
+```
+
+The numbers come from a ledger, one line per deletion, purge, move into the trash and restore: `~/Library/Application Support/residue/ledger.jsonl` on macOS, `$XDG_STATE_HOME/residue/ledger.jsonl` (by default `~/.local/state/residue/`) elsewhere. Nothing in it leaves the machine. Each size is the `reclaimable` estimate residue measured before the removal; APFS snapshots, clones and hard links can keep some of the space. A restore does not subtract from what was freed; `stats` counts restores on their own line. The ledger never decides anything: residue writes to it only after a deletion, and a ledger it cannot write is a warning that changes neither the removal nor the exit status. A removal the ledger lacks, such as one from before it existed, is added from its removal record while the record lasts. The format and the JSON are in the [reference](docs/reference.md#stats).
+
 ## Automate cleanup
 
-Turn it on with one command:
+`residue watch` removes a worktree when its work landed, or when the disk is low and it has sat idle ([Reclaim storage automatically](#reclaim-storage-automatically)). These removals delete: they do not use the trash. Branches, commits and locked worktrees stay. Each removal leaves a removal record, so for 30 days `residue restore` brings the worktree back ([Restore a removed worktree](#restore-a-removed-worktree)). `watch` runs only when you start it or install it as a service; `scan` never starts it.
+
+See what it would remove right now:
+
+```sh
+residue watch --once --dry-run
+```
+
+Then turn it on:
 
 ```sh
 residue service install
 ```
 
-That starts `residue watch` now and at every login (launchd on macOS, systemd --user on Linux). With no ROOT it watches the usual code folders in your home folder that exist, and prints which: `~/src`, `~/code`, `~/Code`, `~/dev`, `~/Developer`, `~/projects`, `~/Projects`, `~/repos`, `~/git`, `~/github`, `~/GitHub`, `~/work`, `~/Work` and `~/workspace`. Name folders to watch only those: `residue service install ~/src`. `residue service uninstall` turns it off. One `watch` runs per user. While none is installed or running, `residue scan` at a terminal ends with a one-line reminder of this command.
+That starts `residue watch` now and at every login (launchd on macOS, systemd --user on Linux). With no folder named, both commands use the usual code folders in your home folder that exist, and print which: `~/src`, `~/code`, `~/Code`, `~/dev`, `~/Developer`, `~/projects`, `~/Projects`, `~/repos`, `~/git`, `~/github`, `~/GitHub`, `~/work`, `~/Work` and `~/workspace`. If your code lives elsewhere, name its folder, which replaces the list: `residue watch --once --dry-run ~/src`, then `residue service install ~/src`. `residue service uninstall` turns it off. One `watch` runs per user. While none is installed or running, `residue scan` at a terminal ends with a one-line reminder of `residue service install`.
 
-Try the dry run before anything is removed:
-
-```sh
-residue watch --once --dry-run
-residue service install --dry-run
-```
-
-The first prints what it would remove right now (for one folder: `residue watch --once --dry-run ~/src`); the second installs a service that only logs it. A dry run still fetches (below); add `--no-fetch` to leave the refs alone too.
+To try the service itself before it removes anything, `residue service install --dry-run` installs one that only logs what it would remove. A dry run still fetches (below); add `--no-fetch` to leave the refs alone too.
 
 <a id="reclaim-storage-automatically"></a>
 
@@ -285,7 +304,7 @@ The launchd plist, the systemd unit and timer, how to stop them, and the sweep's
 
 The Mac app is residue in a window. It lists the linked worktrees under your code folders with their size and verdict, shows why each one is kept, moves the ones that can go to the trash, restores them, and turns automatic cleanup on or off. Every check, size and removal comes from the residue binary inside the app, which is this release's own residue, with the same version.
 
-Download [residue-macos.dmg](https://github.com/whiteheap/residue/releases/latest/download/residue-macos.dmg), open it, and drag residue to Applications. The link always serves the latest release. It needs macOS 13 or later, and runs natively on Apple silicon and Intel.
+Download [residue-macos.dmg](https://github.com/whiteheap/residue/releases/latest/download/residue-macos.dmg), open it, and drag residue to Applications. Every release from 0.0.8 on has it, and the link always serves the latest one. It needs macOS 13 or later, and runs natively on Apple silicon and Intel.
 
 ### First launch
 
@@ -312,6 +331,7 @@ Building and changing the app: [app/README.md](app/README.md).
 | --- | --- |
 | The install script, apt, dnf, pacman, archives, `cargo install` | [Install residue](docs/installation.md) |
 | PATH search, `--json` fields, exit codes, regenerable rules | [Command and configuration reference](docs/reference.md) |
+| `residue stats`, the ledger and its JSON | [Stats](docs/reference.md#stats) |
 | Default folders, fetching, launchd, systemd, idle clock, sweep exit status | [Automate residue](docs/automation.md) |
 | Platforms, what was not run, CI scripts | [Platforms and testing](docs/platforms-and-testing.md) |
 

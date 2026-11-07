@@ -68,12 +68,12 @@
             <li><strong>The work landed.</strong> The upstream branch is gone from the local refs, and the worktree has not changed for an hour.</li>
             <li><strong>The disk is low.</strong> Free space is below 10%. Worktrees unchanged for two days go, largest first, until there is room again.</li>
           </ul>
-          <p>Each removal runs <code>residue remove</code> with every one of its checks. These removals delete: they do not use the trash. Branches, commits and locked worktrees stay.</p>
+          <p>Each removal runs <code>residue remove</code> with every one of its checks. These removals delete: they do not use the trash. Branches, commits and locked worktrees stay. Each removal leaves a record, so for 30 days <code>residue restore</code> brings the worktree back.</p>
           <p>See what it would remove first:</p>
-          <pre tabindex="0"><code>residue watch --once --dry-run ~/src</code></pre>
+          <pre tabindex="0"><code>residue watch --once --dry-run</code></pre>
           <p>Then turn it on:</p>
-          <pre tabindex="0"><code>residue service install ~/src</code></pre>
-          <p>That starts <code>residue watch ~/src</code> now and at every login, with launchd on macOS and systemd on Linux. <code>watch</code> runs only when you start it or install it as a service; <code>scan</code> never starts it.</p>
+          <pre tabindex="0"><code>residue service install</code></pre>
+          <p>That starts <code>residue watch</code> now and at every login, with launchd on macOS and systemd on Linux. It watches the usual code folders in your home folder that exist, such as <code>~/src</code>, <code>~/code</code> and <code>~/Work</code>, and prints which. If your code lives elsewhere, name its folder, which replaces the list: <code>residue service install ~/src</code>. <code>watch</code> runs only when you start it or install it as a service; <code>scan</code> never starts it.</p>
           <p><a href="https://github.com/whiteheap/residue#reclaim-storage-automatically">Reclaim storage automatically</a></p>
         </div>
       </section>
@@ -86,10 +86,11 @@
             <li><strong>Committed files and rebuildable output.</strong> A worktree goes only when every tracked file is committed and every ignored entry matches a regenerable rule, such as <code>node_modules/</code>. A check residue cannot finish keeps it.</li>
             <li><strong>Branches, commits and the stash stay.</strong> residue never deletes a branch, never kills a process, and never lifts a lock it did not set. Lock a worktree to keep it.</li>
             <li><strong>What you saw, or nothing.</strong> Right before each removal, residue runs every check again. Any change keeps the worktree, and the reason names it.</li>
-            <li><strong>A trash to restore from.</strong> With <code>--trash</code>, which <code>--idle</code> turns on, a worktree stays restorable until a later run purges it, after seven days by default.</li>
+            <li><strong>A record to restore from.</strong> Every removal leaves one, <code>watch</code>'s included: for 30 days, <code>residue restore</code> recreates the worktree at its path, on its branch and HEAD. Ignored files such as <code>node_modules/</code> are not kept; the project's install makes them again.</li>
+            <li><strong>A trash for the whole worktree.</strong> With <code>--trash</code>, which <code>--idle</code> turns on, the worktree itself waits in the trash, every file included, until a later run purges it, after seven days by default.</li>
           </ul>
           <pre tabindex="0"><code>residue restore fix-login</code></pre>
-          <p><a href="https://github.com/whiteheap/residue#what-removal-deletes-and-what-it-keeps">What removal deletes, and what it keeps</a> · <a href="https://github.com/whiteheap/residue#the-trash">The trash</a></p>
+          <p><a href="https://github.com/whiteheap/residue#what-removal-deletes-and-what-it-keeps">What removal deletes, and what it keeps</a> · <a href="https://github.com/whiteheap/residue#restore-a-removed-worktree">Restore a removed worktree</a> · <a href="https://github.com/whiteheap/residue#the-trash">The trash</a></p>
         </div>
       </section>
 

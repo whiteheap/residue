@@ -115,7 +115,7 @@ All three are signed with the key `1AEA B314 3511 8A1F E575  D36E E155 3632 FC32
 
 ### Release archives and packages
 
-Prebuilt binaries for macOS (Apple silicon and Intel), static Linux (x86_64 and arm64) and FreeBSD (x86_64 and aarch64) are on the releases page too. So is the Mac app, `residue-macos.dmg` (README, [Mac app](../README.md#mac-app)). Each archive, package and DMG has a SHA-256 checksum in `SHA256SUMS` and a GitHub build-provenance attestation:
+Prebuilt binaries for macOS (Apple silicon and Intel), static Linux (x86_64 and arm64) and FreeBSD (x86_64 and aarch64) are on the releases page too. So is the Mac app, `residue-macos.dmg`, from 0.0.8 on (README, [Mac app](../README.md#mac-app)). Each archive, package and DMG has a SHA-256 checksum in `SHA256SUMS` and a GitHub build-provenance attestation:
 
 ```sh
 gh attestation verify residue_amd64.deb --repo whiteheap/residue
