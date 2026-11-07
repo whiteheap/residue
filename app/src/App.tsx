@@ -222,17 +222,26 @@ export function App() {
       </main>
 
       {removing ? (
-        <RemoveDialog
-          paths={removing}
-          home={home}
-          onClose={() => setRemoving(null)}
-          onRemoved={(doc) => {
-            const moved = new Set(doc.results.filter((r) => r.result === "trashed").map((r) => r.path));
-            setSelected((sel) => new Set([...sel].filter((p) => !moved.has(p))));
-            if (detail && moved.has(detail)) setDetail(null);
+        // The dialog's own boundary: a failure to draw a result after a
+        // confirmed move stays in the dialog, and closing it scans again.
+        <ErrorBoundary
+          onClose={() => {
+            setRemoving(null);
             rescan();
           }}
-        />
+        >
+          <RemoveDialog
+            paths={removing}
+            home={home}
+            onClose={() => setRemoving(null)}
+            onRemoved={(doc) => {
+              const moved = new Set(doc.results.filter((r) => r.result === "trashed").map((r) => r.path));
+              setSelected((sel) => new Set([...sel].filter((p) => !moved.has(p))));
+              if (detail && moved.has(detail)) setDetail(null);
+              rescan();
+            }}
+          />
+        </ErrorBoundary>
       ) : null}
     </div>
   );

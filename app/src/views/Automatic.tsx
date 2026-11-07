@@ -2,6 +2,7 @@ import { Button, Checkbox, Dialog } from "@cloudflare/kumo";
 import { ArrowClockwise, Eye, FolderPlus, Info } from "@phosphor-icons/react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useState } from "react";
+import { ErrorBoundary } from "../components/ErrorBoundary";
 import { Command, ErrorPanel, Loading, PageHeader, SolidButton, Toggle } from "../components/ui";
 import { api, asCliError } from "../lib/api";
 import { shellWord, tilde } from "../lib/format";
@@ -191,21 +192,32 @@ export function Automatic({
         </section>
       </div>
 
-      {dialog === "on" && status ? (
-        <TurnOnDialog
-          initial={on && program?.roots.length ? program.roots : roots.length ? roots : suggested}
-          suggested={suggested}
-          home={home}
-          current={on ? program : null}
-          plan={status.plan}
-          bundled={info?.residue_version ?? null}
-          initialDryRun={on ? (program?.dry_run ?? false) : false}
-          onClose={() => setDialog(null)}
-          onChanged={changed}
-          onFailed={load}
-        />
+      {dialog !== null ? (
+        // The dialogs' own boundary: a failure to draw one stays in a dialog,
+        // and closing it reads the service again, since a change may have run.
+        <ErrorBoundary
+          onClose={() => {
+            setDialog(null);
+            load();
+          }}
+        >
+          {dialog === "on" && status ? (
+            <TurnOnDialog
+              initial={on && program?.roots.length ? program.roots : roots.length ? roots : suggested}
+              suggested={suggested}
+              home={home}
+              current={on ? program : null}
+              plan={status.plan}
+              bundled={info?.residue_version ?? null}
+              initialDryRun={on ? (program?.dry_run ?? false) : false}
+              onClose={() => setDialog(null)}
+              onChanged={changed}
+              onFailed={load}
+            />
+          ) : null}
+          {dialog === "off" ? <TurnOffDialog onClose={() => setDialog(null)} onChanged={changed} /> : null}
+        </ErrorBoundary>
       ) : null}
-      {dialog === "off" ? <TurnOffDialog onClose={() => setDialog(null)} onChanged={changed} /> : null}
     </>
   );
 }
