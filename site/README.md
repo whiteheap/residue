@@ -1,6 +1,6 @@
 # The residue site
 
-One static page that introduces residue and sends readers to the [README](../README.md), which stays the user contract. It is served at https://residue.whiteheap.com by Cloudflare Workers Static Assets: the Worker `residue` on the account that holds the `whiteheap.com` zone.
+One static page that introduces residue and sends readers to the [README](../README.md), which stays the user contract. It is served at https://residue.whiteheap.com by Cloudflare Workers Static Assets: the Worker `residue` on the account that holds the `whiteheap.com` zone. A change to `site/` deploys itself when it lands on `main` (see "Deploy").
 
 | Path | What it holds |
 | --- | --- |
@@ -12,6 +12,7 @@ One static page that introduces residue and sends readers to the [README](../REA
 | `public/_headers` | Response headers: Content Security Policy, `nosniff`, no framing, referrer and permissions policies. Cloudflare applies it and does not serve it |
 | `wrangler.jsonc` | The Worker: assets only, no script, `public/` as the only upload, 404 page, the Custom Domain `residue.whiteheap.com`, workers.dev and preview URLs off |
 | `check.sh` | The static checks below |
+| `smoke.sh` | The live check after a deploy: every served file matches `public/`, byte for byte, with the 404 page and the CSP header. Reads only |
 
 No JavaScript, no web font, no analytics, no cookies, no forms, nothing loaded from another origin. Keep it that way: the Content Security Policy blocks anything else.
 
@@ -46,34 +47,38 @@ Then look at it at a phone width and a desktop width, in light and dark, and tab
 
 ## Deploy
 
-A deploy changes a public page, so it waits for the maintainer's approval, and so does every step below that talks to Cloudflare. The maintainer approved the first deploy, to `residue.whiteheap.com`, on 2026-11-07.
+A change to `site/` deploys itself when it lands on `main`: merging the pull request is the approval. The maintainer approved the site on 2026-11-07 and, the same day, asked for every change to deploy this way.
+
+`.github/workflows/site.yml` runs `check.sh` on every pull request that touches `site/`, `README.md` or `docs/assets/`. On a push to `main` that touches `site/`, it runs `check.sh` again, deploys `site/public` with Wrangler under the message `site at SHORT_SHA`, and runs `smoke.sh` against https://residue.whiteheap.com, which waits up to a minute for every served file to match this commit byte for byte and for the 404 page and the Content Security Policy header. A failed deploy or smoke fails the run, and GitHub notifies whoever merged. The run's log has the Cloudflare version ID. Deploys run one at a time: a newer one waits for the one in flight, and of several waiting only the newest runs.
 
 Cloudflare documents that "requests to static assets are free and unlimited" and that storing assets has no additional cost ([billing and limitations](https://developers.cloudflare.com/workers/static-assets/billing-and-limitations/)). This Worker has no script and no `run_worker_first`, so every request, the 404 page included, is answered from the assets and none runs Worker code. That statement covers this static page only: not a custom domain's registration, not Workers Builds, not any later dynamic feature.
 
-1. Log in to the Cloudflare account that holds the `whiteheap.com` zone, or export a `CLOUDFLARE_API_TOKEN` with the Workers Scripts and Workers Routes edit permissions. Check which account Wrangler will use:
+### The token
+
+The deploy job reads `CLOUDFLARE_API_TOKEN` from the GitHub environment `site`, which only `main` can use; a pull request never sees it. The account ID is in the workflow: it names the account and grants nothing. To create or rotate the token:
+
+1. In the Cloudflare account that holds `whiteheap.com`, open [Account API tokens](https://dash.cloudflare.com/?to=/:account/api-tokens), select **Create Token**, and use the **Edit Cloudflare Workers** template.
+2. Limit it to that account and to the zone `whiteheap.com`, and name it `residue site deploy (GitHub Actions)`.
+3. Store it. Without a value on the command line, `gh` prompts for it, so it stays out of the shell history:
 
    ```sh
-   cd site
-   npx --yes wrangler@4.158.0 login
-   npx --yes wrangler@4.158.0 whoami
+   gh secret set CLOUDFLARE_API_TOKEN -R whiteheap/residue --env site
    ```
 
-2. From a clean checkout of the reviewed commit on `main`, run `sh site/check.sh`, then deploy. Wrangler uploads `site/public` and nothing else, attaches the Custom Domain (Cloudflare creates its DNS record and certificate; it refuses a hostname that already has a record), and prints the version ID:
+4. Deploy once to prove it: `gh workflow run site.yml -R whiteheap/residue --ref main`, then `gh run watch -R whiteheap/residue`.
 
-   ```sh
-   cd site
-   npx --yes wrangler@4.158.0 deploy --message "site at $(git rev-parse --short HEAD)"
-   ```
+### By hand
 
-3. Record the version ID, the commit and the time in the pull request or issue that approved it. Then smoke it:
+When the workflow cannot run, deploy from a clean checkout of `main` with your own Cloudflare login. Check that `whoami` names the account that holds `whiteheap.com`. Wrangler uploads `site/public` and nothing else, attaches the Custom Domain (Cloudflare creates its DNS record and certificate; it refuses a hostname that already has a record), and prints the version ID:
 
-   ```sh
-   URL=https://residue.whiteheap.com
-   curl -sI "$URL/"            # 200, text/html, content-security-policy present
-   curl -sI "$URL/style.css"   # 200, text/css
-   curl -sI "$URL/logo.svg"    # 200, image/svg+xml
-   curl -sI "$URL/missing"     # 404
-   ```
+```sh
+cd site
+npx --yes wrangler@4.158.0 login
+npx --yes wrangler@4.158.0 whoami
+sh check.sh
+npx --yes wrangler@4.158.0 deploy --message "site at $(git rev-parse --short HEAD)"
+sh smoke.sh
+```
 
 The page has `<link rel="canonical">` and Open Graph tags with that address, and no `noindex`: search engines may index it. The README links to it.
 
@@ -81,11 +86,13 @@ Leave https://whiteheap.github.io/residue/ alone. GitHub Pages serves the signed
 
 ## Roll back or take it down
 
-Each deploy is a version that holds its assets. To go back to an earlier one:
+The usual way back is a revert on `main`: it deploys like any other change. Each deploy is also a Cloudflare version that holds its assets, so you can go back to one at once:
 
 ```sh
 npx --yes wrangler@4.158.0 versions list --name residue
 npx --yes wrangler@4.158.0 rollback VERSION_ID --name residue --message "why"
 ```
 
-The first deploy has no earlier version. To take the site down, remove `residue.whiteheap.com` from the Worker's Settings > Domains & Routes in the Cloudflare dashboard, and the `routes` entry from `wrangler.jsonc` so the next deploy does not attach it again, or delete the Worker with `npx --yes wrangler@4.158.0 delete residue`. Both are public changes and need the same approval as a deploy. Reverting a commit changes nothing that is deployed until the next deploy.
+The next push to `main` that touches `site/` deploys over a rollback, so revert the change on `main` too.
+
+To take the site down, remove `residue.whiteheap.com` from the Worker's Settings > Domains & Routes in the Cloudflare dashboard, and the `routes` entry from `wrangler.jsonc` so the next deploy does not attach it again, or delete the Worker with `npx --yes wrangler@4.158.0 delete residue` and remove `.github/workflows/site.yml`. Either takes the site away from every reader, so it waits for the maintainer's word.

@@ -1,0 +1,65 @@
+name: site
+
+# Checks the website on every pull request that can change it, and deploys it
+# to https://residue.whiteheap.com when a change to site/ lands on main.
+# site/README.md, "Deploy", has the token, the manual fallback and the rollback.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/site.yml"
+  pull_request:
+    # check.sh also compares the page with README.md and docs/assets, so a
+    # change to either is checked here before it can leave the site behind.
+    paths:
+      - "site/**"
+      - "README.md"
+      - "docs/assets/**"
+      - ".github/workflows/site.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check the site
+        run: sh site/check.sh
+
+  deploy:
+    needs: check
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    # The token is a secret of this environment, which only main may use.
+    environment:
+      name: site
+      url: https://residue.whiteheap.com
+    # One deploy at a time. A newer push waits, and of several waiting only the
+    # newest runs; nothing cancels a deploy in flight.
+    concurrency:
+      group: site-deploy
+      cancel-in-progress: false
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: 5946f06692c48cd0bea2d074e02f2f38
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Wrangler 4.158.0 needs Node.js 22 or later.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Token
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo '::error::The site environment has no CLOUDFLARE_API_TOKEN secret. site/README.md, "Deploy", says how to create it.'
+            exit 1
+          fi
+      - name: Deploy
+        working-directory: site
+        run: npx --yes wrangler@4.158.0 deploy --message "site at ${GITHUB_SHA::7}"
+      - name: Smoke
+        run: sh site/smoke.sh
