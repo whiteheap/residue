@@ -34,7 +34,7 @@ A repository's linked worktrees are checked, then reported. `scan` and `explain`
 curl -fsSL https://residue.whiteheap.com/install.sh | sh
 ```
 
-It installs residue through Homebrew on macOS, the signed apt, dnf or pacman repository on Linux, or else the checksum-verified release archive, so updates arrive with your other upgrades, then turns on automatic cleanup with `residue service install`. [Read the script](site/public/install.sh) first if you like; [its flags and how to undo it](docs/installation.md#the-install-script) are in Install residue.
+It installs residue through Homebrew on macOS, the signed apt, dnf or pacman repository on Linux, or else the checksum-verified release archive, so updates arrive with your other upgrades. On macOS and Linux it then turns on automatic cleanup with `residue service install`; elsewhere it installs residue only. [Read the script](site/public/install.sh) first if you like; [its flags and how to undo it](docs/installation.md#the-install-script) are in Install residue.
 
 Or with Homebrew alone:
 
