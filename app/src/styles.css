@@ -568,7 +568,13 @@ dd {
 }
 
 .notice ul {
+  display: grid;
+  gap: 0.3rem;
   padding-inline-start: 1.1rem;
+}
+
+.notice p + ul {
+  margin-block-start: 0.35rem;
 }
 
 .notice.dev {

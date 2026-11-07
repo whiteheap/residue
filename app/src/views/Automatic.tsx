@@ -45,6 +45,13 @@ export function Automatic({
     load();
   };
 
+  // The save dialog reads the service itself. When what it last read is not
+  // what this screen shows, the screen reads it again.
+  const closeSave = (seen: ServiceStatus | null) => {
+    setDialog(null);
+    if (seen && JSON.stringify(seen.basis) !== JSON.stringify(status?.basis)) load();
+  };
+
   const on = status?.installed ?? false;
   const program = status?.program ?? null;
   const preview = info?.dev_service_preview ?? false;
@@ -201,16 +208,13 @@ export function Automatic({
             load();
           }}
         >
-          {dialog === "on" && status ? (
+          {dialog === "on" ? (
             <TurnOnDialog
-              initial={on && program?.roots.length ? program.roots : roots.length ? roots : suggested}
+              appRoots={roots}
               suggested={suggested}
               home={home}
-              current={on ? program : null}
-              plan={status.plan}
               bundled={info?.residue_version ?? null}
-              initialDryRun={on ? (program?.dry_run ?? false) : false}
-              onClose={() => setDialog(null)}
+              onClose={closeSave}
               onChanged={changed}
               onFailed={load}
             />
@@ -275,44 +279,153 @@ function WhatItRemoves({
   );
 }
 
+/** Where the dialog starts: the running service's folders and mode, or the app's folders, live. */
+function startFrom(status: ServiceStatus, appRoots: string[], suggested: string[]) {
+  const running = status.installed ? status.program : null;
+  return {
+    roots: running?.roots.length ? running.roots : appRoots.length ? appRoots : suggested,
+    dryRun: running?.dry_run ?? false,
+  };
+}
+
+function sameSet(set: Set<string>, list: string[]): boolean {
+  const other = new Set(list);
+  return set.size === other.size && list.every((x) => set.has(x));
+}
+
+/**
+ * Turn the service on, or save other folders. The dialog plans from its own
+ * read of the service, made when it opens, never from the screen's, which can
+ * be older: a `brew upgrade` or a terminal can change the service while the
+ * window is open. A save sends that read's basis back, and installs nothing
+ * when a fresh read differs.
+ */
 function TurnOnDialog({
-  initial,
+  appRoots,
   suggested,
   home,
-  current,
-  plan,
   bundled,
-  initialDryRun,
   onClose,
   onChanged,
   onFailed,
 }: {
-  initial: string[];
+  /** The folders the app scans: where a service that is off starts. */
+  appRoots: string[];
   suggested: string[];
   home: string | undefined;
-  /** The running service, which a save replaces. */
-  current: ServiceProgram | null;
-  plan: ServicePlan;
   /** `residue --version` of the bundled binary, which runs the preview. */
   bundled: string | null;
-  initialDryRun: boolean;
-  onClose: () => void;
+  /** Closed without a save: the service as the dialog last read it. */
+  onClose: (seen: ServiceStatus | null) => void;
   onChanged: (c: ServiceChange) => void;
   /** A save failed: read the service again, since it may have changed. */
   onFailed: () => void;
 }) {
-  const [options, setOptions] = useState<string[]>(() => [...new Set([...initial, ...suggested])]);
-  const [chosen, setChosen] = useState<Set<string>>(() => new Set(initial));
-  const [dryRun, setDryRun] = useState(initialDryRun);
+  // This dialog's own read, made when it opens. A save that finds the service
+  // changed replaces it with the fresh read it returns (`adopted`).
+  const q = useCli("save-dialog", api.serviceStatus);
+  const [adopted, setAdopted] = useState<ServiceStatus | null>(null);
+  const status = adopted ?? q.data ?? null;
   const [working, setWorking] = useState<"preview" | "install" | null>(null);
+
+  const close = () => onClose(status);
+
+  return (
+    <Dialog.Root
+      role="alertdialog"
+      open
+      onOpenChange={(open) => {
+        if (!open && !working) close();
+      }}
+    >
+      <Dialog size="xl" className="dialog">
+        {status ? (
+          <SaveForm
+            status={status}
+            appRoots={appRoots}
+            suggested={suggested}
+            home={home}
+            bundled={bundled}
+            working={working}
+            setWorking={setWorking}
+            onAdopt={setAdopted}
+            onCancel={close}
+            onChanged={onChanged}
+            onFailed={onFailed}
+          />
+        ) : (
+          <>
+            <Dialog.Title className="dialog-title">Automatic cleanup</Dialog.Title>
+            {q.error ? (
+              <ErrorPanel
+                title="residue could not read the service"
+                error={q.error}
+                action={
+                  <Button variant="secondary" onClick={q.reload}>
+                    Try again
+                  </Button>
+                }
+              />
+            ) : (
+              <Loading title="Reading the service" detail="A save plans from what residue reports now." />
+            )}
+            <div className="dialog-buttons">
+              <Button variant="secondary" onClick={close}>
+                Cancel
+              </Button>
+            </div>
+          </>
+        )}
+      </Dialog>
+    </Dialog.Root>
+  );
+}
+
+function SaveForm({
+  status,
+  appRoots,
+  suggested,
+  home,
+  bundled,
+  working,
+  setWorking,
+  onAdopt,
+  onCancel,
+  onChanged,
+  onFailed,
+}: {
+  /** The dialog's read: everything below plans from it. */
+  status: ServiceStatus;
+  appRoots: string[];
+  suggested: string[];
+  home: string | undefined;
+  bundled: string | null;
+  working: "preview" | "install" | null;
+  setWorking: (w: "preview" | "install" | null) => void;
+  /** A save found the service changed: plan from this read from now on. */
+  onAdopt: (status: ServiceStatus) => void;
+  onCancel: () => void;
+  onChanged: (c: ServiceChange) => void;
+  onFailed: () => void;
+}) {
+  const [options, setOptions] = useState<string[]>(() => [
+    ...new Set([...startFrom(status, appRoots, suggested).roots, ...suggested]),
+  ]);
+  const [chosen, setChosen] = useState<Set<string>>(
+    () => new Set(startFrom(status, appRoots, suggested).roots),
+  );
+  const [dryRun, setDryRun] = useState(() => startFrom(status, appRoots, suggested).dryRun);
   const [previewed, setPreviewed] = useState<ServicePreview | null>(null);
   const [error, setError] = useState<CliError | null>(null);
+  const [changedSince, setChangedSince] = useState<string[] | null>(null);
 
-  const replacing = current !== null;
+  const plan = status.plan;
+  const current = status.installed ? status.program : null;
+  const replacing = status.installed;
   const roots = options.filter((o) => chosen.has(o));
   const settings = plan.settings;
   const low = diskLow(settings);
-  const changes = replacing ? changedSettings(current, plan) : [];
+  const changes = current ? changedSettings(current, plan) : [];
   const fetches = settings.fetch.mode === "every";
 
   const add = async () => {
@@ -349,8 +462,24 @@ function TurnOnDialog({
   const install = async () => {
     setWorking("install");
     setError(null);
+    setChangedSince(null);
     try {
-      onChanged(await api.serviceInstall(roots, dryRun, plan.keep));
+      const result = await api.serviceInstall(roots, dryRun, status.basis);
+      if (result.outcome === "saved") {
+        onChanged(result.change);
+        return;
+      }
+      // Nothing was installed. The folders and the mode follow the fresh
+      // read where the user had left them as the dialog started.
+      const before = startFrom(status, appRoots, suggested);
+      const after = startFrom(result.status, appRoots, suggested);
+      setOptions((o) => [...new Set([...o, ...after.roots])]);
+      setChosen((c) => (sameSet(c, before.roots) ? new Set(after.roots) : c));
+      setDryRun((d) => (d === before.dryRun ? after.dryRun : d));
+      setPreviewed(null);
+      setChangedSince(result.changes);
+      onAdopt(result.status);
+      setWorking(null);
     } catch (e) {
       setError(asCliError(e));
       setWorking(null);
@@ -359,146 +488,152 @@ function TurnOnDialog({
   };
 
   return (
-    <Dialog.Root
-      role="alertdialog"
-      open
-      onOpenChange={(open) => {
-        if (!open && !working) onClose();
-      }}
-    >
-      <Dialog size="xl" className="dialog">
-        <Dialog.Title className="dialog-title">
-          {replacing ? "Change the watched folders" : "Turn on automatic cleanup"}
-        </Dialog.Title>
-        <Dialog.Description className="dialog-text">
-          residue watch starts now and at every login. It deletes a worktree in the folders below
-          when its upstream branch is gone and it has not changed for{" "}
-          {duration(settings.grace.value)}, or when the disk is below {low.below} free and it has
-          not changed for {duration(settings.idle.value)}. Every check runs first. It deletes
-          instead of using the trash; branches and commits stay.
-        </Dialog.Description>
+    <>
+      <Dialog.Title className="dialog-title">
+        {replacing ? "Change the watched folders" : "Turn on automatic cleanup"}
+      </Dialog.Title>
+      <Dialog.Description className="dialog-text">
+        residue watch starts now and at every login. It deletes a worktree in the folders below
+        when its upstream branch is gone and it has not changed for{" "}
+        {duration(settings.grace.value)}, or when the disk is below {low.below} free and it has
+        not changed for {duration(settings.idle.value)}. Every check runs first. It deletes
+        instead of using the trash; branches and commits stay.
+      </Dialog.Description>
 
-        <fieldset className="folder-choice">
-          <legend>Folders to watch</legend>
-          {options.map((root) => (
-            <Checkbox
-              key={root}
-              label={tilde(root, home)}
-              checked={chosen.has(root)}
-              onCheckedChange={(on) => toggle(root, on === true)}
-            />
-          ))}
-          <Button variant="ghost" size="sm" icon={<FolderPlus />} onClick={add}>
-            Add a folder…
-          </Button>
-        </fieldset>
+      <fieldset className="folder-choice">
+        <legend>Folders to watch</legend>
+        {options.map((root) => (
+          <Checkbox
+            key={root}
+            label={tilde(root, home)}
+            checked={chosen.has(root)}
+            onCheckedChange={(on) => toggle(root, on === true)}
+          />
+        ))}
+        <Button variant="ghost" size="sm" icon={<FolderPlus />} onClick={add}>
+          Add a folder…
+        </Button>
+      </fieldset>
 
-        <Checkbox
-          label="Log only: record what it would remove, and remove nothing (--dry-run)"
-          checked={dryRun}
-          onCheckedChange={(on) => setDryRun(on === true)}
-        />
+      <Checkbox
+        label="Log only: record what it would remove, and remove nothing (--dry-run)"
+        checked={dryRun}
+        onCheckedChange={(on) => setDryRun(on === true)}
+      />
 
-        <section className="plan-section" aria-labelledby="save-settings">
-          <h3 id="save-settings">{replacing ? "What a save keeps" : "Settings"}</h3>
-          <dl className="facts">
-            <div>
-              <dt>Runs</dt>
-              <dd>
-                <code>{tilde(plan.binary, home)}</code>
-                {plan.version ? ` (${plan.version})` : " (version unknown)"}
-                {plan.managed ? ", the app's own copy, kept outside the app" : ""}
-              </dd>
-            </div>
-            <div>
-              <dt>Options</dt>
-              <dd>
-                {plan.keep.length > 0 ? (
-                  <>
-                    <code>{plan.keep.join(" ")}</code>, kept from the service as written
-                  </>
-                ) : replacing ? (
-                  "the service sets none, so residue's defaults apply"
-                ) : (
-                  "residue's defaults"
-                )}
-              </dd>
-            </div>
-            <div>
-              <dt>Fetching</dt>
-              <dd>{fetchWords(settings.fetch, plan.version)}</dd>
-            </div>
-            {changes.length > 0 ? (
-              <div>
-                <dt>Changes</dt>
-                <dd>{changes.join("; ")}</dd>
-              </div>
-            ) : null}
-          </dl>
-          {plan.blocked ? (
-            <p className="notice" role="alert">
-              <strong className="warn">Saving is off. </strong>
-              {plan.blocked}
-            </p>
-          ) : null}
-        </section>
-
-        <section className="plan-section">
-          <div className="plan-section-head">
-            <h3>What it would remove right now</h3>
-            <Button
-              variant="secondary"
-              size="sm"
-              icon={<Eye />}
-              loading={working === "preview"}
-              disabled={working !== null || roots.length === 0}
-              onClick={preview}
-            >
-              Preview
-            </Button>
+      <section className="plan-section" aria-labelledby="save-settings">
+        <h3 id="save-settings">{replacing ? "What a save keeps" : "Settings"}</h3>
+        <dl className="facts">
+          <div>
+            <dt>Runs</dt>
+            <dd>
+              <code>{tilde(plan.binary, home)}</code>
+              {plan.version ? ` (${plan.version})` : " (version unknown)"}
+              {plan.managed ? ", the app's own copy, kept outside the app" : ""}
+            </dd>
           </div>
-          {previewed ? (
-            <>
-              <pre className="log full" aria-label="Preview">
-                {previewed.lines.length > 0 ? previewed.lines.join("\n") : "Nothing to remove right now."}
-              </pre>
-              {previewed.left_out.length > 0 ? (
-                <p className="hint">
-                  Left out: {previewed.left_out.join(" ")} ({previewed.left_out_reason}).
-                </p>
-              ) : null}
-            </>
-          ) : (
-            <p className="hint">
-              Runs residue watch --once --dry-run on these folders with these settings, using the
-              residue {bundled ? `${bundled} ` : ""}inside the app. It removes nothing.
-            </p>
-          )}
-          {fetches ? (
-            <p className="hint">
-              The preview does not fetch, while the service fetches before its first pass. The
-              service can also remove a worktree whose branch was deleted on the remote and is not
-              yet pruned here.
-            </p>
+          <div>
+            <dt>Options</dt>
+            <dd>
+              {plan.keep.length > 0 ? (
+                <>
+                  <code>{plan.keep.join(" ")}</code>, kept from the service as written
+                </>
+              ) : replacing ? (
+                "the service sets none, so residue's defaults apply"
+              ) : (
+                "residue's defaults"
+              )}
+            </dd>
+          </div>
+          <div>
+            <dt>Fetching</dt>
+            <dd>{fetchWords(settings.fetch, plan.version)}</dd>
+          </div>
+          {changes.length > 0 ? (
+            <div>
+              <dt>Changes</dt>
+              <dd>{changes.join("; ")}</dd>
+            </div>
           ) : null}
-        </section>
+        </dl>
+        {plan.blocked ? (
+          <p className="notice" role="alert">
+            <strong className="warn">Saving is off. </strong>
+            {plan.blocked}
+          </p>
+        ) : null}
+      </section>
 
-        {error ? <ErrorPanel title="residue did not finish" error={error} /> : null}
-
-        <div className="dialog-buttons">
-          <Button variant="secondary" onClick={onClose} disabled={working !== null}>
-            Cancel
-          </Button>
-          <SolidButton
-            loading={working === "install"}
-            disabled={working !== null || roots.length === 0 || plan.blocked !== null}
-            onClick={install}
+      <section className="plan-section">
+        <div className="plan-section-head">
+          <h3>What it would remove right now</h3>
+          <Button
+            variant="secondary"
+            size="sm"
+            icon={<Eye />}
+            loading={working === "preview"}
+            disabled={working !== null || roots.length === 0}
+            onClick={preview}
           >
-            {replacing ? "Save" : "Turn on"}
-          </SolidButton>
+            Preview
+          </Button>
         </div>
-      </Dialog>
-    </Dialog.Root>
+        {previewed ? (
+          <>
+            <pre className="log full" aria-label="Preview">
+              {previewed.lines.length > 0 ? previewed.lines.join("\n") : "Nothing to remove right now."}
+            </pre>
+            {previewed.left_out.length > 0 ? (
+              <p className="hint">
+                Left out: {previewed.left_out.join(" ")} ({previewed.left_out_reason}).
+              </p>
+            ) : null}
+          </>
+        ) : (
+          <p className="hint">
+            Runs residue watch --once --dry-run on these folders with these settings, using the
+            residue {bundled ? `${bundled} ` : ""}inside the app. It removes nothing.
+          </p>
+        )}
+        {fetches ? (
+          <p className="hint">
+            The preview does not fetch, while the service fetches before its first pass. The
+            service can also remove a worktree whose branch was deleted on the remote and is not
+            yet pruned here.
+          </p>
+        ) : null}
+      </section>
+
+      {changedSince ? (
+        <div className="notice" role="alert">
+          <p>
+            <strong className="warn">Nothing was saved: the service changed after this dialog read it. </strong>
+            The dialog now shows it as it is. Check it, then save again.
+          </p>
+          <ul>
+            {changedSince.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {error ? <ErrorPanel title="residue did not finish" error={error} /> : null}
+
+      <div className="dialog-buttons">
+        <Button variant="secondary" onClick={onCancel} disabled={working !== null}>
+          Cancel
+        </Button>
+        <SolidButton
+          loading={working === "install"}
+          disabled={working !== null || roots.length === 0 || plan.blocked !== null}
+          onClick={install}
+        >
+          {replacing ? "Save" : "Turn on"}
+        </SolidButton>
+      </div>
+    </>
   );
 }
 

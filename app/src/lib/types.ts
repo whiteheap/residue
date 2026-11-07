@@ -277,6 +277,27 @@ export interface ServicePlan {
   blocked: string | null;
 }
 
+/**
+ * What a save is planned from: everything the save dialog shows about what a
+ * save installs and the service it replaces. The dialog sends it back with
+ * the save, and a fresh read that differs in any of it installs nothing.
+ */
+export interface ServiceBasis {
+  installed: boolean;
+  /** The binary a save installs with, and its `residue --version`. */
+  binary: string;
+  version: string | null;
+  /** The options a save passes on. */
+  keep: string[];
+  /** The service a save replaces, when launchd runs one and its agent file can be read. */
+  running: {
+    binary: string;
+    version: string | null;
+    roots: string[];
+    dry_run: boolean;
+  } | null;
+}
+
 export interface ServiceStatus {
   installed: boolean;
   state: string | null;
@@ -288,6 +309,7 @@ export interface ServiceStatus {
   log_error: string | null;
   program: ServiceProgram | null;
   plan: ServicePlan;
+  basis: ServiceBasis;
   dev_dry_run: boolean;
 }
 
@@ -297,6 +319,15 @@ export interface ServiceChange {
   dev_dry_run: boolean;
   status: ServiceStatus;
 }
+
+/**
+ * A save: installed (in the development preview, only shown), or refused
+ * because a fresh read differs from the basis the dialog showed, with one line
+ * per change (`what: before → after`) and the service as it is now.
+ */
+export type ServiceSave =
+  | { outcome: "saved"; change: ServiceChange }
+  | { outcome: "changed"; changes: string[]; status: ServiceStatus };
 
 /** `residue watch --once --dry-run`, which removes nothing. */
 export interface ServicePreview {

@@ -307,21 +307,21 @@ async fn service_status(state: AppState<'_>) -> Result<service::Status, CliError
     .await
 }
 
-/// Turn the service on, or save other folders. `keep` is the options the
-/// window showed a save would keep (`Status.plan.keep`); when the service
-/// changed since, nothing is installed.
+/// Turn the service on, or save other folders. `basis` is the one the window
+/// showed (`Status.basis`); when a fresh read differs, nothing is installed
+/// and the result is `changed`, with what changed and the fresh status.
 #[tauri::command]
 async fn service_install(
     state: AppState<'_>,
     roots: Vec<String>,
     dry_run: bool,
-    keep: Vec<String>,
-) -> Result<service::Change, CliError> {
+    basis: service::Basis,
+) -> Result<service::Save, CliError> {
     blocking(&state, move |s| {
         let roots = settings::folders(&roots)?;
         let version = s.bundled_version()?;
         let ctx = s.service_context(&version);
-        service::install(&ctx, &s.dev, &roots, dry_run, &keep)
+        service::install(&ctx, &s.dev, &roots, dry_run, &basis)
     })
     .await
 }

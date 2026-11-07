@@ -20,9 +20,16 @@
 //! window never assumes the bundled residue's behavior for it. Saving other
 //! folders passes the service's options on as they are written, and refuses
 //! when an argument is one the app does not know, rather than drop it.
+//!
+//! A save installs what the window showed or nothing. Every read carries a
+//! `Basis`: the binary a save installs with and its version, the options it
+//! keeps, and the service it replaces (binary, version, folders, mode). The
+//! save dialog reads the service when it opens and sends that basis back;
+//! `install` reads again and refuses, installing nothing, when any of it
+//! differs (`Save::Changed`).
 
 use crate::cli::{CliError, ErrorKind, Run, shown};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -160,8 +167,192 @@ pub struct Status {
     pub log_error: Option<String>,
     pub program: Option<Program>,
     pub plan: Plan,
+    /// What a save is planned from; the window sends it back with the save.
+    pub basis: Basis,
     /// The development preview mode is on: nothing was installed.
     pub dev_dry_run: bool,
+}
+
+/// Everything the save dialog shows about what a save installs and what it
+/// replaces. `install` refuses when a fresh read differs in any of it: a
+/// `brew upgrade` that brings a residue which fetches, or a terminal that
+/// switches the service to `--dry-run` or other folders, while the dialog is
+/// open.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Basis {
+    /// launchd runs the service, so a save replaces it.
+    pub installed: bool,
+    /// The binary a save installs with (`Plan.binary`), and its
+    /// `residue --version`.
+    pub binary: String,
+    pub version: Option<String>,
+    /// The options a save passes on (`Plan.keep`).
+    pub keep: Vec<String>,
+    /// The service a save replaces, when launchd runs one and its agent file
+    /// can be read.
+    pub running: Option<Running>,
+}
+
+/// The service a save replaces, as the window showed it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Running {
+    pub binary: String,
+    pub version: Option<String>,
+    pub roots: Vec<String>,
+    pub dry_run: bool,
+}
+
+impl Basis {
+    fn of(installed: bool, program: Option<&Program>, plan: &Plan) -> Self {
+        Basis {
+            installed,
+            binary: plan.binary.clone(),
+            version: plan.version.clone(),
+            keep: plan.keep.clone(),
+            running: program.filter(|_| installed).map(|p| Running {
+                binary: p.binary.clone(),
+                version: p.version.clone(),
+                roots: p.roots.clone(),
+                dry_run: p.dry_run,
+            }),
+        }
+    }
+
+    /// What differs from `seen`, one line each, `what: before → after`. Each
+    /// field of the basis has its line, so a basis that differs never has
+    /// an empty list.
+    fn changes_since(&self, seen: &Basis) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut line = |what: &str, before: String, after: String| {
+            if before != after {
+                out.push(format!("{what}: {before} → {after}"));
+            }
+        };
+        let on_off = |on: bool| if on { "on" } else { "off" }.to_string();
+        line(
+            "Automatic cleanup",
+            on_off(seen.installed),
+            on_off(self.installed),
+        );
+        match (&seen.running, &self.running) {
+            (Some(before), Some(after)) => {
+                let (what, from, to) = binary_change(
+                    "The service runs",
+                    (&before.binary, before.version.as_deref()),
+                    (&after.binary, after.version.as_deref()),
+                );
+                line(&what, from, to);
+                line(
+                    "The service watches",
+                    before.roots.join(", "),
+                    after.roots.join(", "),
+                );
+                line(
+                    "The service's mode",
+                    mode_text(before.dry_run),
+                    mode_text(after.dry_run),
+                );
+            }
+            (before, after) if seen.installed && self.installed => line(
+                "The service's agent file",
+                readable_text(before.is_some()),
+                readable_text(after.is_some()),
+            ),
+            _ => {}
+        }
+        let (what, from, to) = binary_change(
+            "A save installs with",
+            (&seen.binary, seen.version.as_deref()),
+            (&self.binary, self.version.as_deref()),
+        );
+        line(&what, from, to);
+        line(
+            "Options a save keeps",
+            options_text(&seen.keep),
+            options_text(&self.keep),
+        );
+        line(
+            "Fetching after a save",
+            fetch_text(&watch_settings(&seen.keep, seen.version.as_deref()).fetch),
+            fetch_text(&watch_settings(&self.keep, self.version.as_deref()).fetch),
+        );
+        if out.is_empty() && self != seen {
+            out.push("The service changed after this window read it.".into());
+        }
+        out
+    }
+}
+
+/// The label and both sides of a binary's line. When the path stayed, as
+/// after `brew upgrade`, only the version changed: the path goes in the
+/// label once instead of on both sides.
+fn binary_change(
+    what: &str,
+    (before, before_version): (&str, Option<&str>),
+    (after, after_version): (&str, Option<&str>),
+) -> (String, String, String) {
+    if before == after {
+        (
+            format!("{what} {before}"),
+            version_text(before_version),
+            version_text(after_version),
+        )
+    } else {
+        (
+            what.to_string(),
+            format!("{before} ({})", version_text(before_version)),
+            format!("{after} ({})", version_text(after_version)),
+        )
+    }
+}
+
+/// A `residue --version` line as read, which already names residue.
+fn version_text(version: Option<&str>) -> String {
+    version.unwrap_or("version unknown").to_string()
+}
+
+fn mode_text(dry_run: bool) -> String {
+    if dry_run {
+        "log only (--dry-run)".into()
+    } else {
+        "removes".into()
+    }
+}
+
+fn readable_text(read: bool) -> String {
+    if read { "read" } else { "missing" }.into()
+}
+
+fn options_text(options: &[String]) -> String {
+    if options.is_empty() {
+        "none, residue's defaults".into()
+    } else {
+        options.join(" ")
+    }
+}
+
+fn fetch_text(fetch: &Fetch) -> String {
+    match fetch {
+        Fetch::Every { value, .. } => format!("about every {value}"),
+        Fetch::Off => "off (--no-fetch)".into(),
+        Fetch::Never { .. } => "never".into(),
+        Fetch::Unknown { .. } => "unknown".into(),
+    }
+}
+
+/// The result of a save.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum Save {
+    /// The service was installed, or in the development preview would have
+    /// been.
+    Saved { change: Change },
+    /// A fresh read differs from what the window showed, so nothing was
+    /// installed: what changed, and the service as it is now.
+    Changed {
+        changes: Vec<String>,
+        status: Status,
+    },
 }
 
 /// The result of turning the service on or off.
@@ -190,12 +381,21 @@ pub struct Preview {
 /// The switch then shows the command it would run and the output of
 /// `residue watch --once --dry-run`, which removes nothing, and remembers the
 /// pretend state until the app quits. With `RESIDUE_APP_DEV_AGENT_FILE`
-/// set to a plist as well, the preview starts as if that file were the
-/// installed service; the app only reads it. Release builds ignore both.
+/// set to a plist as well, the preview reads that file as the installed
+/// service's agent file, on every read, until the switch is used: a change
+/// to the file shows as a change to the service, as it would for the real
+/// one. The app only reads it. Release builds ignore both.
 pub struct DevPreview {
     pub enabled: bool,
-    state: Mutex<Option<(Program, Vec<String>)>>,
-    seed: Mutex<Option<PathBuf>>,
+    state: Mutex<Pretend>,
+}
+
+#[derive(Clone)]
+enum Pretend {
+    /// `RESIDUE_APP_DEV_AGENT_FILE`, read on every read.
+    File(PathBuf),
+    /// What the switch set: the pretend service and its log lines, or none.
+    Set(Option<Box<(Program, Vec<String>)>>),
 }
 
 /// A poisoned lock still holds a whole value here: every writer replaces it
@@ -208,43 +408,34 @@ impl DevPreview {
     pub fn from_env() -> Self {
         let enabled = cfg!(debug_assertions)
             && std::env::var("RESIDUE_APP_DEV_SERVICE").as_deref() == Ok("preview");
-        let seed = std::env::var_os("RESIDUE_APP_DEV_AGENT_FILE")
-            .filter(|p| enabled && !p.is_empty())
-            .map(PathBuf::from);
+        let state = match std::env::var_os("RESIDUE_APP_DEV_AGENT_FILE") {
+            Some(path) if enabled && !path.is_empty() => Pretend::File(PathBuf::from(path)),
+            _ => Pretend::Set(None),
+        };
         DevPreview {
             enabled,
-            state: Mutex::new(None),
-            seed: Mutex::new(seed),
+            state: Mutex::new(state),
         }
     }
 
-    fn get(&self) -> Option<(Program, Vec<String>)> {
-        lock(&self.state).clone()
+    /// The pretend service. A file that cannot be read fails the read with
+    /// its reason, as the real agent file does.
+    fn get(&self, ctx: &Context) -> Result<Option<(Program, Vec<String>)>, CliError> {
+        let state = lock(&self.state).clone();
+        match state {
+            Pretend::File(path) => Ok(Some((
+                read_program(ctx, &path)?,
+                vec![format!(
+                    "development preview: read from {}, which the app only reads",
+                    path.display()
+                )],
+            ))),
+            Pretend::Set(current) => Ok(current.map(|c| *c)),
+        }
     }
 
     fn set(&self, value: Option<(Program, Vec<String>)>) {
-        *lock(&self.state) = value;
-    }
-
-    /// Start from the seed agent file, the first time the state is read. The
-    /// seed stays locked until the state is set, so a read that runs at the
-    /// same time waits and sees it; a file that cannot be read stays the seed
-    /// and fails every read with its reason.
-    fn seed(&self, ctx: &Context) -> Result<(), CliError> {
-        let mut seed = lock(&self.seed);
-        let Some(path) = seed.as_ref() else {
-            return Ok(());
-        };
-        let program = read_program(ctx, path)?;
-        self.set(Some((
-            program,
-            vec![format!(
-                "development preview: started from {}, which the app only reads",
-                path.display()
-            )],
-        )));
-        *seed = None;
-        Ok(())
+        *lock(&self.state) = Pretend::Set(value.map(Box::new));
     }
 }
 
@@ -268,11 +459,11 @@ pub fn status(ctx: &Context, dev: &DevPreview) -> Result<Status, CliError> {
 /// The service's status, and the binary a save would install with.
 fn read(ctx: &Context, dev: &DevPreview) -> Result<(Status, Installer), CliError> {
     if dev.enabled {
-        dev.seed(ctx)?;
-        let current = dev.get();
+        let current = dev.get(ctx)?;
         let installed = current.is_some();
         let program = current.as_ref().map(|(p, _)| p);
         let (plan, installer) = plan(ctx, installed, program)?;
+        let basis = Basis::of(installed, program, &plan);
         let status = match current {
             Some((program, log_lines)) => Status {
                 installed: true,
@@ -287,6 +478,7 @@ fn read(ctx: &Context, dev: &DevPreview) -> Result<(Status, Installer), CliError
                 log_error: None,
                 program: Some(program),
                 plan,
+                basis,
                 dev_dry_run: true,
             },
             None => Status {
@@ -300,6 +492,7 @@ fn read(ctx: &Context, dev: &DevPreview) -> Result<(Status, Installer), CliError
                 log_error: None,
                 program: None,
                 plan,
+                basis,
                 dev_dry_run: true,
             },
         };
@@ -342,6 +535,7 @@ fn read(ctx: &Context, dev: &DevPreview) -> Result<(Status, Installer), CliError
         None
     };
     let (plan, installer) = plan(ctx, installed, program.as_ref())?;
+    let basis = Basis::of(installed, program.as_ref(), &plan);
     let (log_lines, log_error) = match tail(&log_path, 40) {
         Ok(lines) => (lines, None),
         Err(e) => (Vec::new(), Some(e)),
@@ -357,6 +551,7 @@ fn read(ctx: &Context, dev: &DevPreview) -> Result<(Status, Installer), CliError
         log_path: Some(log_path.to_string_lossy().into_owned()),
         program,
         plan,
+        basis,
         dev_dry_run: false,
     };
     Ok((status, installer))
@@ -800,38 +995,31 @@ fn watch_args(roots: &[PathBuf], options: &[String], dry_run: bool) -> Vec<OsStr
 }
 
 /// Install (or replace) the service for `roots`, passing on the options of
-/// the running service as they are written. `expect_keep` is the options the
-/// window showed: when the service changed since, nothing is installed.
+/// the running service as they are written. `seen` is the basis the window
+/// showed: when a fresh read differs, nothing is installed, and the result
+/// says what changed.
 pub fn install(
     ctx: &Context,
     dev: &DevPreview,
     roots: &[PathBuf],
     dry_run: bool,
-    expect_keep: &[String],
-) -> Result<Change, CliError> {
+    seen: &Basis,
+) -> Result<Save, CliError> {
     if roots.is_empty() {
         return Err(CliError::invalid("choose at least one folder to watch"));
     }
     let (current, installer) = read(ctx, dev)?;
+    if current.basis != *seen {
+        return Ok(Save::Changed {
+            changes: current.basis.changes_since(seen),
+            status: current,
+        });
+    }
     let plan = current.plan;
     if let Some(reason) = plan.blocked {
         return Err(CliError::invalid(reason));
     }
-    if plan.keep != expect_keep {
-        return Err(CliError::invalid(format!(
-            "The service changed after this window read it: a save now keeps {}. Check the \
-             settings and save again.",
-            if plan.keep.is_empty() {
-                "no options, so residue's defaults apply".to_string()
-            } else {
-                plan.keep.join(" ")
-            }
-        )));
-    }
     let options = plan.keep;
-    if installer.managed {
-        copy_sidecar(ctx.sidecar, &installer.bin)?;
-    }
     let mut args: Vec<OsString> = vec!["service".into(), "install".into()];
     args.extend(watch_args(roots, &options, dry_run));
     let command = shown(&installer.bin, &args);
@@ -854,14 +1042,21 @@ pub fn install(
             settings,
         };
         dev.set(Some((program, preview.lines.clone())));
-        return Ok(Change {
-            command,
-            output: preview.lines,
-            dev_dry_run: true,
-            status: status(ctx, dev)?,
+        return Ok(Save::Saved {
+            change: Change {
+                command,
+                output: preview.lines,
+                dev_dry_run: true,
+                status: status(ctx, dev)?,
+            },
         });
     }
 
+    // Only a real save writes the app's own copy: the preview installs
+    // nothing, so it needs none.
+    if installer.managed {
+        copy_sidecar(ctx.sidecar, &installer.bin)?;
+    }
     let out = Run {
         bin: &installer.bin,
         args,
@@ -876,11 +1071,13 @@ pub fn install(
             "residue could not install the service".into(),
         ));
     }
-    Ok(Change {
-        command: out.command.clone(),
-        output: out.stdout.lines().map(str::to_string).collect(),
-        dev_dry_run: false,
-        status: status(ctx, dev)?,
+    Ok(Save::Saved {
+        change: Change {
+            command: out.command.clone(),
+            output: out.stdout.lines().map(str::to_string).collect(),
+            dev_dry_run: false,
+            status: status(ctx, dev)?,
+        },
     })
 }
 
