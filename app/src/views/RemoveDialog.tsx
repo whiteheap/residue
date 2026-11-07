@@ -184,10 +184,11 @@ function Plan({
 
       {purges.length > 0 ? (
         <section className="plan-section">
-          <h3>Deleted from the trash for good</h3>
+          <h3>Deleted from the trash</h3>
           <p className="hint">
-            The same run deletes these trash entries, older than {span(plan.trash.keep_seconds)}. They cannot
-            be restored afterwards.
+            The same run deletes these trash entries, older than {span(plan.trash.keep_seconds)}. The app
+            cannot put them back afterwards. Each leaves a removal record: residue restore in a terminal
+            recreates the worktree on its branch and HEAD, without its ignored files.
           </p>
           <ul className="plan-list">
             {purges.map((p) => (
@@ -264,7 +265,7 @@ function Result({ doc, home, onClose }: { doc: RemoveDocument; home: string | un
       </ul>
       {purged.length > 0 ? (
         <p className="hint">
-          Deleted {plural(purged.length, "old trash entry", "old trash entries")} for good, freeing{" "}
+          Deleted {plural(purged.length, "old trash entry", "old trash entries")}, freeing{" "}
           {bytes(purged.reduce((s, p) => s + (p.entry.reclaimable_bytes ?? 0), 0))}.
         </p>
       ) : null}

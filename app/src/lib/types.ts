@@ -180,9 +180,9 @@ export interface Listing {
 }
 
 /**
- * Something the Restore screen can bring back. residue 0.0.6 lists its
- * trash. A later release also lists worktrees it deleted, with a hidden ref
- * that keeps their commit (`kind: "removed"`); the screen shows both kinds.
+ * Something the Restore screen can bring back. Since 0.0.7 a listing also
+ * has the removal records of worktrees residue deleted (`removed`); the
+ * screen reads only `trash` so far, so every row is `kind: "trash"`.
  */
 export interface Restorable {
   kind: "trash" | "removed";

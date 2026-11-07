@@ -128,7 +128,7 @@ export function Restore({
           <Empty
             icon={<ClockCounterClockwise size={32} />}
             title="Nothing to restore"
-            description="When you move worktrees to the trash, they are listed here until residue deletes them for good."
+            description="When you move worktrees to the trash, they are listed here until residue deletes them from the trash."
           />
         ) : (
           <>
@@ -171,11 +171,12 @@ export function Restore({
             {items.length > 0 ? (
               <p className="hint">
                 A trashed worktree still takes its disk space. The next removal or automatic
-                cleanup in its repository deletes the entries older than its --keep-trash for good
+                cleanup in its repository deletes the entries older than its --keep-trash
                 {keepTrash
                   ? `: ${duration(keepTrash)}, residue's default, which the app and automatic cleanup use`
                   : ""}
-                .
+                . Each one it deletes leaves a removal record, which this screen does not list yet:
+                residue restore in a terminal recreates the worktree from it.
               </p>
             ) : null}
           </>
