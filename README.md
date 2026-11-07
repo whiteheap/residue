@@ -1,6 +1,18 @@
 # residue
 
-**Reclaim your storage from Git worktrees, automatically and safely.**
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.png">
+  <img src="docs/assets/logo.png" width="112" alt="Residue mark: three flat sheets stacked like linked worktrees, and a small square set apart beneath them.">
+</picture>
+
+**Coding agents leave Git worktrees on disk; residue removes one only when every check passes.**
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/how-it-works-dark.png">
+  <img src="docs/assets/how-it-works.png" width="420" alt="Chart. A repository leads to its linked worktrees, then checks, then a report. Read only ends at scan and explain, which read and stop. A separate arrow, you or watch, enters remove, then fresh checks. Block, unknown, or changed leads to stays. All pass leads to git remove without --force, or to the trash for restore. Scan does not lead to deletion.">
+</picture>
+
+A repository's linked worktrees are checked, then reported. `scan` and `explain` only read that report and stop. `remove` is separate: you run it, or `watch` chooses paths for it. Fresh checks leave the worktree in place on a block, an unknown, or a change. When every check passes, `git worktree remove` deletes it without `--force`, or the trash holds it for `restore`. A pass is not a guarantee, and age alone does not mean inactive.
 
 Coding agents leave Git worktrees behind. Each one is a full checkout with its own `node_modules`, `target` and build output, and a machine that runs agents all day fills its disk with them. residue finds those worktrees, measures them, and removes one only when nothing in it would be lost.
 
