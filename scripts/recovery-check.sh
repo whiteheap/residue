@@ -36,6 +36,11 @@
 #                  so both have passed every check; the test releases one,
 #                  waits for it to finish, then releases the other (4, and
 #                  4b with --trash, where each made a trash entry first)
+#   part-remove-reflog, part-remove-head
+#                  fail `worktree remove ASIDE` after deleting the
+#                  worktree's HEAD reflog, or its HEAD, from its Git
+#                  directory: what Git's own remove leaves when it stops
+#                  at a file it cannot delete (5, 5b)
 #
 # A held command waits at most 50 s, and never runs once its residue has
 # exited or the test aborted it. The two removers of scenario 4 start one
@@ -48,7 +53,10 @@
 #
 # Outside the model: a kill or power loss during `git worktree remove`
 # itself. Deletion may then be partial; residue does not promise to roll
-# back a deletion that has started, and nothing here claims it.
+# back a deletion that has started, and nothing here claims it. What it
+# does promise, and 5 checks: a remove that fails part way keeps the
+# removal record, so the commits the worktree held survive `git gc`, and
+# `residue restore` brings it back.
 #
 # Needs bash, git, jq and pgrep. Everything lives under one fresh
 # directory with its own HOME and Git config, and only that directory is
@@ -154,6 +162,18 @@ case " \$* " in
 *" worktree remove "*)
     case "\$last \$mode" in
     *residue-removing-*hold-remove*) [ -e "\$work/at-remove" ] || hold remove ;;
+    *residue-removing-*part-remove-*)
+        # Git's own remove stops at the first file it cannot delete, after
+        # the ones the filesystem listed before it: here, the worktree's
+        # HEAD reflog or its HEAD, while Git still lists the worktree.
+        gd=\$("\$real" -C "\$last" rev-parse --absolute-git-dir) || exit 1
+        case \$mode in
+        *part-remove-reflog*) rm -f "\$gd/logs/HEAD" ;;
+        *part-remove-head*) rm -f "\$gd/HEAD" ;;
+        esac
+        echo "error: recovery-check: the remove stops part way on purpose" >&2
+        exit 255
+        ;;
     esac
     ;;
 *" worktree move "*)
@@ -356,7 +376,8 @@ if [ -n "$partial_probe" ]; then
     elif [ "$(records)" != "0 records, 0 refs" ]; then fail "removal records: $(records), want 0 records, 0 refs"
     elif common_ok; then ok "refused before any move: $(jq -r '.results[0].worktree.activity.detail' "$out")"; fi
     for scenario in stopped-after-move stopped-after-move-restore stopped-after-move-control refused-after-move \
-        refused-after-move-control move-back-fails original-taken two-removers two-removers-trash; do
+        refused-after-move-control move-back-fails original-taken two-removers two-removers-trash \
+        remove-fails-part-way-reflog remove-fails-part-way-head; do
         skip_partial "$scenario"
     done
     echo "recovery-check: $passes passed, $failures failed"
@@ -582,6 +603,87 @@ else
     elif [ -e "$wt" ] || [ -n "$(asides)" ]; then fail "something of w is left outside the trash"
     elif [ "$(records)" != "0 records, 0 refs" ]; then fail "removal records: $(records), want 0 records, 0 refs"
     elif common_ok; then ok "one trash entry; second: $rb"; fi
+fi
+
+# --- 5. git worktree remove fails part way ----------------------------------
+# Git deletes the checkout, then its own directory for the worktree, each
+# in the order the filesystem lists the files, and stops at the first it
+# cannot delete. Here it lost its HEAD reflog (5) or its HEAD (5b), still
+# lists the worktree, and kept its files. w holds a commit only its HEAD
+# reflog names. The removal record must stay, that commit must survive `git
+# gc`, and `residue restore` must bring w back with the commit in its
+# reflog: moved back (5), or recreated once Git's leftovers of a worktree
+# it can no longer use are cleared, as restore says (5b).
+part_remove() { # MODE: make the repository and run the failing removal
+    make_repo
+    setup git -C "$wt" checkout -q --detach
+    setup git -C "$wt" commit -q --allow-empty -m lone
+    lone=$(git -C "$wt" rev-parse HEAD) || exit 2
+    setup git -C "$wt" checkout -q w
+    echo "$1" >"$work/mode"
+    start "" remove --yes --json "$wt"
+    finish "$pid"
+    out=$work/$name.out
+    aside=$(asides)
+    reason=$(jq -r '.results[0].reason' "$out")
+    git -C "$repo" -c gc.reflogExpire=now -c gc.reflogExpireUnreachable=now gc -q --prune=now >/dev/null 2>&1
+}
+# The failed removal left w at the moved-aside path, and its record keeps
+# it. LACK is what the reason must say is gone.
+part_remove_ok() { # LACK
+    if [ "$status" != 3 ]; then fail "exit $status, want 3"
+    elif [ "$(jq -r '.results[0].result' "$out")" != failed ]; then fail "result $(jq -r '.results[0].result' "$out"), want failed"
+    elif ! grep -qF "but $1" <<<"$reason" || ! grep -q "; its removal record keeps its HEAD and reflog: residue restore " <<<"$reason"; then fail "reason: $reason"
+    elif grep -q "Recover with: " <<<"$reason"; then fail "it gives a move back as the recovery: $reason"
+    elif [ -z "$aside" ] || [ "$(record "$aside")" != registered ]; then fail "want it at the moved-aside path, which Git lists: ${aside:-none}"
+    elif [ "$(sums "$aside")" != "$w_sum" ]; then fail "the moved worktree's files changed"
+    elif [ "$(records)" != "1 records, 2 refs" ]; then fail "removal records: $(records), want 1 records, 2 refs"
+    elif ! git -C "$repo" cat-file -e "$lone^{commit}" 2>/dev/null; then fail "git gc lost the commit only its HEAD reflog held"
+    else return 0; fi
+    return 1
+}
+# w is back at its path, its reflog names the lone commit, and the record
+# and its refs are gone. CHECKOUT is how restore brought it back.
+restored_ok() { # CHECKOUT
+    if [ "$restored" != 0 ]; then fail "restore exited $restored: $(cat "$work/$name.err-restore")"
+    elif [ "$(jq -r '.restore.checkout' "$work/$name.out-restore")" != "$1" ]; then fail "checkout $(jq -r '.restore.checkout' "$work/$name.out-restore"), want $1"
+    elif [ "$(record "$wt")" != registered ]; then fail "at its path Git has: $(record "$wt")"
+    elif [ -n "$(asides)" ]; then fail "a moved-aside directory is left: $(asides)"
+    elif ! grep -qx "$lone" <<<"$(git -C "$wt" reflog --format=%H)"; then fail "the restored worktree's reflog does not name the commit only its HEAD reflog held"
+    elif [ "$(records)" != "0 records, 0 refs" ]; then fail "after restore: $(records), want 0 records, 0 refs"
+    elif common_ok; then return 0; fi
+    return 1
+}
+restore_w() { # sets $restored
+    (cd "$repo" && "$bin" restore --json w >"$work/$name.out-restore" 2>"$work/$name.err-restore")
+    restored=$?
+}
+
+name=remove-fails-part-way-reflog
+part_remove part-remove-reflog
+if part_remove_ok "part of its HEAD reflog is gone"; then
+    restore_w
+    if ! restored_ok moved_back; then :
+    elif [ "$(sums "$wt")" != "$w_sum" ]; then fail "the restored worktree's files changed"
+    else ok "the record stays, gc keeps the commit, and restore moves it back with its reflog"; fi
+fi
+
+name=remove-fails-part-way-head
+part_remove part-remove-head
+if part_remove_ok "Git can no longer use it"; then
+    restore_w
+    main=$(cd "$repo" && pwd -P)
+    if [ "$restored" != 1 ]; then fail "restore of a worktree Git cannot use exited $restored, want 1"
+    elif ! grep -qF "Git can no longer use it" "$work/$name.err-restore" || ! grep -qF "delete $aside, run \`git -C $main worktree prune\`, then run this restore again" "$work/$name.err-restore"; then fail "restore does not say what to clear: $(cat "$work/$name.err-restore")"
+    elif [ "$(records)" != "1 records, 2 refs" ]; then fail "after the refused restore: $(records), want 1 records, 2 refs"
+    else
+        rm -rf -- "$aside"
+        setup git -C "$repo" worktree prune
+        restore_w
+        if ! restored_ok checked_out_branch; then :
+        elif [ "$(sums "$wt")" != "$(grep -v '^\./node_modules/' <<<"$w_sum")" ]; then fail "the recreated worktree's tracked files differ"
+        else ok "the record stays, gc keeps the commit, restore says what to clear, then recreates it"; fi
+    fi
 fi
 
 echo "recovery-check: $passes passed, $failures failed"

@@ -930,38 +930,18 @@ pub fn refs_named(dir: &Path, patterns: &[&str]) -> Result<Vec<(String, String)>
     Ok(refs)
 }
 
-/// Every commit the reflogs read from `dir` name, the old and the new value
-/// of each entry: its own worktree's (`HEAD`) and the shared ones
-/// (branches, remote-tracking refs). Commits Git has already pruned are
-/// skipped. `--stdin` with no input lets a repository without any reflog
-/// answer with nothing rather than a usage error (Git 2.36 checks
-/// `read_from_stdin` for that).
-pub fn reflog_commits(dir: &Path) -> Result<Vec<String>, String> {
-    let out = git(
-        dir,
-        &[
-            "rev-list",
-            "--no-walk=unsorted",
-            "--single-worktree",
-            "--reflog",
-            "--stdin",
-        ],
-    )?;
-    Ok(lines(&out)
-        .into_iter()
-        .map(|l| String::from_utf8_lossy(l).into_owned())
-        .collect())
-}
-
 /// Those of `commits` that no ref outside `refs/residue/` and no
 /// worktree's HEAD reaches. The commits go in on standard input, before
-/// `--not`, so their number is not bounded by the command line.
+/// `--not`, so their number is not bounded by the command line. A commit
+/// Git no longer has is left out (`--ignore-missing`): there is nothing
+/// left of it to keep.
 pub fn unreferenced(dir: &Path, commits: &[&str]) -> Result<Vec<String>, String> {
     if commits.is_empty() {
         return Ok(Vec::new());
     }
     let args = [
         "rev-list",
+        "--ignore-missing",
         "--stdin",
         "--not",
         "--exclude=refs/residue/*",

@@ -16,9 +16,12 @@
 //! the commits before a rebase or an amend, can have no other holder. So
 //! the record also keeps a copy of `logs/HEAD`, and one ref,
 //! `refs/residue/reflog/NAME-STAMP/N`, at each of the fewest commits that
-//! reach every commit only that reflog held. Worktree-private refs and an
-//! operation in progress already keep a worktree from removal
-//! (`inspect`), so the reflog is all the Git directory adds.
+//! reach every commit that reflog names and no ref outside `refs/residue/`
+//! and no worktree's HEAD reaches. Another reflog naming it is no holder:
+//! `git branch -D` deletes a branch's reflog with the branch, and reflogs
+//! expire. Worktree-private refs and an operation in progress already keep
+//! a worktree from removal (`inspect`), so the reflog is all the Git
+//! directory adds.
 //!
 //! A removal writes the record and its refs after it moves the worktree
 //! aside and before its check at the new path, which drops them again
@@ -453,8 +456,9 @@ pub struct Item {
     /// When the entry directory last changed, in Unix seconds.
     pub modified: Option<i64>,
     /// Git still lists the worktree where the deletion started: the run
-    /// stopped before it finished (an interrupted removal), so nothing of
-    /// it is gone that Git's own record does not keep.
+    /// did not finish (an interrupted removal). A `git worktree remove`
+    /// that failed part way can have deleted part of its files and of its
+    /// Git directory, which the record keeps.
     pub registered: Option<Entry>,
 }
 
@@ -465,6 +469,17 @@ impl Item {
 
     pub fn interrupted(&self) -> bool {
         self.registered.is_some()
+    }
+
+    /// An interrupted removal whose HEAD Git can no longer read: a `git
+    /// worktree remove` that failed part way deleted it. Git can neither
+    /// move nor remove that worktree, so restore cannot move it back.
+    pub fn head_gone(&self) -> bool {
+        self.registered.as_ref().is_some_and(|e| {
+            e.head
+                .as_deref()
+                .is_none_or(|h| h.bytes().all(|b| b == b'0'))
+        })
     }
 
     pub fn age(&self, now: i64) -> Option<i64> {
@@ -576,11 +591,16 @@ pub struct Written {
     head: String,
     kept: Vec<String>,
     command_dir: PathBuf,
+    /// The worktree's own Git directory, and the `config.worktree` and HEAD
+    /// reflog the record copied from it.
+    git_dir: Option<PathBuf>,
+    config: Option<Vec<u8>>,
+    reflog: Option<Vec<u8>>,
 }
 
 impl Written {
     /// Drop the record and its refs: the worktree was not deleted after
-    /// all.
+    /// all. Only once [`Written::lacks`] finds nothing missing.
     pub fn undo(&self) -> Result<(), String> {
         drop_record(
             &self.command_dir,
@@ -588,6 +608,50 @@ impl Written {
             &self.dir,
             &refs_of(&self.name, &self.head, &self.kept),
         )
+    }
+
+    /// What the worktree Git still lists, with `head` as its HEAD, lacks
+    /// of what this record keeps: `None` when its HEAD contains the
+    /// recorded HEAD, its HEAD reflog still begins with the one the record
+    /// copied (so it names every commit the record's refs keep), and its
+    /// `config.worktree` is the one the record copied. A `git worktree
+    /// remove` that failed part way may have deleted any of them, in the
+    /// order the filesystem lists them, while Git still lists the worktree.
+    pub fn lacks(&self, head: Option<&str>) -> Option<String> {
+        let short = |c: &str| c[..c.len().min(12)].to_string();
+        let head = head.filter(|h| is_object_id(h) && h.bytes().any(|b| b != b'0'));
+        let Some(head) = head else {
+            return Some(format!(
+                "its HEAD is gone (Git reads no commit there, not the recorded {})",
+                short(&self.head)
+            ));
+        };
+        match git::is_ancestor(&self.command_dir, &self.head, head) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Some(format!(
+                    "its HEAD is {}, which does not contain the recorded {}",
+                    short(head),
+                    short(&self.head)
+                ));
+            }
+            Err(e) => return Some(format!("residue could not compare its HEAD ({e})")),
+        }
+        let Some(git_dir) = &self.git_dir else {
+            return None;
+        };
+        let now = |file: &Path| read_if_present(Some(git_dir.join(file)));
+        match (&self.reflog, now(&Path::new("logs").join("HEAD"))) {
+            (None, Ok(_)) => {}
+            (Some(saved), Ok(Some(now))) if now.starts_with(saved) => {}
+            (Some(_), Ok(_)) => return Some("part of its HEAD reflog is gone".to_string()),
+            (_, Err(e)) => return Some(format!("residue could not read its HEAD reflog ({e})")),
+        }
+        match now(Path::new(CONFIG)) {
+            Ok(now) if now == self.config => None,
+            Ok(_) => Some(format!("its {CONFIG} is gone or changed")),
+            Err(e) => Some(format!("residue could not read its {CONFIG} ({e})")),
+        }
     }
 }
 
@@ -612,7 +676,7 @@ pub fn create(
     let reflog = read_if_present(git_dir.map(|d| d.join("logs").join("HEAD")))
         .map_err(|e| format!("cannot read its HEAD reflog: {e}"))?;
     let mut record = record.clone();
-    record.kept = reflog_only(&record.aside, command_dir)
+    record.kept = reflog_only(reflog.as_deref(), command_dir)
         .map_err(|e| format!("cannot tell which commits only its reflog holds: {e}"))?;
     let root = root(common_dir);
     let new_root = match fs::create_dir(&root) {
@@ -679,6 +743,9 @@ pub fn create(
             head: record.head.clone(),
             kept: record.kept.clone(),
             command_dir: command_dir.to_path_buf(),
+            git_dir: git_dir.map(Path::to_path_buf),
+            config,
+            reflog,
         });
     }
     Err(format!(
@@ -711,25 +778,41 @@ fn write_entry(dir: &Path, files: &[(&str, &[u8])], info: &[u8]) -> Result<(), S
     sync_dir(dir)
 }
 
-/// The commits only the worktree at `worktree` holds through its own
-/// reflog: its reflogs name them, no shared reflog and not the main
-/// worktree's does, and no ref outside `refs/residue/` and no worktree's
-/// HEAD reaches them (the record's own ref keeps its HEAD). Of those, the
-/// fewest that reach them all, so one ref each keeps every one. `main` is
-/// where Git commands for the repository run.
-fn reflog_only(worktree: &Path, main: &Path) -> Result<Vec<String>, String> {
-    let mine = git::reflog_commits(worktree)?;
-    if mine.is_empty() {
-        return Ok(Vec::new());
-    }
-    let shared: HashSet<String> = git::reflog_commits(main)?.into_iter().collect();
-    let only: Vec<&str> = mine
-        .iter()
-        .filter(|c| !shared.contains(*c))
-        .map(String::as_str)
-        .collect();
-    let lost = git::unreferenced(main, &only)?;
+/// The commits the worktree's HEAD reflog (`reflog`, the bytes of its
+/// `logs/HEAD`) holds that no ref outside `refs/residue/` and no
+/// worktree's HEAD reaches (the record's own ref keeps its HEAD). Another
+/// reflog naming one does not count: a branch's reflog goes with `git
+/// branch -D`, and any reflog expires. Of those, the fewest that reach
+/// them all, so one ref each keeps every one. `main` is where Git commands
+/// for the repository run.
+fn reflog_only(reflog: Option<&[u8]>, main: &Path) -> Result<Vec<String>, String> {
+    let named = reflog.map(reflog_ids).unwrap_or_default();
+    let named: Vec<&str> = named.iter().map(String::as_str).collect();
+    let lost = git::unreferenced(main, &named)?;
     git::independent(main, &lost)
+}
+
+/// Every commit a reflog's bytes name, the old and the new value of each
+/// entry, once each, in lowercase; never the null id. A line Git would not
+/// parse names nothing, as in `git reflog`.
+fn reflog_ids(bytes: &[u8]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut ids = Vec::new();
+    for line in bytes.split(|&b| b == b'\n') {
+        for field in line.split(|&b| b == b' ').take(2) {
+            let Ok(id) = std::str::from_utf8(field) else {
+                break;
+            };
+            if !is_object_id(id) {
+                break;
+            }
+            let id = id.to_ascii_lowercase();
+            if id.bytes().any(|b| b != b'0') && seen.insert(id.clone()) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
 }
 
 fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -919,43 +1002,52 @@ pub fn restore(item: &Item, to: Option<&Path>, listed: &[Entry]) -> Result<Resto
         Some(registered) => move_back(item, record, registered, dest)?,
         None => recreate(item, record, dest, listed)?,
     };
-    // A worktree moved back kept its own Git directory. A recreated one
-    // has a new one: until the recorded config.worktree and reflog are in
-    // it, and it holds the commits the refs keep, the record stays.
+    // A worktree moved back kept its own Git directory, though a removal
+    // that failed part way may have deleted its reflog or config.worktree
+    // from it. A recreated one has a new one. Either way, until the
+    // recorded config.worktree and reflog are in it, and it holds the
+    // commits the refs keep, the record stays.
     let recreated = item.registered.is_none();
     let mut keep_record = false;
-    match git::identity(&restored.path) {
+    let git_dir = match git::identity(&restored.path) {
         Ok(id) => {
             if let Err(e) = mark(&id.git_dir, &format!("removal record {}", item.name)) {
                 restored.notes.push(format!(
                     "could not mark it as restored ({e}); `residue watch` may remove it again once its upstream is gone: lock it with `git worktree lock` to keep it"
                 ));
             }
-            if recreated {
-                for step in [
-                    restore_config(&item.dir, &id.git_dir),
-                    restore_reflog(&item.dir, &id.git_dir),
-                ] {
-                    match step {
-                        Ok(None) => {}
-                        Ok(Some(note)) => restored.notes.push(note),
-                        Err(note) => {
-                            restored.notes.push(note);
-                            keep_record = true;
-                        }
+            let reflog = if recreated {
+                restore_reflog(&item.dir, &id.git_dir)
+            } else {
+                reflog_if_lost(&item.dir, &id.git_dir)
+            };
+            for step in [restore_config(&item.dir, &id.git_dir), reflog] {
+                match step {
+                    Ok(None) => {}
+                    Ok(Some(note)) => restored.notes.push(note),
+                    Err(note) => {
+                        restored.notes.push(note);
+                        keep_record = true;
                     }
                 }
             }
+            Some(id.git_dir)
         }
         Err(e) => {
             restored.notes.push(format!(
                 "could not find its Git directory to mark it as restored ({e}); `residue watch` may remove it again once its upstream is gone: lock it with `git worktree lock` to keep it"
             ));
-            keep_record = recreated && (item.worktree_config || item.head_reflog);
+            keep_record = item.worktree_config || item.head_reflog;
+            None
         }
-    }
-    if recreated && !keep_record {
-        if let Err(note) = holds(record, &restored.path, &mut restored.how) {
+    };
+    if !keep_record {
+        if let Err(note) = holds(
+            record,
+            &restored.path,
+            git_dir.as_deref(),
+            &mut restored.how,
+        ) {
             restored.notes.push(note);
             keep_record = true;
         }
@@ -975,10 +1067,17 @@ pub fn restore(item: &Item, to: Option<&Path>, listed: &[Entry]) -> Result<Resto
 
 /// The restored worktree at `path` holds what the record's refs keep: its
 /// HEAD contains the recorded HEAD (a branch moved between the check and
-/// `git worktree add` would not), and its reflogs name every kept commit.
-/// A branch checkout's tip in `how` becomes the HEAD it found, so the
-/// report says where the worktree is. `Err` is a note saying what it lacks.
-fn holds(record: &Record, path: &Path, how: &mut How) -> Result<(), String> {
+/// `git worktree add` would not), and its own HEAD reflog, in its Git
+/// directory `git_dir`, names every kept commit: that reflog, not a
+/// branch's, is what kept them before the removal. A branch checkout's tip
+/// in `how` becomes the HEAD it found, so the report says where the
+/// worktree is. `Err` is a note saying what it lacks.
+fn holds(
+    record: &Record,
+    path: &Path,
+    git_dir: Option<&Path>,
+    how: &mut How,
+) -> Result<(), String> {
     let short = |c: &str| c[..c.len().min(12)].to_string();
     let mut check = || -> Result<Option<String>, String> {
         let now = git::commit_of(path, "HEAD")?.ok_or("it has no HEAD commit")?;
@@ -996,8 +1095,17 @@ fn holds(record: &Record, path: &Path, how: &mut How) -> Result<(), String> {
         if record.kept.is_empty() {
             return Ok(None);
         }
-        let named: HashSet<String> = git::reflog_commits(path)?.into_iter().collect();
-        let missing = record.kept.iter().filter(|k| !named.contains(*k)).count();
+        let git_dir = git_dir.ok_or("residue cannot find its Git directory")?;
+        let log = git_dir.join("logs").join("HEAD");
+        let bytes = read_if_present(Some(log.clone()))
+            .map_err(|e| format!("cannot read {}: {e}", log.display()))?
+            .unwrap_or_default();
+        let named: HashSet<String> = reflog_ids(&bytes).into_iter().collect();
+        let missing = record
+            .kept
+            .iter()
+            .filter(|k| !named.contains(&k.to_ascii_lowercase()))
+            .count();
         Ok((missing > 0).then(|| {
             format!(
                 "its reflog does not name {missing} of the {} commits only the old reflog held",
@@ -1084,6 +1192,23 @@ fn move_back(
             if let Err(relock) = git::lock_worktree(main, aside, crate::remove::REMOVING) {
                 return Err(format!("{e}; and could not lock it again: {relock}"));
             }
+        }
+        // A `git worktree remove` that failed part way can delete its HEAD
+        // or the file that ties it to the repository, and leave the rest:
+        // Git then can neither move nor remove it. The record still keeps
+        // its HEAD and reflog, so once Git's leftovers are cleared, this
+        // restore recreates it.
+        if let Err(why) = git::identity(aside) {
+            let git = format!("git -C {} worktree", output::shell(main));
+            let unlock = if ours {
+                format!("run `{git} unlock {}`, ", output::shell(aside))
+            } else {
+                String::new()
+            };
+            return Err(format!(
+                "{e}; Git can no longer use it ({why}), so it can neither move it back nor remove it; the record keeps its HEAD and reflog: {unlock}delete {}, run `{git} prune`, then run this restore again",
+                aside.display()
+            ));
         }
         return Err(e);
     }
@@ -1219,6 +1344,24 @@ fn restore_config(entry_dir: &Path, git_dir: &Path) -> Result<Option<String>, St
             Err(e) => Err(format!("could not put back its config.worktree ({e})")),
         },
         Err(e) => Err(format!("could not read {}: {e}", target.display())),
+    }
+}
+
+/// For a worktree moved back: its HEAD reflog still begins with the one
+/// the record copied, unless a `git worktree remove` that failed part way
+/// deleted it; then the recorded one goes back in front, as for a
+/// recreated worktree.
+fn reflog_if_lost(entry_dir: &Path, git_dir: &Path) -> Result<Option<String>, String> {
+    let saved = match fs::read(entry_dir.join(REFLOG)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("could not read its recorded HEAD reflog: {e}")),
+    };
+    let log = git_dir.join("logs").join("HEAD");
+    match read_if_present(Some(log.clone())) {
+        Ok(Some(now)) if now.starts_with(&saved) => Ok(None),
+        Ok(_) => restore_reflog(entry_dir, git_dir),
+        Err(e) => Err(format!("could not read {}: {e}", log.display())),
     }
 }
 

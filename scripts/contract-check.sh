@@ -160,6 +160,7 @@ json_ok() { # N
             and (.generated_at | type) == "string"
             and (.results | type) == "array" and (.results | length) == $n
             and (.errors | type) == "array"
+            and (.warnings | type) == "array"
             and (.purged | type) == "array"
             and (.trash | type) == "object"
             and all(.results[]; (.path | type) == "string" and (.result | type) == "string"))
@@ -544,7 +545,7 @@ if [ -z "$partial_probe" ]; then
     sed 's/^removed [0-9]* .*/removed 1767225600 2026-01-01T00:00:00Z/' "$old/info" >"$work/$name.info" && cat "$work/$name.info" >"$old/info" || exit 2
     setup git -C "$repo" worktree add -q "$repo/.worktrees/x" -b x
     run remove --yes --json --keep-removed 30d "$repo/.worktrees/x"
-    if [ "$status" != 0 ]; then fail "exit $status, want 0; forgotten: $(jq -c "[.forgotten[] | {result, reason}]" "$out"); errors: $(jq -c .errors "$out")"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0; forgotten: $(jq -c "[.forgotten[] | {result, reason}]" "$out"); errors: $(jq -c .errors "$out"); warnings: $(jq -c .warnings "$out")"
     elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
     elif [ "$(jq -r '[.forgotten[] | .result + " " + .entry.entry] | join(",")' "$out")" != "forgotten $(basename "$old")" ]; then fail "forgotten: $(jq -c .forgotten "$out")"
     elif [ "$(jq -r '.removal_records.keep' "$out")" != 30d ]; then fail "removal_records: $(jq -c .removal_records "$out")"
@@ -584,10 +585,40 @@ if [ -z "$partial_probe" ]; then
         elif common_ok; then ok; fi
     fi
 
+    # A commit both the worktree's HEAD reflog and its branch's reflog name:
+    # the one before an amend. The branch's reflog goes with `git branch
+    # -D`, the usual step once a branch landed, so the removal pins that
+    # commit too, and the restored worktree's reflog names it again.
+    name=record-reflog-branch
+    make_repo
+    echo b >>"$wt/README.md"
+    setup git -C "$wt" commit -qam b
+    before_amend=$(git -C "$wt" rev-parse HEAD) || exit 2
+    setup git -C "$wt" commit -q --amend -m b2
+    w_sha=$(git -C "$repo" rev-parse w) || exit 2
+    run remove --yes --json "$wt"
+    entry=$(basename "$(result 0 removal_record)")
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
+    elif [ "$(git -C "$repo" for-each-ref --format='%(refname) %(objectname)' refs/residue/reflog/)" != "refs/residue/reflog/$entry/1 $before_amend" ]; then fail "the reflog pin: $(git -C "$repo" for-each-ref refs/residue/reflog/)"
+    elif ! git -C "$repo" branch -q -D w >/dev/null 2>&1; then fail "git branch -D w failed"
+    elif ! git -C "$repo" gc -q --prune=now >/dev/null 2>&1; then fail "git gc failed"
+    elif [ "$(git -C "$repo" cat-file -t "$before_amend" 2>/dev/null)" != commit ]; then fail "gc lost the commit before the amend once branch w was deleted"
+    else
+        run restore --json "$wt"
+        if [ "$status" != 0 ]; then fail "restore: exit $status, want 0"
+        elif ! restore_ok removed recreated_branch; then fail "stdout is not one restore document with checkout recreated_branch"
+        elif ! grep -qx "$before_amend" <<<"$(git -C "$wt" reflog --format=%H)"; then fail "the restored worktree's reflog does not name the commit before the amend"
+        elif [ "$(records)" != "0 records, 0 refs" ]; then fail "$(records) after the restore, want 0 records, 0 refs"
+        elif [ -s "$err" ]; then fail "stderr is not empty"
+        elif common_ok; then ok; fi
+    fi
+
     # A record residue cannot read or forget never fails a removal: the
-    # PATH is removed, exit 0, and the problem is in `errors` and on
-    # stderr. An entry with no info (a run stopped while writing it) and no
-    # ref, an hour old, is cleared; a fresh one is left alone.
+    # PATH is removed, exit 0, and the problem is a warning, in `warnings`
+    # and on stderr, never in `errors`, which keeps meaning exit 3. An
+    # entry with no info (a run stopped while writing it) and no ref, an
+    # hour old, is cleared; a fresh one is left alone.
     name=record-unreadable
     make_repo
     remove_w
@@ -600,7 +631,8 @@ if [ -z "$partial_probe" ]; then
     run remove --yes --json "$repo/.worktrees/x"
     if [ "$status" != 0 ]; then fail "exit $status, want 0"
     elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
-    elif ! jq -e '.errors | length == 1 and (.[0] | contains("bad-20260101T000000Z"))' "$out" >/dev/null; then fail "errors: $(jq -c .errors "$out")"
+    elif [ "$(jq -c .errors "$out")" != "[]" ]; then fail "errors: $(jq -c .errors "$out"), want []: a record problem is a warning"
+    elif ! jq -e '.warnings | length == 1 and (.[0] | contains("bad-20260101T000000Z"))' "$out" >/dev/null; then fail "warnings: $(jq -c .warnings "$out")"
     elif ! grep -q '^residue: warning: removal record: .*bad-20260101T000000Z' "$err"; then fail "no warning on stderr"
     elif [ "$(jq -r '[.forgotten[] | .result + " " + .entry.entry] | join(",")' "$out")" != "forgotten half-20260101T000000Z" ]; then fail "forgotten: $(jq -c '[.forgotten[] | {result, reason}]' "$out")"
     elif [ -e "$rr/half-20260101T000000Z" ]; then fail "the hour-old entry with no info is still there"
@@ -672,7 +704,7 @@ if [ -z "$partial_probe" ]; then
     elif common_ok; then ok; fi
 else
     for c in record-json record-text record-fail-closed-dir record-fail-closed-ref record-retention \
-        record-reflog-pin record-unreadable \
+        record-reflog-pin record-reflog-branch record-unreadable \
         restore-branch-ahead restore-branch-rewritten restore-branch-gone restore-branch-elsewhere \
         restore-path-occupied restore-detached; do
         skip_partial "$c"

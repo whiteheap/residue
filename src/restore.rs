@@ -52,11 +52,16 @@ pub fn command(options: &Options) -> u8 {
     // repositories at or under this one.
     let mut chosen = None;
     let mut unsearched = None;
+    let mut missed = None;
     match repository_of(wanted) {
         Ok(Some(root)) => {
-            let found = gather(&[root]);
-            if let Ok(pick) = choose(&found, wanted) {
-                chosen = Some((found, pick));
+            let found = gather(std::slice::from_ref(&root));
+            match choose(&found, wanted) {
+                Ok(pick) => chosen = Some((found, pick)),
+                // More than one entry where the path points is the answer:
+                // the message names them.
+                Err(Miss::Many(e)) => return fail(&e),
+                Err(Miss::Nothing) => missed = Some(root),
             }
         }
         Ok(None) => {}
@@ -65,16 +70,25 @@ pub fn command(options: &Options) -> u8 {
     let (found, pick) = match chosen {
         Some(c) => c,
         None => {
-            if let Some(e) = unsearched
-                .as_ref()
-                .filter(|_| at_or_above_home(Path::new(".")))
-            {
-                return fail(e);
+            // A path ENTRY that is not where it points leaves the current
+            // directory to search, but never the home folder or a folder
+            // above it, for the reason `repository_of` gives.
+            if at_or_above_home(Path::new(".")) {
+                if let Some(e) = unsearched {
+                    return fail(&e);
+                }
+                if let Some(root) = missed {
+                    return fail(&format!(
+                        "nothing named {} in the trash or the removal records of the repositories at or under {}, and residue does not search your home folder or the folders above it for it; run residue restore inside its repository, or pass the entry's path it lists there",
+                        wanted.display(),
+                        root.display()
+                    ));
+                }
             }
             let found = gather(&[PathBuf::from(".")]);
             match choose(&found, wanted) {
                 Ok(pick) => (found, pick),
-                Err(e) => return fail(&unsearched.unwrap_or(e)),
+                Err(miss) => return fail(&unsearched.unwrap_or_else(|| miss.text(wanted))),
             }
         }
     };
@@ -207,10 +221,32 @@ fn name_of(found: &Found, pick: Pick) -> String {
     })
 }
 
+/// Why [`choose`] picked no entry.
+enum Miss {
+    /// No entry matched.
+    Nothing,
+    /// More than one did; the message names them.
+    Many(String),
+}
+
+impl Miss {
+    /// The message for a search of the repositories at or under the
+    /// current directory.
+    fn text(self, wanted: &Path) -> String {
+        match self {
+            Miss::Nothing => format!(
+                "nothing named {} in the trash or the removal records of the repositories at or under the current directory; `residue restore` lists them",
+                wanted.display()
+            ),
+            Miss::Many(e) => e,
+        }
+    }
+}
+
 /// The entry ENTRY names: an entry's path, or the path its worktree had;
 /// an entry name from the list; or the directory name or the branch of
 /// its worktree, when only one entry of either kind matches.
-fn choose(found: &Found, wanted: &Path) -> Result<Pick, String> {
+fn choose(found: &Found, wanted: &Path) -> Result<Pick, Miss> {
     let shown = wanted.display();
     if let Ok(path) = git::canonical(wanted) {
         if let Some(i) = found.trash.iter().position(|i| {
@@ -256,11 +292,11 @@ fn choose(found: &Found, wanted: &Path) -> Result<Pick, String> {
                     Pick::Removed(i) => found.removed[i].dir.display().to_string(),
                 })
                 .collect();
-            return Err(format!(
+            return Err(Miss::Many(format!(
                 "{shown} names {} entries ({}); pass the entry's path",
                 many.len(),
                 paths.join(", ")
-            ));
+            )));
         }
     }
     // The path the worktree had, when ENTRY looks like a path.
@@ -300,16 +336,14 @@ fn choose(found: &Found, wanted: &Path) -> Result<Pick, String> {
     }
     match matches.as_slice() {
         [one] => Ok(*one),
-        [] => Err(format!(
-            "nothing named {shown} in the trash or the removal records of the repositories at or under the current directory; `residue restore` lists them"
-        )),
+        [] => Err(Miss::Nothing),
         many => {
             let names: Vec<String> = many.iter().map(|p| name_of(found, *p)).collect();
-            Err(format!(
+            Err(Miss::Many(format!(
                 "{shown} names {} entries ({}); pass the entry name",
                 many.len(),
                 names.join(", ")
-            ))
+            )))
         }
     }
 }
@@ -421,10 +455,7 @@ fn done_text(found: &Found, pick: Pick, done: &Done, places: &Places) -> String 
     let from = match pick {
         Pick::Trash(_) => format!("the trash entry {}", name_of(found, pick)),
         Pick::Removed(i) if found.removed[i].interrupted() => {
-            format!(
-                "the interrupted removal {}; it was never deleted",
-                name_of(found, pick)
-            )
+            format!("the interrupted removal {}", name_of(found, pick))
         }
         Pick::Removed(_) => format!("the removal record {}", name_of(found, pick)),
     };
@@ -574,10 +605,15 @@ fn removed_row(item: &removed::Item, now: i64, places: &Places, style: &Style) -
                 ))
             ));
             if item.interrupted() {
+                let how = if item.head_gone() {
+                    "Git can no longer read its HEAD; restore says how to bring it back"
+                } else {
+                    "restore moves it back"
+                };
                 out.push_str(&format!(
                     "    {}\n",
                     style.dim(&format!(
-                        "interrupted: the run stopped before Git deleted it, and it is still at {}; restore moves it back",
+                        "interrupted: its removal did not finish, and Git still lists it at {}; {how}",
                         places.show(&r.aside)
                     ))
                 ));
