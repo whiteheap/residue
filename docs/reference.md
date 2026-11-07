@@ -139,7 +139,7 @@ Each line is one JSON object, one event:
 | Key | Value |
 | --- | --- |
 | `v` | `1`, the line format |
-| `at` | Unix seconds: when the run wrote the line, right after the deletion, move or restore; on a seeded line, the time the record or trash entry names |
+| `at` | Unix seconds: when the run wrote the line, right after the deletion, move or restore; on a seeded line, the time the record or trash entry names. A reader keeps a time outside 1970 to 9999 at the nearest end |
 | `event` | `freed`: a deletion (`remove --no-trash`, `watch`, a sweep with `--no-trash`, or the trash's purge). `trashed`: a move into the trash. `restored`: `residue restore` put a worktree back |
 | `by` | `remove`, `sweep` or `watch`, as the removal record names the command. Absent on a `restored` line, and on a `trashed` line taken from a trash entry |
 | `reason` | As the record's `reason`: `remove`, `sweep`, `watch_landed`, `watch_low_disk` or `trash_purge` |
@@ -156,9 +156,9 @@ When it is written:
 - `restore` appends a `restored` line.
 - Seeding: before it acts, a `remove` that will delete or move something, `restore`, and `scan` without `--json` add a `seeded` line for each removal record and trash entry of the repositories they read that the ledger lacks. Not added: a record that `--keep-removed` forgot or a restore took back, removals by residue 0.0.6 or earlier (which wrote no record), an interrupted removal (nothing was deleted), a record whose run may still be going (its process is running and the record is under an hour old), a trash entry whose worktree is gone, and repositories none of those commands reads again. `scan --json`, `explain`, `watch` itself and `stats` never write the ledger; `watch`'s `remove` child does.
 
-Each line is appended with one `write(2)` to the file opened with `O_APPEND`, so runs at the same time (a `watch` child and a terminal) append whole lines and never overwrite each other on a local filesystem; NFS does not promise that. Each event counts once, by `event`, `repo` and `entry`: a removal its run recorded and a later run seeded is one removal. A line residue cannot read, such as one cut short by a full disk, is skipped and counted (`skipped_lines`).
+Each line is appended with one `write(2)` to the file opened with `O_APPEND`, so runs at the same time (a `watch` child and a terminal) append whole lines and never overwrite each other on a local filesystem; NFS does not promise that. Each event counts once, by `event`, `repo` and `entry`: a removal its run recorded and a later run seeded is one removal. A line residue cannot read, such as one cut short by a crash or a full disk, is skipped and counted (`skipped_lines`); when the file does not end in a newline, the next append starts with one, so only the cut line is lost.
 
-The ledger never decides anything. A ledger residue cannot read or write never changes a removal or a restore: `remove` prints `residue: warning: the stats ledger is not up to date (...); this does not change what was removed` on stderr, lists it in `warnings` and `stats.error`, and exits as it would have. `restore` adds it to its `notes`, or, when it only lists, prints it as a warning. To start over, delete the file; the next run that reads a repository adds its removal records and trash entries again.
+The ledger never decides anything. residue reads and writes it only as a regular file (or a symbolic link to one), opened without waiting: a FIFO, a device or a folder at its path is a ledger it cannot read or write. A ledger residue cannot read or write never changes a removal or a restore: `remove` prints `residue: warning: the stats ledger is not up to date (...); this does not change what was removed` on stderr, lists it in `warnings` and `stats.error`, and exits as it would have. `restore` adds it to its `notes`, or, when it only lists, prints it as a warning. To start over, delete the file; the next run that reads a repository adds its removal records and trash entries again.
 
 ### In a remove run
 

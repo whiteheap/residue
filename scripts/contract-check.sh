@@ -917,6 +917,50 @@ if [ -z "$partial_probe" ]; then
         elif common_ok; then ok; fi
     fi
 
+    # A last line cut short, as a crash leaves it: the next removal's line
+    # starts on a line of its own, so only the cut one is skipped.
+    name=stats-torn-line
+    make_repo
+    reset_ledger
+    if [ -n "$ledger" ]; then
+        mkdir -p "$(dirname "$ledger")" || exit 2
+        {
+            echo '{"v":1,"at":1767225600,"event":"freed","by":"watch","reason":"watch_landed","bytes":1000,"repo":"/r/.git","entry":"a-20260101T000000Z"}'
+            printf '{"v":1,"at":1767225601,"event":"fre'
+        } >"$ledger" || exit 2
+    fi
+    run remove --yes --json "$wt"
+    if [ -z "$ledger" ]; then fail "residue stats --json does not name a ledger under HOME"
+    elif [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
+    elif ! stats_has '.skipped_lines == 1 and .freed.all_time.worktrees == 2 and .freed.all_time.by.remove.worktrees == 1'; then fail "the removal's line was glued onto the cut one: $(stats_show)"
+    elif common_ok; then ok; fi
+
+    # A FIFO at the ledger path: never waited on. The removal goes ahead
+    # with the warning, and `residue stats` fails at once.
+    name=stats-ledger-fifo
+    make_repo
+    reset_ledger
+    if [ -n "$ledger" ]; then
+        mkdir -p "$(dirname "$ledger")" && mkfifo "$ledger" || exit 2
+    fi
+    run remove --yes --json "$wt"
+    if [ -z "$ledger" ]; then fail "residue stats --json does not name a ledger under HOME"
+    elif [ "$status" = timeout ]; then fail "remove waited on the FIFO for 120 s"
+    elif [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
+    elif [ -e "$wt" ] || registered "$wt"; then fail "the worktree is still there"
+    elif ! jq -e '.errors == [] and any(.warnings[]; test("^the stats ledger is not up to date .*not a regular file")) and .stats.freed_worktrees == 1' "$out" >/dev/null; then fail "errors, warnings and stats: $(jq -c '{errors, warnings, stats}' "$out")"
+    elif ! common_ok; then :
+    else
+        run stats --json
+        if [ "$status" = timeout ]; then fail "stats waited on the FIFO for 120 s"
+        elif [ "$status" != 1 ]; then fail "stats: exit $status, want 1"
+        elif ! grep -q "not a regular file" "$err"; then fail "stats: stderr does not say why: $(cat "$err")"
+        else ok; fi
+    fi
+    [ -z "$ledger" ] || rm -f -- "$ledger"
+
     # A ledger residue cannot write never changes a removal: the PATH is
     # removed, exit 0, nothing in `errors`, a warning on stderr, in
     # `warnings` and in stats.error.
@@ -956,7 +1000,7 @@ if [ -z "$partial_probe" ]; then
         elif common_ok; then ok; fi
     fi
 else
-    for c in stats-remove-json stats-trash-and-purge stats-restore stats-seed stats-unwritable-ledger stats-text; do
+    for c in stats-remove-json stats-trash-and-purge stats-restore stats-seed stats-torn-line stats-ledger-fifo stats-unwritable-ledger stats-text; do
         skip_partial "$c"
     done
 fi

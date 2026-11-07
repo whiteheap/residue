@@ -36,8 +36,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::cli::Options;
@@ -55,6 +55,10 @@ const FORMAT: i64 = 1;
 /// A line, newline included, stays under this when it can.
 const LINE_MAX: usize = 512;
 const DAY: i64 = 86_400;
+/// 9999-12-31T23:59:59Z. A line's `at` is kept between the epoch and
+/// this, so a damaged or hand-edited time never prints a negative or a
+/// five-digit year.
+const LATEST: i64 = 253_402_300_799;
 /// `residue stats --json` `weeks`: this many 7-day windows.
 const WEEKS: i64 = 12;
 /// The repositories `residue stats` lists in text; JSON lists every one.
@@ -153,8 +157,8 @@ impl Line {
     /// The line as written, with its newline: without `worktree` when that
     /// keeps it under [`LINE_MAX`]. A line still longer (a repository path
     /// of several hundred bytes) is written all the same: local filesystems
-    /// keep one `O_APPEND` write whole, and the 512-byte bound is only the
-    /// portable promise.
+    /// keep one `O_APPEND` write whole, and the 512-byte bound only keeps
+    /// lines short.
     pub fn text(&self) -> String {
         let mut text = self.json(true).render();
         if text.len() >= LINE_MAX {
@@ -225,8 +229,10 @@ impl Ledger {
         }
     }
 
-    /// Take a line, unless the ledger has its event already.
-    fn take(&mut self, line: Line) {
+    /// Take a line, unless the ledger has its event already. Its time is
+    /// kept between the epoch and [`LATEST`].
+    fn take(&mut self, mut line: Line) {
+        line.at = line.at.clamp(0, LATEST);
         if self.seen.insert(line.key()) {
             self.lines.push(line);
         }
@@ -280,11 +286,31 @@ pub fn read() -> Result<Ledger, String> {
 }
 
 fn read_at(path: PathBuf) -> Result<Ledger, String> {
-    match fs::read(&path) {
-        Ok(bytes) => Ok(Ledger::parse(path, &bytes)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Ledger::new(path)),
-        Err(e) => Err(format!("{}: {e}", path.display())),
+    let at = |e: io::Error| format!("{}: {e}", path.display());
+    let mut file = match open(&path, OpenOptions::new().read(true)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Ledger::new(path)),
+        Err(e) => return Err(at(e)),
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(at)?;
+    Ok(Ledger::parse(path, &bytes))
+}
+
+/// Open the ledger without waiting, and only when it is a regular file
+/// (or a symbolic link to one). A FIFO there would make the open or the
+/// read wait for a writer forever, after `remove`'s confirmation too, and
+/// a device such as `/dev/zero` would never end; the caller reports it as
+/// any ledger it cannot use, a warning. `O_NONBLOCK` changes nothing for a
+/// regular file.
+fn open(path: &Path, options: &mut OpenOptions) -> io::Result<fs::File> {
+    let file = options.custom_flags(libc::O_NONBLOCK).open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other(
+            "not a regular file, so residue neither reads nor writes it",
+        ));
     }
+    Ok(file)
 }
 
 /// Append `lines` to the ledger at `path`, each with one `write(2)`.
@@ -297,14 +323,30 @@ fn append(path: &Path, lines: &[Line]) -> Result<(), String> {
             .create(dir)
             .map_err(|e| format!("{}: {e}", dir.display()))?;
     }
-    let mut file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(at)?;
-    for line in lines {
-        let text = line.text();
+    let mut file = open(
+        path,
+        OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .mode(0o600),
+    )
+    .map_err(at)?;
+    // A crash or a short write can leave the last line without its
+    // newline. The first line then starts with one, in the same write, so
+    // it is not glued onto the cut line and skipped with it. Two writers
+    // that both see the cut line leave one blank line, which a reader
+    // ignores.
+    let len = file.metadata().map_err(at)?.len();
+    let mut last = [b'\n'];
+    if len > 0 {
+        file.read_exact_at(&mut last, len - 1).map_err(at)?;
+    }
+    for (i, line) in lines.iter().enumerate() {
+        let mut text = line.text();
+        if i == 0 && last[0] != b'\n' {
+            text.insert(0, '\n');
+        }
         let written = file.write(text.as_bytes()).map_err(at)?;
         if written != text.len() {
             // A short write leaves part of a line. End it, so the next line
@@ -1181,6 +1223,22 @@ mod tests {
     }
 
     #[test]
+    fn a_time_out_of_range_is_kept_in_range() {
+        let ledger = ledger_of(
+            "{\"v\":1,\"at\":-99999999999,\"event\":\"freed\",\"repo\":\"/r\",\"entry\":\"a\"}\n\
+             {\"v\":1,\"at\":99999999999999,\"event\":\"freed\",\"repo\":\"/r\",\"entry\":\"b\"}\n",
+        );
+        let at: Vec<i64> = ledger.lines.iter().map(|l| l.at).collect();
+        assert_eq!(at, vec![0, LATEST]);
+        let stats = tally(&ledger, 100 * DAY);
+        assert_eq!(
+            stats.since.map(output::rfc3339).as_deref(),
+            Some("1970-01-01T00:00:00Z")
+        );
+        assert_eq!(output::rfc3339(LATEST), "9999-12-31T23:59:59Z");
+    }
+
+    #[test]
     fn a_line_reads_back_as_written() {
         let mut l = line(
             Event::Freed,
@@ -1545,11 +1603,27 @@ mod tests {
         append(&path, std::slice::from_ref(&a)).unwrap();
         append(&path, &[b.clone(), a.clone()]).unwrap();
         let ledger = read_at(path.clone()).unwrap();
-        assert_eq!(ledger.lines, vec![a, b]);
+        assert_eq!(ledger.lines, vec![a.clone(), b.clone()]);
         assert_eq!(ledger.skipped, 0);
         use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        // A last line cut short, as a crash leaves it: the next append
+        // starts on a line of its own, so only the cut one is skipped.
+        let mut cut = OpenOptions::new().append(true).open(&path).unwrap();
+        cut.write_all(b"{\"v\":1,\"at\":3,\"ev").unwrap();
+        drop(cut);
+        let c = line(Event::Freed, 4, Some("watch"), Some(4), "c-1");
+        append(&path, std::slice::from_ref(&c)).unwrap();
+        let ledger = read_at(path.clone()).unwrap();
+        assert_eq!(ledger.lines, vec![a.clone(), b, c]);
+        assert_eq!(ledger.skipped, 1);
+        // A FIFO: refused at once, never an open or a read that waits.
+        let fifo = dir.join("fifo");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(made.unwrap().success());
+        assert!(read_at(fifo.clone()).is_err());
+        assert!(append(&fifo, std::slice::from_ref(&a)).is_err());
         // A ledger that is a directory: an error, never a panic.
         assert!(read_at(dir.join("state")).is_err());
         assert!(
