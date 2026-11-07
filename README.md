@@ -224,7 +224,7 @@ What `--keep-removed` can lose: forgetting a record deletes its refs, so a commi
 
 ## Automate cleanup
 
-`residue watch` removes a worktree when its work landed, or when the disk is low and it has sat idle ([Reclaim storage automatically](#reclaim-storage-automatically)). These removals delete: they do not use the trash. Branches, commits and locked worktrees stay. `watch` runs only when you start it or install it as a service; `scan` never starts it.
+`residue watch` removes a worktree when its work landed, or when the disk is low and it has sat idle ([Reclaim storage automatically](#reclaim-storage-automatically)). These removals delete: they do not use the trash. Branches, commits and locked worktrees stay. Each removal leaves a removal record, so for 30 days `residue restore` brings the worktree back ([Restore a removed worktree](#restore-a-removed-worktree)). `watch` runs only when you start it or install it as a service; `scan` never starts it.
 
 See what it would remove right now:
 
