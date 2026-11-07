@@ -670,6 +670,10 @@ pub fn restore(item: &Item, to: Option<&Path>, listed: &[Entry]) -> Result<Resto
         None => recreate(item, record, dest, listed)?,
     };
     let mut restored = restored;
+    // A recreated worktree's config.worktree is only in the record until
+    // it is back in the Git directory; until then the record stays.
+    let config_kept = item.registered.is_some() || !item.dir.join(CONFIG).exists();
+    let mut keep_record = false;
     match git::identity(&restored.path) {
         Ok(id) => {
             if let Err(e) = mark(&id.git_dir, &format!("removal record {}", item.name)) {
@@ -678,16 +682,29 @@ pub fn restore(item: &Item, to: Option<&Path>, listed: &[Entry]) -> Result<Resto
                 ));
             }
             if item.registered.is_none() {
-                if let Some(note) = restore_config(&item.dir, &id.git_dir) {
-                    restored.notes.push(note);
+                match restore_config(&item.dir, &id.git_dir) {
+                    Ok(None) => {}
+                    Ok(Some(note)) => restored.notes.push(note),
+                    Err(note) => {
+                        restored.notes.push(note);
+                        keep_record = true;
+                    }
                 }
             }
         }
-        Err(e) => restored.notes.push(format!(
-            "could not find its Git directory to mark it as restored ({e}); `residue watch` may remove it again once its upstream is gone: lock it with `git worktree lock` to keep it"
-        )),
+        Err(e) => {
+            restored.notes.push(format!(
+                "could not find its Git directory to mark it as restored ({e}); `residue watch` may remove it again once its upstream is gone: lock it with `git worktree lock` to keep it"
+            ));
+            keep_record = !config_kept;
+        }
     }
-    if let Err(e) = forget(item) {
+    if keep_record {
+        restored.notes.push(format!(
+            "the removal record stays at {}, with its config.worktree; a remove run forgets it after --keep-removed",
+            item.dir.display()
+        ));
+    } else if let Err(e) = forget(item) {
         restored.notes.push(format!(
             "could not drop the removal record ({e}); a remove run forgets it after --keep-removed"
         ));
@@ -871,34 +888,35 @@ fn free_branch(dir: &Path, wanted: &str) -> Result<String, String> {
 /// Put the recorded `config.worktree` into the restored worktree's Git
 /// directory. When Git already made one (it copies the main worktree's)
 /// that differs, Git's stays and the recorded one is saved next to it.
-fn restore_config(entry_dir: &Path, git_dir: &Path) -> Option<String> {
+/// `Ok` with a note when the recorded one is in the Git directory either
+/// way; `Err` when it is not, so the record, which still holds it, must
+/// stay.
+fn restore_config(entry_dir: &Path, git_dir: &Path) -> Result<Option<String>, String> {
     let recorded = match fs::read(entry_dir.join(CONFIG)) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
-        Err(e) => return Some(format!("could not read its recorded config.worktree: {e}")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("could not read its recorded config.worktree: {e}")),
     };
     let target = git_dir.join(CONFIG);
     match fs::read(&target) {
-        Ok(now) if now == recorded => None,
+        Ok(now) if now == recorded => Ok(None),
         Ok(_) => {
             let aside = git_dir.join(format!("{CONFIG}.residue-removed"));
             match write_new(&aside, &recorded) {
-                Ok(()) => Some(format!(
+                Ok(()) => Ok(Some(format!(
                     "Git gave it a config.worktree that differs from the one it had; the one it had is at {}",
                     aside.display()
-                )),
-                Err(e) => Some(format!(
-                    "Git gave it a config.worktree that differs from the one it had, and residue could not save that one ({e})"
+                ))),
+                Err(e) => Err(format!(
+                    "Git gave it a config.worktree that differs from the one it had, and residue could not save that one next to it ({e})"
                 )),
             }
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => match write_new(&target, &recorded) {
-            Ok(()) => None,
-            Err(e) => Some(format!(
-                "could not put back its config.worktree ({e}); its per-worktree config is gone"
-            )),
+            Ok(()) => Ok(None),
+            Err(e) => Err(format!("could not put back its config.worktree ({e})")),
         },
-        Err(e) => Some(format!("could not read {}: {e}", target.display())),
+        Err(e) => Err(format!("could not read {}: {e}", target.display())),
     }
 }
 
