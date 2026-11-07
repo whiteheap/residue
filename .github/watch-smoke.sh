@@ -12,6 +12,10 @@
 #   3. A running watch notices `wip`'s upstream being deleted (a fetch
 #      --prune, no polling) and removes it within two minutes.
 #   4. --min-free 99.9 (disk pressure) removes the idle `local`.
+#   5. The removal child checks --only-if-upstream-gone itself, from fresh
+#      local refs: an upstream restored before it runs keeps the worktree,
+#      as do no upstream and a detached HEAD; a gone upstream is removed;
+#      a dirty worktree stays refused; remove without it is unchanged.
 # Every branch stays, and nothing goes to the trash: watch deletes.
 set -eu
 
@@ -94,6 +98,66 @@ grep -q "removed .*worktrees/local" "$S/log" || fail "pressure did not remove lo
 [ ! -e .git/residue-trash ] || fail "watch moved local to the trash instead of deleting it"
 
 for b in fix wip local; do
+  git rev-parse --verify -q "$b" > /dev/null || fail "branch $b is gone"
+done
+
+# 5. --only-if-upstream-gone in the removal child (#7). It runs `remove`
+# exactly as watch does for a branch that landed.
+git init -q --bare -b main "$S/child.git"
+git clone -q "$S/child.git" "$S/child" 2> /dev/null
+cd "$S/child"
+git config user.email smoke@example.com
+git config user.name smoke
+echo hello > README.md
+git add . && git commit -qm init && git push -q origin main
+for name in back gone none dirty; do
+  git worktree add -q "$S/child/.worktrees/$name" -b "$name"
+  (cd "$S/child/.worktrees/$name" && echo "$name" >> README.md && git commit -qam "$name")
+done
+git worktree add -q --detach "$S/child/.worktrees/detached" HEAD
+for name in back gone dirty; do
+  (cd "$S/child/.worktrees/$name" && git push -q -u origin "$name")
+  git push -q origin --delete "$name"
+done
+git fetch -q --prune
+# back: its upstream came back between watch's scan and the child.
+git update-ref refs/remotes/origin/back "$(git rev-parse back)"
+echo edit >> .worktrees/dirty/README.md
+find "$S/child/.worktrees" "$S/child/.git/worktrees" -exec touch -t 202601010000 {} +
+
+child() { # PATH: sets $out and $st
+  set +e
+  out=$("$residue" remove --yes --json --no-trash --only-if-upstream-gone --idle 1m "$1")
+  st=$?
+  set -e
+}
+kept() { # NAME RESULT TEXT
+  child ".worktrees/$1"
+  [ "$st" = 3 ] || fail "$1: exit $st, want 3: $out"
+  printf '%s' "$out" | grep -q "\"result\":\"$2\"" || fail "$1: want result $2: $out"
+  printf '%s' "$out" | grep -q "$3" || fail "$1: want a reason with '$3': $out"
+  [ -d ".worktrees/$1" ] || fail "$1: the worktree is gone"
+  git worktree list --porcelain | grep -q "^worktree .*/\.worktrees/$1\$" || fail "$1: no longer registered"
+  for leftover in .worktrees/.residue-removing-*; do
+    [ ! -e "$leftover" ] || fail "$1: $leftover was left behind"
+  done
+  [ ! -e .git/residue-trash ] || [ -z "$(ls -A .git/residue-trash)" ] || fail "$1: a trash entry was left"
+}
+kept back skipped "its upstream origin/back exists in the local refs"
+kept none skipped "branch none has no upstream"
+kept detached skipped "detached HEAD, which has no upstream"
+kept dirty refused "one or more checks did not pass"
+child .worktrees/gone
+[ "$st" = 0 ] || fail "gone: exit $st, want 0: $out"
+[ ! -e .worktrees/gone ] || fail "gone: still exists"
+# Without the requirement, remove is unchanged: back has its upstream and goes.
+"$residue" remove --yes --no-trash --idle 1m .worktrees/back > /dev/null || fail "remove without --only-if-upstream-gone kept back"
+[ ! -e .worktrees/back ] || fail "back: still exists after a plain remove"
+set +e
+"$residue" remove --all --only-if-upstream-gone "$S/child" > /dev/null 2>&1; st=$?
+set -e
+[ "$st" = 2 ] || fail "--all with --only-if-upstream-gone: exit $st, want 2"
+for b in back gone none dirty; do
   git rev-parse --verify -q "$b" > /dev/null || fail "branch $b is gone"
 done
 echo "watch-smoke: ok"

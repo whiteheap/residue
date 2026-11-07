@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fix (#7): `watch` chose a worktree because its upstream branch was gone, but the removal child did not know why, so an upstream that came back between the scan and the removal did not keep the worktree. `remove --only-if-upstream-gone` now carries that reason: the child removes a worktree only when the local refs show its branch's upstream gone, checked at the plan and again in the re-check right before the move. An upstream that exists, no upstream, a detached HEAD or a failed lookup keeps the worktree, with the reason in JSON and the text output, and exit status 3. `watch` passes it for work-landed removals only. Manual `remove` and disk-pressure removals are unchanged. residue still never fetches, so a remote change that has not reached the local refs is not seen. `--only-if-upstream-gone` with `--all`, or outside `remove`, is a usage error.
+
 ## 0.0.5 (2026-11-07)
 
 Deletes what you saw, or nothing, and makes a scheduled sweep reversible. Until 0.0.4, `remove` re-ran the checks right before acting, but it compared the verdict, HEAD, branch, lock and the set of ignored entries, not what they held. Measured with `scripts/race-check.sh` against the 0.0.4 release binary: a file added inside `node_modules/` while the prompt waited was deleted with the worktree (exit 0). And a scheduled sweep that took a paused agent's worktree took it for good.
