@@ -79,13 +79,19 @@ sleep 5
 git push -q origin --delete wip
 git fetch -q --prune
 age
+# Wait for the log line, not for the directory: remove first moves the
+# worktree aside (so .worktrees/wip vanishes), then deletes it, then the
+# watcher logs, so the directory goes before the line is written.
 i=0
-while [ -d .worktrees/wip ]; do
+until grep -q "removed .*worktrees/wip" "$S/log"; do
   i=$((i + 1))
   [ "$i" -le 120 ] || fail "the running watch did not remove wip within 2 minutes"
   sleep 1
 done
-grep -q "removed .*worktrees/wip" "$S/log" || fail "wip vanished without a log line"
+[ ! -e .worktrees/wip ] || fail "the log says wip was removed, but it is still there"
+for leftover in .worktrees/.residue-removing-*; do
+  [ ! -e "$leftover" ] || fail "$leftover was left behind"
+done
 kill "$watcher" && wait "$watcher" 2> /dev/null || true
 watcher=
 [ -d .worktrees/local ] || fail "the running watch removed local"
