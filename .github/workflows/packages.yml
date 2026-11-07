@@ -31,7 +31,10 @@ permissions:
 jobs:
   # The runners have no FreeBSD cross toolchain, so each binary is built in a
   # FreeBSD VM of its own architecture. The aarch64 VM is emulated on an
-  # x86_64 runner, as vmactions/freebsd-vm recommends, so that leg is slower.
+  # x86_64 runner, as vmactions/freebsd-vm recommends, so that leg is slower:
+  # 13.5 minutes against 2 for x86_64 in the v0.0.5 dry run (run 42369712711).
+  # The linux job waits for both, so the timeout bounds how long a hung VM
+  # can hold back the Linux packages.
   # Each leg builds, runs and smoke-tests its binary on its own architecture;
   # one failing never drops the other's archive. A release without the
   # FreeBSD activity probe gets no binary: every worktree would be `unknown`
@@ -39,7 +42,7 @@ jobs:
   freebsd:
     name: freebsd-${{ matrix.arch }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
