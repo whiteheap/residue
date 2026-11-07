@@ -23,7 +23,7 @@ One same-origin script and two same-origin fonts; no analytics, no cookies, no f
 - Every command on the page is copied exactly from the README, and so is the minimum Git version. If the README changes one, change the page in the same pull request.
 - Link to README sections for detail instead of copying flag tables, install alternatives or release notes. Do not add a version number: the page links to the latest release instead.
 - The caveat section stays visible and keeps its four points: residue deletes directories, the activity probe cannot see everything, a write can still land after the last check, reclaimable space is an estimate. The README's "What removal deletes" and "Limits" are their owners.
-- The "automatic" and "nothing is lost" sections say only what the README says today. Its "Reclaim storage automatically", "What removal deletes, and what it keeps" and "The trash" are their owners; a new claim lands in the README first.
+- The "automatic" and "what it keeps" sections say only what the README says today. Its "Reclaim storage automatically", "What removal deletes, and what it keeps" and "The trash" are their owners; a new claim lands in the README first.
 - The hero has one install command, the README's first. A link beside it, "read the formula" today, shows what that command runs; keep the two in step.
 - After a change to the logo or the dark chart in `docs/assets/`, copy them again: `cp docs/assets/logo.svg docs/assets/logo-dark.svg docs/assets/how-it-works-dark.svg site/public/`.
 - A new file in `public/` is published. Add it to the allowlist in `check.sh` on purpose (one name per line, sorted), or keep it out of `public/`. Keep `public/` flat: `smoke.sh` fetches each file as `/NAME`.
