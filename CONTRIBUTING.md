@@ -134,7 +134,7 @@ Then run `bash /scratch.sh` and the same `residue` commands, without the `./targ
 1. Branch from `main` and keep one change per pull request.
 2. Start each commit message with a type such as `feat:`, `fix:` or `docs:`, as the history does.
 3. For a change users will notice, add a line to `CHANGELOG.md` under `## Unreleased` at the top. Create the heading if it isn't there.
-4. In the pull request description, list the exact platform, OS version and Git version you ran, and which commands you ran on which worktree states. If you covered a platform or state the README's "Tested on" table does not list, update the table.
+4. In the pull request description, list the exact platform, OS version and Git version you ran, and which commands you ran on which worktree states. If you covered a platform or state [docs/platforms-and-testing.md](docs/platforms-and-testing.md) does not list, add it there and adjust the short summary under the README's "Tested on" heading.
 5. CI must pass on macOS and both Linux runners.
 
 Check ids (`ignored`, `activity`, ...) and the JSON fields under `residue.scan/v1`, `residue.explain/v1`, `residue.remove/v1` and `residue.restore/v1` are a contract with scripts and coding agents. Add new fields and check ids freely. Do not rename or remove existing ones.
