@@ -676,7 +676,7 @@ pub fn create(
     let reflog = read_if_present(git_dir.map(|d| d.join("logs").join("HEAD")))
         .map_err(|e| format!("cannot read its HEAD reflog: {e}"))?;
     let mut record = record.clone();
-    record.kept = reflog_only(reflog.as_deref(), command_dir)
+    record.kept = reflog_only(reflog.as_deref(), &record.aside, command_dir)
         .map_err(|e| format!("cannot tell which commits only its reflog holds: {e}"))?;
     let root = root(common_dir);
     let new_root = match fs::create_dir(&root) {
@@ -785,8 +785,23 @@ fn write_entry(dir: &Path, files: &[(&str, &[u8])], info: &[u8]) -> Result<(), S
 /// branch -D`, and any reflog expires. Of those, the fewest that reach
 /// them all, so one ref each keeps every one. `main` is where Git commands
 /// for the repository run.
-fn reflog_only(reflog: Option<&[u8]>, main: &Path) -> Result<Vec<String>, String> {
-    let named = reflog.map(reflog_ids).unwrap_or_default();
+///
+/// With no `logs/HEAD` file, as in a reftable repository, where `git
+/// worktree remove` deletes the worktree's reflog all the same, Git reads
+/// that reflog from the worktree at `worktree` instead. Git prints only
+/// each entry's new value, so the old value of its oldest entry, when no
+/// entry names it as new, is not kept there.
+fn reflog_only(reflog: Option<&[u8]>, worktree: &Path, main: &Path) -> Result<Vec<String>, String> {
+    let named = match reflog {
+        Some(bytes) => reflog_ids(bytes),
+        None => {
+            let mut seen = HashSet::new();
+            git::head_reflog_commits(worktree)?
+                .into_iter()
+                .filter(|id| seen.insert(id.clone()))
+                .collect()
+        }
+    };
     let named: Vec<&str> = named.iter().map(String::as_str).collect();
     let lost = git::unreferenced(main, &named)?;
     git::independent(main, &lost)

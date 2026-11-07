@@ -100,9 +100,10 @@ ok() {
 # A repository with two linked worktrees: .worktrees/w on branch w (one
 # commit of its own, a regenerable node_modules/), and .worktrees/u on
 # branch u, which no scenario names and every scenario must leave alone.
+# With ref_format set, Git stores its refs that way (`--ref-format`).
 make_repo() {
     repo=$work/$name
-    setup git init -q "$repo"
+    setup git init -q ${ref_format:+--ref-format="$ref_format"} "$repo"
     printf 'node_modules/\n.env\n' >"$repo/.gitignore"
     echo hello >"$repo/README.md"
     setup git -C "$repo" add .
@@ -614,6 +615,37 @@ if [ -z "$partial_probe" ]; then
         elif common_ok; then ok; fi
     fi
 
+    # The lone commit of record-reflog-pin in a reftable repository (Git
+    # 2.45 and later), which has no logs/HEAD file to copy: Git reads the
+    # worktree's reflog for residue, and the pin keeps the commit through
+    # `git gc`. Restore cannot write that reflog back, so the record and
+    # its refs stay after it.
+    name=record-reflog-reftable
+    if ! git init -q --ref-format=reftable "$work/$name.probe" >/dev/null 2>&1; then
+        echo "skip $name: this Git cannot make a reftable repository (Git 2.45 and later)"
+    else
+        ref_format=reftable make_repo
+        setup git -C "$wt" checkout -q --detach
+        setup git -C "$wt" commit -q --allow-empty -m lone
+        lone=$(git -C "$wt" rev-parse HEAD) || exit 2
+        setup git -C "$wt" checkout -q --detach "$w_sha"
+        run remove --yes --json "$wt"
+        entry=$(basename "$(result 0 removal_record)")
+        if [ "$status" != 0 ]; then fail "exit $status, want 0"
+        elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
+        elif [ -e "$repo/.git/residue-removed/$entry/HEAD.reflog" ]; then fail "a HEAD.reflog was saved from a reftable repository"
+        elif [ "$(git -C "$repo" for-each-ref --format='%(refname) %(objectname)' refs/residue/reflog/)" != "refs/residue/reflog/$entry/1 $lone" ]; then fail "the reflog pin: $(git -C "$repo" for-each-ref refs/residue/reflog/)"
+        elif ! git -C "$repo" gc -q --prune=now >/dev/null 2>&1; then fail "git gc failed"
+        elif [ "$(git -C "$repo" cat-file -t "$lone" 2>/dev/null)" != commit ]; then fail "gc lost the commit only the reflog held"
+        else
+            run restore --json "$wt"
+            if [ "$status" != 0 ]; then fail "restore: exit $status, want 0"
+            elif ! restore_ok removed detached; then fail "stdout is not one restore document with checkout detached"
+            elif [ "$(records)" != "1 records, 2 refs" ]; then fail "$(records) after the restore, want 1 records, 2 refs"
+            elif common_ok; then ok; fi
+        fi
+    fi
+
     # A record residue cannot read or forget never fails a removal: the
     # PATH is removed, exit 0, and the problem is a warning, in `warnings`
     # and on stderr, never in `errors`, which keeps meaning exit 3. An
@@ -704,7 +736,7 @@ if [ -z "$partial_probe" ]; then
     elif common_ok; then ok; fi
 else
     for c in record-json record-text record-fail-closed-dir record-fail-closed-ref record-retention \
-        record-reflog-pin record-reflog-branch record-unreadable \
+        record-reflog-pin record-reflog-branch record-reflog-reftable record-unreadable \
         restore-branch-ahead restore-branch-rewritten restore-branch-gone restore-branch-elsewhere \
         restore-path-occupied restore-detached; do
         skip_partial "$c"

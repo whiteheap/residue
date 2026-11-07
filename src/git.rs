@@ -930,6 +930,21 @@ pub fn refs_named(dir: &Path, patterns: &[&str]) -> Result<Vec<(String, String)>
     Ok(refs)
 }
 
+/// The commits the HEAD reflog of the worktree at `dir` names, newest
+/// first, as Git reads them, for a reflog that is no file (reftable): each
+/// entry's new value, in lowercase. A worktree with no HEAD reflog answers
+/// with none. A commit Git no longer has is left out (`--ignore-missing`).
+pub fn head_reflog_commits(dir: &Path) -> Result<Vec<String>, String> {
+    let out = git(
+        dir,
+        &["rev-list", "--ignore-missing", "--walk-reflogs", "HEAD"],
+    )?;
+    Ok(lines(&out)
+        .into_iter()
+        .map(|l| String::from_utf8_lossy(l).to_ascii_lowercase())
+        .collect())
+}
+
 /// Those of `commits` that no ref outside `refs/residue/` and no
 /// worktree's HEAD reaches. The commits go in on standard input, before
 /// `--not`, so their number is not bounded by the command line. A commit
