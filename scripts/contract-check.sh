@@ -555,6 +555,30 @@ if [ -z "$partial_probe" ]; then
     elif [ "$(git -C "$repo" for-each-ref --format='%(objectname)' refs/residue/removed/)" != "$(git -C "$repo" rev-parse x)" ]; then fail "the ref left is not x's"
     elif common_ok; then ok; fi
 
+    # `watch --keep-removed` reaches its removal child: a record two days
+    # old, which the default 30d keeps, is forgotten by a `watch` removal
+    # in its repository with --keep-removed 1d. The removal is disk
+    # pressure (--min-free 99.9999) of x, which last changed on 2026-01-01;
+    # u changed just now, so --idle 1m keeps it.
+    name=watch-keep-removed
+    make_repo
+    remove_w
+    old=$(find "$repo/.git/residue-removed" -mindepth 1 -maxdepth 1 -type d)
+    two_days_ago=$(($(date +%s) - 2 * 86400))
+    sed "s/^removed [0-9]* /removed $two_days_ago /" "$old/info" >"$work/$name.info" && cat "$work/$name.info" >"$old/info" || exit 2
+    GIT_COMMITTER_DATE=2026-01-01T00:00:00Z GIT_AUTHOR_DATE=2026-01-01T00:00:00Z \
+        setup git -C "$repo" worktree add -q "$repo/.worktrees/x" -b x
+    setup find "$repo/.worktrees/x" "$repo/.git/worktrees/x" -exec touch -t 202601010000 {} +
+    run watch --once --no-fetch --min-free 99.9999 --idle 1m --keep-removed 1d "$repo"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif ! grep -qF "residue watch: removed $(cd "$repo" && pwd -P)/.worktrees/x " "$err"; then fail "the log does not say it removed x"
+    elif ! grep -q "residue watch: forgot the removal record $(basename "$old") " "$err"; then fail "the log does not say it forgot the two-day-old record"
+    elif [ -e "$old" ]; then fail "the two-day-old record is still on disk: the child kept the default --keep-removed"
+    elif registered "$repo/.worktrees/x"; then fail "x is still registered"
+    elif [ "$(records)" != "1 records, 1 refs" ]; then fail "$(records), want 1 records, 1 refs (x's)"
+    elif ! grep -qx "by watch" "$repo"/.git/residue-removed/*/info; then fail "the record left does not say by watch"
+    elif common_ok; then ok; fi
+
     # A commit only the worktree's own HEAD reflog holds: the removal pins
     # it under refs/residue/reflog/, `git gc --prune=now` keeps it, and the
     # restored worktree's reflog names it before the pin goes.
@@ -735,7 +759,7 @@ if [ -z "$partial_probe" ]; then
     elif [ "$(git -C "$wt" rev-parse HEAD)" != "$w_sha" ]; then fail "the restored worktree is not at the recorded HEAD"
     elif common_ok; then ok; fi
 else
-    for c in record-json record-text record-fail-closed-dir record-fail-closed-ref record-retention \
+    for c in record-json record-text record-fail-closed-dir record-fail-closed-ref record-retention watch-keep-removed \
         record-reflog-pin record-reflog-branch record-reflog-reftable record-unreadable \
         restore-branch-ahead restore-branch-rewritten restore-branch-gone restore-branch-elsewhere \
         restore-path-occupied restore-detached; do

@@ -242,7 +242,7 @@ The numbers come from a ledger, one line per deletion, purge, move into the tras
 
 ## Automate cleanup
 
-`residue watch` removes a worktree when its work landed, or when the disk is low and it has sat idle ([Reclaim storage automatically](#reclaim-storage-automatically)). These removals delete: they do not use the trash. Branches, commits and locked worktrees stay. Each removal leaves a removal record, so for 30 days `residue restore` brings the worktree back ([Restore a removed worktree](#restore-a-removed-worktree)). `watch` runs only when you start it or install it as a service; `scan` never starts it.
+`residue watch` removes a worktree when its work landed, or when the disk is low and it has sat idle ([Reclaim storage automatically](#reclaim-storage-automatically)). These removals delete: they do not use the trash. Branches, commits and locked worktrees stay. Each removal leaves a removal record, so `residue restore` brings the worktree back for 30 days, or for the `--keep-removed` you give `watch` ([Restore a removed worktree](#restore-a-removed-worktree)). `watch` runs only when you start it or install it as a service; `scan` never starts it.
 
 See what it would remove right now:
 
@@ -270,6 +270,8 @@ To try the service itself before it removes anything, `residue service install -
 - **The disk is low.** Free space on that filesystem is below `--min-free` (default 10%). Worktrees unchanged for `--idle` (default two days) go, largest first, until free space is five points above the threshold. The child is `residue remove --yes --idle --no-trash` without `--only-if-upstream-gone`.
 
 Both delete. They do not use the trash. The same run still purges that repository's trash entries older than seven days. Branches, commits, and locked worktrees stay. Each removal leaves a removal record, and its log line ends with the command that brings the worktree back, `restore: residue restore RECORD`. A worktree you restore is never removed again because its work landed; disk pressure still removes it. `scan` never starts `watch`.
+
+These removal records last 30 days. To keep them longer, give `watch` the `--keep-removed DURATION` that `residue remove` takes: `residue service install --keep-removed 12w` keeps them twelve weeks, and `residue service status` shows `removal records: kept 12w (--keep-removed)`. A `residue remove` you run yourself forgets by its own `--keep-removed`, `30d` unless you give one, so give it the same value. [Removal records](docs/automation.md#removal-records) has the rest.
 
 To see a branch deleted on the remote, `watch` fetches: about every 30 minutes (`--fetch-every`), `git fetch --prune --no-tags` for each remote that a worktree's branch tracks. The fetch never prompts. It runs without a terminal, and SSH runs with `BatchMode=yes` unless you set your own SSH command, so a fetch that needs a password or a passphrase fails, is logged, and changes nothing. A fetch changes only remote-tracking refs and writes no `FETCH_HEAD`, so it does not reset a worktree's idle clock. It is never a reason to remove: it only refreshes the refs the checks read. `--no-fetch` turns it off; then a deleted branch counts after your own `git fetch --prune`.
 
@@ -351,7 +353,7 @@ Ignored does not mean disposable. An untracked file that is not ignored always k
 
 **A file showed up while the prompt was waiting. Is it deleted?** No. `remove` compares a fresh record with the plan and skips the worktree, naming the difference. In 0.0.4 a file added under `node_modules/` during that wait was deleted with the worktree. From 0.0.5 that case is a skip.
 
-**residue removed a worktree I still wanted. Can I get it back?** Yes, for 30 days: `residue restore` lists what it can bring back, and `residue restore NAME` recreates the worktree at its path, on its branch and HEAD. The log or remove line names the exact command. The ignored files the removal deleted, such as `node_modules/`, are not kept. `watch` never removes a restored worktree again because its work landed. [Restore a removed worktree](#restore-a-removed-worktree).
+**residue removed a worktree I still wanted. Can I get it back?** Yes, for 30 days unless you set `--keep-removed`: `residue restore` lists what it can bring back, and `residue restore NAME` recreates the worktree at its path, on its branch and HEAD. The log or remove line names the exact command. The ignored files the removal deleted, such as `node_modules/`, are not kept. `watch` never removes a restored worktree again because its work landed. [Restore a removed worktree](#restore-a-removed-worktree).
 
 **`watch` removed a worktree after the upstream branch came back.** That was fixed. For a landed branch, `watch` runs `remove --only-if-upstream-gone`, and the child checks the local refs at the plan, again before the move aside, and again after the move. If the upstream is back, the worktree stays. The child does not fetch, so it judges what is in the local refs at that moment.
 

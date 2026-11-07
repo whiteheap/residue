@@ -165,7 +165,8 @@ pub struct Installed {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Installed {
-    /// The `runs:` and `watches:` lines of `service status`.
+    /// The `runs:`, `watches:` and `removal records:` lines of `service
+    /// status`.
     fn print(&self) {
         let Some((exe, args)) = self.program.split_first() else {
             return;
@@ -184,6 +185,14 @@ impl Installed {
                 } else {
                     ""
                 }
+            );
+            // A service installed before `watch` took --keep-removed runs
+            // its removals with the default.
+            let keep = watch::option_in(&args[1..], "--keep-removed");
+            println!(
+                "removal records: kept {} (--keep-removed{})",
+                output::clean(keep.as_deref().unwrap_or(crate::cli::DEFAULT_KEEP_REMOVED)),
+                if keep.is_some() { "" } else { ", the default" }
             );
         }
     }

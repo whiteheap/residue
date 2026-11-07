@@ -46,6 +46,7 @@
 //! Without a ROOT it watches `DEFAULT_ROOTS`, the usual code folders in the
 //! home folder that exist.
 
+use crate::cli;
 use crate::events::{self, Events};
 use crate::git;
 use crate::jsonread::{self, Value};
@@ -94,8 +95,9 @@ trash, and purges that repository's trash entries older than 7 days.
 Branches and commits are always kept.
 Each removal first writes a removal record, and its log line ends with
 `restore: residue restore RECORD`, which recreates the worktree on its
-branch and HEAD (for 30 days). A restored worktree is never removed again
-because its branch landed; disk pressure still removes it.
+branch and HEAD for --keep-removed (30 days by default). A restored
+worktree is never removed again because its branch landed; disk pressure
+still removes it.
 
 Options:
   --grace DURATION        Once its branch landed, keep a worktree that
@@ -103,6 +105,10 @@ Options:
   --idle DURATION         When the disk is low, keep a worktree that changed
                           within DURATION (default 2d)
   --min-free PERCENT      The disk is low below PERCENT free (default 10)
+  --keep-removed DURATION Keep each removal record, and with it `residue
+                          restore`, for DURATION (default 30d). The next
+                          removal in a repository forgets its older records;
+                          branches stay
   --fetch-every DURATION  Fetch each repository about this often (default
                           30m), each on its own clock
   --no-fetch              Never fetch: a deleted branch is seen after your
@@ -189,7 +195,31 @@ fn no_default_roots(command: &str) -> String {
 }
 
 /// The options of `watch` that take a value. `roots_in` skips them.
-const VALUE_OPTIONS: &[&str] = &["--grace", "--idle", "--min-free", "--fetch-every"];
+const VALUE_OPTIONS: &[&str] = &[
+    "--grace",
+    "--idle",
+    "--min-free",
+    "--keep-removed",
+    "--fetch-every",
+];
+
+/// The value of the option `flag` in the arguments of a `watch` command
+/// line (after `watch`), as written; the last one when it is given twice,
+/// as `Options::parse` takes it. `service status` reads the installed
+/// service's settings with it.
+pub fn option_in(args: &[String], flag: &str) -> Option<String> {
+    let mut value = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if VALUE_OPTIONS.contains(&arg.as_str()) {
+            let v = it.next();
+            if arg == flag {
+                value = v.cloned();
+            }
+        }
+    }
+    value
+}
 
 /// The ROOTs in the arguments of a `watch` command line (after `watch`), as
 /// written: every argument that is neither an option nor an option's
@@ -249,6 +279,10 @@ pub struct Options {
     pub grace: Span,
     pub idle: Span,
     pub min_free: f64,
+    /// `--keep-removed`, passed to each removal child: how long the
+    /// removal records of the repositories it removes in are kept. Parsed
+    /// as `residue remove` parses it.
+    pub keep_removed: cli::Span,
     /// `None` with `--no-fetch`.
     pub fetch_every: Option<Span>,
     pub dry_run: bool,
@@ -264,6 +298,7 @@ impl Options {
         let mut grace = Span::parse("--grace", "1h")?;
         let mut idle = Span::parse("--idle", "2d")?;
         let mut min_free = 10.0;
+        let mut keep_removed = cli::Span::parse("--keep-removed", cli::DEFAULT_KEEP_REMOVED)?;
         let mut fetch_every = Some(Span::parse("--fetch-every", DEFAULT_FETCH_EVERY)?);
         let mut fetch_every_given = false;
         let mut no_fetch = false;
@@ -294,6 +329,9 @@ impl Options {
                                 "--min-free {v:?}: use a percentage between 0 and 100, such as 10"
                             )
                         })?;
+                }
+                "--keep-removed" => {
+                    keep_removed = cli::Span::parse("--keep-removed", &value("--keep-removed")?)?;
                 }
                 "--fetch-every" => {
                     fetch_every = Some(Span::parse("--fetch-every", &value("--fetch-every")?)?);
@@ -328,6 +366,7 @@ impl Options {
             grace,
             idle,
             min_free,
+            keep_removed,
             fetch_every,
             dry_run,
             once,
@@ -348,6 +387,8 @@ impl Options {
             self.idle.text.clone(),
             "--min-free".into(),
             format!("{}", self.min_free),
+            "--keep-removed".into(),
+            self.keep_removed.text.clone(),
         ];
         match &self.fetch_every {
             Some(every) => args.extend(["--fetch-every".into(), every.text.clone()]),
@@ -422,7 +463,7 @@ pub fn main(args: &[OsString]) -> u8 {
         }
     };
     log(&format!(
-        "watching {} ({}{}). Removes a worktree when its upstream branch is deleted and it is unchanged for {}, and, below {}% free space, worktrees unchanged for {}, largest first. {}{}",
+        "watching {} ({}{}). Removes a worktree when its upstream branch is deleted and it is unchanged for {}, and, below {}% free space, worktrees unchanged for {}, largest first. Keeps each removal record {} (--keep-removed). {}{}",
         opts.shown_roots(),
         events::BACKEND,
         if opts.default_roots {
@@ -433,6 +474,7 @@ pub fn main(args: &[OsString]) -> u8 {
         opts.grace.text,
         opts.min_free,
         opts.idle.text,
+        opts.keep_removed.text,
         match &opts.fetch_every {
             Some(every) => format!(
                 "Fetches the remotes its worktrees' branches track about every {}, with --prune.",
@@ -838,6 +880,9 @@ fn remove(
     if require_upstream_gone {
         cmd.arg("--only-if-upstream-gone");
     }
+    // How long the records it writes, and the older ones in these
+    // repositories, are kept.
+    cmd.args(["--keep-removed", &opts.keep_removed.text]);
     // Why, as each removal record says it.
     cmd.args([
         "--removal-reason",
@@ -1401,6 +1446,7 @@ mod tests {
             grace: Span::parse("--grace", "1h").unwrap(),
             idle: Span::parse("--idle", "2d").unwrap(),
             min_free: 10.0,
+            keep_removed: cli::Span::parse("--keep-removed", "30d").unwrap(),
             fetch_every: Some(Span::parse("--fetch-every", "30m").unwrap()),
             dry_run: true,
             once: false,
@@ -1435,6 +1481,43 @@ mod tests {
         let args = opts.to_args();
         assert!(args.contains(&"--no-fetch".to_string()));
         assert!(!args.contains(&"--fetch-every".to_string()));
+    }
+
+    /// `service status` reads `--keep-removed` back from what `to_args`
+    /// wrote, and never takes its value for a root.
+    #[test]
+    fn option_in_reads_back_keep_removed() {
+        let mut opts = options(&["/r"]);
+        opts.keep_removed = cli::Span::parse("--keep-removed", "12w").unwrap();
+        let args = opts.to_args();
+        assert_eq!(
+            option_in(&args[1..], "--keep-removed").as_deref(),
+            Some("12w")
+        );
+        assert_eq!(roots_in(&args[1..]), ["/r"]);
+        let old: Vec<String> = ["--grace", "1h", "--no-fetch", "/r"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(option_in(&old, "--keep-removed"), None);
+    }
+
+    #[test]
+    fn keep_removed_is_parsed_as_remove_parses_it() {
+        let parse = |v: &str| {
+            let args: Vec<OsString> = ["--keep-removed", v, "/"]
+                .iter()
+                .map(OsString::from)
+                .collect();
+            Options::parse(&args).map(|o| o.map(|o| o.keep_removed.seconds))
+        };
+        assert_eq!(parse("2w"), Ok(Some(14 * 86_400)));
+        for bad in ["0d", "30", "1y", "101000w"] {
+            assert!(parse(bad).is_err(), "{bad} was accepted");
+        }
+        let none: Vec<OsString> = vec![OsString::from("/")];
+        let opts = Options::parse(&none).unwrap().unwrap();
+        assert_eq!(opts.keep_removed.text, cli::DEFAULT_KEEP_REMOVED);
     }
 
     #[test]

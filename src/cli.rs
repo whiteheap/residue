@@ -56,7 +56,8 @@ Options:
   --keep-removed DURATION
                         remove: forget removal records older than DURATION
                         (default 30d), after the same confirmation. Only the
-                        record and its ref go; branches stay
+                        record and its ref go; branches stay. `residue watch`
+                        takes it too
   --removal-reason watch-landed|watch-low-disk
                         remove: the reason its removal records name.
                         `residue watch` passes it
@@ -388,7 +389,9 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
             return Err("--keep-trash applies only to `residue remove`".into());
         }
         if options.keep_removed.is_some() {
-            return Err("--keep-removed applies only to `residue remove`".into());
+            return Err(
+                "--keep-removed applies only to `residue remove` and `residue watch`".into(),
+            );
         }
         if options.removal_reason.is_some() {
             return Err("--removal-reason applies only to `residue remove`".into());
