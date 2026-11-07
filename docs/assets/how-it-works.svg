@@ -1,58 +1,85 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Compact how-it-works chart for the README.
-  Flat grayscale, 1px rules, no gradients or shadows.
+  Conceptual chart: nodes and arrows, not a procedure listing.
+  Flat grayscale, 1px lines, no gradients or shadows.
   Light colors are the default. docs/assets/how-it-works.png
   and how-it-works-dark.png are rasterized from this file.
-  Text uses Geist Mono when installed, otherwise a local mono.
 -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 468" role="img" aria-labelledby="howTitle howDesc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 420" role="img" aria-labelledby="howTitle howDesc">
   <title id="howTitle">How residue works</title>
-  <desc id="howDesc">scan and explain only read and do not delete. They report a candidate when every check passes, and keep the worktree when any check blocks or is unknown. remove runs the checks again and leaves the worktree in place when a check blocks, is unknown, or it changed since the plan. Otherwise it moves the worktree aside, checks the new path, and moves it back on any doubt. Only then does git worktree remove delete it, without --force, or the trash keeps it for restore. watch does not delete on its own. It chooses paths and runs that same remove.</desc>
+  <desc id="howDesc">A repository's linked worktrees are checked and reported. scan and explain only read that report and stop; they do not lead to deletion. remove is a separate command, which you run or which watch chooses paths for. Fresh checks then leave the worktree in place on a block, an unknown, or a change. When every check passes, git worktree remove deletes it without --force, or it goes to the trash for restore. Passing is not a safety guarantee, and age alone does not mean inactive.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 8 8" refX="7.2" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L8 4 L0 8 Z" class="head"/>
+    </marker>
+  </defs>
   <style>
     .bg { fill: #ffffff; }
-    .frame, .rule { stroke: #141414; }
+    .frame, .box, .line { stroke: #141414; }
+    .box { fill: #ffffff; }
     .ink { fill: #141414; }
     .muted { fill: #3a3a3a; }
+    .head { fill: #141414; }
     text { font-family: "Geist Mono", "JetBrains Mono", ui-monospace, "Cascadia Mono", monospace; }
     @media (prefers-color-scheme: dark) {
-      .bg { fill: #0d1117; }
-      .frame, .rule { stroke: #f4f4f4; }
-      .ink { fill: #f4f4f4; }
+      .bg, .box { fill: #0d1117; }
+      .frame, .box, .line { stroke: #f4f4f4; }
+      .ink, .head { fill: #f4f4f4; }
       .muted { fill: #d2d2d2; }
     }
   </style>
-  <rect class="bg" width="440" height="468"/>
-  <rect class="frame" x="0.5" y="0.5" width="439" height="467" fill="none" stroke-width="1"/>
+  <rect class="bg" width="420" height="420"/>
+  <rect class="frame" x="0.5" y="0.5" width="419" height="419" fill="none" stroke-width="1"/>
 
-  <g font-size="11" letter-spacing="1.4">
-    <text class="ink" x="24" y="32">READ ONLY</text>
-  </g>
-  <text class="ink" x="24" y="56" font-size="16">scan / explain</text>
-  <text class="muted" x="24" y="80" font-size="13">Reads a linked worktree. Deletes nothing.</text>
-  <text class="ink" x="24" y="108" font-size="13">candidate</text>
-  <text class="muted" x="128" y="108" font-size="13">every check passed</text>
-  <text class="ink" x="24" y="128" font-size="13">keep</text>
-  <text class="muted" x="128" y="128" font-size="13">any block or unknown</text>
+  <!-- repository -> linked worktrees -> report -->
+  <rect class="box" x="126" y="16" width="168" height="32" stroke-width="1"/>
+  <text class="ink" x="210" y="37" text-anchor="middle" font-size="13">repository</text>
 
-  <line class="rule" x1="24" y1="152" x2="416" y2="152" stroke-width="1"/>
+  <line class="line" x1="210" y1="48" x2="210" y2="70" stroke-width="1.25" marker-end="url(#arrow)"/>
 
-  <g font-size="11" letter-spacing="1.4">
-    <text class="ink" x="24" y="180">REMOVE</text>
-  </g>
-  <text class="ink" x="24" y="204" font-size="16">fresh checks, then Git</text>
-  <text class="muted" x="24" y="230" font-size="13">Leaves it in place when a check blocks,</text>
-  <text class="muted" x="24" y="248" font-size="13">is unknown, or it changed since the plan.</text>
-  <text class="muted" x="24" y="274" font-size="13">Otherwise moves it aside, checks again,</text>
-  <text class="muted" x="24" y="292" font-size="13">and moves it back on any doubt.</text>
-  <text class="muted" x="24" y="318" font-size="13">Then git worktree remove, no --force,</text>
-  <text class="muted" x="24" y="336" font-size="13">or the trash, which restore can put back.</text>
+  <rect class="box" x="102" y="72" width="216" height="32" stroke-width="1"/>
+  <text class="ink" x="210" y="93" text-anchor="middle" font-size="13">linked worktrees</text>
 
-  <line class="rule" x1="24" y1="360" x2="416" y2="360" stroke-width="1"/>
+  <line class="line" x1="210" y1="104" x2="210" y2="126" stroke-width="1.25" marker-end="url(#arrow)"/>
+  <text class="muted" x="218" y="120" font-size="11">checks</text>
 
-  <g font-size="11" letter-spacing="1.4">
-    <text class="ink" x="24" y="388">WATCH</text>
-  </g>
-  <text class="ink" x="24" y="412" font-size="16">chooses paths only</text>
-  <text class="muted" x="24" y="436" font-size="13">Runs that same remove. Deletes nothing itself.</text>
+  <rect class="box" x="150" y="128" width="120" height="32" stroke-width="1"/>
+  <text class="ink" x="210" y="149" text-anchor="middle" font-size="13">report</text>
+
+  <!-- read path ends; removal is a separate command -->
+  <polyline class="line" points="210,160 210,180 104,180 104,198" fill="none" stroke-width="1.25" marker-end="url(#arrow)"/>
+  <polyline class="line" points="210,180 318,180 318,198" fill="none" stroke-width="1.25" marker-end="url(#arrow)"/>
+  <text class="muted" x="28" y="174" font-size="11">read only</text>
+  <text class="muted" x="232" y="174" font-size="11">you or watch</text>
+
+  <rect class="box" x="16" y="200" width="176" height="48" stroke-width="1"/>
+  <text class="ink" x="104" y="220" text-anchor="middle" font-size="13">scan / explain</text>
+  <text class="muted" x="104" y="238" text-anchor="middle" font-size="11">reads. stops.</text>
+
+  <rect class="box" x="232" y="200" width="172" height="32" stroke-width="1"/>
+  <text class="ink" x="318" y="221" text-anchor="middle" font-size="13">remove</text>
+
+  <line class="line" x1="318" y1="232" x2="318" y2="266" stroke-width="1.25" marker-end="url(#arrow)"/>
+
+  <rect class="box" x="232" y="268" width="172" height="32" stroke-width="1"/>
+  <text class="ink" x="318" y="289" text-anchor="middle" font-size="13">fresh checks</text>
+
+  <!-- stay, or Git delete, or trash -->
+  <polyline class="line" points="318,300 318,322 90,322 90,344" fill="none" stroke-width="1.25" marker-end="url(#arrow)"/>
+  <polyline class="line" points="318,322 234,322 234,344" fill="none" stroke-width="1.25" marker-end="url(#arrow)"/>
+  <polyline class="line" points="318,322 363,322 363,344" fill="none" stroke-width="1.25" marker-end="url(#arrow)"/>
+  <text class="muted" x="16" y="314" font-size="11">block, unknown, or changed</text>
+  <text class="muted" x="268" y="314" font-size="11">all pass</text>
+
+  <rect class="box" x="16" y="346" width="148" height="44" stroke-width="1"/>
+  <text class="ink" x="90" y="373" text-anchor="middle" font-size="13">stays</text>
+
+  <rect class="box" x="176" y="346" width="116" height="44" stroke-width="1"/>
+  <text class="ink" x="234" y="364" text-anchor="middle" font-size="13">git remove</text>
+  <text class="muted" x="234" y="380" text-anchor="middle" font-size="11">no --force</text>
+  <text class="muted" x="307" y="373" text-anchor="middle" font-size="11">or</text>
+
+  <rect class="box" x="316" y="346" width="88" height="44" stroke-width="1"/>
+  <text class="ink" x="360" y="364" text-anchor="middle" font-size="13">trash</text>
+  <text class="muted" x="360" y="380" text-anchor="middle" font-size="11">restore</text>
 </svg>

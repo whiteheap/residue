@@ -9,10 +9,10 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/how-it-works-dark.png">
-  <img src="docs/assets/how-it-works.png" width="440" alt="How residue works. scan and explain only read a linked worktree and delete nothing. A candidate requires every check to pass. Any block or any unknown keeps the worktree. remove runs the checks again and leaves the worktree in place when a check blocks, is unknown, or it changed since the plan. Otherwise residue moves it aside, checks the new path, and moves it back on any doubt. Only then does git worktree remove delete it, without --force, or the trash holds it for residue restore. watch does not delete on its own. It chooses paths and runs that same remove.">
+  <img src="docs/assets/how-it-works.png" width="420" alt="Chart. A repository leads to its linked worktrees, then checks, then a report. Read only ends at scan and explain, which read and stop. A separate arrow, you or watch, enters remove, then fresh checks. Block, unknown, or changed leads to stays. All pass leads to git remove without --force, or to the trash for restore. Scan does not lead to deletion.">
 </picture>
 
-`scan` and `explain` only read. A worktree is a candidate only when every check passes; any block or any unknown keeps it. `remove` runs the checks again and leaves the worktree in place when a check blocks, is unknown, or it changed since the plan. Otherwise residue moves it aside, checks the new path, and moves it back on any doubt. Only then does `git worktree remove` delete it, without `--force`, or the trash holds it for `residue restore`. `watch` does not delete on its own: it chooses paths and runs that same `remove`. Age alone does not make a worktree inactive.
+A repository's linked worktrees are checked, then reported. `scan` and `explain` only read that report and stop. `remove` is separate: you run it, or `watch` chooses paths for it. Fresh checks leave the worktree in place on a block, an unknown, or a change. When every check passes, `git worktree remove` deletes it without `--force`, or the trash holds it for `restore`. A pass is not a guarantee, and age alone does not mean inactive.
 
 Coding agents leave Git worktrees behind. Each one is a full checkout with its own `node_modules`, `target` and build output, and a machine that runs agents all day fills its disk with them. residue finds those worktrees, measures them, and removes one only when nothing in it would be lost.
 
