@@ -544,7 +544,7 @@ if [ -z "$partial_probe" ]; then
     sed 's/^removed [0-9]* .*/removed 1767225600 2026-01-01T00:00:00Z/' "$old/info" >"$work/$name.info" && cat "$work/$name.info" >"$old/info" || exit 2
     setup git -C "$repo" worktree add -q "$repo/.worktrees/x" -b x
     run remove --yes --json --keep-removed 30d "$repo/.worktrees/x"
-    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0; forgotten: $(jq -c "[.forgotten[] | {result, reason}]" "$out"); errors: $(jq -c .errors "$out")"
     elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
     elif [ "$(jq -r '[.forgotten[] | .result + " " + .entry.entry] | join(",")' "$out")" != "forgotten $(basename "$old")" ]; then fail "forgotten: $(jq -c .forgotten "$out")"
     elif [ "$(jq -r '.removal_records.keep' "$out")" != 30d ]; then fail "removal_records: $(jq -c .removal_records "$out")"

@@ -555,11 +555,8 @@ fn discard(dir: &Path) -> Result<(), String> {
     }
     fs::remove_dir(dir).map_err(|e| format!("cannot remove {}: {e}", dir.display()))?;
     if let Some(root) = dir.parent() {
-        match fs::remove_dir(root) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
-            Err(e) => return Err(format!("cannot remove {}: {e}", root.display())),
-        }
+        crate::trash::remove_dir_if_empty(root)
+            .map_err(|e| format!("cannot remove {}: {e}", root.display()))?;
     }
     Ok(())
 }

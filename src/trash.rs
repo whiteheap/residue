@@ -284,14 +284,28 @@ pub fn discard(entry: &Path) -> Result<(), String> {
     }
     fs::remove_dir(entry).map_err(|e| format!("cannot remove {}: {e}", entry.display()))?;
     if let Some(root) = entry.parent() {
-        match fs::remove_dir(root) {
-            Ok(()) => {}
-            // Other entries are still in the trash.
-            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
-            Err(e) => return Err(format!("cannot remove {}: {e}", root.display())),
-        }
+        // Other entries may still be in the trash.
+        remove_dir_if_empty(root).map_err(|e| format!("cannot remove {}: {e}", root.display()))?;
     }
     Ok(())
+}
+
+/// Remove a directory if it is empty; one that still has entries stays and
+/// is not an error. POSIX lets rmdir(2) report a non-empty directory as
+/// ENOTEMPTY or EEXIST, and illumos uses EEXIST, which Rust calls
+/// `AlreadyExists`. rmdir never reports EEXIST for anything else.
+pub fn remove_dir_if_empty(dir: &Path) -> io::Result<()> {
+    match fs::remove_dir(dir) {
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::AlreadyExists
+            ) =>
+        {
+            Ok(())
+        }
+        other => other,
+    }
 }
 
 /// The lock on a trashed worktree is residue's own, so residue may lift it.
