@@ -5,8 +5,9 @@ name: packages
 # release. When the tag is the latest release, it also publishes signed apt,
 # dnf and pacman repositories to https://whiteheap.github.io/residue/ with
 # GitHub Pages.
-# It also builds the FreeBSD x86_64 binary, in a FreeBSD virtual machine from
-# the tag's source, for releases that have the FreeBSD activity probe.
+# It also builds the FreeBSD x86_64 and aarch64 binaries, each in a FreeBSD
+# virtual machine of its architecture from the tag's source, for releases
+# that have the FreeBSD activity probe.
 # release.yml starts it after publishing. To package an existing release by
 # hand: gh workflow run packages.yml -f tag=vX.Y.Z
 # To check a change to this workflow without uploading or deploying anything:
@@ -28,13 +29,27 @@ permissions:
   contents: read
 
 jobs:
-  # The runners have no FreeBSD cross toolchain, so the binary is built in a
-  # FreeBSD VM. A release without the FreeBSD activity probe gets no binary:
-  # every worktree would be `unknown` there, so it could never remove one.
+  # The runners have no FreeBSD cross toolchain, so each binary is built in a
+  # FreeBSD VM of its own architecture. The aarch64 VM is emulated on an
+  # x86_64 runner, as vmactions/freebsd-vm recommends, so that leg is slower:
+  # 13.5 minutes against 2 for x86_64 in the v0.0.5 dry run (run 42369712711).
+  # The linux job waits for both, so the timeout bounds how long a hung VM
+  # can hold back the Linux packages.
+  # Each leg builds, runs and smoke-tests its binary on its own architecture;
+  # one failing never drops the other's archive. A release without the
+  # FreeBSD activity probe gets no binary: every worktree would be `unknown`
+  # there, so it could never remove one.
   freebsd:
+    name: freebsd-${{ matrix.arch }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
     env:
       TAG: ${{ inputs.tag }}
+      ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -52,15 +67,21 @@ jobs:
         uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
         with:
           release: "14"
-          envs: TAG
+          arch: ${{ matrix.arch }}
+          envs: TAG ARCH
           prepare: pkg install -y rust git
           run: |
             freebsd-version
+            uname -mp
+            rustc -vV
+            # The archive is named for the triple this VM builds and runs.
+            rustc -vV | grep -qx "host: $ARCH-unknown-freebsd"
             cargo build --locked --release --target-dir /tmp/target
             bin=/tmp/target/release/residue
+            file "$bin"
             test "$($bin --version)" = "residue ${TAG#v}"
             if [ -f .github/smoke.sh ]; then sh .github/smoke.sh "$bin"; fi
-            name="residue-$TAG-x86_64-unknown-freebsd"
+            name="residue-$TAG-$ARCH-unknown-freebsd"
             mkdir -p "dist/$name"
             cp "$bin" README.md LICENSE CHANGELOG.md "dist/$name/"
             tar -C dist -czf "dist/$name.tar.gz" "$name"
@@ -68,12 +89,13 @@ jobs:
       - if: steps.probe.outputs.build == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: freebsd
+          name: freebsd-${{ matrix.arch }}
           path: dist/*.tar.gz
           if-no-files-found: error
 
-  # Runs even when the FreeBSD build failed, so the Linux packages and the
-  # repositories never wait on it.
+  # Runs even when a FreeBSD build failed, so the Linux packages and the
+  # repositories never wait on a broken one; it takes the archives of the
+  # legs that succeeded.
   linux:
     needs: freebsd
     if: ${{ !cancelled() }}
@@ -107,12 +129,12 @@ jobs:
           cd dist && grep -E 'unknown-linux-musl\.tar\.gz$' SHA256SUMS | sha256sum -c
       - name: Build packages
         run: packaging/linux-packages.sh "$TAG" dist pkgs
-      - name: The FreeBSD binary, when one was built
-        if: needs.freebsd.result == 'success'
+      - name: The FreeBSD binaries that were built
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         continue-on-error: true
         with:
-          name: freebsd
+          pattern: freebsd-*
+          merge-multiple: true
           path: pkgs
       - if: ${{ !inputs.dry_run }}
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
