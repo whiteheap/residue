@@ -463,10 +463,11 @@ These are the exact platforms and versions that ran. Apart from the smoke tests 
 
 Not run: the Intel macOS binary (built by cross-compiling, never executed), NetBSD, OpenBSD, DragonFly and illumos (they build, but have no activity probe, so nothing is a candidate), and Windows (not supported).
 
-CI runs three scripts on macOS, Linux x86_64 and arm64, and FreeBSD 14 as root and as an ordinary user, on every push:
+CI runs four scripts on macOS, Linux x86_64 and arm64, and FreeBSD 14 as root and as an ordinary user, on every push:
 
 - `.github/smoke.sh`: a clean candidate, a kept `.env`, a worktree a process is using, and a removal that keeps the branch.
 - `scripts/race-check.sh`: five changes made while the prompt waits, each skipped; an upstream restored while it waits, kept with and without the trash; and three removals that changed nothing.
+- `scripts/contract-check.sh` (needs `jq`): `remove` with no prompt, one repository per case. A clean worktree removed, in JSON and text; refusals for a staged edit, a modified file, an untracked file, an ignored `.env` and a lock; the main checkout, a directory inside a worktree and a missing path, each `invalid`; no terminal without `--yes`; several targets at once; diagnostics on stderr, never in the JSON; and usage errors. Each case checks the exit status, the JSON result and failing check ids, and afterwards the file bytes, Git's registration, the branch, an unrelated worktree, and that nothing was left moved aside or in the trash.
 - `.github/watch-smoke.sh`: `watch` removing a worktree whose branch landed, once and as a running process woken by a `git fetch --prune`, and under disk pressure, without the trash. Then `remove --only-if-upstream-gone` on its own: an upstream that is back, none, a local one, a detached HEAD, a ref Git marks gone that still exists, dirty, locked and recently changed worktrees, and a gone upstream that is removed. Then `watch` through a `git` wrapper that restores the upstream right before each of the removal's three reads, and once during the re-measure before the last read. `.github/service-smoke.sh` installs, checks and uninstalls the launchd agent on macOS and the systemd user service on Linux.
 
 ## Limits
