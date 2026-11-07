@@ -35,6 +35,7 @@ use crate::json::Json;
 use crate::output::{self, Places, Style, clean};
 use crate::policy::Policy;
 use crate::removed::{self, By, Reason};
+use crate::stats;
 use crate::trash;
 
 /// The lock reason on a worktree residue has moved aside to delete.
@@ -71,7 +72,7 @@ pub fn original_of(aside: &Path) -> Option<PathBuf> {
 }
 
 /// A process with this PID exists (it may belong to another user).
-fn running(pid: u32) -> bool {
+pub fn running(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
     };
@@ -392,6 +393,13 @@ pub fn remove(options: &Options) -> u8 {
         }
     }
 
+    // The stats ledger takes in the removal records and trash entries of
+    // these repositories it lacks, before this run forgets any. Nothing it
+    // does changes what the run removes.
+    let acting =
+        declined.is_none() && (!ready.is_empty() || !purgeable.is_empty() || !forgets.is_empty());
+    let seeded = acting.then(|| stats::seed_repos(&repos));
+
     for &i in &ready {
         if items[i].outcome.is_some() {
             continue;
@@ -447,6 +455,13 @@ pub fn remove(options: &Options) -> u8 {
             Some(Outcome::Removed(_)) | Some(Outcome::Refused)
         )
     }) && errors.is_empty();
+    // After every deletion: a ledger it cannot write is a warning, like a
+    // removal record it could not read, and the exit status stays about
+    // the PATHs and the trash.
+    let run = stats::Run::record(seeded, ledger_lines(&items, &purges, &mode));
+    if let Some(e) = &run.error {
+        warnings.push(e.clone());
+    }
     for warning in &warnings {
         eprintln!("residue: warning: {}", clean(warning));
     }
@@ -455,19 +470,68 @@ pub fn remove(options: &Options) -> u8 {
             errors: &errors,
             warnings: &warnings,
         };
-        println!(
-            "{}",
-            json(
-                &items, &purges, &forgets, &problems, &snapshot, &policy, &mode
-            )
-            .render()
+        let mut doc = json(
+            &items, &purges, &forgets, &problems, &snapshot, &policy, &mode,
         );
+        // Added last, so every field before it keeps its place.
+        if let Json::Obj(fields) = &mut doc {
+            fields.push(("stats", run.json()));
+        }
+        println!("{}", doc.render());
     } else if let Some(why) = declined {
         println!("nothing removed: {}", clean(&why));
     } else if ready.is_empty() && purgeable.is_empty() && forgets.is_empty() && options.all {
         println!("nothing to remove");
+    } else if let Some(line) = run.text(&mode.keep.text) {
+        println!("{line}");
     }
     if done { 0 } else { 3 }
+}
+
+/// The stats ledger's lines for what this run freed or moved: a deletion
+/// that succeeded, with the record it wrote, a move into the trash, and a
+/// purge. The plan's reclaimable size, as the removal record keeps it.
+fn ledger_lines(items: &[Item], purges: &[Purge], mode: &Mode) -> Vec<stats::Line> {
+    let mut lines = Vec::new();
+    for item in items {
+        let (Some(target), Some(report)) = (&item.target, &item.report) else {
+            continue;
+        };
+        let (event, entry) = match &item.outcome {
+            Some(Outcome::Removed(Some(record))) => (stats::Event::Freed, record),
+            Some(Outcome::Trashed(entry)) => (stats::Event::Trashed, entry),
+            _ => continue,
+        };
+        lines.push(stats::made(
+            event,
+            mode.by,
+            mode.reason,
+            report.usage.as_ref().map(|u| u.reclaimable),
+            &target.repo.common_dir,
+            &target.canonical,
+            entry,
+        ));
+    }
+    for p in purges {
+        // An empty record purged (`Removed(None)`) held no worktree.
+        let (Some(Outcome::Removed(Some(record))), Ok(trashed)) = (&p.outcome, &p.item.record)
+        else {
+            continue;
+        };
+        lines.push(stats::made(
+            stats::Event::Freed,
+            mode.by,
+            Reason::TrashPurge,
+            p.report
+                .as_ref()
+                .and_then(|r| r.usage.as_ref())
+                .map(|u| u.reclaimable),
+            &p.item.common_dir,
+            &trashed.original,
+            record,
+        ));
+    }
+    lines
 }
 
 /// A trash entry as `inspect` should judge it: residue's own trash lock is

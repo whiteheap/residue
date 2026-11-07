@@ -15,6 +15,7 @@ use crate::output::{self, Places, Style, clean};
 use crate::policy::{GIT_CONFIG_KEY, Policy};
 use crate::remove::{self, Leftover};
 use crate::removed;
+use crate::stats;
 use crate::trash;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -342,6 +343,25 @@ pub fn scan(options: &Options) -> u8 {
             style.dim(&format!("(filesystem of {})", places.show(&repo.main.path)))
         ));
     }
+    // What residue has freed on this machine, once it has freed anything.
+    // The stats ledger first takes in the removal records and trash entries
+    // of these repositories it lacks; that never changes the report.
+    let records = grouped.iter().flat_map(|g| &g.records);
+    let freed = match stats::seed(records, grouped.iter().flat_map(|g| &g.trash)) {
+        Ok(ledger) => stats::scan_line(&ledger, started)
+            .map(|line| style.dim(&format!("{line}\n")))
+            .unwrap_or_default(),
+        Err(e) => {
+            eprintln!(
+                "residue: warning: the stats ledger is not up to date ({})",
+                clean(&e)
+            );
+            String::new()
+        }
+    };
+    if total == 0 {
+        out.push_str(&freed);
+    }
     if total > 0 {
         out.push_str(&format!(
             "{} candidate{} of {} linked worktree{} · {} allocated · about {} reclaimable\n",
@@ -355,6 +375,7 @@ pub fn scan(options: &Options) -> u8 {
         out.push_str(&style.dim(
             "next: residue explain PATH  ·  residue remove PATH  ·  keep one: git worktree lock PATH\n",
         ));
+        out.push_str(&freed);
         // Only for a person at a terminal: a pipe or a script reads the
         // report, not advice.
         if std::io::stdout().is_terminal() {

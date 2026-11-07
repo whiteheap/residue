@@ -967,8 +967,9 @@ fn remove(
         }
     }
     // What it could not read (`errors`, which failed the run), and the
-    // removal records it could not read or forget (`warnings`, which never
-    // do): the log is the only place a service user sees either.
+    // removal records it could not read or forget and a stats ledger it
+    // could not write (`warnings`, which never do): the log is the only
+    // place a service user sees either.
     for (key, kind) in [("errors", ""), ("warnings", "warning: ")] {
         for line in doc.get(key).map(Value::items).unwrap_or(&[]) {
             if let Some(text) = line.str() {
@@ -976,7 +977,36 @@ fn remove(
             }
         }
     }
+    if let Some(stats) = doc.get("stats") {
+        log_freed(stats);
+    }
     removed
+}
+
+/// What a removal child freed, and the total on this machine, from its
+/// `stats`. The date is the log's: UTC. A ledger it could not write is in
+/// its `warnings`, logged above.
+fn log_freed(stats: &Value) {
+    let number = |key: &str| {
+        stats
+            .get(key)
+            .and_then(Value::i64)
+            .and_then(|n| u64::try_from(n).ok())
+    };
+    if let (Some(bytes), Some(1..)) = (number("freed_bytes"), number("freed_worktrees")) {
+        let total = match (
+            number("total_freed_bytes"),
+            stats.get("since").and_then(Value::str),
+        ) {
+            (Some(total), Some(since)) => format!(
+                " (residue has freed about {} on this machine since {})",
+                output::bytes(total),
+                since.get(..10).unwrap_or(since)
+            ),
+            _ => String::new(),
+        };
+        log(&format!("freed about {}{total}", output::bytes(bytes)));
+    }
 }
 
 /// `; restore: residue restore RECORD` for a result that names the removal

@@ -18,6 +18,7 @@ mod removed;
 mod restore;
 mod run;
 mod service;
+mod stats;
 mod trash;
 mod watch;
 
@@ -52,6 +53,7 @@ fn main() -> ExitCode {
         cli::Command::Explain(options) => commands::explain(&options),
         cli::Command::Remove(options) => remove::remove(&options),
         cli::Command::Restore(options) => restore::command(&options),
+        cli::Command::Stats(options) => stats::command(&options),
     };
     ExitCode::from(code)
 }
