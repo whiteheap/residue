@@ -279,9 +279,11 @@ pub fn remove(options: &Options) -> u8 {
             if report.verdict != Verdict::Candidate {
                 item.outcome = Some(Outcome::Refused);
             } else if mode.only_if_upstream_gone {
-                if let Err(why) = upstream_gone(&report) {
-                    item.outcome =
-                        Some(Outcome::Skipped(format!("--only-if-upstream-gone: {why}")));
+                if let Err(unmet) = upstream_gone(&report) {
+                    item.outcome = Some(Outcome::Skipped(format!(
+                        "--only-if-upstream-gone: {}",
+                        unmet.text()
+                    )));
                 }
             }
             item.report = Some(report);
@@ -600,28 +602,56 @@ fn confirm(worktrees: usize, purges: usize, trash: bool) -> Result<bool, String>
     Ok(answer.trim().eq_ignore_ascii_case("yes"))
 }
 
-/// `--only-if-upstream-gone`: `Ok` only when the local refs show that this
-/// worktree's branch has an upstream and that it is gone. A detached HEAD,
-/// a branch with no upstream, an upstream that exists, and a lookup that
-/// failed all keep the worktree. residue never fetches, so this is the
-/// remote as of the last fetch.
-fn upstream_gone(report: &Report) -> Result<(), String> {
-    let Some(branch) = report.entry.short_branch() else {
-        return Err("it is on a detached HEAD, which has no upstream".into());
+/// Why `--only-if-upstream-gone` keeps a worktree: the local refs say its
+/// upstream is not gone, or residue could not read them.
+enum Unmet {
+    NotGone(String),
+    Unreadable(String),
+}
+
+impl Unmet {
+    fn text(&self) -> &str {
+        match self {
+            Unmet::NotGone(why) | Unmet::Unreadable(why) => why,
+        }
+    }
+}
+
+/// `--only-if-upstream-gone`: `Ok` only when the local refs show that the
+/// branch has an upstream and that it is gone. A detached HEAD, a branch
+/// with no upstream, an upstream that exists, and a lookup that failed all
+/// keep the worktree. residue never fetches, so this is the remote as of
+/// the last fetch.
+fn judge_upstream(
+    branch: Option<&str>,
+    upstream: &Result<Option<inspect::Upstream>, String>,
+) -> Result<(), Unmet> {
+    let Some(branch) = branch else {
+        return Err(Unmet::NotGone(
+            "it is on a detached HEAD, which has no upstream".into(),
+        ));
     };
-    match &report.upstream {
+    match upstream {
         Ok(Some(u)) if u.gone => Ok(()),
-        Ok(Some(u)) => Err(format!(
+        Ok(Some(u)) => Err(Unmet::NotGone(format!(
             "its upstream {} exists in the local refs",
             clean(&u.name)
-        )),
-        Ok(None) => Err(format!("branch {} has no upstream", clean(branch))),
-        Err(e) => Err(format!(
+        ))),
+        Ok(None) => Err(Unmet::NotGone(format!(
+            "branch {} has no upstream",
+            clean(branch)
+        ))),
+        Err(e) => Err(Unmet::Unreadable(format!(
             "residue could not read the upstream of branch {}: {}",
             clean(branch),
             clean(e)
-        )),
+        ))),
     }
+}
+
+/// `judge_upstream` on what a report recorded.
+fn upstream_gone(report: &Report) -> Result<(), Unmet> {
+    judge_upstream(report.entry.short_branch(), &report.upstream)
 }
 
 /// The worktree at `path` as Git lists it now, judged again against a
@@ -670,8 +700,10 @@ fn recheck(
         return Err(Outcome::Skipped(why));
     }
     if only_if_upstream_gone {
-        upstream_gone(&now)
-            .map_err(|why| Outcome::Skipped(format!("changed since {since}: {why}")))?;
+        upstream_gone(&now).map_err(|unmet| match unmet {
+            Unmet::NotGone(why) => Outcome::Skipped(format!("changed since {since}: {why}")),
+            Unmet::Unreadable(why) => Outcome::Failed(format!("--only-if-upstream-gone: {why}")),
+        })?;
     }
     Ok(listed.clone())
 }
@@ -731,7 +763,7 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
         before,
         policy,
         since,
-        None,
+        /* ours */ None,
         mode.only_if_upstream_gone,
     ) {
         Ok(l) => l,
@@ -809,7 +841,14 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
     if let Err(e) = git::lock_worktree(&main, &dest, reason) {
         return moved.put_back(false, &format!("could not lock it: {e}"));
     }
-    if let Err(why) = verify_moved(&dest, before, policy, since, reason) {
+    if let Err(why) = verify_moved(
+        &dest,
+        before,
+        policy,
+        since,
+        reason,
+        mode.only_if_upstream_gone,
+    ) {
         return moved.put_back(true, &why);
     }
     if let Some(entry) = entry {
@@ -891,6 +930,7 @@ fn verify_moved(
     policy: &Policy,
     since: &str,
     reason: &str,
+    only_if_upstream_gone: bool,
 ) -> Result<(), String> {
     let list = git::worktrees(dest)?;
     let listed = list
@@ -932,10 +972,22 @@ fn verify_moved(
     let now = planned
         .again(dest, listed.head.clone(), policy)
         .map_err(|e| format!("cannot measure it after moving it aside: {e}"))?;
-    match planned.changed(&now, since) {
-        Some(why) => Err(why),
-        None => Ok(()),
+    if let Some(why) = planned.changed(&now, since) {
+        return Err(why);
     }
+    // Measuring again can take seconds on a large worktree, so read the
+    // upstream once more, last, right before the deletion.
+    if only_if_upstream_gone {
+        let live = match &listed.branch {
+            Some(branch) => inspect::upstream(dest, branch),
+            None => Ok(None),
+        };
+        judge_upstream(listed.short_branch(), &live).map_err(|unmet| match unmet {
+            Unmet::NotGone(why) => format!("changed after residue moved it aside: {why}"),
+            Unmet::Unreadable(why) => format!("--only-if-upstream-gone: {why}"),
+        })?;
+    }
+    Ok(())
 }
 
 /// Re-check one expired trash entry, then delete it with `git worktree
@@ -953,7 +1005,7 @@ fn purge(p: &Purge, policy: &Policy, mode: &Mode) -> Outcome {
             policy,
             mode.since,
             Some(trash::LOCK),
-            false,
+            /* only_if_upstream_gone */ false,
         ) {
             return outcome;
         }

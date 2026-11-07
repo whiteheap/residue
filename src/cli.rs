@@ -291,7 +291,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
     }
     if options.only_if_upstream_gone && options.all {
         return Err(
-            "--only-if-upstream-gone takes worktree PATHs, not --all; `residue watch --once ROOT` removes every worktree whose branch landed".into(),
+            "--only-if-upstream-gone takes worktree PATHs, not --all: name each worktree, such as the paths `residue scan --json` reports with upstream_gone true".into(),
         );
     }
     if kind != "remove" {

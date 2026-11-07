@@ -476,13 +476,20 @@ fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> usize 
         tried.insert(&w.path);
     }
     if !landed.is_empty() {
-        removed += remove(exe, opts, &landed, &opts.grace, true, |w| {
-            format!(
-                "its upstream branch {} was deleted and it was unchanged for {}",
-                w.upstream.as_deref().unwrap_or("(unknown)"),
-                opts.grace.text
-            )
-        });
+        removed += remove(
+            exe,
+            opts,
+            &landed,
+            &opts.grace,
+            /* require_upstream_gone */ true,
+            |w| {
+                format!(
+                    "its upstream branch {} was deleted and it was unchanged for {}",
+                    w.upstream.as_deref().unwrap_or("(unknown)"),
+                    opts.grace.text
+                )
+            },
+        );
     }
 
     for (dev, sample, free, total) in filesystems(snap) {
@@ -526,12 +533,19 @@ fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> usize 
             continue;
         }
         state.pressure_notes.remove(&dev);
-        removed += remove(exe, opts, &chosen, &opts.idle, false, |_| {
-            format!(
-                "free space on its filesystem is {pct:.1}%, below {}%, and it was unchanged for {}",
-                opts.min_free, opts.idle.text
-            )
-        });
+        removed += remove(
+            exe,
+            opts,
+            &chosen,
+            &opts.idle,
+            /* require_upstream_gone */ false,
+            |_| {
+                format!(
+                    "free space on its filesystem is {pct:.1}%, below {}%, and it was unchanged for {}",
+                    opts.min_free, opts.idle.text
+                )
+            },
+        );
     }
     removed
 }
@@ -545,7 +559,7 @@ fn remove(
     opts: &Options,
     worktrees: &[&Worktree],
     span: &Span,
-    landed: bool,
+    require_upstream_gone: bool,
     why: impl Fn(&Worktree) -> String,
 ) -> usize {
     if opts.dry_run {
@@ -568,7 +582,7 @@ fn remove(
         "--idle",
         &span.text,
     ]);
-    if landed {
+    if require_upstream_gone {
         cmd.arg("--only-if-upstream-gone");
     }
     for w in worktrees {
