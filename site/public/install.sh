@@ -232,16 +232,19 @@ listed() {
   [ -n "$want" ]
 }
 
-# Set $older to the newest release whose assets include this machine's
-# archive, from one GitHub API call that lists releases, newest first. Empty
-# when the call fails ($api is its HTTP status) or none of them has it.
+# Set $older to the newest release other than $latest whose assets include
+# this machine's archive, from one GitHub API call that lists releases, newest
+# first. $latest is skipped: packages.yml uploads its archives a second before
+# the SHA256SUMS that names them, so $latest can list the archive while
+# `listed` fails. Empty when the call fails ($api is its HTTP status) or none
+# of them has it.
 find_older() {
   older=
   api=$(curl --proto '=https' --tlsv1.2 -sSL -o "$tmp/releases.json" -w '%{http_code}' \
     "https://api.github.com/repos/$REPO/releases?per_page=10") || true
   [ "$api" = 200 ] || return 0
   url=$(grep -o "\"browser_download_url\": *\"https://github.com/$REPO/releases/download/v[0-9][0-9.]*/residue-v[0-9][0-9.]*-$triple\.tar\.gz\"" \
-    "$tmp/releases.json" | head -n 1)
+    "$tmp/releases.json" | grep -Fv "/download/$latest/" | head -n 1)
   url=${url%/*}
   older=${url##*/}
 }
@@ -280,8 +283,7 @@ install_archive() {
     fi
     tag=$older
     listed || die "SHA256SUMS of $tag lists no $name.tar.gz"
-    [ "$tag" = "$latest" ] ||
-      say "residue $latest has no archive for $triple yet.$late Using $tag, the newest release that has one. To update to $latest, run this script again later."
+    say "residue $latest has no archive for $triple yet.$late Using $tag, the newest release that has one. To update to $latest, run this script again later."
   fi
   bin=$prefix/residue
   updates="run this script again"
