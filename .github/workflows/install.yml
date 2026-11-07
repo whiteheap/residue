@@ -6,7 +6,8 @@ name: install
 # Alpine (busybox sh) and FreeBSD. Each job runs --dry-run first, then the
 # real install, then the installed `residue --version`, then the script again,
 # which must be an upgrade or a no-op. It installs the latest release, so it
-# also checks that release's packages, repositories and checksums.
+# also checks that release's packages, repositories and checksums. On FreeBSD,
+# --version of a release with no FreeBSD archive must stop with a plain error.
 on:
   pull_request:
     paths:
@@ -181,3 +182,10 @@ jobs:
             sh site/public/install.sh | tee /tmp/again.log
             grep -q 'is already installed at' /tmp/again.log
             grep -q '^Cleanup:    not available on FreeBSD' /tmp/again.log
+            # --version is exact: v0.0.4 has no FreeBSD archive, so it stops
+            # with a plain message, never a curl 404 or another release.
+            if sh site/public/install.sh --version v0.0.4 --no-service > /tmp/exact.log 2>&1; then exit 1; fi
+            cat /tmp/exact.log
+            grep -q 'residue v0.0.4 has no archive for x86_64-unknown-freebsd' /tmp/exact.log
+            if grep -q 'curl: (22)' /tmp/exact.log; then exit 1; fi
+            test "$("$HOME/.local/bin/residue" --version)" != "residue 0.0.4"

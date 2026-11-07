@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Install (#30): one command installs residue and, on macOS and Linux, turns on automatic cleanup: `curl -fsSL https://residue.whiteheap.com/install.sh | sh`. The script (`site/public/install.sh`, POSIX sh) uses Homebrew on macOS, the signed apt, dnf or pacman repository on Linux when it can act as root, and otherwise the release archive, checked against `SHA256SUMS` and, when `gh` is logged in, its build-provenance attestation; it pins the SHA-256 of the signing key it adds. Then it runs `residue service install`, leaves an existing service alone, and prints what it did and how to undo it. `--no-service`, `--archive`, `--prefix`, `--version` and `--dry-run`. Running it again upgrades. CI runs it through Homebrew, apt, dnf, pacman and the archive (macOS, Ubuntu, Alpine, FreeBSD). README and `docs/installation.md` lead with it; Homebrew and the manual channels remain.
+- Install (#52): right after a release, when its FreeBSD archives are still being built, the script installs the newest release that has this machine's archive, names both versions and says to run it again later; before, it stopped with `curl: (22) ... 404`. It decides by the release's `SHA256SUMS` and finds the earlier release with one GitHub API call; when that call fails, it says the archive is still being built and how to pick a release with `--version`. `--version` stays exact: a release with no archive for this machine is a plain error, never another release.
 
 ## 0.0.7 (2026-11-08)
 
