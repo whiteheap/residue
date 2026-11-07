@@ -501,6 +501,7 @@ mod platform {
                 if let Some(installed) = installed() {
                     installed.print();
                 }
+                super::freed(true);
                 if let Some(log) = log_file() {
                     println!("log: {}", log.display());
                     super::tail(&log);
@@ -510,6 +511,7 @@ mod platform {
             Err(_) => {
                 println!("launchd agent {LABEL}: not installed");
                 super::homebrew_note();
+                super::freed(false);
                 3
             }
         }
@@ -686,6 +688,7 @@ mod platform {
         if !installed {
             println!("systemd user service {UNIT}: not installed");
             super::homebrew_note();
+            super::freed(false);
             return 3;
         }
         let state = match run(SYSTEMCTL, &["--user", "is-active", UNIT]) {
@@ -696,6 +699,7 @@ mod platform {
         if let Some(installed) = self::installed() {
             installed.print();
         }
+        super::freed(true);
         if let Ok(log) = run(
             "journalctl",
             &["--user", "-u", UNIT, "-n", "5", "--no-pager", "-o", "cat"],
@@ -749,6 +753,17 @@ fn homebrew_note() {
             "Homebrew runs residue watch instead ({}): brew services info residue",
             output::clean(&file.to_string_lossy())
         );
+    }
+}
+
+/// On `service status`: what automatic cleanup freed in the last 7 days
+/// and when it last removed a worktree (`stats::service_line`). Without
+/// residue's own service, only once `watch` has freed something, as a
+/// Homebrew service's `watch` would.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn freed(installed: bool) {
+    if let Some(line) = crate::stats::service_line(installed) {
+        println!("{}", output::clean(&line));
     }
 }
 

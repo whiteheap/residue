@@ -24,6 +24,9 @@ Usage:
                              and removal records), or put one ENTRY back (its
                              name from the list, the worktree's name or branch,
                              or a path)
+  residue stats              Show how much disk residue has freed on this
+                             machine: all time, the last 7 and 30 days, by
+                             command and by repository (estimates)
   residue watch [ROOT...]    Stay running; remove a worktree when its branch
                              lands or the disk runs low. Without a ROOT, the
                              usual code folders (`residue watch --help`)
@@ -31,7 +34,8 @@ Usage:
                              Run `residue watch` from login (launchd, systemd)
 
 Options:
-  --json                Print one JSON document (scan, explain, remove, restore)
+  --json                Print one JSON document (scan, explain, remove, restore,
+                        stats)
   --idle DURATION       Keep any worktree changed within DURATION (30m, 12h,
                         2d, 1w): its files, its index and other files in its
                         Git directory, or its HEAD reflog. For scheduled runs,
@@ -213,6 +217,7 @@ pub enum Command {
     Explain(Options),
     Remove(Options),
     Restore(Options),
+    Stats(Options),
 }
 
 fn utf8(value: OsString, what: &str) -> Result<String, String> {
@@ -227,7 +232,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
         None => return Ok(Command::Scan(Options::default())),
         Some("-h" | "--help" | "help") => return Ok(Command::Help),
         Some("-V" | "--version" | "version") => return Ok(Command::Version),
-        Some(word @ ("scan" | "explain" | "remove" | "restore")) => {
+        Some(word @ ("scan" | "explain" | "remove" | "restore" | "stats")) => {
             let word = word.to_string();
             args.next();
             word
@@ -395,6 +400,13 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
     if kind == "restore" && (options.idle.is_some() || !options.regenerable.is_empty()) {
         return Err("`residue restore` takes only --json, --to PATH and an ENTRY".into());
     }
+    if kind == "stats"
+        && (options.idle.is_some() || !options.regenerable.is_empty() || !options.paths.is_empty())
+    {
+        return Err(
+            "`residue stats` takes only --json: it reports every repository on this machine".into(),
+        );
+    }
     if kind == "restore" && options.to.is_some() && options.paths.is_empty() {
         return Err("--to needs an ENTRY to restore; run `residue restore` to list them".into());
     }
@@ -408,6 +420,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
                 .into(),
         ),
         "restore" => Ok(Command::Restore(options)),
+        "stats" => Ok(Command::Stats(options)),
         "remove" if options.all && options.paths.is_empty() => Err(
             "`residue remove --all` needs at least one PATH to scan, such as ~/src".into(),
         ),

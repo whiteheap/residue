@@ -18,6 +18,7 @@ pub const SCHEMA_SCAN: &str = "residue.scan/v1";
 pub const SCHEMA_EXPLAIN: &str = "residue.explain/v1";
 pub const SCHEMA_REMOVE: &str = "residue.remove/v1";
 pub const SCHEMA_RESTORE: &str = "residue.restore/v1";
+pub const SCHEMA_STATS: &str = "residue.stats/v1";
 
 pub struct Style {
     on: bool,
@@ -272,6 +273,11 @@ pub fn date(seconds: i64) -> String {
             )
         }
     }
+}
+
+/// `2026-11-07`: the local day of [`date`].
+pub fn day(seconds: i64) -> String {
+    date(seconds).chars().take(10).collect()
 }
 
 /// RFC 3339 in UTC: `2026-11-06T21:04:05Z`.

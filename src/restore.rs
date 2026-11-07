@@ -17,6 +17,7 @@ use crate::git;
 use crate::json::Json;
 use crate::output::{self, Places, Style, clean};
 use crate::removed::{self, How};
+use crate::stats;
 use crate::trash;
 
 /// Everything `residue restore` can bring back in some repositories.
@@ -40,6 +41,12 @@ pub fn command(options: &Options) -> u8 {
     let places = Places::new();
     let Some(wanted) = options.paths.first() else {
         let found = gather(&[PathBuf::from(".")]);
+        if let Err(e) = seed(&found) {
+            eprintln!(
+                "residue: warning: the stats ledger is not up to date ({})",
+                clean(&e)
+            );
+        }
         if options.json {
             println!("{}", list_json(&found, started, None).render());
         } else {
@@ -97,12 +104,23 @@ pub fn command(options: &Options) -> u8 {
         Some(Ok(to)) => Some(to),
         Some(Err(e)) => return fail(&e),
     };
+    // Before the restore takes a removal record back, the stats ledger
+    // takes in what it lacks, so the removal it undoes still counts.
+    let seeded = seed(&found);
     let result = match pick {
         Pick::Trash(i) => restore_trash(&found, i, to.as_deref()),
         Pick::Removed(i) => restore_removed(&found, i, to.as_deref()),
     };
     match result {
-        Ok(done) => {
+        Ok(mut done) => {
+            let recorded = seeded.and_then(|mut ledger| {
+                stats::record(Some(&mut ledger), vec![restored_line(&found, pick)])
+            });
+            if let Err(e) = recorded {
+                done.notes.push(format!(
+                    "the stats ledger is not up to date ({e}); this does not change the restore"
+                ));
+            }
             for note in &done.notes {
                 eprintln!("residue: note: {}", clean(note));
             }
@@ -212,6 +230,44 @@ fn gather(roots: &[PathBuf]) -> Found {
         }
     }
     found
+}
+
+/// The stats ledger, after it took in the removal records and trash
+/// entries it lacks of the repositories `found` covers.
+fn seed(found: &Found) -> Result<stats::Ledger, String> {
+    stats::seed(&found.removed, &found.trash)
+}
+
+/// The stats ledger's line for the entry `pick` names, once it is back.
+fn restored_line(found: &Found, pick: Pick) -> stats::Line {
+    match pick {
+        Pick::Trash(i) => {
+            let item = &found.trash[i];
+            let record = item.record.as_ref().ok();
+            stats::restored(
+                "trash",
+                &item.common_dir,
+                &item.name,
+                record.map(|r| r.original.as_path()),
+                record.and_then(|r| r.reclaimable),
+            )
+        }
+        Pick::Removed(i) => {
+            let item = &found.removed[i];
+            let record = item.record.as_ref().ok();
+            stats::restored(
+                if item.interrupted() {
+                    "interrupted"
+                } else {
+                    "removed"
+                },
+                &item.common_dir,
+                &item.name,
+                record.map(|r| r.original.as_path()),
+                record.and_then(|r| r.reclaimable),
+            )
+        }
+    }
 }
 
 fn name_of(found: &Found, pick: Pick) -> String {
