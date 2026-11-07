@@ -1,6 +1,6 @@
 import { Button, Loader } from "@cloudflare/kumo";
 import { Check, Copy, WarningCircle } from "@phosphor-icons/react";
-import { useEffect, useRef, useState, type ComponentProps, type ReactNode } from "react";
+import { Fragment, useEffect, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import type { CliError, Verdict } from "../lib/types";
 import { verdictHelp, verdictLabel } from "../lib/worktree";
 
@@ -54,6 +54,20 @@ export function Words({ text }: { text: string }) {
         // The split alternates text and code; a part's index is its identity.
         i % 2 === 1 ? <code key={i}>{part}</code> : part,
       )}
+    </>
+  );
+}
+
+/** Options in a sentence, each kept on one line: a browser breaks a line after a hyphen. */
+export function Flags({ flags }: { flags: string[] }) {
+  return (
+    <>
+      {flags.map((flag, i) => (
+        <Fragment key={flag}>
+          {i > 0 ? ", " : null}
+          <span className="flag">{flag}</span>
+        </Fragment>
+      ))}
     </>
   );
 }

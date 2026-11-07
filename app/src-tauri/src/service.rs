@@ -18,8 +18,10 @@
 //! What the service does comes from its arguments and the version of the
 //! binary it runs, which `brew upgrade` can change without the app: the
 //! window never assumes the bundled residue's behavior for it. Saving other
-//! folders passes the service's options on as they are written, and refuses
-//! when an argument is one the app does not know, rather than drop it.
+//! folders passes the service's options on as they are written, every one,
+//! including an option the app does not know, such as one a newer residue
+//! adds. It refuses when an argument is neither an option nor a folder,
+//! rather than drop it.
 //!
 //! A save installs what the window showed or nothing. Every read carries a
 //! `Basis`: the binary a save installs with and its version, the options it
@@ -42,8 +44,16 @@ use std::time::Duration;
 pub const LABEL: &str = "com.whiteheap.residue.watch";
 
 /// `residue watch` options that take a value. `--fetch-every` is new in
-/// residue 0.0.7, which writes it (or `--no-fetch`) into every service.
-const VALUE_OPTIONS: &[&str] = &["--grace", "--idle", "--min-free", "--fetch-every"];
+/// residue 0.0.7, which writes it (or `--no-fetch`) into every service;
+/// `--keep-removed` is new after 0.0.7 (#55), and the CLI that has it writes
+/// it into every service too.
+const VALUE_OPTIONS: &[&str] = &[
+    "--grace",
+    "--idle",
+    "--min-free",
+    "--fetch-every",
+    "--keep-removed",
+];
 
 /// `residue watch` options without a value that a save passes on.
 /// `--dry-run` is the dialog's own checkbox, so it is not one of them.
@@ -61,6 +71,10 @@ pub const DEFAULT_FETCH_EVERY: &str = "30m";
 /// `residue remove --keep-trash`. Automatic cleanup and the app's own
 /// removals never pass one, so it is the trash's retention for both.
 pub const DEFAULT_KEEP_TRASH: &str = "7d";
+/// `--keep-removed` of `residue remove` and of `watch` (`cli::DEFAULT_KEEP_REMOVED`
+/// at the root): how long a removal record is kept. The app's own removals
+/// never pass one; a service that does not set one forgets records after it.
+pub const DEFAULT_KEEP_REMOVED: &str = "30d";
 /// The first release whose `watch` fetches (`--fetch-every`, `--no-fetch`).
 const FETCH_SINCE: (u64, u64, u64) = (0, 0, 7);
 const FETCH_SINCE_TEXT: &str = "0.0.7";
@@ -87,11 +101,17 @@ pub struct Program {
     /// canonical.
     pub roots: Vec<String>,
     /// The options a save passes on, as written: `["--grace", "1h",
-    /// "--no-fetch"]`.
+    /// "--no-fetch"]`. Every option is one, including those the app does not
+    /// know.
     pub options: Vec<String>,
+    /// The options among `options` that the app does not know, such as one a
+    /// newer residue added (`--some-new-option 2d`), with their values. A save
+    /// passes them on as written.
+    pub other_options: Vec<String>,
     pub dry_run: bool,
-    /// Arguments the app does not know. While there are any, the app does not
-    /// save the service, since a save would drop them.
+    /// Arguments the app cannot read: a program other than `residue watch`,
+    /// or an argument that is neither an option nor a folder. While there are
+    /// any, the app does not save the service, since a save would drop them.
     pub unknown: Vec<String>,
     /// What the service does: its options, and residue's defaults for the
     /// ones it does not set.
@@ -132,6 +152,9 @@ pub struct WatchSettings {
     /// The trash retention of the removals watch runs: it passes no
     /// `--keep-trash`, so this is always residue's default.
     pub keep_trash: Setting,
+    /// How long the removal records of its repositories are kept: the
+    /// service's `--keep-removed`, or residue's default.
+    pub keep_removed: Setting,
 }
 
 /// What turning the service on, or saving other folders, installs.
@@ -369,9 +392,8 @@ pub struct Change {
 pub struct Preview {
     pub command: String,
     pub lines: Vec<String>,
-    /// Options of the service that the preview did not pass, with the reason.
-    pub left_out: Vec<String>,
-    pub left_out_reason: Option<String>,
+    /// Whether it fetched first, as the service's passes do.
+    pub fetch: Fetch,
 }
 
 /// The preview mode for development builds. With
@@ -668,6 +690,7 @@ fn read_program(ctx: &Context, plist: &Path) -> Result<Program, CliError> {
         version,
         managed: binary_path == managed_binary(ctx.data_dir),
         roots: parsed.roots,
+        other_options: other_options(&parsed.options),
         options: parsed.options,
         dry_run: parsed.dry_run,
         unknown: parsed.unknown,
@@ -683,12 +706,16 @@ struct Parsed {
     unknown: Vec<String>,
 }
 
-/// Sort the arguments after `watch` the way residue reads them. An
-/// argument that is neither an option the app knows nor an absolute path is
-/// unknown, never a folder: residue writes every ROOT canonical.
+/// Sort the arguments after `watch` the way residue writes them: its
+/// options, then the folders, each an absolute canonical path. An option the
+/// app does not know (`--some-new-option 2d`, which a newer residue may write) is
+/// one of the options and is passed on as written. It takes the next argument
+/// as its value unless that argument is an option or an absolute path: no
+/// `watch` option takes an absolute path. Anything else is unknown, never a
+/// folder.
 fn parse_watch(args: &[String]) -> Parsed {
     let mut parsed = Parsed::default();
-    let mut rest = args.iter();
+    let mut rest = args.iter().peekable();
     while let Some(arg) = rest.next() {
         if VALUE_OPTIONS.contains(&arg.as_str()) {
             match rest.next() {
@@ -699,6 +726,11 @@ fn parse_watch(args: &[String]) -> Parsed {
             parsed.options.push(arg.clone());
         } else if arg == "--dry-run" {
             parsed.dry_run = true;
+        } else if arg.len() > 2 && arg.starts_with("--") {
+            parsed.options.push(arg.clone());
+            if let Some(value) = rest.next_if(|next| is_value(next)) {
+                parsed.options.push(value.clone());
+            }
         } else if !arg.starts_with('-') && Path::new(arg).is_absolute() {
             parsed.roots.push(arg.clone());
         } else {
@@ -706,6 +738,30 @@ fn parse_watch(args: &[String]) -> Parsed {
         }
     }
     parsed
+}
+
+/// An argument that can be the value of an option the app does not know:
+/// neither an option nor a folder.
+fn is_value(arg: &str) -> bool {
+    !arg.starts_with('-') && !Path::new(arg).is_absolute()
+}
+
+/// The options among `options` (as `parse_watch` sorts them) that the app
+/// does not know, each with its value.
+fn other_options(options: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = options.iter().peekable();
+    while let Some(option) = it.next() {
+        if VALUE_OPTIONS.contains(&option.as_str()) {
+            it.next();
+        } else if !FLAG_OPTIONS.contains(&option.as_str()) {
+            out.push(option.clone());
+            if let Some(value) = it.next_if(|next| is_value(next)) {
+                out.push(value.clone());
+            }
+        }
+    }
+    out
 }
 
 /// What `residue watch` does with these options when a binary of this
@@ -767,6 +823,7 @@ fn watch_settings(options: &[String], version: Option<&str>) -> WatchSettings {
             value: DEFAULT_KEEP_TRASH.into(),
             default: true,
         },
+        keep_removed: setting("--keep-removed", DEFAULT_KEEP_REMOVED),
     }
 }
 
@@ -904,10 +961,10 @@ fn plan(
         (true, Some(program)) => {
             if !program.unknown.is_empty() {
                 blocked = Some(format!(
-                    "The service runs residue with arguments the app does not know: {}. A save \
-                     here would drop them. Change the service in a terminal with residue \
-                     service install, or turn automatic cleanup off and on again to start from \
-                     residue's defaults.",
+                    "The service runs arguments the app cannot read as residue watch options or \
+                     folders: {}. A save here would drop them. Change the service in a terminal \
+                     with residue service install, or turn automatic cleanup off and on again to \
+                     start from residue's defaults.",
                     program.unknown.join(" ")
                 ));
             }
@@ -1025,7 +1082,7 @@ pub fn install(
     let command = shown(&installer.bin, &args);
 
     if dev.enabled {
-        let preview = preview(ctx, roots, &options)?;
+        let preview = run_preview(ctx, &installer, roots, &options)?;
         let settings = watch_settings(&options, installer.version.as_deref());
         let program = Program {
             binary: installer.bin.to_string_lossy().into_owned(),
@@ -1036,6 +1093,7 @@ pub fn install(
                 .iter()
                 .map(|r| r.to_string_lossy().into_owned())
                 .collect(),
+            other_options: other_options(&options),
             options,
             dry_run,
             unknown: Vec::new(),
@@ -1114,33 +1172,41 @@ pub fn uninstall(ctx: &Context, dev: &DevPreview) -> Result<Change, CliError> {
     })
 }
 
-/// What automatic cleanup would remove right now, as the bundled residue
-/// sees it: `residue watch --once --dry-run`, which removes nothing. The
-/// preview never fetches: the fetch options of the service are left out and
-/// named, and a bundled residue that fetches gets `--no-fetch`.
-pub fn preview(ctx: &Context, roots: &[PathBuf], options: &[String]) -> Result<Preview, CliError> {
+/// What automatic cleanup would remove right now, after a save of `roots`:
+/// the service's next pass with `--dry-run`, which removes nothing.
+pub fn preview(ctx: &Context, dev: &DevPreview, roots: &[PathBuf]) -> Result<Preview, CliError> {
+    let (current, installer) = read(ctx, dev)?;
+    run_preview(ctx, &installer, roots, &current.plan.keep)
+}
+
+/// `residue watch --once --dry-run` with every option a save passes on, run
+/// by the binary a save installs with: a pass as the saved service runs it,
+/// which removes nothing. Like the service, it fetches first unless the
+/// options say `--no-fetch` or the binary is older than 0.0.7. A fetch
+/// changes only remote-tracking refs.
+fn run_preview(
+    ctx: &Context,
+    installer: &Installer,
+    roots: &[PathBuf],
+    options: &[String],
+) -> Result<Preview, CliError> {
     if roots.is_empty() {
         return Err(CliError::invalid("choose at least one folder to watch"));
     }
-    let bundled = format!("residue {}", ctx.bundled_version);
-    let (fetch, mut passed) = split_fetch(options);
-    let (left_out, reason) = if fetches(Some(&bundled)) == Some(true) {
-        passed.push("--no-fetch".into());
-        let left: Vec<String> = fetch.into_iter().filter(|o| o != "--no-fetch").collect();
-        (left, "the preview does not fetch".to_string())
+    // A save writes the app's own copy from the bundled binary, so the
+    // bundled binary is the one the service would run.
+    let (bin, path_env) = if installer.managed {
+        (ctx.sidecar, ctx.path_env)
     } else {
-        (
-            fetch,
-            format!("{bundled} runs the preview and has no fetch options"),
-        )
+        (installer.bin.as_path(), installer.path_env.as_os_str())
     };
     let mut args: Vec<OsString> = vec!["watch".into(), "--once".into()];
-    args.extend(watch_args(roots, &passed, true));
+    args.extend(watch_args(roots, options, true));
     let out = Run {
-        bin: ctx.sidecar,
+        bin,
         args,
         cwd: ctx.home,
-        path_env: ctx.path_env,
+        path_env,
         deadline: Duration::from_secs(15 * 60),
     }
     .output()?;
@@ -1159,7 +1225,6 @@ pub fn preview(ctx: &Context, roots: &[PathBuf], options: &[String]) -> Result<P
             .chain(out.stdout.lines())
             .map(str::to_string)
             .collect(),
-        left_out_reason: (!left_out.is_empty()).then_some(reason),
-        left_out,
+        fetch: watch_settings(options, installer.version.as_deref()).fetch,
     })
 }

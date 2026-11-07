@@ -1,6 +1,6 @@
 # The residue Mac app
 
-This folder holds the Mac app: a window over the residue CLI that lists the linked worktrees under your code folders, moves the ones that can go to the trash, restores them, and turns automatic cleanup on or off. What it does for users, the download and the first launch are in the [README](../README.md#mac-app), which is the contract. This file is for building and changing the app.
+This folder holds the Mac app: a window over the residue CLI that lists the linked worktrees under your code folders, moves the ones that can go to the trash, restores them from the trash or from a removal record, and turns automatic cleanup on or off. What it does for users, the download and the first launch are in the [README](../README.md#mac-app), which is the contract. This file is for building and changing the app.
 
 The app never reimplements a check, a size or a deletion. Every action runs the residue binary bundled inside the app, with explicit arguments, and reads its JSON. That binary is built from this repository, at the same commit as the app, and has the same version. It is Tauri 2: Rust in `src-tauri/`, React and TypeScript in `src/` (Kumo components, Phosphor icons, Tailwind 4). [AGENTS.md](AGENTS.md) has the invariants.
 

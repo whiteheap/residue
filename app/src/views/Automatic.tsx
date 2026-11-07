@@ -3,7 +3,7 @@ import { ArrowClockwise, Eye, FolderPlus, Info } from "@phosphor-icons/react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useState } from "react";
 import { ErrorBoundary } from "../components/ErrorBoundary";
-import { Command, ErrorPanel, Loading, PageHeader, SolidButton, Toggle } from "../components/ui";
+import { Command, ErrorPanel, Flags, Loading, PageHeader, SolidButton, Toggle } from "../components/ui";
 import { api, asCliError } from "../lib/api";
 import { shellWord, tilde } from "../lib/format";
 import type {
@@ -14,6 +14,7 @@ import type {
   ServicePreview,
   ServiceProgram,
   ServiceStatus,
+  WatchFetch,
 } from "../lib/types";
 import { useCli } from "../lib/useCli";
 import { diskLow, duration, fetchWords, settingFlags, settingLines } from "../lib/watch";
@@ -123,14 +124,15 @@ export function Automatic({
                     <dt>Options</dt>
                     <dd>
                       <code>{program.options.join(" ")}</code>
+                      <OtherOptions options={program.other_options} />
                     </dd>
                   </div>
                 ) : null}
                 {program.unknown.length > 0 ? (
                   <div>
-                    <dt>Not known to the app</dt>
+                    <dt>Cannot read</dt>
                     <dd>
-                      <code>{program.unknown.join(" ")}</code>
+                      <code>{program.unknown.join(" ")}</code>: neither an option nor a folder
                     </dd>
                   </div>
                 ) : null}
@@ -213,7 +215,6 @@ export function Automatic({
               appRoots={roots}
               suggested={suggested}
               home={home}
-              bundled={info?.residue_version ?? null}
               onClose={closeSave}
               onChanged={changed}
               onFailed={load}
@@ -224,6 +225,44 @@ export function Automatic({
       ) : null}
     </>
   );
+}
+
+/** The service's options this app does not know, such as one a newer residue added. */
+function OtherOptions({ options }: { options: string[] }) {
+  // Each option, with the value after it: a value never starts with "-" (`parse_watch`).
+  const each = options.reduce<string[]>((out, arg) => {
+    if (arg.startsWith("-") || out.length === 0) out.push(arg);
+    else out[out.length - 1] += ` ${arg}`;
+    return out;
+  }, []);
+  if (each.length === 0) return null;
+  return (
+    <>
+      {". The app does not know "}
+      <code>
+        <Flags flags={each} />
+      </code>
+      , and a save passes {each.length === 1 ? "it" : "them"} on as written
+    </>
+  );
+}
+
+/** Whether the preview fetches, as the service would: before it runs (`done` false) or after. */
+function previewFetch(fetch: WatchFetch, done: boolean): string {
+  switch (fetch.mode) {
+    case "every":
+      return done
+        ? `It fetched each repository first, as the service does on its first pass and about every ${duration(fetch.value)} after, so a worktree whose branch was deleted on the remote shows here. A fetch changes only remote-tracking refs.`
+        : "Like the service's first pass, it fetches each repository first, which can take a while. A fetch changes only remote-tracking refs.";
+    case "off":
+      return done
+        ? "It did not fetch (--no-fetch), as the service does not: a branch deleted on the remote shows after your next git fetch --prune."
+        : "It does not fetch (--no-fetch), as the service does not.";
+    case "never":
+      return `A residue older than ${fetch.since} never fetches, so neither ${done ? "did" : "does"} the preview.`;
+    default:
+      return `Whether it ${done ? "fetched" : "fetches"} depends on the residue version, which the app could not read.`;
+  }
 }
 
 /** What the service does, from its arguments; when it is off, what turning it on installs. */
@@ -262,17 +301,30 @@ function WhatItRemoves({
         running process stays. Automatic cleanup deletes the worktree instead of using the trash,
         because freeing the disk is its job. The branch and its commits stay, and a locked worktree
         stays. In each repository it removes from, it also deletes trash entries older than{" "}
-        {duration(settings.keep_trash.value)}, residue's default --keep-trash.
+        {duration(settings.keep_trash.value)}, residue's default <Flags flags={["--keep-trash"]} />, and
+        forgets the removal records older than {duration(settings.keep_removed.value)},{" "}
+        {settings.keep_removed.default ? "residue's default " : "its "}
+        <Flags flags={["--keep-removed"]} />. Until then, Restore recreates a worktree it deleted.
       </p>
       <p className="hint">
-        {running
-          ? set.length > 0
-            ? `From the service's arguments: ${set.join(", ")}.`
-            : "The service sets no options."
-          : set.length > 0
-            ? `Turning it on keeps ${set.join(", ")}.`
-            : "Turning it on starts from residue's defaults."}
-        {defaults.length > 0 ? ` residue's defaults, where it sets none: ${defaults.join(", ")}.` : ""}
+        {set.length === 0 ? (
+          running ? (
+            "The service sets no options."
+          ) : (
+            "Turning it on starts from residue's defaults."
+          )
+        ) : (
+          <>
+            {running ? "From the service's arguments: " : "Turning it on keeps "}
+            <Flags flags={set} />.
+          </>
+        )}
+        {defaults.length > 0 ? (
+          <>
+            {" residue's defaults, where it sets none: "}
+            <Flags flags={defaults} />.
+          </>
+        ) : null}
         {running ? "" : ` It would run ${version ?? "a residue of unknown version"}.`}
       </p>
     </section>
@@ -304,7 +356,6 @@ function TurnOnDialog({
   appRoots,
   suggested,
   home,
-  bundled,
   onClose,
   onChanged,
   onFailed,
@@ -313,8 +364,6 @@ function TurnOnDialog({
   appRoots: string[];
   suggested: string[];
   home: string | undefined;
-  /** `residue --version` of the bundled binary, which runs the preview. */
-  bundled: string | null;
   /** Closed without a save: the service as the dialog last read it. */
   onClose: (seen: ServiceStatus | null) => void;
   onChanged: (c: ServiceChange) => void;
@@ -345,7 +394,6 @@ function TurnOnDialog({
             appRoots={appRoots}
             suggested={suggested}
             home={home}
-            bundled={bundled}
             working={working}
             setWorking={setWorking}
             onAdopt={setAdopted}
@@ -386,7 +434,6 @@ function SaveForm({
   appRoots,
   suggested,
   home,
-  bundled,
   working,
   setWorking,
   onAdopt,
@@ -399,7 +446,6 @@ function SaveForm({
   appRoots: string[];
   suggested: string[];
   home: string | undefined;
-  bundled: string | null;
   working: "preview" | "install" | null;
   setWorking: (w: "preview" | "install" | null) => void;
   /** A save found the service changed: plan from this read from now on. */
@@ -426,7 +472,6 @@ function SaveForm({
   const settings = plan.settings;
   const low = diskLow(settings);
   const changes = current ? changedSettings(current, plan) : [];
-  const fetches = settings.fetch.mode === "every";
 
   const add = async () => {
     const picked = await openDialog({ directory: true, multiple: true, title: "Folders to watch" });
@@ -538,6 +583,7 @@ function SaveForm({
               {plan.keep.length > 0 ? (
                 <>
                   <code>{plan.keep.join(" ")}</code>, kept from the service as written
+                  <OtherOptions options={current?.other_options ?? []} />
                 </>
               ) : replacing ? (
                 "the service sets none, so residue's defaults apply"
@@ -581,28 +627,21 @@ function SaveForm({
         </div>
         {previewed ? (
           <>
+            <Command text={previewed.command} />
             <pre className="log full" aria-label="Preview">
               {previewed.lines.length > 0 ? previewed.lines.join("\n") : "Nothing to remove right now."}
             </pre>
-            {previewed.left_out.length > 0 ? (
-              <p className="hint">
-                Left out: {previewed.left_out.join(" ")} ({previewed.left_out_reason}).
-              </p>
-            ) : null}
+            <p className="hint">{previewFetch(previewed.fetch, true)}</p>
           </>
         ) : (
           <p className="hint">
-            Runs residue watch --once --dry-run on these folders with these settings, using the
-            residue {bundled ? `${bundled} ` : ""}inside the app. It removes nothing.
+            Runs one pass of the service as a save sets it up:{" "}
+            <span className="flag">residue watch --once --dry-run</span> on these folders, with every
+            option above, by the residue under Runs
+            {plan.managed ? " (for now the one inside the app, which a save copies there)" : ""}.{" "}
+            <Flags flags={["--dry-run"]} /> removes nothing. {previewFetch(settings.fetch, false)}
           </p>
         )}
-        {fetches ? (
-          <p className="hint">
-            The preview does not fetch, while the service fetches before its first pass. The
-            service can also remove a worktree whose branch was deleted on the remote and is not
-            yet pruned here.
-          </p>
-        ) : null}
       </section>
 
       {changedSince ? (
