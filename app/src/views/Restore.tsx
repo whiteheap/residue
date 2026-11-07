@@ -2,12 +2,14 @@ import { Button, Empty } from "@cloudflare/kumo";
 import { ArrowClockwise, ArrowCounterClockwise, ClockCounterClockwise } from "@phosphor-icons/react";
 import { useState } from "react";
 import { ErrorPanel, Loading, PageHeader } from "../components/ui";
+import { Meter } from "../components/viz/Meter";
 import { api, asCliError } from "../lib/api";
-import { ageOf, baseName, bytes, shortBranch, shortHead, tilde } from "../lib/format";
+import { ageOf, baseName, bytes, plural, shortBranch, shortHead, tilde } from "../lib/format";
 import { removedBy, sized } from "../lib/records";
 import type { CliError, Listing, Restorable, RestoreDocument } from "../lib/types";
 import { documentTime, useCli } from "../lib/useCli";
-import { duration } from "../lib/watch";
+import { trashAge, trashTotals } from "../lib/viz";
+import { duration, durationSeconds } from "../lib/watch";
 
 /** Everything the listings return, once each, newest first. */
 function restorables(listings: Listing[]): Restorable[] {
@@ -141,9 +143,12 @@ export function Restore({
   };
 
   const items = listings ? restorables(listings) : [];
-  const trashed = items.some((i) => i.kind === "trash");
+  const totals = trashTotals(items);
+  const trashed = totals.entries > 0;
   // Ages count to when residue listed them.
   const now = documentTime(listings?.find((l) => l.document)?.document?.generated_at);
+  // The keep window in force: the app's removals and the service both use residue's default.
+  const keepSeconds = keepTrash ? durationSeconds(keepTrash) : null;
   const failed = (listings ?? []).filter((l) => l.error);
   const listErrors = (listings ?? []).flatMap((l) => l.document?.errors ?? []);
   const appKeep = keepRemoved
@@ -219,6 +224,13 @@ export function Restore({
           />
         ) : (
           <>
+            {trashed ? (
+              <p className="stat-line">
+                <strong className="num">{bytes(totals.bytes)}</strong> reclaimable in{" "}
+                {plural(totals.entries, "trash entry", "trash entries")}
+                {totals.unmeasured > 0 ? `, ${totals.unmeasured} not measured` : ""}
+              </p>
+            ) : null}
             <ul className="rows restore-rows">
               {items.map((item) => {
                 const name = baseName(item.originalPath ?? item.name);
@@ -227,6 +239,7 @@ export function Restore({
                 const note = item.kind === "removed" && !item.error ? recordNote(item, home) : null;
                 // residue cannot restore from a record it cannot read.
                 const restorable = item.kind === "trash" || (!item.error && !item.incomplete);
+                const kept = item.kind === "trash" && !item.error ? trashAge(item.at, now, keepSeconds) : null;
                 return (
                   <li key={item.entryPath} className="row" data-kind={item.kind}>
                     <span className="row-main static">
@@ -248,6 +261,26 @@ export function Restore({
                                 .filter(Boolean)
                                 .join(" ")}
                       </span>
+                      {kept && keepTrash ? (
+                        <span className="row-age">
+                          <Meter
+                            size="thin"
+                            value={kept.seconds}
+                            max={kept.keep}
+                            label={`Time in the trash, against --keep-trash ${keepTrash}`}
+                            valueText={
+                              kept.eligible
+                                ? `past ${duration(keepTrash)}`
+                                : `${Math.round(kept.fraction * 100)}% of ${duration(keepTrash)}`
+                            }
+                          />
+                          <span>
+                            {kept.eligible
+                              ? `past ${duration(keepTrash)}: the next cleanup in its repository deletes it and leaves a removal record`
+                              : `the first cleanup after ${duration(keepTrash)} deletes it and leaves a removal record`}
+                          </span>
+                        </span>
+                      ) : null}
                       <span className="row-path">{tilde(item.originalPath ?? item.entryPath, home)}</span>
                       {note ? <span className="row-note">{note}</span> : null}
                     </span>

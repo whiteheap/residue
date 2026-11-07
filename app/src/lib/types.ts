@@ -75,6 +75,12 @@ export interface Worktree {
 }
 
 export interface FreeSpace {
+  /**
+   * The filesystem's device number as a decimal string (#45). Repositories
+   * with the same one share a disk, within one scan only. An older residue
+   * does not send it.
+   */
+  device?: string;
   free_bytes: number;
   total_bytes: number;
   free_inodes: number;

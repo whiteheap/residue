@@ -32,6 +32,21 @@
     --radius: 0.6rem;
     --pad-x: clamp(1.25rem, 0.6rem + 1.6vw, 2rem);
 
+    /* Charts carry meaning by emphasis, never by hue: bright, gray, hatched,
+       and a recessive gray for aggregates. Each fill has its ink, the text
+       color that reads on it. */
+    --viz-bright: var(--fg);
+    --viz-bright-ink: var(--bg);
+    --viz-gray: var(--faint);
+    --viz-gray-ink: oklch(1 0 none);
+    --viz-hatch: var(--bg);
+    --viz-rest: var(--line-strong);
+    --viz-rest-ink: var(--fg);
+    --viz-frame: var(--raise-1);
+    --viz-frame-ink: var(--muted);
+    --viz-track: var(--raise-2);
+    --viz-tick: var(--muted);
+
     text-wrap: pretty;
     overflow-wrap: break-word;
     font-synthesis: none;
@@ -116,6 +131,22 @@
   --text-color-kumo-brand: var(--fg);
   --text-color-kumo-link: var(--fg);
   --text-color-kumo-danger: var(--fg);
+}
+
+/* The chart steps for a light mode, ready for when the app has one: each
+   ink keeps 4.5:1 on its fill. */
+:root[data-mode="light"] {
+  --viz-bright: oklch(0.2 0 none);
+  --viz-bright-ink: oklch(1 0 none);
+  --viz-gray: oklch(0.55 0 none);
+  --viz-gray-ink: oklch(1 0 none);
+  --viz-hatch: oklch(1 0 none);
+  --viz-rest: oklch(0.84 0 none);
+  --viz-rest-ink: oklch(0.2 0 none);
+  --viz-frame: oklch(0.96 0 none);
+  --viz-frame-ink: oklch(0.42 0 none);
+  --viz-track: oklch(0.92 0 none);
+  --viz-tick: oklch(0.45 0 none);
 }
 
 /* Names and labels in the mono face, like the headings. */
@@ -1097,6 +1128,367 @@ li:not([data-result="trashed"]) > .plan-result {
   justify-self: start;
 }
 
+/* --------------------------------------------------------------- charts */
+
+.viz-figure {
+  display: grid;
+  gap: 0.6rem;
+  margin: 0;
+}
+
+.viz-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem 1.5rem;
+}
+
+.viz-crumbs {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+}
+
+.viz-crumbs [aria-current] {
+  color: var(--fg);
+}
+
+.viz-crumb {
+  /* A larger target than the words, without moving the row when it appears. */
+  margin: -0.2rem -0.3rem;
+  padding: 0.2rem 0.3rem;
+  border: 0;
+  border-radius: 0.25rem;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--line-strong);
+  text-underline-offset: 0.2em;
+}
+
+.viz-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem 1rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.viz-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.viz-bar .viz-legend {
+  font-family: var(--font-mono);
+}
+
+.viz-swatch {
+  flex: none;
+}
+
+.viz-figure[aria-busy="true"] .viz-body,
+.disks[data-busy="true"] {
+  opacity: 0.5;
+}
+
+.viz-plot {
+  position: relative;
+}
+
+.viz-plot svg,
+.viz-meter svg {
+  display: block;
+}
+
+.viz-caption {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+/* Labels are measured in code at this size: IBM Plex Mono, 11 px. */
+.viz-label,
+.viz-tick text {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  pointer-events: none;
+}
+
+.viz-fill {
+  fill: var(--fill);
+}
+
+.viz-fill[data-tone="bright"] {
+  --fill: var(--viz-bright);
+  --fill-hover: color-mix(in oklch, var(--viz-bright) 85%, var(--viz-bright-ink));
+}
+
+.viz-fill[data-tone="gray"],
+.viz-fill[data-tone="hatched"] {
+  --fill: var(--viz-gray);
+  --fill-hover: color-mix(in oklch, var(--viz-gray) 80%, var(--viz-gray-ink));
+}
+
+.viz-fill[data-tone="rest"] {
+  --fill: var(--viz-rest);
+  --fill-hover: color-mix(in oklch, var(--viz-rest) 80%, var(--viz-rest-ink));
+}
+
+/* The hatch is drawn for every mark that is not bright, and shown for the
+   hatched ones; forced colors show it for more. */
+.viz-hatch {
+  display: none;
+  pointer-events: none;
+}
+
+.viz-hatch[data-tone="hatched"] {
+  display: inline;
+}
+
+.viz-hatch-line {
+  fill: var(--viz-hatch);
+}
+
+.viz-frame {
+  fill: var(--viz-frame);
+}
+
+.viz-label {
+  fill: var(--viz-gray-ink);
+}
+
+[data-tone="bright"] > .viz-label {
+  fill: var(--viz-bright-ink);
+}
+
+[data-tone="rest"] > .viz-label {
+  fill: var(--viz-rest-ink);
+}
+
+.viz-repo:not([data-tone]) > .viz-label {
+  fill: var(--viz-frame-ink);
+}
+
+/* Text on the hatch gets a halo of the fill under it. */
+[data-tone="hatched"] > .viz-label {
+  paint-order: stroke;
+  stroke: var(--viz-gray);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
+.viz-tile,
+.viz-tree:not([data-single]) .viz-repo {
+  cursor: pointer;
+}
+
+.viz-tree[data-single] .viz-tile[data-tone="rest"] {
+  cursor: default;
+}
+
+/* Focus: a 2 px ring inside the mark, in the ink that reads on it. */
+.viz-node:focus-visible {
+  outline: none;
+}
+
+.viz-ring {
+  fill: none;
+  stroke: var(--viz-gray-ink);
+  stroke-width: 2px;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+[data-tone="bright"] > .viz-ring {
+  stroke: var(--viz-bright-ink);
+}
+
+[data-tone="rest"] > .viz-ring,
+.viz-repo:not([data-tone]) > .viz-ring {
+  stroke: var(--fg);
+}
+
+.viz-node:focus-visible > .viz-ring {
+  visibility: visible;
+}
+
+.viz-tip {
+  position: absolute;
+  inset-block-start: 0;
+  inset-inline-start: 0;
+  z-index: 2;
+  display: grid;
+  gap: 0.15rem;
+  inline-size: max-content;
+  max-inline-size: 18rem;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 0.45rem;
+  background: var(--raise-1);
+  color: var(--muted);
+  font-size: 0.75rem;
+  box-shadow: 0 0.4rem 1.5rem oklch(0 0 none / 0.5);
+  pointer-events: none;
+}
+
+.viz-tip p {
+  margin: 0;
+}
+
+.viz-tip-value {
+  color: var(--fg);
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+.viz-tip strong,
+.viz-tip code {
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-weight: 500;
+}
+
+.viz-bar {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.viz-meter {
+  position: relative;
+}
+
+.viz-track {
+  fill: var(--viz-track);
+}
+
+.viz-meter-fill {
+  fill: var(--viz-bright);
+}
+
+.viz-tick line {
+  stroke: var(--viz-tick);
+  stroke-width: 1px;
+}
+
+.viz-tick text {
+  fill: var(--muted);
+}
+
+.viz-notch {
+  fill: var(--bg);
+}
+
+.disks {
+  display: grid;
+  gap: 1.1rem;
+}
+
+.disk {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.disk-name {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+}
+
+.disk-free {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.disk-low {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0;
+  color: var(--fg);
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+.stat-line {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+
+.stat-line strong {
+  color: var(--fg);
+  font-weight: 500;
+}
+
+.row-age {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  color: var(--faint);
+  font-size: 0.6875rem;
+}
+
+.row-age .viz-meter {
+  flex: none;
+  inline-size: 5rem;
+}
+
+.row-age > span {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* Forced colors drop the grays: bright is solid, kept is an outline, and
+   residue's unsettled verdicts keep the hatch. */
+@media (forced-colors: active) {
+  :root {
+    --viz-bright: CanvasText;
+    --viz-bright-ink: Canvas;
+    --viz-gray: Canvas;
+    --viz-gray-ink: CanvasText;
+    --viz-hatch: CanvasText;
+    --viz-rest: GrayText;
+    --viz-rest-ink: Canvas;
+    --viz-frame: Canvas;
+    --viz-frame-ink: CanvasText;
+    --viz-track: Canvas;
+    --viz-tick: CanvasText;
+  }
+
+  .viz-plot svg,
+  .viz-meter svg,
+  .viz-swatch {
+    forced-color-adjust: none;
+  }
+
+  .viz-fill[data-tone="gray"],
+  .viz-fill[data-tone="hatched"],
+  .viz-track {
+    stroke: CanvasText;
+    stroke-width: 1px;
+  }
+
+  .viz-ring {
+    stroke: Highlight;
+  }
+
+  .viz-notch {
+    fill: Canvas;
+  }
+}
+
 /* ------------------------------------------------------ hover and motion */
 
 @media (hover: hover) and (pointer: fine) {
@@ -1112,11 +1504,43 @@ li:not([data-result="trashed"]) > .plan-result {
   .row:has(.row-main:hover) .row-caret {
     color: var(--fg);
   }
+
+  .viz-tile:hover > .viz-fill,
+  .viz-tree:not([data-single]) .viz-repo:hover > .viz-fill,
+  .viz-part:hover > .viz-fill {
+    fill: var(--fill-hover);
+  }
+
+  .viz-tree:not([data-single]) .viz-repo:hover > .viz-frame {
+    fill: color-mix(in oklch, var(--viz-frame) 70%, var(--viz-frame-ink));
+  }
+
+  .viz-crumb:hover {
+    color: var(--fg);
+    text-decoration-color: currentColor;
+  }
 }
 
 .nav-item:active,
 .toggle:not(:disabled):active .toggle-track {
   scale: 0.97;
+}
+
+.viz-tile:active > .viz-fill,
+.viz-tree:not([data-single]) .viz-repo:active > :is(.viz-fill, .viz-frame) {
+  opacity: 0.8;
+}
+
+.viz-crumb:active {
+  opacity: 0.7;
+}
+
+/* A zoom grows the repository from where its group was. */
+@keyframes viz-zoom {
+  from {
+    opacity: 0.4;
+    transform: var(--zoom-from);
+  }
 }
 
 @media (prefers-reduced-motion: no-preference) {
@@ -1135,6 +1559,31 @@ li:not([data-result="trashed"]) > .plan-result {
       background-color 180ms var(--ease-out),
       border-color 180ms var(--ease-out),
       scale 120ms var(--ease-out);
+  }
+
+  .viz-fill,
+  .viz-frame {
+    transition:
+      fill 120ms var(--ease-out),
+      opacity 120ms var(--ease-out);
+  }
+
+  .viz-body,
+  .disks {
+    transition: opacity 160ms var(--ease-out);
+  }
+
+  .viz-crumb {
+    transition:
+      color 120ms var(--ease-out),
+      text-decoration-color 120ms var(--ease-out),
+      opacity 120ms var(--ease-out);
+  }
+
+  .viz-zoom[style] {
+    transform-box: view-box;
+    transform-origin: 0 0;
+    animation: viz-zoom 240ms var(--ease-out);
   }
 }
 

@@ -1,6 +1,7 @@
 import { Button, Checkbox, Empty, Tabs } from "@cloudflare/kumo";
 import { ArrowClockwise, CaretRight, FolderPlus, Trash } from "@phosphor-icons/react";
-import { useId, useMemo, useState } from "react";
+import { useId, useMemo } from "react";
+import { Treemap, type ZoomLevel } from "../components/viz/Treemap";
 import {
   ErrorPanel,
   Loading,
@@ -14,21 +15,15 @@ import {
 import { baseName, bytes, inside, plural, tilde } from "../lib/format";
 import type { CliError, Repository, ScanDocument, Worktree } from "../lib/types";
 import { documentTime } from "../lib/useCli";
+import { matches, type Filter } from "../lib/viz";
 import { branchLabel, displayPath, sizeOf, summary } from "../lib/worktree";
 
-type Filter = "all" | "candidate" | "kept";
-
+/** One filter scopes the chart and the list alike. */
 const FILTERS = [
   { value: "all", label: "All" },
   { value: "candidate", label: "Can go" },
   { value: "kept", label: "Kept" },
 ];
-
-function matches(w: Worktree, filter: Filter): boolean {
-  if (filter === "all") return true;
-  if (filter === "candidate") return w.verdict === "candidate";
-  return w.verdict !== "candidate";
-}
 
 export function Worktrees({
   doc,
@@ -36,6 +31,10 @@ export function Worktrees({
   scanning,
   roots,
   home,
+  filter,
+  onFilter,
+  zoom,
+  onZoom,
   selected,
   onSelect,
   onRescan,
@@ -48,6 +47,11 @@ export function Worktrees({
   scanning: boolean;
   roots: string[];
   home: string | undefined;
+  /** The filter and the chart's zoom live in the app, so both outlast a visit to a worktree's checks. */
+  filter: Filter;
+  onFilter: (filter: Filter) => void;
+  zoom: ZoomLevel[];
+  onZoom: (zoom: ZoomLevel[]) => void;
   selected: Set<string>;
   onSelect: (paths: string[], on: boolean) => void;
   onRescan: () => void;
@@ -55,7 +59,6 @@ export function Worktrees({
   onRemove: (paths: string[]) => void;
   onChooseFolders: () => void;
 }) {
-  const [filter, setFilter] = useState<Filter>("all");
   const now = documentTime(doc?.generated_at) ?? 0;
 
   const repos = useMemo(() => {
@@ -166,7 +169,7 @@ export function Worktrees({
                     size="sm"
                     tabs={FILTERS}
                     value={filter}
-                    onValueChange={(v) => setFilter(v as Filter)}
+                    onValueChange={(v) => onFilter(v as Filter)}
                   />
                 </div>
                 {repos.length === 0 ? (
@@ -176,19 +179,28 @@ export function Worktrees({
                       : "Every worktree can go."}
                   </p>
                 ) : (
-                  repos.map(({ repo, worktrees }) => (
-                    <RepoGroup
-                      key={repo.common_dir}
-                      repo={repo}
-                      worktrees={worktrees}
-                      home={home}
-                      now={now}
-                      selected={selected}
-                      onSelect={onSelect}
-                      onOpen={onOpen}
-                    />
-                  ))
+                  <Treemap
+                    doc={doc}
+                    filter={filter}
+                    now={now}
+                    busy={scanning}
+                    zoom={zoom}
+                    onZoom={onZoom}
+                    onOpen={onOpen}
+                  />
                 )}
+                {repos.map(({ repo, worktrees }) => (
+                  <RepoGroup
+                    key={repo.common_dir}
+                    repo={repo}
+                    worktrees={worktrees}
+                    home={home}
+                    now={now}
+                    selected={selected}
+                    onSelect={onSelect}
+                    onOpen={onOpen}
+                  />
+                ))}
               </>
             )}
           </>

@@ -41,6 +41,12 @@ export function plural(n: number, one: string, many = `${one}s`): string {
   return `${grouped(n)} ${n === 1 ? one : many}`;
 }
 
+/** `a, b, c, d`, or `a, b, c and 5 more`: "and 1 more" never takes a name's place. */
+export function someOf(names: string[]): string {
+  if (names.length <= 4) return names.join(", ");
+  return `${names.slice(0, 3).join(", ")} and ${grouped(names.length - 3)} more`;
+}
+
 /** `~/Work/app` for a path under the home folder. */
 export function tilde(path: string, home: string | undefined): string {
   if (!home || home === "/") return path;

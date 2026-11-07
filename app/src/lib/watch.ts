@@ -15,8 +15,18 @@ export function duration(text: string): string {
   return m && unit ? plural(Number(m[1]), unit) : text;
 }
 
+const UNIT_SECONDS: Record<string, number> = { m: 60, h: 3_600, d: 86_400, w: 604_800 };
+
+/** A residue DURATION in seconds (`7d` -> 604800), or null when residue would refuse it. */
+export function durationSeconds(text: string): number | null {
+  const m = /^(\d+)([mhdw])$/.exec(text);
+  const scale = m ? UNIT_SECONDS[m[2] ?? ""] : undefined;
+  const n = m ? Number(m[1]) : 0;
+  return scale && n > 0 ? n * scale : null;
+}
+
 /** `--min-free` as a number of percent, or null when residue would refuse it. */
-function percent(text: string): number | null {
+export function percent(text: string): number | null {
   const n = Number.parseFloat(text.replace(/%$/, ""));
   return Number.isFinite(n) ? n : null;
 }

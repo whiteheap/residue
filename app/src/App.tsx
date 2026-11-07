@@ -9,10 +9,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@cloudflare/kumo";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Mark } from "./components/Mark";
+import type { ZoomLevel } from "./components/viz/Treemap";
 import { ErrorPanel, Loading } from "./components/ui";
 import { api } from "./lib/api";
 import { bytes } from "./lib/format";
 import type { Settings } from "./lib/types";
+import type { Filter } from "./lib/viz";
 import { useCli } from "./lib/useCli";
 import { Automatic } from "./views/Automatic";
 import { Detail } from "./views/Detail";
@@ -41,6 +43,9 @@ export function App() {
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [removing, setRemoving] = useState<string[] | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
+  // The Worktrees filter and chart zoom, kept here so leaving a worktree's checks returns to them.
+  const [filter, setFilter] = useState<Filter>("all");
+  const [zoom, setZoom] = useState<ZoomLevel[]>([]);
 
   const info = infoQ.data;
   const settings = saved ?? settingsQ.data;
@@ -207,6 +212,10 @@ export function App() {
                   scanning={scanQ.loading}
                   roots={roots}
                   home={home}
+                  filter={filter}
+                  onFilter={setFilter}
+                  zoom={zoom}
+                  onZoom={setZoom}
                   selected={selected}
                   onSelect={select}
                   onRescan={rescan}
@@ -231,6 +240,8 @@ export function App() {
                 suggested={settings.suggested}
                 home={home}
                 refreshKey={refreshKey}
+                scanDoc={scanDoc}
+                scanning={scanQ.loading}
               />
             ) : (
               <Folders settings={settings} home={home} onSaved={setSaved} />
