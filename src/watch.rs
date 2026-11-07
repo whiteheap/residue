@@ -11,31 +11,44 @@
 //! watch decides with `residue scan --json` and removes with `residue remove
 //! --yes --idle --no-trash`, both run as child processes of this same
 //! binary. Every check, and the re-check right before a deletion, is exactly
-//! `remove`'s: watch only chooses when to ask. It never fetches. It deletes
-//! rather than using the trash, which `--idle` would turn on: freeing the
-//! disk is its job, a trashed worktree keeps every byte until a later remove
-//! run purges it, and nothing would purge the trash of a repository where
-//! watch removes nothing more.
+//! `remove`'s: watch only chooses when to ask. It deletes rather than using
+//! the trash, which `--idle` would turn on: freeing the disk is its job, a
+//! trashed worktree keeps every byte until a later remove run purges it, and
+//! nothing would purge the trash of a repository where watch removes nothing
+//! more.
+//!
+//! To see a branch deleted on the remote, it fetches (`Fetcher`): about
+//! every `--fetch-every`, `git fetch --prune --no-tags` of each remote that
+//! a linked worktree's branch tracks (`git::fetch`, which never prompts). A
+//! fetch changes only remote-tracking refs. It is never a reason to remove:
+//! it only refreshes the refs that the scan and the removal child read, and
+//! a failed fetch is logged and changes nothing. `--no-fetch` turns it off.
 //!
 //! A removal because work landed also passes `--only-if-upstream-gone`, so
 //! the child checks the reason itself, from fresh local refs, at its plan,
 //! right before the move and right before the deletion: an upstream that
-//! is back by then keeps the worktree. A disk-pressure removal does not need the upstream gone,
-//! and does not pass it.
+//! is back by then keeps the worktree. A disk-pressure removal does not
+//! need the upstream gone, and does not pass it.
 //!
 //! It wakes on: a change under a repository's `refs/remotes`, `packed-refs`
-//! or `reftable` (a fetch or prune); the moment a waiting worktree passes
-//! `--grace` or `--idle`; a filesystem dropping below `--min-free` (free
-//! space is read every five minutes, as there is no event for it); and every
-//! six hours, to find repositories created under the roots since.
+//! or `reftable` (a fetch or prune, its own or the user's); a repository's
+//! fetch coming due; the moment a waiting worktree passes `--grace` or
+//! `--idle`; a filesystem dropping below `--min-free` (free space is read
+//! every five minutes, as there is no event for it); and every six hours,
+//! to find repositories created under the roots since.
+//!
+//! Without a ROOT it watches `DEFAULT_ROOTS`, the usual code folders in the
+//! home folder that exist.
 
 use crate::events::{self, Events};
+use crate::git;
 use crate::jsonread::{self, Value};
 use crate::output;
 use crate::run::{self, RunError};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
+use std::hash::BuildHasher;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -46,7 +59,12 @@ residue watch: stay running and reclaim storage from Git worktrees as soon
 as it is safe and worth it. No schedule: it reacts to Git and the disk.
 
 Usage:
-  residue watch [OPTIONS] ROOT...
+  residue watch [OPTIONS] [ROOT...]
+
+ROOT is a folder that holds repositories. Without one, it watches the
+usual code folders that exist in your home folder, and logs which:
+~/src ~/code ~/Code ~/dev ~/Developer ~/projects ~/Projects ~/repos ~/git
+~/github ~/GitHub ~/work ~/Work ~/workspace
 
 It removes a linked worktree of a repository at or under ROOT when:
   its work landed  its upstream branch was deleted (a merged pull request,
@@ -55,28 +73,129 @@ It removes a linked worktree of a repository at or under ROOT when:
                    worktrees unchanged for --idle go, largest first, until
                    free space is 5 points above --min-free
 
+To see a branch deleted on the remote, it runs `git fetch --prune
+--no-tags` about every --fetch-every, for each remote that a worktree's
+branch tracks. It never prompts: Git and SSH run without a terminal, and
+SSH with BatchMode=yes unless you set your own SSH command, so a fetch
+that needs a password, a passphrase or a host key answer fails instead.
+A fetch changes only remote-tracking refs. One that fails is logged and
+changes nothing.
+
 Each removal is `residue remove --yes --idle --no-trash`, with
 --only-if-upstream-gone when its branch landed: every check runs,
 and runs again right before the deletion. It deletes rather than using the
 trash, and purges that repository's trash entries older than 7 days.
 Branches and commits are always kept.
-residue never fetches, so a deleted upstream is noticed after your next
-`git fetch --prune` (`git config --global fetch.prune true` makes that the
-default).
 
 Options:
-  --grace DURATION     Once its branch landed, keep a worktree that changed
-                       within DURATION (default 1h)
-  --idle DURATION      When the disk is low, keep a worktree that changed
-                       within DURATION (default 2d)
-  --min-free PERCENT   The disk is low below PERCENT free (default 10)
-  --dry-run            Log what it would remove, and remove nothing
-  --once               Decide and act once, then exit
-  -h, --help           Show this help
+  --grace DURATION        Once its branch landed, keep a worktree that
+                          changed within DURATION (default 1h)
+  --idle DURATION         When the disk is low, keep a worktree that changed
+                          within DURATION (default 2d)
+  --min-free PERCENT      The disk is low below PERCENT free (default 10)
+  --fetch-every DURATION  Fetch each repository about this often (default
+                          30m), each on its own clock
+  --no-fetch              Never fetch: a deleted branch is seen after your
+                          own `git fetch --prune`
+  --dry-run               Log what it would remove, and remove nothing (it
+                          still fetches unless --no-fetch)
+  --once                  Fetch, decide and act once, then exit
+  -h, --help              Show this help
 
 DURATION is a whole number and a unit: m, h, d or w (30m, 1h, 2d, 1w).
-Install it as a login service: residue service install ROOT...
+Install it as a login service: residue service install [ROOT...]
 ";
+
+/// The folders in the home folder that `watch` and `service install` use
+/// when no ROOT is given, those that exist. Each is searched the way any
+/// ROOT is (`discover`: four levels, no symbolic links below it, one
+/// filesystem, hidden folders, `node_modules`, `target` and `Library`
+/// skipped). Never the home folder itself, which holds far more than code,
+/// and nothing under `Documents`, `Desktop` or `Downloads`, which macOS
+/// guards with a permission prompt for a background process.
+pub const DEFAULT_ROOTS: &[&str] = &[
+    "src",
+    "code",
+    "Code",
+    "dev",
+    "Developer",
+    "projects",
+    "Projects",
+    "repos",
+    "git",
+    "github",
+    "GitHub",
+    "work",
+    "Work",
+    "workspace",
+];
+
+/// How often `watch` fetches each repository when `--fetch-every` is not
+/// given.
+pub const DEFAULT_FETCH_EVERY: &str = "30m";
+
+/// The `DEFAULT_ROOTS` that exist, canonical, each once (on a
+/// case-insensitive filesystem `~/code` and `~/Code` are one folder). A name
+/// that resolves to the home folder or above it is skipped.
+pub fn default_roots() -> Result<Vec<PathBuf>, String> {
+    let no_home = "no ROOT given, and HOME names no home folder: name the folder that holds your repositories";
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .ok_or(no_home)?;
+    let home = home.canonicalize().unwrap_or(home);
+    // HOME=/ (some daemons and minimal containers) would make `/dev` a code
+    // folder.
+    if home.parent().is_none() {
+        return Err(no_home.into());
+    }
+    let mut seen = HashSet::new();
+    let mut roots = Vec::new();
+    for name in DEFAULT_ROOTS {
+        let Ok(path) = home.join(name).canonicalize() else {
+            continue;
+        };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_dir() || home.starts_with(&path) {
+            continue;
+        }
+        if seen.insert((meta.dev(), meta.ino())) {
+            roots.push(path);
+        }
+    }
+    Ok(roots)
+}
+
+/// The usage error, one line, when no ROOT is given and no default root
+/// exists. `command` is what to run with a ROOT (`residue watch`).
+fn no_default_roots(command: &str) -> String {
+    let names: Vec<String> = DEFAULT_ROOTS.iter().map(|n| format!("~/{n}")).collect();
+    format!(
+        "no ROOT given, and none of the usual code folders exists in your home folder ({}); name the folder that holds your repositories: {command} ~/path/to/repos",
+        names.join(", ")
+    )
+}
+
+/// The options of `watch` that take a value. `roots_in` skips them.
+const VALUE_OPTIONS: &[&str] = &["--grace", "--idle", "--min-free", "--fetch-every"];
+
+/// The ROOTs in the arguments of a `watch` command line (after `watch`), as
+/// written: every argument that is neither an option nor an option's
+/// value. `service status` reads them back from the installed service.
+pub fn roots_in(args: &[String]) -> Vec<String> {
+    let mut roots = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if VALUE_OPTIONS.contains(&arg.as_str()) {
+            it.next();
+        } else if !(arg.starts_with('-') && arg != "-") {
+            roots.push(arg.clone());
+        }
+    }
+    roots
+}
 
 #[derive(Clone)]
 pub struct Span {
@@ -120,9 +239,13 @@ pub struct Options {
     pub grace: Span,
     pub idle: Span,
     pub min_free: f64,
+    /// `None` with `--no-fetch`.
+    pub fetch_every: Option<Span>,
     pub dry_run: bool,
     pub once: bool,
     pub roots: Vec<PathBuf>,
+    /// No ROOT was given: `roots` are the `DEFAULT_ROOTS` that exist.
+    pub default_roots: bool,
 }
 
 impl Options {
@@ -131,6 +254,9 @@ impl Options {
         let mut grace = Span::parse("--grace", "1h")?;
         let mut idle = Span::parse("--idle", "2d")?;
         let mut min_free = 10.0;
+        let mut fetch_every = Some(Span::parse("--fetch-every", DEFAULT_FETCH_EVERY)?);
+        let mut fetch_every_given = false;
+        let mut no_fetch = false;
         let mut dry_run = false;
         let mut once = false;
         let mut roots = Vec::new();
@@ -159,6 +285,11 @@ impl Options {
                             )
                         })?;
                 }
+                "--fetch-every" => {
+                    fetch_every = Some(Span::parse("--fetch-every", &value("--fetch-every")?)?);
+                    fetch_every_given = true;
+                }
+                "--no-fetch" => no_fetch = true,
                 "--dry-run" => dry_run = true,
                 "--once" => once = true,
                 flag if flag.starts_with('-') && flag != "-" => {
@@ -176,20 +307,28 @@ impl Options {
                 }
             }
         }
-        if roots.is_empty() {
-            return Err("name at least one ROOT, the folder that holds your repositories".into());
+        if no_fetch {
+            if fetch_every_given {
+                return Err("--no-fetch and --fetch-every cannot both be given".into());
+            }
+            fetch_every = None;
         }
+        let default_roots = roots.is_empty();
         Ok(Some(Options {
             grace,
             idle,
             min_free,
+            fetch_every,
             dry_run,
             once,
             roots,
+            default_roots,
         }))
     }
 
     /// The arguments that reproduce these options, for a service definition.
+    /// The roots are always written out, default ones included, so the
+    /// service watches the same folders on every start.
     pub fn to_args(&self) -> Vec<String> {
         let mut args = vec![
             "watch".to_string(),
@@ -200,11 +339,38 @@ impl Options {
             "--min-free".into(),
             format!("{}", self.min_free),
         ];
+        match &self.fetch_every {
+            Some(every) => args.extend(["--fetch-every".into(), every.text.clone()]),
+            None => args.push("--no-fetch".into()),
+        }
         if self.dry_run {
             args.push("--dry-run".into());
         }
         args.extend(self.roots.iter().map(|r| r.to_string_lossy().into_owned()));
         args
+    }
+
+    /// When no ROOT was given, watch the `DEFAULT_ROOTS` that exist. The
+    /// error is one line that names the folders it looked for and how to
+    /// pass a ROOT to `command`.
+    pub fn use_default_roots(&mut self, command: &str) -> Result<(), String> {
+        if !self.default_roots {
+            return Ok(());
+        }
+        self.roots = default_roots()?;
+        if self.roots.is_empty() {
+            return Err(no_default_roots(command));
+        }
+        Ok(())
+    }
+
+    /// The roots for a message: `~/src, ~/Work`.
+    pub fn shown_roots(&self) -> String {
+        self.roots
+            .iter()
+            .map(|r| output::home(&r.to_string_lossy()))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -215,7 +381,7 @@ const SETTLE_MAX: Duration = Duration::from_secs(2 * 60);
 const MAX_WATCHES: usize = 4_000;
 
 pub fn main(args: &[OsString]) -> u8 {
-    let opts = match Options::parse(args) {
+    let mut opts = match Options::parse(args) {
         Ok(Some(opts)) => opts,
         Ok(None) => {
             print!("{HELP}");
@@ -227,6 +393,10 @@ pub fn main(args: &[OsString]) -> u8 {
             return 2;
         }
     };
+    if let Err(message) = opts.use_default_roots("residue watch") {
+        eprintln!("residue watch: {}", output::clean(&message));
+        return 2;
+    }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
@@ -241,18 +411,25 @@ pub fn main(args: &[OsString]) -> u8 {
             return 1;
         }
     };
-    let roots: Vec<String> = opts
-        .roots
-        .iter()
-        .map(|r| output::home(&r.to_string_lossy()))
-        .collect();
     log(&format!(
-        "watching {} ({}). Removes a worktree when its upstream branch is deleted and it is unchanged for {}, and, below {}% free space, worktrees unchanged for {}, largest first.{}",
-        roots.join(", "),
+        "watching {} ({}{}). Removes a worktree when its upstream branch is deleted and it is unchanged for {}, and, below {}% free space, worktrees unchanged for {}, largest first. {}{}",
+        opts.shown_roots(),
         events::BACKEND,
+        if opts.default_roots {
+            "; the usual code folders in your home folder, name ROOTs to choose others"
+        } else {
+            ""
+        },
         opts.grace.text,
         opts.min_free,
         opts.idle.text,
+        match &opts.fetch_every {
+            Some(every) => format!(
+                "Fetches the remotes its worktrees' branches track about every {}, with --prune.",
+                every.text
+            ),
+            None => "Does not fetch (--no-fetch).".to_string(),
+        },
         if opts.dry_run {
             " Dry run: nothing is removed."
         } else {
@@ -269,25 +446,28 @@ pub fn main(args: &[OsString]) -> u8 {
         }
     };
     let mut state = State::default();
+    let mut fetcher = Fetcher::new(opts.fetch_every.clone());
     let mut rescans_in_a_row = 0;
     loop {
-        let snap = match scan(&exe, &opts) {
+        let mut snap = match scan(&exe, &opts) {
             Ok(snap) => snap,
-            Err(ScanError::Gone) => {
-                log(
-                    "the residue binary is gone, most likely upgraded; exiting so the service manager starts the new one",
-                );
-                return 1;
-            }
-            Err(ScanError::Failed(message)) => {
-                log(&format!("scan failed: {message}"));
-                if opts.once {
-                    return 1;
-                }
-                std::thread::sleep(FREE_CHECK);
-                continue;
-            }
+            Err(e) => match failed(e, opts.once) {
+                Some(code) => return code,
+                None => continue,
+            },
         };
+        // Repositories never fetched (all of them, on the first pass) and
+        // those whose fetch came due while scanning: fetch, and judge with
+        // the refs it brought.
+        if fetcher.run(&snap) {
+            snap = match scan(&exe, &opts) {
+                Ok(snap) => snap,
+                Err(e) => match failed(e, opts.once) {
+                    Some(code) => return code,
+                    None => continue,
+                },
+            };
+        }
         let removed = act(&exe, &opts, &snap, &mut state);
         if opts.once {
             return 0;
@@ -303,7 +483,28 @@ pub fn main(args: &[OsString]) -> u8 {
             arm(events, &snap, &mut state);
         }
         let deadline = next_deadline(&opts, &snap, output::now());
-        wait(events.as_mut(), &opts, &snap, deadline);
+        wait(events.as_mut(), &opts, &snap, deadline, &mut fetcher);
+    }
+}
+
+/// What to do after a failed scan: `Some(code)` to exit with, or `None` to
+/// try again after a pause.
+fn failed(error: ScanError, once: bool) -> Option<u8> {
+    match error {
+        ScanError::Gone => {
+            log(
+                "the residue binary is gone, most likely upgraded; exiting so the service manager starts the new one",
+            );
+            Some(1)
+        }
+        ScanError::Failed(message) => {
+            log(&format!("scan failed: {message}"));
+            if once {
+                return Some(1);
+            }
+            std::thread::sleep(FREE_CHECK);
+            None
+        }
     }
 }
 
@@ -341,6 +542,14 @@ struct Worktree {
 
 struct Repo {
     common_dir: PathBuf,
+    /// Where to run Git for the whole repository: the main checkout, or the
+    /// common directory when the main checkout is gone or bare.
+    dir: PathBuf,
+    /// The branches (`refs/heads/fix`) of its linked worktrees whose
+    /// upstream is a remote-tracking ref: the ones a fetch can show landed.
+    branches: BTreeSet<String>,
+    /// Those upstreams (`refs/remotes/origin/fix`).
+    upstreams: HashSet<String>,
 }
 
 struct Snapshot {
@@ -381,12 +590,35 @@ fn scan(exe: &Path, opts: &Options) -> Result<Snapshot, ScanError> {
         worktrees: Vec::new(),
     };
     for repo in doc.get("repositories").map(Value::items).unwrap_or(&[]) {
-        if let Some(dir) = repo.get("common_dir").and_then(Value::str) {
+        let worktrees = repo.get("worktrees").map(Value::items).unwrap_or(&[]);
+        if let Some(common_dir) = repo.get("common_dir").and_then(Value::str) {
+            let common_dir = PathBuf::from(common_dir);
+            let dir = repo
+                .get("main_path")
+                .and_then(Value::str)
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir())
+                .unwrap_or_else(|| common_dir.clone());
+            let mut branches = BTreeSet::new();
+            let mut upstreams = HashSet::new();
+            for w in worktrees {
+                let branch = w.get("branch").and_then(Value::str);
+                let upstream = w.get("upstream_ref").and_then(Value::str);
+                if let (Some(branch), Some(upstream)) = (branch, upstream) {
+                    if upstream.starts_with("refs/remotes/") {
+                        branches.insert(branch.to_string());
+                        upstreams.insert(upstream.to_string());
+                    }
+                }
+            }
             snap.repos.push(Repo {
-                common_dir: PathBuf::from(dir),
+                common_dir,
+                dir,
+                branches,
+                upstreams,
             });
         }
-        for w in repo.get("worktrees").map(Value::items).unwrap_or(&[]) {
+        for w in worktrees {
             let Some(path) = w.get("path").and_then(Value::str) else {
                 continue;
             };
@@ -758,9 +990,16 @@ fn next_deadline(opts: &Options, snap: &Snapshot, now: i64) -> Option<i64> {
 }
 
 /// Sleep until something warrants a new scan: a watched change (after it
-/// settles), the deadline, a filesystem newly below `--min-free`, or the
-/// rediscovery timer.
-fn wait(mut events: Option<&mut Events>, opts: &Options, snap: &Snapshot, deadline: Option<i64>) {
+/// settles), the deadline, a filesystem newly below `--min-free`, the
+/// rediscovery timer, or a fetch that changed a remote-tracking ref. A fetch
+/// that comes due runs here, and one that changed nothing keeps waiting.
+fn wait(
+    mut events: Option<&mut Events>,
+    opts: &Options,
+    snap: &Snapshot,
+    deadline: Option<i64>,
+    fetcher: &mut Fetcher,
+) {
     let started = Instant::now();
     let low_before: HashSet<u64> = filesystems(snap)
         .into_iter()
@@ -776,9 +1015,16 @@ fn wait(mut events: Option<&mut Events>, opts: &Options, snap: &Snapshot, deadli
         if elapsed >= REDISCOVER {
             return;
         }
+        let fetch_at = fetcher.next(snap);
+        if fetch_at.is_some_and(|t| now >= t) {
+            if fetcher.run(snap) {
+                return;
+            }
+            continue;
+        }
         let mut step = FREE_CHECK.min(REDISCOVER - elapsed);
-        if let Some(d) = deadline {
-            step = step.min(Duration::from_secs((d - now).max(1) as u64));
+        for at in [deadline, fetch_at].into_iter().flatten() {
+            step = step.min(Duration::from_secs((at - now).max(1) as u64));
         }
         let changed = match events.as_deref_mut() {
             Some(events) => events.wait(step).unwrap_or_else(|e| {
@@ -808,38 +1054,292 @@ fn wait(mut events: Option<&mut Events>, opts: &Options, snap: &Snapshot, deadli
     }
 }
 
-/// One watcher per user: a second one would race the first.
+/// Where `watch` keeps its lock: `$XDG_STATE_HOME/residue/watch.lock`, or
+/// `~/.local/state/residue/watch.lock`.
+fn lock_path() -> Option<PathBuf> {
+    let dir = match std::env::var_os("XDG_STATE_HOME").filter(|d| !d.is_empty()) {
+        Some(d) => PathBuf::from(d).join("residue"),
+        None => PathBuf::from(std::env::var_os("HOME").filter(|h| !h.is_empty())?)
+            .join(".local/state/residue"),
+    };
+    Some(dir.join("watch.lock"))
+}
+
+/// One watcher per user: a second one would race the first. A moment of
+/// contention is not a second watcher (`lock_held` takes the lock briefly
+/// to look), so it tries for a second before giving up.
 fn lock(opts: &Options) -> Result<Option<File>, String> {
     if opts.once {
         return Ok(None);
     }
-    let dir = match std::env::var_os("XDG_STATE_HOME").filter(|d| !d.is_empty()) {
-        Some(d) => PathBuf::from(d).join("residue"),
-        None => match std::env::var_os("HOME") {
-            Some(home) => PathBuf::from(home).join(".local/state/residue"),
-            None => return Ok(None),
-        },
+    let Some(path) = lock_path() else {
+        return Ok(None);
     };
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let path = dir.join("watch.lock");
-    let file = File::create(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if !try_lock(&file) {
-        return Err(format!(
-            "another residue watch is already running for this user (lock: {})",
-            output::home(&path.to_string_lossy())
-        ));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
-    Ok(Some(file))
+    let file = File::create(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    for attempt in 0..10 {
+        if try_lock(&file, libc::LOCK_EX) {
+            return Ok(Some(file));
+        }
+        if attempt < 9 {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    Err(format!(
+        "another residue watch is already running for this user (lock: {})",
+        output::home(&path.to_string_lossy())
+    ))
+}
+
+/// Whether a `residue watch` of this user runs now, by its lock. `None`
+/// when residue cannot tell (the lock cannot be read, or this system has no
+/// `flock`). It never creates the lock file: no file means no watch ever
+/// ran with this state folder.
+pub fn lock_held() -> Option<bool> {
+    if cfg!(any(target_os = "illumos", target_os = "solaris")) {
+        return None;
+    }
+    let path = lock_path()?;
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+    };
+    // A shared lock is enough to see an exclusive one; closing `file`
+    // releases it at once.
+    Some(!try_lock(&file, libc::LOCK_SH))
 }
 
 #[cfg(not(any(target_os = "illumos", target_os = "solaris")))]
-fn try_lock(file: &File) -> bool {
+fn try_lock(file: &File, kind: libc::c_int) -> bool {
     use std::os::unix::io::AsRawFd;
     // SAFETY: flock on a descriptor we own; the lock lives as long as `file`.
-    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    unsafe { libc::flock(file.as_raw_fd(), kind | libc::LOCK_NB) == 0 }
 }
 
 #[cfg(any(target_os = "illumos", target_os = "solaris"))]
-fn try_lock(_file: &File) -> bool {
+fn try_lock(_file: &File, _kind: libc::c_int) -> bool {
     true
+}
+
+/// Fetches each repository's tracked remotes on its own clock.
+///
+/// A repository is due at once when watch first sees it (at start, or when
+/// the six-hourly rediscovery finds it), then about every `--fetch-every`:
+/// each next time is drawn between 90% and 110% of it, so repositories
+/// drift apart instead of all fetching in the same minute. Fetches run one
+/// at a time. Only the remotes that a linked worktree's branch tracks
+/// through a remote-tracking upstream are fetched (`git::upstream_remotes`),
+/// and a repository with none is never fetched: no other ref decides
+/// whether work landed.
+struct Fetcher {
+    every: Option<Span>,
+    /// When each repository, by its common directory, is next due, in Unix
+    /// seconds.
+    due: HashMap<PathBuf, i64>,
+    /// The failure last logged for a repository and remote, so a remote
+    /// that stays unreachable is logged when the error changes, not on
+    /// every try.
+    failing: HashMap<(PathBuf, String), String>,
+    random: std::collections::hash_map::RandomState,
+    draws: u64,
+}
+
+impl Fetcher {
+    fn new(every: Option<Span>) -> Fetcher {
+        Fetcher {
+            every,
+            due: HashMap::new(),
+            failing: HashMap::new(),
+            random: std::collections::hash_map::RandomState::new(),
+            draws: 0,
+        }
+    }
+
+    /// The repositories of `snap` that a fetch could tell something.
+    fn fetched<'a>(&self, snap: &'a Snapshot) -> impl Iterator<Item = &'a Repo> {
+        let on = self.every.is_some();
+        snap.repos
+            .iter()
+            .filter(move |r| on && !r.branches.is_empty())
+    }
+
+    /// The next moment a repository of `snap` is due, if any.
+    fn next(&self, snap: &Snapshot) -> Option<i64> {
+        self.fetched(snap)
+            .map(|r| self.due.get(&r.common_dir).copied().unwrap_or(0))
+            .min()
+    }
+
+    /// `every`, scaled by a random factor between 0.9 and 1.1.
+    fn interval(&mut self, every: &Span) -> i64 {
+        self.draws += 1;
+        let bits = self.random.hash_one(self.draws) >> 11;
+        let unit = bits as f64 / (1u64 << 53) as f64;
+        ((every.seconds as f64) * (0.9 + 0.2 * unit))
+            .round()
+            .max(60.0) as i64
+    }
+
+    /// Fetch every repository of `snap` that is due. `true` when a
+    /// remote-tracking ref changed, or when residue could not tell: the
+    /// caller scans again.
+    fn run(&mut self, snap: &Snapshot) -> bool {
+        let Some(every) = self.every.clone() else {
+            return false;
+        };
+        let known: HashSet<&Path> = snap.repos.iter().map(|r| r.common_dir.as_path()).collect();
+        self.due.retain(|dir, _| known.contains(dir.as_path()));
+        self.failing
+            .retain(|(dir, _), _| known.contains(dir.as_path()));
+        let mut changed = false;
+        let repos: Vec<&Repo> = self.fetched(snap).collect();
+        for repo in repos {
+            if self
+                .due
+                .get(&repo.common_dir)
+                .is_some_and(|t| *t > output::now())
+            {
+                continue;
+            }
+            changed |= self.fetch(repo, &every);
+            let next = output::now() + self.interval(&every);
+            self.due.insert(repo.common_dir.clone(), next);
+        }
+        changed
+    }
+
+    /// Fetch the tracked remotes of one repository. `true` when a
+    /// remote-tracking ref changed, or when residue could not tell.
+    fn fetch(&mut self, repo: &Repo, every: &Span) -> bool {
+        let shown = output::home(&repo.dir.to_string_lossy());
+        let remotes = match git::upstream_remotes(&repo.dir, &repo.branches) {
+            Ok(remotes) => remotes,
+            Err(e) => {
+                self.failed(
+                    repo,
+                    "",
+                    &format!("cannot list the remotes to fetch in {shown}: {e}"),
+                    every,
+                );
+                return false;
+            }
+        };
+        let before = git::remote_refs(&repo.dir);
+        let mut fetched = false;
+        for remote in &remotes {
+            match git::fetch(&repo.dir, remote) {
+                Ok(()) => {
+                    if self
+                        .failing
+                        .remove(&(repo.common_dir.clone(), remote.clone()))
+                        .is_some()
+                    {
+                        log(&format!("fetch of {remote} in {shown} works again"));
+                    }
+                    fetched = true;
+                }
+                Err(e) => self.failed(
+                    repo,
+                    remote,
+                    &format!(
+                        "fetch of {remote} in {shown} failed, so its remote-tracking refs stay as they were ({e})"
+                    ),
+                    every,
+                ),
+            }
+        }
+        if !fetched {
+            return false;
+        }
+        let (Ok(before), Ok(after)) = (before, git::remote_refs(&repo.dir)) else {
+            return true;
+        };
+        for name in before.keys().filter(|r| !after.contains_key(*r)) {
+            if repo.upstreams.contains(name) {
+                log(&format!(
+                    "fetched {shown}: {} is gone from the remote",
+                    name.strip_prefix("refs/remotes/").unwrap_or(name)
+                ));
+            }
+        }
+        before != after
+    }
+
+    /// Log a failure once, until it changes or the fetch works again.
+    fn failed(&mut self, repo: &Repo, remote: &str, message: &str, every: &Span) {
+        let key = (repo.common_dir.clone(), remote.to_string());
+        if self.failing.get(&key).map(String::as_str) == Some(message) {
+            return;
+        }
+        log(&format!("{message}; next try in about {}", every.text));
+        self.failing.insert(key, message.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(roots: &[&str]) -> Options {
+        Options {
+            grace: Span::parse("--grace", "1h").unwrap(),
+            idle: Span::parse("--idle", "2d").unwrap(),
+            min_free: 10.0,
+            fetch_every: Some(Span::parse("--fetch-every", "30m").unwrap()),
+            dry_run: true,
+            once: false,
+            roots: roots.iter().map(PathBuf::from).collect(),
+            default_roots: false,
+        }
+    }
+
+    /// `service status` and a second `service install` read the roots back
+    /// from what `to_args` wrote, whatever the options.
+    #[test]
+    fn roots_in_reads_back_what_to_args_wrote() {
+        let roots = ["/home/a/src", "/home/a/my repos", "/srv/-dash"];
+        let mut opts = options(&roots);
+        for fetch in [Some(Span::parse("--fetch-every", "5m").unwrap()), None] {
+            opts.fetch_every = fetch;
+            let args = opts.to_args();
+            assert_eq!(args[0], "watch");
+            assert_eq!(roots_in(&args[1..]), roots);
+        }
+    }
+
+    #[test]
+    fn to_args_records_the_fetch_setting() {
+        let mut opts = options(&["/r"]);
+        assert!(
+            opts.to_args()
+                .windows(2)
+                .any(|w| w == ["--fetch-every", "30m"])
+        );
+        opts.fetch_every = None;
+        let args = opts.to_args();
+        assert!(args.contains(&"--no-fetch".to_string()));
+        assert!(!args.contains(&"--fetch-every".to_string()));
+    }
+
+    #[test]
+    fn no_fetch_and_fetch_every_conflict() {
+        let args: Vec<OsString> = ["--no-fetch", "--fetch-every", "5m", "/"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        assert!(Options::parse(&args).is_err());
+    }
+
+    #[test]
+    fn help_lists_every_default_root() {
+        for name in DEFAULT_ROOTS {
+            assert!(
+                HELP.split_whitespace().any(|w| w == format!("~/{name}")),
+                "HELP does not list ~/{name}"
+            );
+        }
+    }
 }

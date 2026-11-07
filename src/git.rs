@@ -617,3 +617,152 @@ pub fn unlock_worktree(main: &Path, worktree: &Path) -> Result<(), String> {
         ],
     )
 }
+
+/// How long one `git fetch` may run before residue stops it. Long enough
+/// for a slow link to bring a large batch of commits; short enough that a
+/// connection that hangs does not hold `watch` for long.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// The remotes that `branches` (full refnames, `refs/heads/fix`) track
+/// through a remote-tracking upstream (`refs/remotes/...`), sorted and
+/// without duplicates. A branch whose upstream is local (`.`), or a URL
+/// without a remote-tracking ref, adds none: fetching it could not change
+/// whether the branch counts as landed.
+pub fn upstream_remotes(
+    dir: &Path,
+    branches: &std::collections::BTreeSet<String>,
+) -> Result<Vec<String>, String> {
+    let out = git(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%00%(upstream)%00%(upstream:remotename)",
+            "refs/heads/",
+        ],
+    )?;
+    let mut remotes = std::collections::BTreeSet::new();
+    for line in lines(&out) {
+        let text = String::from_utf8_lossy(line);
+        let mut fields = text.split('\0');
+        let (Some(branch), Some(upstream), Some(remote)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if branches.contains(branch)
+            && upstream.starts_with("refs/remotes/")
+            && !remote.is_empty()
+            && remote != "."
+        {
+            remotes.insert(remote.to_string());
+        }
+    }
+    Ok(remotes.into_iter().collect())
+}
+
+/// Every remote-tracking ref and the object it names, to tell what a fetch
+/// changed.
+pub fn remote_refs(dir: &Path) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let out = git(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)",
+            "refs/remotes/",
+        ],
+    )?;
+    Ok(lines(&out)
+        .into_iter()
+        .filter_map(|line| {
+            let text = String::from_utf8_lossy(line);
+            let (name, object) = text.split_once('\0')?;
+            Some((name.to_string(), object.to_string()))
+        })
+        .collect())
+}
+
+/// `git fetch --prune --no-tags REMOTE`, run by `watch` from the main
+/// checkout (or the bare repository), so it notices a branch deleted on the
+/// remote without waiting for the user's own fetch.
+///
+/// It changes only remote-tracking refs (and their reflogs) and adds
+/// objects: no `FETCH_HEAD` (`--no-write-fetch-head`; a linked worktree's
+/// `FETCH_HEAD` is part of its last change), no tags, no submodules, no
+/// automatic `git maintenance` or `gc`, and hooks stay off (`command`).
+///
+/// It never waits for a person. Git's terminal prompt is off (`command`);
+/// it runs in a new session, so neither Git nor SSH nor a credential
+/// helper has a terminal to ask on; SSH gets `BatchMode=yes` through
+/// `GIT_SSH_COMMAND`, unless the user chose their own SSH command
+/// (`GIT_SSH_COMMAND`, `GIT_SSH`, `core.sshCommand`), which is respected;
+/// SSH never runs an askpass program (`SSH_ASKPASS_REQUIRE=never`), and
+/// `SSH_ASKPASS` is removed so Git does not fall back to it for a
+/// password; Git Credential Manager is told never to prompt
+/// (`GCM_INTERACTIVE=never`). An askpass program the user set for Git
+/// itself (`GIT_ASKPASS`, `core.askPass`) is theirs, and stays. A fetch
+/// that needs a person fails instead, and so does one that runs past
+/// `FETCH_TIMEOUT`. The error is the first line Git or SSH printed.
+pub fn fetch(dir: &Path, remote: &str) -> Result<(), String> {
+    let mut cmd = command(dir);
+    let user_ssh = std::env::var_os("GIT_SSH_COMMAND").is_some_and(|v| !v.is_empty())
+        || std::env::var_os("GIT_SSH").is_some_and(|v| !v.is_empty())
+        || ssh_command_configured(dir);
+    if !user_ssh {
+        cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
+    cmd.env("SSH_ASKPASS_REQUIRE", "never")
+        .env_remove("SSH_ASKPASS")
+        .env("GCM_INTERACTIVE", "never");
+    new_session(&mut cmd);
+    let args: Vec<&OsStr> = [
+        "fetch",
+        "--prune",
+        "--no-tags",
+        "--no-write-fetch-head",
+        "--no-auto-maintenance",
+        "--no-recurse-submodules",
+        "--quiet",
+        "--",
+        remote,
+    ]
+    .into_iter()
+    .map(OsStr::new)
+    .collect();
+    let exit = exec_command(cmd, &args, FETCH_TIMEOUT)?;
+    if exit.success {
+        Ok(())
+    } else {
+        Err(format!(
+            "exit {}: {}",
+            exit.code.map_or("signal".to_string(), |c| c.to_string()),
+            exit.stderr
+        ))
+    }
+}
+
+/// Whether `core.sshCommand` is set for `dir`. When Git cannot answer,
+/// assume it is, so residue does not replace a command the user chose.
+fn ssh_command_configured(dir: &Path) -> bool {
+    match git_exit(dir, &["config", "--get", "core.sshCommand"]) {
+        Ok(exit) if exit.code == Some(1) => false,
+        Ok(exit) => !(exit.success && exit.stdout.trim_ascii().is_empty()),
+        Err(_) => true,
+    }
+}
+
+/// Start `cmd` in a new session, with no controlling terminal: a program
+/// that would ask on `/dev/tty` gets an error instead of a prompt.
+fn new_session(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs in the child between fork and exec, and
+    // calls only setsid(2), which is async-signal-safe and touches no
+    // memory of this process.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}

@@ -5,28 +5,59 @@ Back to [Automate cleanup](../README.md#automate-cleanup). `residue watch` delet
 ## Reclaim storage automatically
 
 ```sh
-residue service install ~/src
+residue service install
 ```
 
-This starts `residue watch ~/src` now and at every login, as a launchd agent on macOS or a systemd user service on Linux. It removes a worktree in two cases, and otherwise does nothing:
+This starts `residue watch` now and at every login, as a launchd agent on macOS or a systemd user service on Linux, and prints the folders it watches and how to turn it off (`residue service uninstall`). It never asks a question, so a script or an installer can run it. It removes a worktree in two cases, and otherwise does nothing:
 
-- **Its work landed.** Its upstream branch was deleted, which is what merging a pull request with branch deletion, or `git push --delete`, does, and the worktree has not changed for an hour (`--grace`). residue never fetches, so it notices after your next `git fetch --prune`. `git config --global fetch.prune true` makes every fetch prune.
+- **Its work landed.** Its upstream branch was deleted, which is what merging a pull request with branch deletion, or `git push --delete`, does, and the worktree has not changed for an hour (`--grace`). `watch` sees the deletion through its own fetch ([Fetching](#fetching)), or sooner through yours.
 - **The disk is low.** Free space on the worktree's filesystem is below 10% (`--min-free`). Then worktrees unchanged for two days (`--idle`) go, largest first, until free space is 5 points above that. While the disk has room, idle worktrees stay.
 
 Each removal is `residue remove --yes --idle --no-trash`, so every check in [What makes a worktree a candidate](../README.md#what-makes-a-worktree-a-candidate) runs, and runs again after the worktree is moved aside, right before the deletion. For a branch that landed, `watch` also passes `--only-if-upstream-gone`, so the removal checks the reason itself, from the local refs, three times: at its plan, right before the move aside, and after the move, right before the deletion. If the upstream is back by then (a fetch brought the branch back, say), the worktree stays, back in place, and the log says why. A worktree with no upstream, or on a detached HEAD, never counts as landed. Neither does a local upstream (`branch.NAME.remote` set to `.`), since a deleted local branch is not work that landed on a remote, nor an upstream Git marks `[gone]` whose ref still exists without resolving to a commit, such as a symbolic ref to a missing ref. `watch` deletes instead of using [the trash](../README.md#the-trash): freeing the disk is its job, and a trashed worktree keeps every byte until the purge. The same run purges that repository's trash entries older than seven days. Branches and commits stay, and a locked worktree stays. It works the same for worktrees from any tool (Claude Code, Codex, Cursor, Conductor, `git worktree add`), because it reads Git and the disk, not the agent.
 
-There is no schedule. `watch` sleeps until a fetch or prune changes a repository's `refs/remotes` or `packed-refs` (inotify on Linux, kqueue on macOS and the BSDs), until a waiting worktree passes `--grace` or `--idle`, or until a filesystem drops below `--min-free`. Free space is read every five minutes, because no system sends an event for it. Every six hours `watch` also looks for repositories created under the roots since. One `watch` runs per user.
+There is no schedule. `watch` sleeps until a fetch or prune changes a repository's `refs/remotes` or `packed-refs` (inotify on Linux, kqueue on macOS and the BSDs), until a repository's own fetch comes due, until a waiting worktree passes `--grace` or `--idle`, or until a filesystem drops below `--min-free`. Free space is read every five minutes, because no system sends an event for it. Every six hours `watch` also looks for repositories created under the roots since. One `watch` runs per user.
 
-Try it without removing anything first:
+### Which folders
+
+With no ROOT, `watch` and `service install` use the usual code folders in your home folder, those that exist: `~/src`, `~/code`, `~/Code`, `~/dev`, `~/Developer`, `~/projects`, `~/Projects`, `~/repos`, `~/git`, `~/github`, `~/GitHub`, `~/work`, `~/Work` and `~/workspace`. On a case-insensitive filesystem `~/code` and `~/Code` are one folder, watched once. Each is searched like any ROOT: four levels deep, on one filesystem, without following symbolic links, skipping hidden folders, `node_modules`, `target` and `Library`. The list leaves out the home folder itself, which holds far more than code, and `Documents`, `Desktop` and `Downloads`, which macOS guards with a permission prompt that a background service cannot answer. If none of the folders exists, both commands print one line that names them and how to pass a ROOT, and exit 2:
 
 ```sh
-residue watch --once --dry-run ~/src       # what it would remove right now
-residue service install --dry-run ~/src    # a service that only logs what it would remove
-residue service status                     # is it running, and the last lines of its log
+residue service install ~/path/to/repos
+```
+
+A ROOT you name replaces the list. `service install` writes the folders it found into the service, so the service watches the same ones at every start, and `residue service status` shows them. A folder created later is picked up when you run `residue service install` again.
+
+### Running install again
+
+`residue service install` replaces the service it finds, so running it twice leaves one service. Without a ROOT, it keeps the ROOTs you named for the service it replaces, and drops any that is no longer a folder, with a note; a service on the usual code folders looks for them again. To change the folders, name them. Options are not kept: each one you do not give goes back to its default, `--dry-run` included, and the command says so when the service it replaced was a dry run.
+
+If `brew services start residue` already runs `watch`, `service install` says so and exits 1: only one `watch` runs per user. Keep Homebrew's, or stop it first with `brew services stop residue`.
+
+### Fetching
+
+To see a branch deleted on the remote, `watch` runs `git fetch --prune --no-tags` in each repository about every 30 minutes (`--fetch-every`), each repository on its own clock, its interval varied by up to a tenth so they do not all fetch at once. It fetches only the remotes that a linked worktree's branch tracks, and none in a repository with no such branch: no other ref decides anything `watch` does. It fetches in the main checkout, with no `FETCH_HEAD` written, no automatic maintenance and no submodules, so a worktree's last change is not touched.
+
+The fetch never prompts. Git runs without a terminal and with `GIT_TERMINAL_PROMPT=0`; SSH runs with `BatchMode=yes` unless you set your own SSH command (`GIT_SSH_COMMAND`, `GIT_SSH` or `core.sshCommand`), which is used as it is, still without a terminal. A fetch that needs a password, a passphrase or a host key answer fails. So does one that takes longer than five minutes. Use an SSH agent or a credential helper for a remote that needs one.
+
+A fetch changes only remote-tracking refs. It is never a reason to remove: it only refreshes the refs that the scan and the removal read, and every check above still decides. A fetch that fails logs one line, leaves that repository's refs as they were, and is tried again at the next interval; the log says when it works again. A branch the fetch finds deleted is logged too, before any removal it leads to:
+
+```text
+2026-11-07T18:41:14Z residue watch: fetched ~/src/app: origin/fix-login is gone from the remote
+2026-11-07T18:41:17Z residue watch: removed ~/src/app/.worktrees/fix-login (8.2 KB): its upstream branch origin/fix-login was deleted and it was unchanged for 1h
+```
+
+`--no-fetch` turns it off. Then `watch` sees a deleted branch after your own `git fetch --prune`; `git config --global fetch.prune true` makes every fetch prune. `scan`, `explain` and `remove` never fetch.
+
+### Try it first
+
+```sh
+residue watch --once --dry-run             # what it would remove right now
+residue service install --dry-run          # a service that only logs what it would remove
+residue service status                     # is it running, what it watches, the last lines of its log
 residue service uninstall
 ```
 
-The log is `~/Library/Logs/residue/watch.log` on macOS and `journalctl --user -u residue-watch` on Linux. A Linux user service stops when you log out unless you run `loginctl enable-linger "$USER"` once. On other systems, `residue service install` prints the `residue watch` command to run from your system's service manager. [Why `--idle` matters](#why---idle-matters) explains what counts as a change, and why a paused agent session needs a wait. If you would rather sweep at a fixed time, see [Run it on a schedule](#run-it-on-a-schedule).
+A dry run still fetches; add `--no-fetch` to leave the refs alone too. The log is `~/Library/Logs/residue/watch.log` on macOS and `journalctl --user -u residue-watch` on Linux. A Linux user service stops when you log out unless you run `loginctl enable-linger "$USER"` once. On other systems, `residue service install` prints the `residue watch` command to run from your system's service manager. [Why `--idle` matters](#why---idle-matters) explains what counts as a change, and why a paused agent session needs a wait. If you would rather sweep at a fixed time, see [Run it on a schedule](#run-it-on-a-schedule).
 
 ## Run it on a schedule
 

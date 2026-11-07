@@ -621,7 +621,7 @@ impl Unmet {
 /// `--only-if-upstream-gone`: `Ok` only when the local refs show that the
 /// branch's upstream is a remote-tracking ref and that it is gone. A
 /// detached HEAD, a branch with no upstream, a local upstream, an upstream
-/// that exists, and a lookup that failed all keep the worktree. residue never fetches, so this is the remote as of
+/// that exists, and a lookup that failed all keep the worktree. `remove` never fetches, so this is the remote as of
 /// the last fetch.
 fn judge_upstream(
     branch: Option<&str>,

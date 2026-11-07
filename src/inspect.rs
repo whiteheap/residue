@@ -207,7 +207,7 @@ pub struct Report {
     pub activity: Option<Evidence>,
     pub ignored: Vec<Ignored>,
     /// Commits reachable from HEAD but from no remote-tracking ref, as the
-    /// local refs see it (residue never fetches). `Ok(None)` when the
+    /// local refs see it (as of the last fetch). `Ok(None)` when the
     /// repository has no remote-tracking refs at all. Facts never block, so
     /// a failed query is kept as its error and shown, not hidden.
     pub local_commits: Result<Option<u64>, String>,
