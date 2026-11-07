@@ -914,8 +914,8 @@ if [ -z "$partial_probe" ]; then
     fi
 
     # A ledger residue cannot write never changes a removal: the PATH is
-    # removed, exit 0, nothing in `errors`, a warning on stderr and in
-    # stats.error.
+    # removed, exit 0, nothing in `errors`, a warning on stderr, in
+    # `warnings` and in stats.error.
     name=stats-unwritable-ledger
     make_repo
     reset_ledger
@@ -925,7 +925,7 @@ if [ -z "$partial_probe" ]; then
     elif [ "$status" != 0 ]; then fail "exit $status, want 0"
     elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
     elif [ -e "$wt" ] || registered "$wt"; then fail "the worktree is still there"
-    elif ! jq -e '.errors == [] and (.stats | .freed_worktrees == 1 and .total_freed_bytes == null and (.error | test("stats ledger")))' "$out" >/dev/null; then fail "errors and stats: $(jq -c '{errors, stats}' "$out")"
+    elif ! jq -e '.errors == [] and any(.warnings[]; test("^the stats ledger is not up to date")) and (.stats | .freed_worktrees == 1 and .total_freed_bytes == null and (.error | test("stats ledger")))' "$out" >/dev/null; then fail "errors, warnings and stats: $(jq -c '{errors, warnings, stats}' "$out")"
     elif ! grep -q "^residue: warning: the stats ledger is not up to date" "$err"; then fail "no warning on stderr"
     elif common_ok; then ok; fi
     rmdir "$ledger" 2>/dev/null
@@ -942,7 +942,7 @@ if [ -z "$partial_probe" ]; then
     run remove --yes "$wt"
     if [ "$status" != 0 ]; then fail "exit $status, want 0"
     elif grep -q "freed" "$work/$name.preview"; then fail "a run that removed nothing printed a freed line"
-    elif ! tail -n 1 "$out" | grep -q -E '^freed about [0-9.]+ [KMG]?B \(residue has freed about [0-9.]+ [KMG]?B on this machine since [0-9]{4}-[0-9]{2}-[0-9]{2}\)$'; then fail "the last line is not the freed line: $(tail -n 1 "$out")"
+    elif ! tail -n 1 "$out" | grep -q -E '^freed about [0-9.]+ [KMG]?B \(residue has freed about [0-9.]+ [KMG]?B on this machine since [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\)$'; then fail "the last line is not the freed line: $(tail -n 1 "$out")"
     elif [ "$(ledger_lines | wc -l | tr -d ' ')" != 1 ]; then fail "the ledger has $(ledger_lines | wc -l | tr -d ' ') lines, want 1"
     else
         run stats
