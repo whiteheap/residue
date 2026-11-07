@@ -17,6 +17,12 @@
 //! nothing would purge the trash of a repository where watch removes nothing
 //! more.
 //!
+//! Every removal writes a removal record first (`removed`), and its log line
+//! ends with the `residue restore` command that brings the worktree back.
+//! A worktree `residue restore` put back is never removed again because its
+//! work landed (the scan's `restored`, and the child's own check): someone
+//! wanted it after it landed. Disk pressure still removes it.
+//!
 //! To see a branch deleted on the remote, it fetches (`Fetcher`): about
 //! every `--fetch-every`, `git fetch --prune --no-tags` of each remote that
 //! a linked worktree's branch tracks (`git::fetch`, which never prompts). A
@@ -86,6 +92,10 @@ Each removal is `residue remove --yes --idle --no-trash`, with
 and runs again right before the deletion. It deletes rather than using the
 trash, and purges that repository's trash entries older than 7 days.
 Branches and commits are always kept.
+Each removal first writes a removal record, and its log line ends with
+`restore: residue restore RECORD`, which recreates the worktree on its
+branch and HEAD (for 30 days). A restored worktree is never removed again
+because its branch landed; disk pressure still removes it.
 
 Options:
   --grace DURATION        Once its branch landed, keep a worktree that
@@ -536,6 +546,9 @@ struct Worktree {
     /// The only checks that fail are `idle`: it becomes a candidate once it
     /// has been unchanged long enough.
     waits_for_idle: bool,
+    /// `residue restore` put it back (or residue could not read whether
+    /// it did): the landed-work rule never removes it again.
+    restored: bool,
     /// The filesystem it is on.
     dev: Option<u64>,
 }
@@ -547,6 +560,8 @@ struct Repo {
     dir: PathBuf,
     /// The branches (`refs/heads/fix`) of its linked worktrees whose
     /// upstream is a remote-tracking ref: the ones a fetch can show landed.
+    /// A restored worktree's is left out: the landed rule never removes it,
+    /// so no fetch is needed for it.
     branches: BTreeSet<String>,
     /// Those upstreams (`refs/remotes/origin/fix`).
     upstreams: HashSet<String>,
@@ -601,7 +616,7 @@ fn scan(exe: &Path, opts: &Options) -> Result<Snapshot, ScanError> {
                 .unwrap_or_else(|| common_dir.clone());
             let mut branches = BTreeSet::new();
             let mut upstreams = HashSet::new();
-            for w in worktrees {
+            for w in worktrees.iter().filter(|w| !restored(w)) {
                 let branch = w.get("branch").and_then(Value::str);
                 let upstream = w.get("upstream_ref").and_then(Value::str);
                 if let (Some(branch), Some(upstream)) = (branch, upstream) {
@@ -653,6 +668,7 @@ fn scan(exe: &Path, opts: &Options) -> Result<Snapshot, ScanError> {
                     .unwrap_or(0)
                     .max(0) as u64,
                 waits_for_idle: !failing.is_empty() && failing.iter().all(|id| *id == "idle"),
+                restored: restored(w),
                 dev: std::fs::metadata(path).ok().map(|m| m.dev()),
             });
         }
@@ -707,7 +723,7 @@ fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> usize 
     let landed: Vec<&Worktree> = snap
         .worktrees
         .iter()
-        .filter(|w| w.verdict == "candidate" && w.upstream_gone)
+        .filter(|w| w.verdict == "candidate" && w.upstream_gone && !w.restored)
         .collect();
     for w in &landed {
         tried.insert(&w.path);
@@ -822,6 +838,15 @@ fn remove(
     if require_upstream_gone {
         cmd.arg("--only-if-upstream-gone");
     }
+    // Why, as each removal record says it.
+    cmd.args([
+        "--removal-reason",
+        if require_upstream_gone {
+            "watch-landed"
+        } else {
+            "watch-low-disk"
+        },
+    ]);
     for w in worktrees {
         cmd.arg(&w.path);
     }
@@ -854,8 +879,9 @@ fn remove(
             Some("removed") => {
                 removed += 1;
                 log(&format!(
-                    "removed {} ({size}): {reason}",
-                    output::home(path)
+                    "removed {} ({size}): {reason}{}",
+                    output::home(path),
+                    restore_hint(result)
                 ));
             }
             // --no-trash makes this unreachable today; if a remove run ever
@@ -898,7 +924,10 @@ fn remove(
             .map(|p| format!(" (was {})", output::home(p)))
             .unwrap_or_default();
         match purge.get("result").and_then(Value::str) {
-            Some("purged") => log(&format!("purged {name} from the trash{was}")),
+            Some("purged") => log(&format!(
+                "purged {name} from the trash{was}{}",
+                restore_hint(purge)
+            )),
             other => {
                 let reason = purge
                     .get("reason")
@@ -911,7 +940,51 @@ fn remove(
             }
         }
     }
+    // And it forgets the removal records older than --keep-removed there.
+    for forgot in doc.get("forgotten").map(Value::items).unwrap_or(&[]) {
+        let entry = forgot.get("entry");
+        let name = entry
+            .and_then(|e| e.get("entry"))
+            .and_then(Value::str)
+            .unwrap_or("(unnamed record)");
+        let was = entry
+            .and_then(|e| e.get("original_path"))
+            .and_then(Value::str)
+            .map(|p| format!(" (was {})", output::home(p)))
+            .unwrap_or_default();
+        match forgot.get("result").and_then(Value::str) {
+            Some("forgotten") => log(&format!("forgot the removal record {name}{was}")),
+            other => {
+                let reason = forgot
+                    .get("reason")
+                    .and_then(Value::str)
+                    .unwrap_or("no reason given");
+                log(&format!(
+                    "kept the removal record {name}{was} ({}): {reason}",
+                    other.unwrap_or("unknown result")
+                ));
+            }
+        }
+    }
     removed
+}
+
+/// `; restore: residue restore RECORD` for a result that names the removal
+/// record its deletion wrote.
+fn restore_hint(result: &Value) -> String {
+    result
+        .get("removal_record")
+        .and_then(Value::str)
+        .map(|r| format!("; restore: residue restore {}", output::shell(Path::new(r))))
+        .unwrap_or_default()
+}
+
+/// The scan says `residue restore` put this worktree back, or cannot read
+/// whether it did (`restored_error`): either way the landed rule keeps it.
+fn restored(worktree: &Value) -> bool {
+    ["restored", "restored_error"]
+        .iter()
+        .any(|k| worktree.get(k).is_some_and(|v| !matches!(v, Value::Null)))
 }
 
 /// Watch what a fetch or prune changes in each repository: the directories
@@ -974,7 +1047,7 @@ fn next_deadline(opts: &Options, snap: &Snapshot, now: i64) -> Option<i64> {
     for w in &snap.worktrees {
         let Some(t) = w.last_change else { continue };
         let mut times = Vec::new();
-        if w.upstream_gone && w.waits_for_idle {
+        if w.upstream_gone && w.waits_for_idle && !w.restored {
             times.push(t + opts.grace.seconds);
         }
         if w.dev.is_some_and(|d| low.contains(&d)) && (w.waits_for_idle || w.verdict == "candidate")

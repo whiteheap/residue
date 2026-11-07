@@ -14,6 +14,7 @@ use crate::json::Json;
 use crate::output::{self, Places, Style, clean};
 use crate::policy::{GIT_CONFIG_KEY, Policy};
 use crate::remove::{self, Leftover};
+use crate::removed;
 use crate::trash;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -105,6 +106,10 @@ pub fn scan(options: &Options) -> u8 {
                 errors.push(e);
                 Vec::new()
             });
+        let records = removed::of_repo(repo).unwrap_or_else(|e| {
+            errors.push(e);
+            Vec::new()
+        });
         let leftovers = repo
             .interrupted
             .iter()
@@ -115,6 +120,7 @@ pub fn scan(options: &Options) -> u8 {
             list,
             space,
             trash,
+            records,
             leftovers,
         });
     }
@@ -135,6 +141,7 @@ pub fn scan(options: &Options) -> u8 {
         .sum();
     let total = grouped.iter().map(|g| g.list.len()).sum::<usize>();
     let trashed = grouped.iter().map(|g| g.trash.len()).sum::<usize>();
+    let records = grouped.iter().map(|g| g.records.len()).sum::<usize>();
     let leftovers: Vec<&Leftover> = grouped.iter().flat_map(|g| g.leftovers.iter()).collect();
 
     if options.json {
@@ -160,6 +167,10 @@ pub fn scan(options: &Options) -> u8 {
                     (
                         "interrupted",
                         Json::Arr(g.leftovers.iter().map(Leftover::json).collect()),
+                    ),
+                    (
+                        "removed",
+                        Json::Arr(g.records.iter().map(removed::item_json).collect()),
                     ),
                 ])
             })
@@ -208,6 +219,7 @@ pub fn scan(options: &Options) -> u8 {
                     ("candidate_reclaimable_bytes", Json::UInt(reclaimable)),
                     ("trash_entries", Json::UInt(trashed as u64)),
                     ("interrupted_removals", Json::UInt(leftovers.len() as u64)),
+                    ("removal_records", Json::UInt(records as u64)),
                 ]),
             ),
         ]);
@@ -265,6 +277,15 @@ pub fn scan(options: &Options) -> u8 {
                 ))
             ));
         }
+        if !g.records.is_empty() {
+            out.push_str(&format!(
+                "  {}\n",
+                style.dim(&format!(
+                    "removed: {} restorable · list or restore: residue restore · a remove run forgets records older than --keep-removed",
+                    g.records.len()
+                ))
+            ));
+        }
     }
     if found.repos.is_empty() && errors.is_empty() {
         out.push_str("\nno Git repositories found\n");
@@ -273,6 +294,18 @@ pub fn scan(options: &Options) -> u8 {
         out.push_str(&format!("\n{}\n", remove::LEFTOVER_TITLE));
         for l in &leftovers {
             out.push_str(&l.text(&places, &style));
+            // A run that stopped after writing its removal record: restore
+            // moves it back, with the same checks.
+            let record = grouped
+                .iter()
+                .flat_map(|g| g.records.iter())
+                .find(|i| i.record.as_ref().is_ok_and(|r| r.aside == l.path));
+            if let Some(item) = record {
+                out.push_str(&format!(
+                    "    or: residue restore {}\n",
+                    output::shell(&item.dir)
+                ));
+            }
         }
     }
     if !found.orphans.is_empty() {
@@ -339,13 +372,15 @@ pub fn scan(options: &Options) -> u8 {
     0
 }
 
-/// One repository of a scan: its judged worktrees, free space, trash and
-/// interrupted removals.
+/// One repository of a scan: its judged worktrees, free space, trash,
+/// removal records and interrupted removals.
 struct Group<'a> {
     repo: &'a Repo,
     list: Vec<Report>,
     space: Option<Space>,
     trash: Vec<trash::Item>,
+    /// Removal records `residue restore` can bring back.
+    records: Vec<removed::Item>,
     leftovers: Vec<Leftover>,
 }
 
@@ -545,6 +580,24 @@ pub fn explain_text(r: &Report, repo: &Repo, places: &Places, style: &Style) -> 
         ),
         Ok(None) => {}
         Err(e) => fact(&mut out, "last change", format!("unknown: {}", clean(e))),
+    }
+    match &r.restored {
+        Ok(Some(m)) => fact(
+            &mut out,
+            "restored",
+            format!(
+                "{}from {}; residue watch never removes it again because its work landed",
+                m.at.map(|t| format!("{} ({}), ", output::date(t), output::age(output::now() - t)))
+                    .unwrap_or_default(),
+                clean(&m.from)
+            ),
+        ),
+        Ok(None) => {}
+        Err(e) => fact(
+            &mut out,
+            "restored",
+            format!("unknown: {}; residue watch treats it as restored", clean(e)),
+        ),
     }
     if let Some(u) = &r.usage {
         fact(&mut out, "size", output::usage_phrase(u));

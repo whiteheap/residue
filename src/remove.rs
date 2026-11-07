@@ -34,6 +34,7 @@ use crate::inspect::{self, Report, Verdict};
 use crate::json::Json;
 use crate::output::{self, Places, Style, clean};
 use crate::policy::Policy;
+use crate::removed::{self, Reason};
 use crate::trash;
 
 /// The lock reason on a worktree residue has moved aside to delete.
@@ -181,7 +182,9 @@ pub fn recovery(main: &Path, moved: &Path, original: &Path, locked: bool) -> Str
 }
 
 enum Outcome {
-    Removed,
+    /// Deleted; the removal record residue wrote first, which `residue
+    /// restore` takes (none for a trash record that held no worktree).
+    Removed(Option<PathBuf>),
     /// Moved into the trash; the entry directory.
     Trashed(PathBuf),
     Refused,
@@ -193,7 +196,7 @@ enum Outcome {
 impl Outcome {
     fn code(&self) -> &'static str {
         match self {
-            Outcome::Removed => "removed",
+            Outcome::Removed(_) => "removed",
             Outcome::Trashed(_) => "trashed",
             Outcome::Refused => "refused",
             Outcome::Skipped(_) => "skipped",
@@ -203,7 +206,7 @@ impl Outcome {
     }
 
     fn done(&self) -> bool {
-        matches!(self, Outcome::Removed | Outcome::Trashed(_))
+        matches!(self, Outcome::Removed(_) | Outcome::Trashed(_))
     }
 }
 
@@ -222,6 +225,15 @@ struct Purge {
     outcome: Option<Outcome>,
 }
 
+/// One removal record older than `--keep-removed`, in a repository this
+/// run covers: the run forgets it, its ref and then its files, after the
+/// same confirmation as everything else.
+struct Forget {
+    item: removed::Item,
+    /// `None` until the run acts; then `Ok` when it was forgotten.
+    outcome: Option<Outcome>,
+}
+
 /// How this run treats the worktrees it removes.
 struct Mode {
     trash: bool,
@@ -233,6 +245,10 @@ struct Mode {
     /// `--only-if-upstream-gone`, checked at the plan, in the re-check and
     /// after the move.
     only_if_upstream_gone: bool,
+    /// `--keep-removed`: how long a removal record and its ref are kept.
+    keep_removed: Span,
+    /// Why this run removes, as each removal record says it.
+    reason: Reason,
     started: i64,
 }
 
@@ -252,6 +268,12 @@ pub fn remove(options: &Options) -> u8 {
         },
         sweep: options.all,
         only_if_upstream_gone: options.only_if_upstream_gone,
+        keep_removed: options.keep_removed(),
+        reason: options.removal_reason.unwrap_or(if options.all {
+            Reason::Sweep
+        } else {
+            Reason::Remove
+        }),
         started,
     };
     let places = Places::new();
@@ -298,6 +320,7 @@ pub fn remove(options: &Options) -> u8 {
     let mut purge_policy = policy.clone();
     purge_policy.idle = None;
     let mut purges = expired(&repos, &mode.keep, started, &mut errors);
+    let mut forgets = expired_records(&repos, &mode.keep_removed, started, &mut errors);
     let judged: Vec<Entry> = purges
         .iter()
         .filter_map(|p| p.item.registered.as_ref().map(as_judged))
@@ -331,13 +354,13 @@ pub fn remove(options: &Options) -> u8 {
     if !options.json {
         print!(
             "{}",
-            plan_text(&items, &purges, &errors, &mode, &places, &style)
+            plan_text(&items, &purges, &forgets, &errors, &mode, &places, &style)
         );
     }
 
     let mut declined: Option<String> = None;
-    if (!ready.is_empty() || !purgeable.is_empty()) && !options.yes {
-        declined = match confirm(ready.len(), purgeable.len(), mode.trash) {
+    if (!ready.is_empty() || !purgeable.is_empty() || !forgets.is_empty()) && !options.yes {
+        declined = match confirm(ready.len(), purgeable.len(), forgets.len(), mode.trash) {
             Ok(true) => None,
             Ok(false) => Some("not confirmed".to_string()),
             Err(e) => Some(e),
@@ -348,6 +371,9 @@ pub fn remove(options: &Options) -> u8 {
             }
             for &i in &purgeable {
                 purges[i].outcome = Some(Outcome::Skipped(why.clone()));
+            }
+            for f in &mut forgets {
+                f.outcome = Some(Outcome::Skipped(why.clone()));
             }
         }
     }
@@ -372,6 +398,19 @@ pub fn remove(options: &Options) -> u8 {
         }
         purges[i].outcome = Some(outcome);
     }
+    for f in &mut forgets {
+        if f.outcome.is_some() {
+            continue;
+        }
+        let outcome = match removed::forget(&f.item) {
+            Ok(()) => Outcome::Removed(None),
+            Err(e) => Outcome::Failed(e),
+        };
+        if !options.json {
+            println!("{}", forget_line(&f.item, &outcome, &places));
+        }
+        f.outcome = Some(outcome);
+    }
 
     // A sweep never asked for the worktrees it kept, so only a candidate
     // that was not removed, or a PATH it could not read, makes it fail.
@@ -381,18 +420,26 @@ pub fn remove(options: &Options) -> u8 {
         Some(o) if o.done() => true,
         Some(Outcome::Refused) => options.all,
         _ => false,
-    }) && purges
+    }) && purges.iter().all(|p| {
+        matches!(
+            p.outcome,
+            Some(Outcome::Removed(_)) | Some(Outcome::Refused)
+        )
+    }) && forgets
         .iter()
-        .all(|p| matches!(p.outcome, Some(Outcome::Removed) | Some(Outcome::Refused)))
+        .all(|f| matches!(f.outcome, Some(Outcome::Removed(_))))
         && errors.is_empty();
     if options.json {
         println!(
             "{}",
-            json(&items, &purges, &errors, &snapshot, &policy, &mode, started).render()
+            json(
+                &items, &purges, &forgets, &errors, &snapshot, &policy, &mode
+            )
+            .render()
         );
     } else if let Some(why) = declined {
         println!("nothing removed: {}", clean(&why));
-    } else if ready.is_empty() && purgeable.is_empty() && options.all {
+    } else if ready.is_empty() && purgeable.is_empty() && forgets.is_empty() && options.all {
         println!("nothing to remove");
     }
     if done { 0 } else { 3 }
@@ -418,11 +465,40 @@ fn repos_of(items: &[Item]) -> Vec<Repo> {
                 main: t.repo.main.clone(),
                 linked: Vec::new(),
                 trash: t.repo.trash.clone(),
-                interrupted: Vec::new(),
+                interrupted: t.repo.interrupted.clone(),
             });
         }
     }
     repos
+}
+
+/// The removal records of these repositories at least `keep` old. A record
+/// of an interrupted removal is never forgotten: its worktree is still
+/// there, and `residue restore` is how it goes back. An unreadable record
+/// is never forgotten either, since residue cannot tell which ref it names.
+fn expired_records(repos: &[Repo], keep: &Span, now: i64, errors: &mut Vec<String>) -> Vec<Forget> {
+    let mut out = Vec::new();
+    for repo in repos {
+        match removed::of_repo(repo) {
+            Ok(list) => {
+                for item in list {
+                    match &item.record {
+                        Err(e) => errors.push(format!("removal record: {e}")),
+                        Ok(_) if item.interrupted() => {}
+                        Ok(_) if item.age(now).is_some_and(|a| a >= keep.seconds) => {
+                            out.push(Forget {
+                                item,
+                                outcome: None,
+                            });
+                        }
+                        Ok(_) => {}
+                    }
+                }
+            }
+            Err(e) => errors.push(e),
+        }
+    }
+    out
 }
 
 /// The trash entries of these repositories that are at least `keep` old,
@@ -549,7 +625,7 @@ fn sweep(roots: &[PathBuf]) -> (Vec<Item>, Vec<String>, Vec<Repo>) {
     (items, found.errors, found.repos)
 }
 
-fn confirm(worktrees: usize, purges: usize, trash: bool) -> Result<bool, String> {
+fn confirm(worktrees: usize, purges: usize, forgets: usize, trash: bool) -> Result<bool, String> {
     let stdin = io::stdin();
     if !stdin.is_terminal() {
         return Err(
@@ -588,10 +664,21 @@ fn confirm(worktrees: usize, purges: usize, trash: bool) -> Result<bool, String>
             format!("purge {what}")
         });
     }
-    let prompt = format!(
-        "{}? Branches and commits stay. Type yes to continue: ",
-        parts.join(" and ")
-    );
+    if forgets > 0 {
+        let what = count(forgets, "removal record", "removal records");
+        parts.push(if parts.is_empty() {
+            format!("Forget {what}")
+        } else {
+            format!("forget {what}")
+        });
+    }
+    // A forgotten record's ref no longer keeps its commits; branches do.
+    let keeps = if forgets > 0 {
+        "Branches stay; a forgotten record cannot be restored."
+    } else {
+        "Branches and commits stay."
+    };
+    let prompt = format!("{}? {keeps} Type yes to continue: ", parts.join(" and "));
     write!(err, "{}", style.bold(&prompt))
         .and_then(|_| err.flush())
         .map_err(|e| format!("cannot write the prompt: {e}"))?;
@@ -619,14 +706,35 @@ impl Unmet {
 }
 
 /// `--only-if-upstream-gone`: `Ok` only when the local refs show that the
-/// branch's upstream is a remote-tracking ref and that it is gone. A
-/// detached HEAD, a branch with no upstream, a local upstream, an upstream
-/// that exists, and a lookup that failed all keep the worktree. `remove` never fetches, so this is the remote as of
-/// the last fetch.
+/// branch's upstream is a remote-tracking ref and that it is gone, and
+/// `residue restore` did not put the worktree back. A detached HEAD, a
+/// branch with no upstream, a local upstream, an upstream that exists, a
+/// restored worktree, and a lookup that failed all keep the worktree.
+/// `remove` never fetches, so this is the remote as of the last fetch.
 fn judge_upstream(
     branch: Option<&str>,
     upstream: &Result<Option<inspect::Upstream>, String>,
+    restored: &Result<Option<removed::Mark>, String>,
 ) -> Result<(), Unmet> {
+    // A worktree someone restored was wanted back after its work landed;
+    // that rule never removes it again. An explicit remove still does.
+    match restored {
+        Ok(None) => {}
+        Ok(Some(mark)) => {
+            return Err(Unmet::NotGone(format!(
+                "`residue restore` put it back{}, so its landed work never removes it again; `residue remove PATH` still does",
+                mark.at
+                    .map(|t| format!(" on {}", output::date(t)))
+                    .unwrap_or_default()
+            )));
+        }
+        Err(e) => {
+            return Err(Unmet::Unreadable(format!(
+                "residue could not read whether `residue restore` put it back: {}",
+                clean(e)
+            )));
+        }
+    }
     let Some(branch) = branch else {
         return Err(Unmet::NotGone(
             "it is on a detached HEAD, which has no upstream".into(),
@@ -656,7 +764,11 @@ fn judge_upstream(
 
 /// `judge_upstream` on what a report recorded.
 fn upstream_gone(report: &Report) -> Result<(), Unmet> {
-    judge_upstream(report.entry.short_branch(), &report.upstream)
+    judge_upstream(
+        report.entry.short_branch(),
+        &report.upstream,
+        &report.restored,
+    )
 }
 
 /// The worktree at `path` as Git lists it now, judged again against a
@@ -859,15 +971,109 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
     if let Some(entry) = entry {
         return Outcome::Trashed(entry);
     }
+    // The record and its ref come after the last check and before the
+    // deletion; without them residue deletes nothing.
+    let record = removal_record(original, &dest, &listed, before, mode.reason);
+    let git_dir = before
+        .fingerprint
+        .as_ref()
+        .ok()
+        .map(|f| f.git_dir.as_path());
+    let written = match removed::create(&target.repo.common_dir, &main, &record, git_dir) {
+        Ok(w) => w,
+        Err(e) => {
+            return moved.put_back(
+                true,
+                &format!("could not write its removal record, so residue deleted nothing: {e}"),
+            );
+        }
+    };
     if let Err(e) = git::unlock_worktree(&main, &dest) {
-        return moved.put_back(true, &format!("could not unlock it: {e}"));
+        let outcome = moved.put_back(true, &format!("could not unlock it: {e}"));
+        return settle(&written, &main, &[original, &dest], outcome);
     }
     match git::remove_worktree(&main, &dest) {
-        Ok(()) => Outcome::Removed,
-        Err(e) => match moved.put_back(false, &e) {
-            Outcome::Skipped(why) => Outcome::Failed(why),
-            other => other,
+        Ok(()) => Outcome::Removed(Some(written.dir)),
+        Err(e) => {
+            let outcome = match moved.put_back(false, &e) {
+                Outcome::Skipped(why) => Outcome::Failed(why),
+                other => other,
+            };
+            settle(&written, &main, &[original, &dest], outcome)
+        }
+    }
+}
+
+/// What the removal record keeps of a worktree about to be deleted at
+/// `aside`: `listed` is Git's entry for it, `before` the plan's report.
+fn removal_record(
+    original: &Path,
+    aside: &Path,
+    listed: &Entry,
+    before: &Report,
+    reason: Reason,
+) -> removed::Record {
+    removed::Record {
+        original: original.to_path_buf(),
+        aside: aside.to_path_buf(),
+        branch: listed.branch.clone(),
+        head: listed.head.clone().unwrap_or_default(),
+        upstream: before
+            .upstream
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map(|u| u.full.clone()),
+        reason: reason.code().to_string(),
+        removed: output::now(),
+        allocated: before.usage.as_ref().map(|u| u.allocated),
+        reclaimable: before.usage.as_ref().map(|u| u.reclaimable),
+        gone: before
+            .ignored
+            .iter()
+            .map(|i| removed::Gone {
+                path: i.path.clone(),
+                files: i.files,
+                bytes: i.bytes,
+            })
+            .collect(),
+        pid: Some(std::process::id()),
+        version: Some(VERSION.to_string()),
+    }
+}
+
+/// After a deletion that did not complete: while Git still lists the
+/// worktree at one of `paths`, nothing of it is gone that the worktree
+/// does not still hold (Git deletes the checkout before its own record,
+/// and drops that record even when the delete fails partway), so its
+/// removal record is dropped. Otherwise the record stays: it is how the
+/// worktree comes back.
+fn settle(written: &removed::Written, main: &Path, paths: &[&Path], outcome: Outcome) -> Outcome {
+    let listed = git::worktrees(main).map(|list| {
+        list.iter().any(|e| {
+            paths
+                .iter()
+                .any(|p| e.path == *p || git::canonical(&e.path).ok().as_deref() == Some(*p))
+        })
+    });
+    let note = match listed {
+        Ok(true) => match written.undo() {
+            Ok(()) => return outcome,
+            Err(e) => format!("its removal record stays ({e})"),
         },
+        Ok(false) => format!(
+            "Git no longer lists it, so part of it may be gone; its removal record keeps its HEAD: residue restore {}",
+            output::shell(&written.dir)
+        ),
+        Err(e) => format!(
+            "residue could not list the worktrees to tell whether any of it is gone ({e}); its removal record keeps its HEAD: residue restore {}",
+            output::shell(&written.dir)
+        ),
+    };
+    match outcome {
+        Outcome::Skipped(why) => Outcome::Skipped(format!("{why}; {note}")),
+        Outcome::Failed(why) => Outcome::Failed(format!("{why}; {note}")),
+        other => other,
     }
 }
 
@@ -987,7 +1193,8 @@ fn verify_moved(
             Some(branch) => inspect::upstream(dest, branch),
             None => Ok(None),
         };
-        judge_upstream(listed.short_branch(), &live).map_err(|unmet| match unmet {
+        let mark = removed::marked(&planned.git_dir);
+        judge_upstream(listed.short_branch(), &live, &mark).map_err(|unmet| match unmet {
             Unmet::NotGone(why) => format!("changed after residue moved it aside: {why}"),
             Unmet::Unreadable(why) => format!("--only-if-upstream-gone: {why}"),
         })?;
@@ -998,32 +1205,60 @@ fn verify_moved(
 /// Re-check one expired trash entry, then delete it with `git worktree
 /// remove`.
 fn purge(p: &Purge, policy: &Policy, mode: &Mode) -> Outcome {
-    if !p.item.is_empty_record() {
-        let (Some(worktree), Some(before)) = (&p.item.worktree, &p.report) else {
-            return Outcome::Failed("internal: no report".into());
+    if p.item.is_empty_record() {
+        return match trash::purge(&p.item) {
+            Ok(()) => Outcome::Removed(None),
+            Err(e) => Outcome::Failed(e),
         };
-        let path = git::canonical(worktree).unwrap_or_else(|_| worktree.clone());
-        if let Err(outcome) = recheck(
-            &path,
-            &p.item.common_dir,
-            before,
-            policy,
-            mode.since,
-            Some(trash::LOCK),
-            /* only_if_upstream_gone */ false,
-        ) {
-            return outcome;
-        }
     }
+    let (Some(worktree), Some(before), Ok(trashed)) = (&p.item.worktree, &p.report, &p.item.record)
+    else {
+        return Outcome::Failed("internal: no report".into());
+    };
+    let path = git::canonical(worktree).unwrap_or_else(|_| worktree.clone());
+    let listed = match recheck(
+        &path,
+        &p.item.common_dir,
+        before,
+        policy,
+        mode.since,
+        Some(trash::LOCK),
+        /* only_if_upstream_gone */ false,
+    ) {
+        Ok(l) => l,
+        Err(outcome) => return outcome,
+    };
+    // A purge deletes too, so it records first, as a removal does.
+    let record = removal_record(
+        &trashed.original,
+        &path,
+        &listed,
+        before,
+        Reason::TrashPurge,
+    );
+    let git_dir = before
+        .fingerprint
+        .as_ref()
+        .ok()
+        .map(|f| f.git_dir.as_path());
+    let written = match removed::create(&p.item.common_dir, &p.item.command_dir, &record, git_dir) {
+        Ok(w) => w,
+        Err(e) => {
+            return Outcome::Failed(format!(
+                "could not write its removal record, so residue deleted nothing: {e}"
+            ));
+        }
+    };
     match trash::purge(&p.item) {
-        Ok(()) => Outcome::Removed,
-        Err(e) => Outcome::Failed(e),
+        Ok(()) => Outcome::Removed(Some(written.dir)),
+        Err(e) => settle(&written, &p.item.command_dir, &[&path], Outcome::Failed(e)),
     }
 }
 
 fn plan_text(
     items: &[Item],
     purges: &[Purge],
+    forgets: &[Forget],
     errors: &[String],
     mode: &Mode,
     places: &Places,
@@ -1048,6 +1283,11 @@ fn plan_text(
             out.push_str(&style.dim(&format!(
                 "  `residue restore` puts one back. A remove run purges entries older than {} (--keep-trash), which frees the disk.\n",
                 mode.keep.text
+            )));
+        } else {
+            out.push_str(&style.dim(&format!(
+                "  `residue restore` recreates one at its path, on its branch and HEAD, for {} (--keep-removed); the ignored files it deletes are not kept.\n",
+                mode.keep_removed.text
             )));
         }
         for &i in &ready {
@@ -1099,6 +1339,22 @@ fn plan_text(
         ));
         for &i in &purgeable {
             out.push_str(&purge_summary(&purges[i], places, style));
+        }
+    }
+    if !forgets.is_empty() {
+        out.push_str(&format!(
+            "\n{}\n",
+            style.bold(&format!(
+                "will forget removal records ({}), older than {} (--keep-removed):",
+                forgets.len(),
+                mode.keep_removed.text
+            ))
+        ));
+        out.push_str(&style.dim(
+            "  each worktree was deleted already; forgetting deletes its record and the ref that keeps its HEAD, so `residue restore` can no longer bring it back\n",
+        ));
+        for f in forgets {
+            out.push_str(&forget_summary(&f.item, places, style));
         }
     }
     let refused: Vec<&Item> = items.iter().filter(|i| i.outcome.is_some()).collect();
@@ -1190,6 +1446,14 @@ fn purge_summary(p: &Purge, places: &Places, style: &Style) -> String {
     )
 }
 
+/// `; restore: residue restore PATH` for a deletion residue recorded.
+fn restore_hint(record: &Option<PathBuf>) -> String {
+    record
+        .as_ref()
+        .map(|r| format!("; restore: residue restore {}", output::shell(r)))
+        .unwrap_or_default()
+}
+
 fn outcome_line(item: &Item, outcome: &Outcome, places: &Places) -> String {
     let shown = item.target.as_ref().map_or_else(
         || clean(&item.arg.to_string_lossy()),
@@ -1209,7 +1473,11 @@ fn outcome_line(item: &Item, outcome: &Outcome, places: &Places) -> String {
             .unwrap_or_default()
     };
     match outcome {
-        Outcome::Removed => format!("removed {shown}{branch}{}", reclaimable("reclaimable")),
+        Outcome::Removed(record) => format!(
+            "removed {shown}{branch}{}{}",
+            reclaimable("reclaimable"),
+            restore_hint(record)
+        ),
         Outcome::Trashed(entry) => format!(
             "moved {shown} to the trash{branch}; put it back with: residue restore {}",
             output::shell(entry)
@@ -1229,18 +1497,19 @@ fn purge_line(p: &Purge, outcome: &Outcome, places: &Places) -> String {
         .map(|r| format!(" (was {})", places.show(&r.original)))
         .unwrap_or_default();
     match outcome {
-        Outcome::Removed if p.item.is_empty_record() => {
+        Outcome::Removed(_) if p.item.is_empty_record() => {
             format!("cleared the empty trash record {name}{was}")
         }
-        Outcome::Removed => format!(
-            "purged {name} from the trash{was}{}",
+        Outcome::Removed(record) => format!(
+            "purged {name} from the trash{was}{}{}",
             p.item
                 .record
                 .as_ref()
                 .ok()
                 .and_then(|r| r.reclaimable)
                 .map(|b| format!("; about {} reclaimable", output::bytes(b)))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            restore_hint(record)
         ),
         Outcome::Skipped(why) => format!("kept {name} in the trash: {}", clean(why)),
         Outcome::Failed(why) => format!("failed to purge {name}: {}", clean(why)),
@@ -1248,9 +1517,47 @@ fn purge_line(p: &Purge, outcome: &Outcome, places: &Places) -> String {
     }
 }
 
+fn forget_line(item: &removed::Item, outcome: &Outcome, places: &Places) -> String {
+    let name = clean(&item.name);
+    let was = item
+        .record
+        .as_ref()
+        .map(|r| format!(" (was {})", places.show(&r.original)))
+        .unwrap_or_default();
+    match outcome {
+        Outcome::Removed(_) => format!("forgot the removal record {name}{was}"),
+        Outcome::Skipped(why) | Outcome::Failed(why) | Outcome::Invalid(why) => {
+            format!("kept the removal record {name}{was}: {}", clean(why))
+        }
+        _ => format!("kept the removal record {name}{was}"),
+    }
+}
+
+/// One removal record the plan forgets.
+fn forget_summary(item: &removed::Item, places: &Places, style: &Style) -> String {
+    let now = output::now();
+    let Ok(r) = &item.record else {
+        return String::new();
+    };
+    let branch = r
+        .short_branch()
+        .map(|b| format!("[{}]", clean(b)))
+        .unwrap_or_default();
+    format!(
+        "  {}  {}\n    was {}\n",
+        style.bold(&clean(&item.name)),
+        style.dim(&branch),
+        style.dim(&format!(
+            "{} · removed {}",
+            places.show(&r.original),
+            output::age(now - r.removed)
+        ))
+    )
+}
+
 fn reason_json(outcome: &Option<Outcome>) -> Json {
     match outcome {
-        Some(Outcome::Removed | Outcome::Trashed(_)) => Json::Null,
+        Some(Outcome::Removed(_) | Outcome::Trashed(_)) => Json::Null,
         Some(Outcome::Skipped(r) | Outcome::Failed(r) | Outcome::Invalid(r)) => {
             Json::str(r.clone())
         }
@@ -1262,12 +1569,16 @@ fn reason_json(outcome: &Option<Outcome>) -> Json {
 fn json(
     items: &[Item],
     purges: &[Purge],
+    forgets: &[Forget],
     errors: &[String],
     snapshot: &Snapshot,
     policy: &Policy,
     mode: &Mode,
-    started: i64,
 ) -> Json {
+    let record_json = |outcome: &Option<Outcome>| match outcome {
+        Some(Outcome::Removed(Some(record))) => Json::path(record),
+        _ => Json::Null,
+    };
     let results = items
         .iter()
         .map(|item| {
@@ -1285,6 +1596,7 @@ fn json(
                         _ => Json::Null,
                     },
                 ),
+                ("removal_record", record_json(&item.outcome)),
                 (
                     "worktree",
                     Json::opt(item.report.as_ref(), output::report_json),
@@ -1296,7 +1608,7 @@ fn json(
         .iter()
         .map(|p| {
             let result = match &p.outcome {
-                Some(Outcome::Removed) => "purged",
+                Some(Outcome::Removed(_)) => "purged",
                 Some(Outcome::Refused) => "kept",
                 Some(o) => o.code(),
                 None => "not_attempted",
@@ -1305,6 +1617,7 @@ fn json(
                 ("result", Json::str(result)),
                 ("reason", reason_json(&p.outcome)),
                 ("entry", trash::item_json(&p.item)),
+                ("removal_record", record_json(&p.outcome)),
                 (
                     "worktree",
                     Json::opt(p.report.as_ref(), output::report_json),
@@ -1312,10 +1625,25 @@ fn json(
             ])
         })
         .collect();
+    let forgotten = forgets
+        .iter()
+        .map(|f| {
+            let result = match &f.outcome {
+                Some(Outcome::Removed(_)) => "forgotten",
+                Some(o) => o.code(),
+                None => "not_attempted",
+            };
+            Json::Obj(vec![
+                ("result", Json::str(result)),
+                ("reason", reason_json(&f.outcome)),
+                ("entry", removed::item_json(&f.item)),
+            ])
+        })
+        .collect();
     Json::Obj(vec![
         ("schema", Json::str(output::SCHEMA_REMOVE)),
         ("version", Json::str(VERSION)),
-        ("generated_at", Json::str(output::rfc3339(started))),
+        ("generated_at", Json::str(output::rfc3339(mode.started))),
         ("activity", output::activity_json(snapshot)),
         (
             "ignored_environment_rules",
@@ -1331,8 +1659,17 @@ fn json(
                 ("keep_seconds", Json::Int(mode.keep.seconds)),
             ]),
         ),
+        (
+            "removal_records",
+            Json::Obj(vec![
+                ("reason", Json::str(mode.reason.code())),
+                ("keep", Json::str(mode.keep_removed.text.clone())),
+                ("keep_seconds", Json::Int(mode.keep_removed.seconds)),
+            ]),
+        ),
         ("results", Json::Arr(results)),
         ("purged", Json::Arr(purged)),
+        ("forgotten", Json::Arr(forgotten)),
         (
             "errors",
             Json::Arr(errors.iter().map(|e| Json::str(e.clone())).collect()),

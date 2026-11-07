@@ -30,11 +30,15 @@
 #      FETCH_HEAD, and the worktree is removed. A remote it cannot reach is
 #      logged, its refs stay, and its worktree stays. A HOME with none of
 #      the folders is a usage error that names them.
+#   8. A removal's log line ends with `restore: residue restore RECORD`;
+#      that restore brings the worktree back on its branch and HEAD. The
+#      restored worktree is never removed again because its work landed,
+#      with watch fetching, past --grace; disk pressure still removes it.
 # Every branch stays, and nothing goes to the trash: watch deletes.
 # On NetBSD, OpenBSD and DragonFly (scripts/partial-probe.sh) no worktree
 # is a candidate: there it checks that every worktree is `unknown` for the
 # probe's reason and that dry, landed and disk-pressure runs remove none,
-# skips 1-6 by name, and runs 7 expecting no removal.
+# skips 1-6 and 8 by name, and runs 7 expecting no removal.
 set -eu
 
 residue=$1
@@ -183,7 +187,8 @@ if [ -n "$partial_probe" ]; then
   done
   for case in "1. a dry run names the landed fix" "2. --once removes the landed fix" \
     "3. a running watch removes wip" "4. disk pressure removes local" \
-    "5. the removal child's --only-if-upstream-gone" "6. the child's three upstream reads"; do
+    "5. the removal child's --only-if-upstream-gone" "6. the child's three upstream reads" \
+    "8. a restored worktree is not removed again because its work landed"; do
     skip_partial "$case"
   done
   fetch_case
@@ -401,6 +406,56 @@ stage 1 "--only-if-upstream-gone: its upstream origin/race exists in the local r
 "$residue" watch --once --no-fetch --grace 1m --min-free 99.9 --idle 1m "$S/w6" 2> "$S/log" || fail "the pressure pass failed"
 grep -q "removed .*worktrees/race (.*): free space on its filesystem" "$S/log" || fail "pressure did not remove race on the next pass"
 git rev-parse --verify -q race > /dev/null || fail "branch race is gone"
+
+# 8. Each removal writes a removal record, and its log line names the
+# command that restores it. A restored worktree is never removed again
+# because its work landed, fetch or no fetch, past --grace; disk pressure
+# still removes it.
+git init -q --bare -b main "$S/r8.git"
+git clone -q "$S/r8.git" "$S/r8" 2> /dev/null
+cd "$S/r8"
+git config user.email smoke@example.com
+git config user.name smoke
+echo hello > README.md
+git add . && git commit -qm init && git push -q origin main
+for name in back control; do
+  git worktree add -q "$S/r8/.worktrees/$name" -b "$name"
+  (cd ".worktrees/$name" && echo "$name" >> README.md && git commit -qam "$name" && git push -q -u origin "$name")
+done
+back_sha=$(git rev-parse back)
+git push -q origin --delete back
+git fetch -q --prune
+age8() {
+  find "$S/r8/.worktrees" "$S/r8/.git/worktrees" -exec touch -t 202601010000 {} +
+}
+age8
+"$residue" watch --once --no-fetch --grace 1m "$S/r8" 2> "$S/log" || fail "8: the landed run failed"
+grep -q "removed .*worktrees/back (.*): its upstream branch origin/back was deleted.*; restore: residue restore .*/residue-removed/back-" "$S/log" \
+  || fail "8: the removal line has no 'restore: residue restore RECORD'"
+record=$(sed -n 's/^.*; restore: residue restore //p' "$S/log" | head -n 1)
+[ -f "$record/info" ] || fail "8: the record $record has no info file"
+[ "$(git for-each-ref --format='%(objectname)' refs/residue/removed/)" = "$back_sha" ] || fail "8: no ref pins back's HEAD"
+"$residue" restore "$record" > "$S/restore.out" || fail "8: restore failed: $(cat "$S/restore.out")"
+grep -q "^restored .*worktrees/back from the removal record back-" "$S/restore.out" || fail "8: no 'restored' line: $(cat "$S/restore.out")"
+git worktree list --porcelain | grep -q "^worktree .*/\.worktrees/back\$" || fail "8: back is not registered after the restore"
+[ "$(git -C .worktrees/back rev-parse HEAD)" = "$back_sha" ] || fail "8: back is not at its recorded HEAD"
+[ -z "$(git for-each-ref refs/residue)" ] || fail "8: the restore left its ref"
+# control lands too; both are aged past --grace, the restore marker
+# included. watch fetches this time: control goes, back stays.
+git push -q origin --delete control
+age8
+"$residue" watch --once --grace 1m "$S/r8" 2> "$S/log" || fail "8: the second landed run failed"
+grep -q "removed .*worktrees/control (.*): its upstream branch origin/control was deleted" "$S/log" || fail "8: control was not removed"
+! grep -q "removed .*worktrees/back" "$S/log" || fail "8: watch removed the restored back again because its work landed"
+[ -d .worktrees/back ] || fail "8: back is gone"
+# Disk pressure removes it, and writes a new record.
+"$residue" watch --once --no-fetch --min-free 99.9 --idle 1m "$S/r8" 2> "$S/log" || fail "8: the pressure run failed"
+grep -q "removed .*worktrees/back (.*): free space on its filesystem.*; restore: residue restore .*/residue-removed/back-" "$S/log" \
+  || fail "8: disk pressure did not remove the restored back"
+for b in back control; do
+  git rev-parse --verify -q "$b" > /dev/null || fail "8: branch $b is gone"
+done
+echo "watch-smoke: 8. removal records restored back; the landed rule kept it, disk pressure did not"
 
 fetch_case
 echo "watch-smoke: ok"

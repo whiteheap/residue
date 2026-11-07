@@ -740,6 +740,45 @@ pub fn fetch(dir: &Path, remote: &str) -> Result<(), String> {
     }
 }
 
+/// How `add_worktree` checks out the new worktree. Never `--force`: Git
+/// refuses a branch checked out elsewhere, an existing branch for `-b`,
+/// and a path that is not empty.
+pub enum Checkout<'a> {
+    /// `git worktree add PATH BRANCH`: the existing local branch.
+    Branch(&'a str),
+    /// `git worktree add -b BRANCH PATH COMMIT`: a new branch at COMMIT.
+    NewBranch(&'a str, &'a str),
+    /// `git worktree add --detach PATH COMMIT`.
+    Detached(&'a str),
+}
+
+/// `git worktree add`, from `main`, with a checkout's time limit.
+pub fn add_worktree(main: &Path, path: &Path, checkout: &Checkout) -> Result<(), String> {
+    let mut args = vec![OsStr::new("worktree"), OsStr::new("add")];
+    match checkout {
+        Checkout::Branch(branch) => args.extend([path.as_os_str(), OsStr::new(branch)]),
+        Checkout::NewBranch(branch, commit) => args.extend([
+            OsStr::new("-b"),
+            OsStr::new(branch),
+            path.as_os_str(),
+            OsStr::new(commit),
+        ]),
+        Checkout::Detached(commit) => {
+            args.extend([OsStr::new("--detach"), path.as_os_str(), OsStr::new(commit)]);
+        }
+    }
+    let exit = exec(main, &args, REMOVE_TIMEOUT)?;
+    if exit.success {
+        Ok(())
+    } else {
+        Err(format!(
+            "git worktree add refused (exit {}): {}",
+            exit.code.map_or("signal".to_string(), |c| c.to_string()),
+            exit.stderr
+        ))
+    }
+}
+
 /// Whether `core.sshCommand` is set for `dir`. When Git cannot answer,
 /// assume it is, so residue does not replace a command the user chose.
 fn ssh_command_configured(dir: &Path) -> bool {
@@ -765,4 +804,72 @@ fn new_session(cmd: &mut Command) {
             Ok(())
         });
     }
+}
+
+/// The commit `name` (a full ref name or an object name) resolves to, or
+/// `None` when it names no commit in this repository: `rev-parse --verify
+/// --quiet` exits 1 for that, and anything else is an error.
+pub fn commit_of(dir: &Path, name: &str) -> Result<Option<String>, String> {
+    let exit = git_exit(
+        dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &format!("{name}^{{commit}}"),
+        ],
+    )?;
+    match exit.code {
+        Some(0) => Ok(Some(
+            String::from_utf8_lossy(&exit.stdout).trim().to_string(),
+        )),
+        Some(1) => Ok(None),
+        _ => Err(format!(
+            "git rev-parse --verify {name} failed: {}",
+            exit.stderr
+        )),
+    }
+}
+
+/// The ref `full` exists, whatever it points at.
+pub fn ref_exists(dir: &Path, full: &str) -> Result<bool, String> {
+    let exit = git_exit(dir, &["show-ref", "--verify", "--quiet", full])?;
+    match exit.code {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git show-ref --verify {full} failed: {}",
+            exit.stderr
+        )),
+    }
+}
+
+/// `ancestor` is `descendant` or one of its ancestors.
+pub fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
+    let exit = git_exit(dir, &["merge-base", "--is-ancestor", ancestor, descendant])?;
+    match exit.code {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git merge-base --is-ancestor failed: {}",
+            exit.stderr
+        )),
+    }
+}
+
+/// Create the ref `full` at `commit`. The empty old value makes Git refuse
+/// when the ref already exists, so residue never overwrites one.
+pub fn create_ref(dir: &Path, full: &str, commit: &str) -> Result<(), String> {
+    git(dir, &["update-ref", "--no-deref", full, commit, ""]).map(|_| ())
+}
+
+/// Delete the ref `full` only while it points at `commit`: with the old
+/// value given, Git refuses when it points anywhere else. `Ok(false)` when
+/// it does not exist.
+pub fn delete_ref(dir: &Path, full: &str, commit: &str) -> Result<bool, String> {
+    if !ref_exists(dir, full)? {
+        return Ok(false);
+    }
+    git(dir, &["update-ref", "--no-deref", "-d", full, commit]).map(|_| true)
 }

@@ -2,10 +2,10 @@
 # End-to-end check of a residue binary on the machine it runs on. CI runs it
 # on every platform residue supports. It builds a scratch repository, checks
 # three verdicts (one of them needs the activity probe to see a process),
-# then removes the candidate and checks that its branch stayed. On NetBSD,
-# OpenBSD and DragonFly (scripts/partial-probe.sh) the clean worktree is no
-# candidate: it must be `unknown`, for the probe's reason, and `remove` must
-# keep it.
+# then removes the candidate, checks that its branch stayed, and restores
+# it from its removal record. On NetBSD, OpenBSD and DragonFly
+# (scripts/partial-probe.sh) the clean worktree is no candidate: it must
+# be `unknown`, for the probe's reason, and `remove` must keep it.
 #
 #   sh .github/smoke.sh PATH/TO/residue
 #
@@ -62,6 +62,10 @@ if [ -z "$partial_probe" ]; then
   "$residue" remove --yes .worktrees/clean
   test ! -e .worktrees/clean
   git rev-parse --verify -q clean > /dev/null
+  # Its removal record brings it back, on its branch.
+  "$residue" restore clean
+  test -f .worktrees/clean/README.md
+  [ "$(git -C .worktrees/clean symbolic-ref HEAD)" = refs/heads/clean ]
   echo "smoke: ok"
   exit 0
 fi

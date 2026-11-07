@@ -7,10 +7,10 @@ Back to the [README](../README.md#reference).
 ```sh
 residue scan [PATH...]           # every linked worktree of the repositories at or under PATH
 residue explain PATH             # every check for one worktree, and why it passed or failed
-residue remove PATH...           # confirm, check again, move aside, check, then `git worktree remove` each one
+residue remove PATH...           # confirm, check again, move aside, check, write a removal record, then `git worktree remove` each one
 residue remove --all PATH        # the same for every candidate a scan of PATH finds
 residue remove --trash PATH...   # move each one to the trash instead; --idle turns this on
-residue restore [ENTRY]          # list the trash, or put one worktree back
+residue restore [ENTRY]          # list the trash and the removal records, or put one worktree back (--to PATH: somewhere else)
 residue watch [ROOT...]          # stay running; remove a worktree when its branch lands or the disk runs low
 residue service install [ROOT...]  # run `residue watch` from login; no ROOT: the usual code folders
 ```
@@ -67,10 +67,10 @@ For every repository on the machine, put one rule per line in `~/.config/residue
 
 | Code | Meaning |
 | --- | --- |
-| 0 | Success. For `remove`, every PATH was removed or moved to the trash, and every expired trash entry was purged. For `remove --all`, the same for every candidate, or there was none. For `restore`, the worktree is back, or the trash was listed |
-| 1 | Error: git missing or too old, unreadable config, unknown PATH for `explain`, an ENTRY that `restore` cannot find or put back, or a trash `restore` could not list completely |
-| 2 | Usage error, including an invalid `--idle` or `--keep-trash` DURATION, `--trash` with `--no-trash`, `remove --all --yes` without `--idle`, and `--only-if-upstream-gone` with `--all` or outside `remove` |
-| 3 | `remove` did not remove or trash at least one PATH: refused, skipped, not confirmed, or failed. For `remove --all`: a candidate was skipped, not confirmed or failed, or part of a PATH could not be read. For both: an expired trash entry was skipped or failed, or a trash record could not be read |
+| 0 | Success. For `remove`, every PATH was removed or moved to the trash, every expired trash entry was purged and every expired removal record was forgotten. For `remove --all`, the same for every candidate, or there was none. For `restore`, the worktree is back, or the trash and the removal records were listed |
+| 1 | Error: git missing or too old, unreadable config, unknown PATH for `explain`, an ENTRY that `restore` cannot find or put back (its branch checked out elsewhere, something at its path), or a trash entry or removal record `restore` could not read while listing |
+| 2 | Usage error, including an invalid `--idle`, `--keep-trash` or `--keep-removed` DURATION, `--trash` with `--no-trash`, `remove --all --yes` without `--idle`, `--only-if-upstream-gone` with `--all` or outside `remove`, `--keep-removed` or `--removal-reason` outside `remove`, a `--removal-reason` other than `watch-landed` or `watch-low-disk`, and `--to` outside `restore` or without an ENTRY |
+| 3 | `remove` did not remove or trash at least one PATH: refused, skipped (including a removal record it could not write, so nothing was deleted), not confirmed, or failed. For `remove --all`: a candidate was skipped, not confirmed or failed, or part of a PATH could not be read. For both: an expired trash entry was skipped or failed, an expired removal record was not forgotten, or a trash record or removal record could not be read |
 
 ## For coding agents
 
@@ -80,27 +80,37 @@ To clean up at the end of a task, run this from outside the worktree:
 residue remove --yes --json "$WORKTREE"
 ```
 
-Exit status 0 means the worktree is gone. Exit status 3 means it is still there. The JSON `results[].reason` and `results[].worktree.checks` fields say why, using stable check ids. Do not run it on worktrees another session may still use. Add `--trash` to keep it restorable for `--keep-trash` (default seven days); exit status 0 then means it is in the trash.
+Exit status 0 means the worktree is gone. Exit status 3 means it is still there. The JSON `results[].reason` and `results[].worktree.checks` fields say why, using stable check ids. Do not run it on worktrees another session may still use. Add `--trash` to keep it restorable for `--keep-trash` (default seven days); exit status 0 then means it is in the trash. Without `--trash`, the removal still leaves a removal record, `results[].removal_record`, which `residue restore` takes for `--keep-removed` (default 30 days): it recreates the worktree on its branch and HEAD, without the ignored files the deletion took.
 
 Each PATH gets one `results[].result`:
 
 | Result | Meaning |
 | --- | --- |
-| `removed` | `git worktree remove` removed it. `reason` is null |
+| `removed` | `git worktree remove` removed it. `reason` is null and `removal_record` is the record's path, which `residue restore` takes |
 | `trashed` | It was moved to the trash. `reason` is null and `trash_entry` is the entry's path, which `residue restore` takes |
 | `refused` | A check did not pass, so residue did not try to remove it |
-| `skipped` | residue did not remove it: nobody confirmed (no `yes` at the prompt, or no terminal and no `--yes`), a check before or after the move aside found a change since the plan, or `--only-if-upstream-gone` found the branch's upstream not gone, or could not read it, at any of its three reads. A worktree residue moved aside is back in place |
+| `skipped` | residue did not remove it: nobody confirmed (no `yes` at the prompt, or no terminal and no `--yes`), a check before or after the move aside found a change since the plan, or `--only-if-upstream-gone` found the branch's upstream not gone, or could not read it, at any of its three reads, or residue could not write its removal record (`could not write its removal record, so residue deleted nothing`). A worktree residue moved aside is back in place |
 | `failed` | Git refused the removal, or a Git query during the re-check failed. If residue could not move a worktree back, `reason` names where it is and the one command that puts it back |
 | `invalid` | PATH is not a linked worktree residue may remove: the main checkout, a directory inside a worktree, not in a repository, in the trash, or left under a hidden name by an interrupted run |
 | `not_attempted` | residue stopped before it reached this PATH |
 
 For every result except `removed` and `trashed`, `reason` is a sentence that says why. With `--all`, `results` lists every linked worktree the scan found, and each one it kept is `refused`. `errors` lists the PATHs, repositories and trash records it could not read.
 
-A remove document also has `trash`, `{"enabled": true, "keep": "7d", "keep_seconds": 604800}`, and `purged`: one object per trash entry the run purged or meant to purge, with `result` (`purged`, `kept` when a check failed, `skipped`, `failed`, `not_attempted`), `reason`, `entry` (the entry as `residue restore --json` lists it) and `worktree` (its checks).
+A remove document also has `trash`, `{"enabled": true, "keep": "7d", "keep_seconds": 604800}`, and `purged`: one object per trash entry the run purged or meant to purge, with `result` (`purged`, `kept` when a check failed, `skipped`, `failed`, `not_attempted`), `reason`, `entry` (the entry as `residue restore --json` lists it), `worktree` (its checks) and `removal_record` (the record a purge wrote, or null).
 
-`residue restore --json` prints `residue.restore/v1`: `restored`, the path a worktree was put back at, or null for a listing; `trash`, one object per entry with `entry` (its name), `entry_path`, `worktree_path`, `original_path`, `branch`, `head`, `trashed_at`, `allocated_bytes`, `reclaimable_bytes`, `registered` (Git still lists the worktree) and `error` (a record residue could not read); and `errors`.
+It also has `removal_records`, `{"reason": "remove", "keep": "30d", "keep_seconds": 2592000}`: the reason the run's records name (`remove`, `sweep` for `--all`, `watch_landed`, `watch_low_disk`; a purge's record says `trash_purge`) and `--keep-removed`. And `forgotten`: one object per removal record older than `--keep-removed` that the run forgot or meant to, with `result` (`forgotten`, `skipped`, `failed`, `not_attempted`), `reason` and `entry` (the record as `residue restore --json` lists it). Forgetting deletes the record and its ref, only while the ref still names the recorded commit.
 
-In a scan, each repository has `trash`, its entries in the same shape, and `interrupted`: `{"path", "original_path", "pid", "pid_running", "present", "recovery"}` for each worktree an interrupted run left under a hidden name, where `recovery` is the command that puts it back. `summary` counts both, as `trash_entries` and `interrupted_removals`.
+`residue restore --json` prints `residue.restore/v1`:
+
+- `restored`: the path a worktree was put back at, or null for a listing.
+- `restore`: null for a listing; otherwise `{"kind", "entry", "path", "branch", "head", "checkout", "moved_from", "new_branch", "branch_tip", "not_kept", "notes"}`. `kind` is `trash` or `removed`. `checkout` is `moved_back` (a trash entry, or a removal that stopped before deleting, moved back from `moved_from`), `checked_out_branch` (the branch at the recorded HEAD or ahead of it; `branch_tip` is where), `recreated_branch` (the branch was gone), `new_branch` (the branch was rewritten; `new_branch` names `BRANCH-restored` at the recorded HEAD) or `detached`. `not_kept` lists the ignored entries the deletion took, `{"path", "files", "bytes"}`. `notes` are the warnings it also printed on stderr.
+- `trash`: one object per entry with `kind` (`trash`), `entry` (its name), `entry_path`, `worktree_path`, `original_path`, `branch`, `head`, `trashed_at`, `allocated_bytes`, `reclaimable_bytes`, `registered` (Git still lists the worktree) and `error` (a record residue could not read).
+- `removed`: one object per removal record with `kind` (`removed`), `entry`, `entry_path`, `ref` (`refs/residue/removed/ENTRY`), `state` (`removed`, or `interrupted` when the run stopped before deleting and the worktree is still at `aside_path`), `original_path`, `aside_path`, `branch`, `head`, `upstream`, `reason` (as in `removal_records`), `removed_at`, `allocated_bytes`, `reclaimable_bytes`, `not_kept`, `worktree_config` (its `config.worktree` was saved), `pid`, `residue_version` and `error`.
+- `errors`.
+
+After a restore, `trash` or `removed` holds only the entry it restored, as it was before the restore.
+
+In a scan, each repository has `trash`, its entries in the same shape, `removed`, its removal records in the same shape, and `interrupted`: `{"path", "original_path", "pid", "pid_running", "present", "recovery"}` for each worktree an interrupted run left under a hidden name, where `recovery` is the command that puts it back. `summary` counts them, as `trash_entries`, `removal_records` and `interrupted_removals`. Each worktree in a scan, explain or remove document has `restored`: `{"unix", "at", "from"}` when `residue restore` put it back, or null, and `restored_error` when residue could not read that; `watch` never removes either kind because its branch landed.
 
 A worktree's `rule_sources` is the effective list; the top-level list is what applies to every worktree. Each entry is `{rule, scope, origin}`. A worktree's list starts with the top-level list, `--regenerable` (`command_line`) and then the residue config file (`residue_config`), and continues with its repository's Git config rules in the order Git reads them (`system`, `global`, `local`, `worktree`). Rules add up, so a rule listed twice applies once, and its first entry is the source that wins.
 

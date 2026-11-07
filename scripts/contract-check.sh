@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # Contract check: the real residue binary against real Git, with no prompt.
-# Each scenario builds its own repository, runs `residue remove`, and
-# checks what residue reports and what is left afterwards:
+# Each scenario builds its own repository, runs `residue remove` (and for
+# the removal records, `residue restore`), and checks what residue reports
+# and what is left afterwards:
 #
-#   reported  the exit status; with --json, one residue.remove/v1 document
-#             on stdout with the per-target result, reason and failing
-#             check ids, and diagnostics on stderr only
+#   reported  the exit status; with --json, one residue.remove/v1 or
+#             residue.restore/v1 document on stdout with the per-target
+#             result, reason and failing check ids, and diagnostics on
+#             stderr only
 #   left      the worktree's file bytes, Git's worktree registration, the
-#             branch and its commit, the unrelated worktree, and no
-#             .NAME.residue-removing-PID directory or trash entry
+#             branch and its commit, the unrelated worktree, no
+#             .NAME.residue-removing-PID directory or trash entry, and the
+#             removal records and their refs under refs/residue/removed/
 #
 #   bash scripts/contract-check.sh [BINARY]    (default: target/release/residue)
 #
@@ -393,6 +396,232 @@ usage() { # NAME ARGS...
 usage usage-no-path remove --yes --json
 usage usage-unknown-option remove --yes --bogus "$work/x"
 usage usage-trash-and-no-trash remove --yes --trash --no-trash "$work/x"
+usage usage-keep-removed-not-remove scan --keep-removed 1d "$work/x"
+usage usage-removal-reason-unknown remove --yes --removal-reason sweep "$work/x"
+usage usage-to-without-entry restore --to "$work/x"
+
+# 8. Removal records: every removal writes one before it deletes, and
+# `residue restore` recreates the worktree from it. A record that cannot be
+# written stops the removal with nothing deleted. Every case needs a
+# removal, so a partial probe skips them all.
+
+# Removal records and their refs in $repo: "N records, M refs".
+records() {
+    local n m
+    n=$(find "$repo/.git/residue-removed" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+    m=$(git -C "$repo" for-each-ref refs/residue | wc -l | tr -d ' ')
+    echo "$n records, $m refs"
+}
+
+# The files of w that Git tracks: what a restore from a record brings back.
+tracked() {
+    sums "$wt" | grep -v '^\./node_modules/'
+}
+
+# stdout is exactly one residue.restore/v1 document that restored an entry
+# of KIND with CHECKOUT, and lists only that entry.
+restore_ok() { # KIND CHECKOUT
+    jq -e -s --arg kind "$1" --arg how "$2" '
+        length == 1 and (.[0] |
+            .schema == "residue.restore/v1"
+            and (.version | type) == "string"
+            and (.generated_at | type) == "string"
+            and (.restored | type) == "string"
+            and .restore.kind == $kind
+            and .restore.checkout == $how
+            and .restore.path == .restored
+            and (.restore.not_kept | type) == "array"
+            and (.restore.notes | type) == "array"
+            and (.trash | type) == "array" and (.removed | type) == "array"
+            and ((.trash | length) + (.removed | length)) == 1
+            and .errors == [])
+    ' "$out" >/dev/null
+}
+
+# Remove w with no prompt into a record; stops the run when it does not.
+remove_w() {
+    run remove --yes --json "$wt"
+    if [ "$status" != 0 ] || [ "$(result 0 result)" != removed ] || [ "$(records)" != "1 records, 1 refs" ]; then
+        echo "contract-check: setup failed in $name: remove exit $status, $(result 0 result), $(records)" >&2
+        exit 2
+    fi
+}
+
+# Restore w, after CHANGE... has moved its branch or its path: exit
+# STATUS, and for 0 the restore document with CHECKOUT.
+restore_case() { # NAME STATUS CHECKOUT CHANGE...
+    name=$1
+    local want=$2 how=$3
+    shift 3
+    make_repo
+    remove_w
+    (cd "$repo" && "$@") >/dev/null 2>&1 || { echo "contract-check: setup failed in $name: $*" >&2; exit 2; }
+    run restore --json "$wt"
+    if [ "$status" != "$want" ]; then fail "exit $status, want $want"; return 1; fi
+    if [ "$want" = 0 ] && ! restore_ok removed "$how"; then fail "stdout is not one restore document with checkout $how"; return 1; fi
+    if [ "$want" != 0 ] && [ -s "$out" ]; then fail "stdout is not empty"; return 1; fi
+}
+
+if [ -z "$partial_probe" ]; then
+    name=record-json
+    make_repo
+    before=$(tracked)
+    run remove --yes --json "$wt"
+    record=$(result 0 removal_record)
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
+    elif [ ! -f "$record/info" ]; then fail "removal_record '$record' has no info file"
+    elif [ "$(jq -r '.removal_records.reason' "$out")" != remove ]; then fail "removal_records.reason: $(jq -c .removal_records "$out")"
+    elif [ "$(records)" != "1 records, 1 refs" ]; then fail "$(records), want 1 records, 1 refs"
+    elif [ "$(git -C "$repo" for-each-ref --format='%(objectname)' refs/residue/removed/)" != "$w_sha" ]; then fail "the ref does not pin w's HEAD"
+    elif ! (cd "$repo" && "$bin" restore --json) >"$work/$name.list" 2>"$err"; then fail "restore --json (the list) failed"
+    elif ! jq -e --arg sha "$w_sha" '
+            .schema == "residue.restore/v1" and .restored == null and .restore == null
+            and .trash == [] and (.removed | length) == 1
+            and (.removed[0] | .kind == "removed" and .state == "removed" and .reason == "remove"
+                 and .branch == "refs/heads/w" and .head == $sha
+                 and (.original_path | endswith("/.worktrees/w"))
+                 and (.ref | startswith("refs/residue/removed/"))
+                 and ([.not_kept[].path] == ["node_modules/"]) and .error == null)
+        ' "$work/$name.list" >/dev/null; then fail "the list: $(head -c 2000 "$work/$name.list")"
+    else
+        run restore --json "$wt"
+        if [ "$status" != 0 ]; then fail "restore: exit $status, want 0"
+        elif ! restore_ok removed checked_out_branch; then fail "stdout is not one restore document with checkout checked_out_branch"
+        elif [ "$(jq -r '.restore.branch + " " + .restore.head' "$out")" != "refs/heads/w $w_sha" ]; then fail "restore branch and head: $(jq -c .restore "$out")"
+        elif [ "$(jq -r '[.restore.not_kept[].path] | join(",")' "$out")" != node_modules/ ]; then fail "not_kept: $(jq -c .restore.not_kept "$out")"
+        elif ! registered "$wt"; then fail "Git does not list the restored worktree"
+        elif [ "$(git -C "$wt" symbolic-ref HEAD)" != refs/heads/w ]; then fail "the restored worktree is not on branch w"
+        elif [ "$(tracked)" != "$before" ]; then fail "the restored files differ from w's"
+        elif [ "$(records)" != "0 records, 0 refs" ]; then fail "$(records) after the restore, want 0 records, 0 refs"
+        elif [ -s "$err" ]; then fail "stderr is not empty"
+        elif common_ok; then ok; fi
+    fi
+
+    name=record-text
+    make_repo
+    run remove --yes "$wt"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif ! grep -q "^removed .*\.worktrees/w (branch w kept); .*; restore: residue restore .*/residue-removed/w-" "$out"; then fail "no 'removed ...; restore: residue restore ...' line"
+    elif ! (cd "$repo" && "$bin" restore) >"$work/$name.list" 2>"$err"; then fail "restore (the list) failed"
+    elif ! grep -q "^  removed  w-.*\[w\]" "$work/$name.list"; then fail "the list has no 'removed  w-... [w]' row: $(cat "$work/$name.list")"
+    else
+        run restore "$wt"
+        if [ "$status" != 0 ]; then fail "restore: exit $status, want 0"
+        elif ! grep -q "^restored .*\.worktrees/w from the removal record w-" "$out"; then fail "no 'restored ... from the removal record' line"
+        elif ! registered "$wt"; then fail "Git does not list the restored worktree"
+        elif common_ok; then ok; fi
+    fi
+
+    # Fail closed: a file where the record or its ref goes stops the
+    # removal: skipped (the result for a worktree moved back with nothing
+    # deleted), exit 3, and the worktree is back in place with every byte.
+    fail_closed() { # NAME IN-THE-WAY
+        name=$1
+        make_repo
+        echo in-the-way >"$repo/.git/$2" || exit 2
+        local before
+        before=$(sums "$wt")
+        run remove --yes --json "$wt"
+        if [ "$status" != 3 ]; then fail "exit $status, want 3"
+        elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+        elif [ "$(result 0 result)" != skipped ]; then fail "result $(result 0 result), want skipped"
+        elif ! result 0 reason | grep -q "could not write its removal record, so residue deleted nothing"; then fail "reason: $(result 0 reason)"
+        elif [ "$(jq -r '.results[0].removal_record' "$out")" != null ]; then fail "removal_record is not null"
+        elif [ -n "$(git -C "$repo" for-each-ref refs/residue 2>/dev/null)" ]; then fail "a ref was left under refs/residue"
+        elif [ "$(cat "$repo/.git/$2")" != in-the-way ]; then fail "the file in the way changed"
+        elif untouched "$before"; then ok; fi
+    }
+    fail_closed record-fail-closed-dir residue-removed
+    fail_closed record-fail-closed-ref refs/residue
+
+    # Retention: a record older than --keep-removed is forgotten, with its
+    # ref, by the next remove run in its repository; the new one stays.
+    name=record-retention
+    make_repo
+    remove_w
+    old=$(find "$repo/.git/residue-removed" -mindepth 1 -maxdepth 1 -type d)
+    sed 's/^removed [0-9]* .*/removed 1767225600 2026-01-01T00:00:00Z/' "$old/info" >"$work/$name.info" && cat "$work/$name.info" >"$old/info" || exit 2
+    setup git -C "$repo" worktree add -q "$repo/.worktrees/x" -b x
+    run remove --yes --json --keep-removed 30d "$repo/.worktrees/x"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
+    elif [ "$(jq -r '[.forgotten[] | .result + " " + .entry.entry] | join(",")' "$out")" != "forgotten $(basename "$old")" ]; then fail "forgotten: $(jq -c .forgotten "$out")"
+    elif [ "$(jq -r '.removal_records.keep' "$out")" != 30d ]; then fail "removal_records: $(jq -c .removal_records "$out")"
+    elif [ -e "$old" ]; then fail "the expired record is still on disk"
+    elif [ "$(records)" != "1 records, 1 refs" ]; then fail "$(records), want 1 records, 1 refs (x's)"
+    elif [ "$(git -C "$repo" for-each-ref --format='%(objectname)' refs/residue/removed/)" != "$(git -C "$repo" rev-parse x)" ]; then fail "the ref left is not x's"
+    elif common_ok; then ok; fi
+
+    # Branch and path cases: restore never moves an existing branch and
+    # never overwrites a path.
+    ahead() {
+        local tip
+        tip=$(git commit-tree -p "$w_sha" -m ahead "$w_sha^{tree}") && git update-ref refs/heads/w "$tip" "$w_sha"
+    }
+    if restore_case restore-branch-ahead 0 checked_out_branch ahead; then
+        w_sha=$(git -C "$repo" rev-parse w)
+        if [ "$(jq -r .restore.branch_tip "$out")" != "$w_sha" ]; then fail "branch_tip $(jq -r .restore.branch_tip "$out"), want $w_sha"
+        elif [ "$(git -C "$wt" rev-parse HEAD)" != "$w_sha" ]; then fail "the restored worktree is not at w's new tip"
+        elif common_ok; then ok; fi
+    fi
+
+    if restore_case restore-branch-rewritten 0 new_branch git branch -f w main; then
+        recorded=$(jq -r .restore.head "$out")
+        if [ "$(jq -r .restore.new_branch "$out")" != w-restored ]; then fail "new_branch $(jq -r .restore.new_branch "$out"), want w-restored"
+        elif [ "$(git -C "$wt" symbolic-ref HEAD)" != refs/heads/w-restored ]; then fail "the restored worktree is not on w-restored"
+        elif [ "$(git -C "$repo" rev-parse w-restored)" != "$recorded" ]; then fail "w-restored is not at the recorded HEAD"
+        elif [ "$(git -C "$repo" rev-parse w)" != "$(git -C "$repo" rev-parse main)" ]; then fail "restore moved branch w"
+        elif w_sha=$(git -C "$repo" rev-parse w) && common_ok; then ok; fi
+    fi
+
+    if restore_case restore-branch-gone 0 recreated_branch git branch -D w; then
+        if [ "$(git -C "$repo" rev-parse -q --verify w)" != "$w_sha" ]; then fail "branch w is not back at its recorded HEAD"
+        elif [ "$(git -C "$wt" symbolic-ref HEAD)" != refs/heads/w ]; then fail "the restored worktree is not on branch w"
+        elif common_ok; then ok; fi
+    fi
+
+    if restore_case restore-branch-elsewhere 1 - git worktree add -q .worktrees/y w; then
+        if ! grep -q "branch w is checked out .*worktrees/y" "$err"; then fail "the refusal does not name .worktrees/y"
+        elif [ -e "$wt" ]; then fail "something was created at w's path"
+        elif [ "$(records)" != "1 records, 1 refs" ]; then fail "$(records) after the refusal, want 1 records, 1 refs"
+        elif common_ok; then ok; fi
+    fi
+
+    occupied() { mkdir -p .worktrees/w && echo mine >.worktrees/w/notes.md; }
+    if restore_case restore-path-occupied 1 - occupied; then
+        if ! grep -q "exists; move it away first, or restore somewhere else with --to PATH" "$err"; then fail "the refusal does not say how to go on"
+        elif [ "$(cat "$wt/notes.md")" != mine ] || [ "$(ls -A "$wt")" != notes.md ]; then fail "the directory at w's path changed"
+        elif [ "$(records)" != "1 records, 1 refs" ]; then fail "$(records) after the refusal, want 1 records, 1 refs"
+        else
+            run restore --json --to "$repo/.worktrees/w2" "$wt"
+            if [ "$status" != 0 ]; then fail "restore --to: exit $status, want 0"
+            elif ! restore_ok removed checked_out_branch; then fail "restore --to: not one restore document"
+            elif ! registered "$repo/.worktrees/w2"; then fail "Git does not list .worktrees/w2"
+            elif [ "$(cat "$wt/notes.md")" != mine ]; then fail "restore --to changed the directory at w's path"
+            elif [ "$(records)" != "0 records, 0 refs" ]; then fail "$(records) after the restore, want 0 records, 0 refs"
+            elif common_ok; then ok; fi
+        fi
+    fi
+
+    detach() { git -C .worktrees/w checkout -q --detach; }
+    name=restore-detached
+    make_repo
+    (cd "$repo" && detach) || exit 2
+    remove_w
+    run restore --json "$wt"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif ! restore_ok removed detached; then fail "stdout is not one restore document with checkout detached"
+    elif git -C "$wt" symbolic-ref -q HEAD >/dev/null; then fail "the restored worktree is on a branch"
+    elif [ "$(git -C "$wt" rev-parse HEAD)" != "$w_sha" ]; then fail "the restored worktree is not at the recorded HEAD"
+    elif common_ok; then ok; fi
+else
+    for c in record-json record-text record-fail-closed-dir record-fail-closed-ref record-retention \
+        restore-branch-ahead restore-branch-rewritten restore-branch-gone restore-branch-elsewhere \
+        restore-path-occupied restore-detached; do
+        skip_partial "$c"
+    done
+fi
 
 echo "contract-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]

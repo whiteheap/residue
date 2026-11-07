@@ -16,6 +16,8 @@
 #                                       or a trash entry with --trash
 #   worktree lock --reason "residue: removing" ASIDE
 #   -C ASIDE worktree list, status, ...  the check after the move
+#   update-ref refs/residue/removed/E   the removal record (and its info
+#                                       file), which `residue restore` takes
 #   worktree unlock ASIDE
 #   worktree remove ASIDE               the only step that deletes
 #   (if the check after the move fails: unlock, worktree move ASIDE ORIGINAL)
@@ -318,6 +320,16 @@ interrupted() { # the interrupted removals scan reports, as JSON
     "$bin" scan --json "$repo" 2>/dev/null | jq -c '[.repositories[].interrupted[]]'
 }
 
+# Removal records: residue writes one, and its ref, after the check after
+# the move and right before `git worktree remove`; one that did not delete
+# drops both. "N records, M refs".
+records() {
+    local n m
+    n=$(find "$repo/.git/residue-removed" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+    m=$(git -C "$repo" for-each-ref refs/residue | wc -l | tr -d ' ')
+    echo "$n records, $m refs"
+}
+
 # --- 0. NetBSD, OpenBSD and DragonFly: nothing reaches the move ------------
 # Every scenario below starts from a clean worktree that residue removes.
 # Where the probe cannot show a worktree unused (scripts/partial-probe.sh),
@@ -341,8 +353,9 @@ if [ -n "$partial_probe" ]; then
     elif [ -n "$(asides)" ]; then fail "a moved-aside directory exists: $(asides)"
     elif [ -n "$(ls -A "$repo/.git/residue-trash" 2>/dev/null)" ]; then fail "a trash entry was created"
     elif [ "$(interrupted)" != "[]" ]; then fail "scan lists an interrupted removal: $(interrupted)"
+    elif [ "$(records)" != "0 records, 0 refs" ]; then fail "removal records: $(records), want 0 records, 0 refs"
     elif common_ok; then ok "refused before any move: $(jq -r '.results[0].worktree.activity.detail' "$out")"; fi
-    for scenario in stopped-after-move stopped-after-move-control refused-after-move \
+    for scenario in stopped-after-move stopped-after-move-restore stopped-after-move-control refused-after-move \
         refused-after-move-control move-back-fails original-taken two-removers two-removers-trash; do
         skip_partial "$scenario"
     done
@@ -394,6 +407,28 @@ else
     fi
 fi
 
+# 1, continued: the run wrote its removal record before it stopped, so
+# `residue restore` lists the interrupted removal and moves it back.
+name=stopped-after-move-restore
+if [ -d "${aside:-}" ] && [ "$(record "$aside")" = registered ]; then
+    listed=$(cd "$repo" && "$bin" restore --json 2>/dev/null | jq -c '[.removed[] | {state, aside_path}]')
+    out=$work/$name.out
+    (cd "$repo" && "$bin" restore --json w >"$out" 2>"$work/$name.err")
+    restored=$?
+    if [ "$(records)" = "0 records, 0 refs" ] && [ "$restored" != 0 ]; then fail "the stopped run left no removal record"
+    elif [ "$listed" != "[{\"state\":\"interrupted\",\"aside_path\":\"$aside\"}]" ]; then fail "restore lists: $listed, want one interrupted removal at $aside"
+    elif [ "$restored" != 0 ]; then fail "restore exited $restored: $(cat "$work/$name.err")"
+    elif [ "$(jq -r '.restore.checkout' "$out")" != moved_back ]; then fail "checkout $(jq -r '.restore.checkout' "$out"), want moved_back"
+    elif [ "$(record "$wt")" != registered ]; then fail "at its path Git has: $(record "$wt")"
+    elif [ -n "$(asides)" ]; then fail "a moved-aside directory is left: $(asides)"
+    elif [ "$(sums "$wt")" != "$w_sum" ]; then fail "the restored worktree's files changed"
+    elif [ "$(records)" != "0 records, 0 refs" ]; then fail "after restore: $(records)"
+    elif [ "$(interrupted)" != "[]" ]; then fail "scan still lists an interrupted removal: $(interrupted)"
+    elif common_ok; then ok "restore lists it as interrupted and moves it back, every file as it was"; fi
+else
+    fail "scenario 1 left no interrupted removal to restore"
+fi
+
 name=stopped-after-move-control
 make_repo
 echo hold-remove >"$work/mode"
@@ -407,6 +442,7 @@ else
     if [ "$status" != 0 ]; then fail "exit $status, want 0"
     elif [ "$(jq -r '.results[0].result' "$work/$name.out")" != removed ]; then fail "result $(jq -r '.results[0].result' "$work/$name.out"), want removed"
     elif [ -e "$wt" ] || [ -n "$(asides)" ]; then fail "something of w is left"
+    elif [ "$(records)" != "1 records, 1 refs" ]; then fail "removal records: $(records), want 1 records, 1 refs"
     elif common_ok; then ok "released at the same barrier, the removal completes"; fi
 fi
 
@@ -426,6 +462,7 @@ elif [ -n "$(asides)" ]; then fail "a moved-aside directory is left: $(asides)"
 elif [ "$(cat "$wt/added.txt" 2>/dev/null)" != added ]; then fail "the file added after the move is not in the restored worktree"
 elif [ "$(sums "$wt" | grep -v '^./added.txt ')" != "$w_sum" ]; then fail "the restored worktree's other files changed"
 elif [ "$(interrupted)" != "[]" ]; then fail "scan lists an interrupted removal: $(interrupted)"
+elif [ "$(records)" != "0 records, 0 refs" ]; then fail "removal records: $(records), want 0 records, 0 refs"
 elif common_ok; then ok "$(jq -r '.results[0].reason' "$out")"; fi
 
 name=refused-after-move-control
@@ -435,6 +472,7 @@ start "" remove --yes --json "$wt"
 finish "$pid"
 if [ "$status" != 0 ]; then fail "exit $status, want 0"
 elif [ -e "$wt" ] || [ -n "$(asides)" ]; then fail "something of w is left"
+elif [ "$(records)" != "1 records, 1 refs" ]; then fail "removal records: $(records), want 1 records, 1 refs"
 elif common_ok; then ok "with no fault, the same run removes it"; fi
 
 # --- 3. The check after the move fails, and so does the move back ----------
@@ -457,6 +495,7 @@ elif [ -e "$wt" ]; then fail "something is at the original path"
 elif [ "$(record "$aside")" != "registered, locked residue: removing" ]; then fail "at the moved-aside path Git has: $(record "$aside")"
 elif [ "$(cat "$aside/added.txt" 2>/dev/null)" != added ] || [ "$(sums "$aside" | grep -v '^./added.txt ')" != "$w_sum" ]; then fail "the moved worktree's files changed"
 elif [ "$(interrupted | jq 'length')" != 1 ]; then fail "scan does not list it as an interrupted removal: $(interrupted)"
+elif [ "$(records)" != "0 records, 0 refs" ]; then fail "removal records: $(records), want 0 records, 0 refs"
 elif common_ok; then ok "failed, locked at the hidden path, and scan lists it"; fi
 
 # --- 3b. Something new at the original path: residue cannot move it back ---
@@ -475,6 +514,7 @@ elif [ "$(cat "$wt/occupied.txt" 2>/dev/null)" != occupied ]; then fail "what wa
 elif [ -z "$aside" ] || [ "$(record "$aside")" != "registered, locked residue: removing" ]; then fail "at the moved-aside path Git has: $(record "$aside")"
 elif [ "$(cat "$aside/added.txt" 2>/dev/null)" != added ] || [ "$(sums "$aside" | grep -v '^./added.txt ')" != "$w_sum" ]; then fail "the moved worktree's files changed"
 elif [ "$(interrupted | jq 'length')" != 1 ]; then fail "scan does not list it as an interrupted removal: $(interrupted)"
+elif [ "$(records)" != "0 records, 0 refs" ]; then fail "removal records: $(records), want 0 records, 0 refs"
 elif common_ok; then ok "failed, still locked 'residue: removing' at the hidden path"; fi
 
 # --- 4. Two removers of one worktree ---------------------------------------
@@ -507,6 +547,7 @@ else
     elif ! jq -r '.results[0].reason' "$work/$name.out.b" | grep -q "could not move it aside: git worktree move refused"; then fail "the second remover did not fail at Git's move: $(jq -r '.results[0].reason' "$work/$name.out.b")"
     elif [ -e "$wt" ] || [ -n "$(asides)" ]; then fail "something of w is left: $(asides)"
     elif [ "$(interrupted)" != "[]" ]; then fail "scan lists an interrupted removal: $(interrupted)"
+    elif [ "$(records)" != "1 records, 1 refs" ]; then fail "removal records: $(records), want 1 records, 1 refs"
     elif common_ok; then ok "first removed it; second: $rb, $(jq -r '.results[0].reason' "$work/$name.out.b" | cut -c1-120 | sed "s#$work#\$work#g")"; fi
 fi
 
@@ -539,6 +580,7 @@ else
     elif ! jq -r '.results[0].reason' "$work/$name.out.b" | grep -q "could not move it aside: git worktree move refused"; then fail "the second remover did not fail at Git's move: $(jq -r '.results[0].reason' "$work/$name.out.b")"
     elif [ "$entries" != 1 ]; then fail "$entries trash entries, want exactly 1 (the second remover's must be dropped)"
     elif [ -e "$wt" ] || [ -n "$(asides)" ]; then fail "something of w is left outside the trash"
+    elif [ "$(records)" != "0 records, 0 refs" ]; then fail "removal records: $(records), want 0 records, 0 refs"
     elif common_ok; then ok "one trash entry; second: $rb"; fi
 fi
 
