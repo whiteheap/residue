@@ -36,7 +36,9 @@ how-it-works.svg
 index.html
 logo-dark.svg
 logo.svg
-style.css'
+style.css
+whiteheap-mark-black.svg
+whiteheap-mark-white.svg'
 actual=$(cd "$public" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)
 if [ "$actual" = "$expected" ]; then
   ok "site/public holds only the allowlisted files"

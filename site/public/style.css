@@ -150,14 +150,46 @@ pre {
 
 @media (hover: hover) and (pointer: fine) {
   .site-header nav a:hover,
-  .site-footer nav a:hover {
+  .site-footer nav a:hover,
+  .byline:hover {
     color: var(--fg);
   }
 }
 
 .site-header nav a:active,
-.site-footer nav a:active {
+.site-footer nav a:active,
+.byline:active {
   color: var(--fg);
+}
+
+/* The residue wordmark, then "by whiteheap" with its mark. */
+.brand {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 0.875rem;
+}
+
+.byline {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.375em;
+  padding-block: 0.625rem;
+  font-size: 0.875rem;
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.byline picture {
+  flex: none;
+}
+
+/* The mark leaves a cell of space around its drawing, so 1.3cap shows the
+   pyramid at about the height of the capitals beside it. Black or white
+   only, as the brand kit asks; the light or dark file follows the setting. */
+.byline img {
+  block-size: 1.3cap;
+  inline-size: auto;
 }
 
 .wordmark {
