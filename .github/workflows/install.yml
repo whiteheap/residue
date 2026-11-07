@@ -1,0 +1,183 @@
+name: install
+
+# Runs site/public/install.sh for real, through every channel it can pick:
+# Homebrew (macOS), apt (Ubuntu, with passwordless sudo), dnf (Fedora) and
+# pacman (Arch) in containers, and the release archive on macOS, Ubuntu,
+# Alpine (busybox sh) and FreeBSD. Each job runs --dry-run first, then the
+# real install, then the installed `residue --version`, then the script again,
+# which must be an upgrade or a no-op. It installs the latest release, so it
+# also checks that release's packages, repositories and checksums.
+on:
+  pull_request:
+    paths:
+      - "site/public/install.sh"
+      - ".github/workflows/install.yml"
+  push:
+    branches: [main]
+    paths:
+      - "site/public/install.sh"
+      - ".github/workflows/install.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: shellcheck --version && shellcheck -s sh site/public/install.sh
+      # dash is Ubuntu's sh; -n parses without running.
+      - run: dash -n site/public/install.sh && sh site/public/install.sh --help
+
+  archive:
+    name: archive (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-24.04]
+    permissions:
+      contents: read
+      attestations: read
+    env:
+      # gh is installed on the runners; a token lets it verify the attestation.
+      GH_TOKEN: ${{ github.token }}
+      PREFIX: /tmp/residue-bin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Dry run
+        run: |
+          sh site/public/install.sh --dry-run --prefix "$PREFIX" | tee dry.log
+          test ! -e "$PREFIX/residue"
+          grep -q '^Dry run: nothing was changed' dry.log
+      - name: Install from the archive, piped as in the docs
+        run: |
+          sh -s -- --archive --prefix "$PREFIX" --no-service < site/public/install.sh | tee install.log
+          grep -q '^Checksum: matches SHA256SUMS' install.log
+          grep -q '^Attestation: verified' install.log
+          grep -q '^Channel:    archive' install.log
+          "$PREFIX/residue" --version
+          "$PREFIX/residue" scan .
+      - name: Again, which is a no-op
+        run: |
+          sh site/public/install.sh --prefix "$PREFIX" --no-service | tee again.log
+          grep -q 'is already installed at' again.log
+      - name: An older release, then an upgrade back to the latest
+        run: |
+          sh site/public/install.sh --version v0.0.5 --prefix "$PREFIX" --no-service
+          test "$("$PREFIX/residue" --version)" = "residue 0.0.5"
+          sh site/public/install.sh --prefix "$PREFIX" --no-service
+          "$PREFIX/residue" --version
+
+  brew:
+    runs-on: macos-latest
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Dry run
+        run: |
+          sh site/public/install.sh --dry-run | tee dry.log
+          grep -q '^+ brew install whiteheap/tap/residue' dry.log
+          if brew list --formula whiteheap/tap/residue; then exit 1; fi
+      # The default run, service step included. ~/src is a code folder for a
+      # residue that needs none (0.0.7 on); an older one prints the command.
+      - name: Install through Homebrew
+        run: |
+          mkdir -p ~/src
+          sh site/public/install.sh | tee install.log
+          grep -q '^Channel:    brew' install.log
+          grep '^Cleanup:' install.log
+          residue --version
+          brew test whiteheap/tap/residue
+      - name: Again, which is an upgrade
+        run: |
+          sh site/public/install.sh --no-service | tee again.log
+          grep -q '^+ brew upgrade whiteheap/tap/residue' again.log
+      - name: Remove the service
+        if: always()
+        run: residue service uninstall || true
+
+  apt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Dry run
+        run: |
+          sh site/public/install.sh --dry-run | tee dry.log
+          grep -q '^+ sudo env DEBIAN_FRONTEND=noninteractive apt-get -q install -y residue' dry.log
+          test ! -e /etc/apt/sources.list.d/residue.list
+      # The runner's user has passwordless sudo, so the script picks apt. A
+      # runner has no systemd user manager until lingering is on, as in
+      # .github/service-smoke.sh.
+      - name: Install through apt
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export XDG_RUNTIME_DIR
+          for _ in $(seq 30); do systemctl --user show-environment > /dev/null 2>&1 && break; sleep 1; done
+          mkdir -p ~/src
+          sh site/public/install.sh | tee install.log
+          grep -q '^Channel:    apt' install.log
+          grep '^Cleanup:' install.log
+          /usr/bin/residue --version
+          apt-cache policy residue
+      - name: Again, which is an upgrade or a no-op
+        run: |
+          sh site/public/install.sh --no-service | tee again.log
+          grep -q '^Channel:    apt' again.log
+      - name: Remove the service
+        if: always()
+        run: XDG_RUNTIME_DIR="/run/user/$(id -u)" residue service uninstall || true
+
+  # dnf, pacman and busybox in containers, as root: no sudo, no systemd, so
+  # --no-service. The script is mounted read-only.
+  container:
+    name: ${{ matrix.channel }} (${{ matrix.image }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: "fedora:latest", channel: dnf, setup: "true" }
+          - { image: "archlinux:base", channel: pacman, setup: "pacman-key --init && pacman-key --populate archlinux" }
+          - { image: "alpine:latest", channel: archive, setup: "apk add -q curl" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Dry run, install, run, install again
+        env:
+          IMAGE: ${{ matrix.image }}
+          CHANNEL: ${{ matrix.channel }}
+          SETUP: ${{ matrix.setup }}
+        run: |
+          docker run --rm -e CHANNEL -v "$PWD/site/public:/s:ro" "$IMAGE" sh -c "
+            set -eu
+            $SETUP
+            sh /s/install.sh --dry-run
+            sh /s/install.sh --no-service | tee /tmp/install.log
+            grep -q \"^Channel:    \$CHANNEL\" /tmp/install.log
+            command -v residue || export PATH=\$HOME/.local/bin:\$PATH
+            residue --version
+            sh /s/install.sh --no-service | tail -5
+          "
+
+  freebsd:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
+        with:
+          release: "14"
+          copyback: false
+          prepare: pkg install -y curl
+          run: |
+            sh site/public/install.sh --dry-run
+            sh site/public/install.sh --no-service | tee /tmp/install.log
+            grep -q '^Channel:    archive' /tmp/install.log
+            "$HOME/.local/bin/residue" --version
+            sh site/public/install.sh | tee /tmp/again.log
+            grep -q 'is already installed at' /tmp/again.log
+            grep -q '^Cleanup:    not available on FreeBSD' /tmp/again.log
