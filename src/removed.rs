@@ -1155,6 +1155,14 @@ fn move_back(
         ));
     };
     if left.running {
+        // Git refuses to move a worktree it can no longer use, so there is
+        // no command to give until that process is gone.
+        if let Some(why) = &left.unusable {
+            return Err(format!(
+                "process {} still runs, so residue may still be removing it, and Git can no longer use it ({why}); once that process has exited, run this restore again: it says what to clear",
+                left.pid
+            ));
+        }
         return Err(format!(
             "process {} still runs, so residue may still be removing it; if it is not residue, put it back with: {}",
             left.pid, left.recovery

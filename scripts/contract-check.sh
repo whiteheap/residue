@@ -781,7 +781,7 @@ if [ -z "$partial_probe" ]; then
             elif common_ok; then ok; fi
         fi
     fi
-    rm -rf -- "$HOME/Documents" "$HOME/src"
+    rm -rf -- "$work/home/Documents" "$work/home/src"
 else
     for c in record-json record-text record-fail-closed-dir record-fail-closed-ref record-retention \
         record-reflog-pin record-reflog-branch record-reflog-reftable record-unreadable \

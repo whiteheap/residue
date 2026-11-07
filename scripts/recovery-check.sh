@@ -42,6 +42,8 @@
 #                  directory, or the `.git` file from its checkout: what
 #                  Git's own remove leaves when it stops at a file it
 #                  cannot delete, or is killed during the delete (5, 5b, 5c)
+#   hold-after     with a part-remove mode, hold the Git command after the
+#                  failed remove, so residue still runs (5d)
 #
 # A held command waits at most 50 s, and never runs once its residue has
 # exited or the test aborted it. The two removers of scenario 4 start one
@@ -159,6 +161,11 @@ hold() { # NAME
     [ ! -e "\$work/abort-\$1" ] || exit 1
     kill -0 "\$PPID" 2>/dev/null || exit 1
 }
+# hold-after: once the part-way remove failed, hold the next Git command,
+# so that residue still runs while its removal record names the worktree.
+case \$mode in
+*hold-after*) [ ! -e "\$work/part-done" ] || [ -e "\$work/at-after" ] || hold after ;;
+esac
 case " \$* " in
 *" worktree remove "*)
     case "\$last \$mode" in
@@ -174,6 +181,7 @@ case " \$* " in
         *part-remove-head*) rm -f "\$gd/HEAD" ;;
         *part-remove-dotgit*) rm -f "\$last/.git" ;;
         esac
+        : >"\$work/part-done"
         echo "error: recovery-check: the remove stops part way on purpose" >&2
         exit 255
         ;;
@@ -253,7 +261,7 @@ ok() {
 # node_modules/), and .worktrees/u on branch u, which nothing names.
 make_repo() {
     repo=$work/$name
-    rm -f "$work"/at-* "$work"/go-* "$work"/abort-* "$work/touched" "$work/held"
+    rm -f "$work"/at-* "$work"/go-* "$work"/abort-* "$work/touched" "$work/held" "$work/part-done"
     setup git init -q "$repo"
     printf 'node_modules/\n' >"$repo/.gitignore"
     echo hello >"$repo/README.md"
@@ -380,7 +388,7 @@ if [ -n "$partial_probe" ]; then
     elif common_ok; then ok "refused before any move: $(jq -r '.results[0].worktree.activity.detail' "$out")"; fi
     for scenario in stopped-after-move stopped-after-move-restore stopped-after-move-control refused-after-move \
         refused-after-move-control move-back-fails original-taken two-removers two-removers-trash \
-        remove-fails-part-way-reflog remove-fails-part-way-head remove-fails-part-way-dotgit; do
+        remove-fails-part-way-reflog remove-fails-part-way-head remove-fails-part-way-dotgit remove-fails-part-way-running; do
         skip_partial "$scenario"
     done
     echo "recovery-check: $passes passed, $failures failed"
@@ -715,6 +723,32 @@ part_remove_unusable part-remove-head "Git reads no HEAD in its Git directory"
 
 name=remove-fails-part-way-dotgit
 part_remove_unusable part-remove-dotgit "its .git file is gone" "its files are gone"
+
+# 5d: restore while the run that left w, which Git can no longer use, still
+# runs. There is no command to give yet: restore says to wait for that
+# process and run it again, and never prints an empty command.
+name=remove-fails-part-way-running
+make_repo
+echo "part-remove-head hold-after" >"$work/mode"
+start "" remove --yes --json "$wt"
+if ! await "$work/at-after"; then
+    fail "the removal never got past its failed git worktree remove"
+    : >"$work/abort-after"
+    : >"$work/go-after"
+    finish "$pid"
+else
+    aside=$(asides)
+    restore_w
+    : >"$work/go-after"
+    finish "$pid"
+    if [ "$restored" != 1 ]; then fail "restore while the removal runs exited $restored, want 1"
+    elif ! grep -qF "process $pid still runs, so residue may still be removing it, and Git can no longer use it (Git reads no HEAD in its Git directory); once that process has exited, run this restore again: it says what to clear" "$work/$name.err-restore"; then fail "restore: $(cat "$work/$name.err-restore")"
+    elif grep -qE "put it back with: *$" "$work/$name.err-restore"; then fail "restore prints an empty command: $(cat "$work/$name.err-restore")"
+    elif [ "$status" != 3 ]; then fail "the removal exited $status, want 3"
+    elif [ -z "$aside" ] || [ "$(record "$aside")" != registered ]; then fail "want it at the moved-aside path, which Git lists: ${aside:-none}"
+    elif [ "$(records)" = "0 records, 0 refs" ]; then fail "the removal record is gone"
+    else ok "restore says to wait for process $pid, with no empty command"; fi
+fi
 
 echo "recovery-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]
