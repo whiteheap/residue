@@ -2,40 +2,40 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.png">
-  <img src="docs/assets/logo.png" width="112" alt="Residue mark: three flat sheets stacked like linked worktrees, and a small square set apart beneath them.">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/logo.png">
+  <img src="docs/assets/logo.png" width="112" alt="Residue mark: three flat sheets stacked like linked worktrees, and a small square set apart underneath.">
 </picture>
 
 **Coding agents leave Git worktrees on disk; residue removes one only when every check passes.**
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/how-it-works-dark.png">
-  <img src="docs/assets/how-it-works.png" width="420" alt="Chart. A repository leads to its linked worktrees, then checks, then a report. Read only ends at scan and explain, which read and stop. A separate arrow, you or watch, enters remove, then fresh checks. Block, unknown, or changed leads to stays. All pass leads to git remove without --force, or to the trash for restore. Scan does not lead to deletion.">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/how-it-works.png">
+  <img src="docs/assets/how-it-works.png" width="500" alt="Chart. A repository leads to its linked worktrees, then checks, then a report. Read only ends at scan and explain, which read and stop. A separate arrow, you or watch, enters remove, then fresh checks. The left arrow from fresh checks ends at stays when a check blocks, is unknown, or the worktree changed. A different pair of arrows, only when every check passes, goes to git remove without --force or to the trash for restore. The block path does not continue to deletion.">
 </picture>
 
-A repository's linked worktrees are checked, then reported. `scan` and `explain` only read that report and stop. `remove` is separate: you run it, or `watch` chooses paths for it. Fresh checks leave the worktree in place on a block, an unknown, or a change. When every check passes, `git worktree remove` deletes it without `--force`, or the trash holds it for `restore`. A pass is not a guarantee, and age alone does not mean inactive.
+A repository's linked worktrees are checked, then reported. `scan` and `explain` only read that report and stop. `remove` is separate: you run it, or `watch` chooses paths for it. From fresh checks, a block, an unknown, or a change keeps the worktree. Only when every check passes does `git worktree remove` delete it, without `--force`, or the trash hold it for `restore`. A pass is not a guarantee, and age alone does not mean inactive.
 
-Coding agents leave Git worktrees behind. Each one is a full checkout with its own `node_modules`, `target` and build output, and a machine that runs agents all day fills its disk with them. residue finds those worktrees, measures them, and removes one only when nothing in it would be lost.
+## What it does
 
-```text
-$ residue scan ~/src/app
-residue 0.0.5 · as of 14:03:12 +02:00 · activity: lsof inspected 506 of 807 running processes
+residue finds linked Git worktrees left behind by coding agents and reports which ones are taking disk. The defining constraint is that it deletes a worktree only when every check passes: one blocked check keeps it, and one check it could not finish keeps it too. `scan` and `explain` never delete. Removal is a later command, and the deletion itself is `git worktree remove` without `--force`.
 
-~/src/app · 4 linked worktrees · 5.6 GB
-  candidate   2.1 GB  ~/src/app/.worktrees/fix-login  [fix-login]
-                      branch kept · 1 local-only commit · upstream gone · changed 3 days ago
-  keep        1.9 GB  ~/src/app/.worktrees/feat-search  [feat-search]
-                      in use: node[4211], zsh[4198]
-  keep        1.3 GB  ~/src/app/.worktrees/spike  [spike]
-                      ignored: .env (1 file, 312 B) · 2 untracked
-  keep        0.3 GB  ~/src/app/.worktrees/review  (detached 7954cfbb7b3a)
-                      unreferenced detached HEAD
+## When to reach for it
 
-disk  41 GB free of 494 GB (8%)  (filesystem of ~/src/app)
-1 candidate of 4 linked worktrees · 2.1 GB allocated · about 2.1 GB reclaimable
-next: residue explain PATH  ·  residue remove PATH  ·  keep one: git worktree lock PATH
-```
+| You want | Run |
+| --- | --- |
+| A report of linked worktrees under a directory | `residue scan` |
+| Every check for one worktree | `residue explain PATH` |
+| To remove worktrees you name, after a prompt | `residue remove PATH` |
+| An unattended sweep of every candidate | `residue remove --all --yes --idle DURATION` |
+| Removal when a branch lands, or when the disk is low | `residue watch`, or `residue service install` |
+| A worktree kept through every sweep | `git worktree lock PATH` |
 
-`residue scan` only reads. `residue remove` asks before it deletes anything, checks everything again right before it acts, moves the worktree aside and checks once more, and then hands the deletion to `git worktree remove`, which runs without `--force`. It deletes what you saw, or nothing, and never removes something Git itself would refuse to remove. A scheduled sweep moves worktrees to a trash first, so `residue restore` can put one back until the trash is purged.
+Not this tool: the main checkout, a package-manager store, a Docker build cache, or a toolchain cache. Those have their own commands, listed under [Limits](#limits).
+
+## Prerequisites
+
+`git` 2.36 or later, on `PATH`.
 
 ## Install
 
@@ -407,6 +407,43 @@ For every repository on the machine, put one rule per line in `~/.config/residue
 
 The probe has three answers. `in_use` means a process was seen inside the worktree. `not_observed` means none of the inspected processes was inside it. `unknown` means the probe failed: lsof is missing, it timed out, it failed, or residue could not parse its output. `not_observed` is not proof that a worktree is idle. The probe cannot see processes owned by other users, processes inside containers or virtual machines, processes on other machines that share the disk, or a session that is closed now but that you mean to resume. A process can also open the directory a moment after the snapshot; residue moves the worktree aside and looks again before it deletes, which narrows that gap but does not close it. That is why removal asks a human, why `--yes` belongs to the session that owns the work, and why a scheduled sweep needs `--idle`.
 
+## Common questions
+
+**Why does an unattended sweep need `--idle`?** A paused agent often has no process inside its worktree. Harnesses reset the shell to the main checkout between commands, so the activity check sees nothing while the session is waiting. `--idle` keeps a worktree that changed within the duration. `remove --all --yes` refuses to run without it. [Why `--idle` matters](#why---idle-matters).
+
+**A file showed up while the prompt was waiting. Is it deleted?** No. `remove` compares a fresh record with the plan and skips the worktree, naming the difference. In 0.0.4 a file added under `node_modules/` during that wait was deleted with the worktree. From 0.0.5 that case is a skip.
+
+**`watch` removed a worktree after the upstream branch came back.** That was fixed. For a landed branch, `watch` runs `remove --only-if-upstream-gone`, and the child checks the local refs at the plan, again before the move aside, and again after the move. If the upstream is back, the worktree stays. residue still does not fetch, so it only sees what is already in the local refs.
+
+**`git -c residue.regenerable=...` had no effect.** That is deliberate. A rule inherited through the environment would widen what residue deletes for every child process. residue ignores it, prints a note on stderr, and lists the values in `ignored_environment_rules`. Pass `--regenerable`, or `git config --add residue.regenerable`.
+
+**Is there an AUR package?** Not yet. Arch and Omarchy install from the pacman repository above, or from the release archive. Publishing `residue-bin` to the AUR is waiting on account registration.
+
+## It's working if
+
+`residue scan` prints each linked worktree as `candidate`, `keep`, `unknown`, or `stale`, and the directories are still there:
+
+```text
+$ residue scan ~/src/app
+residue 0.0.5 · as of 14:03:12 +02:00 · activity: lsof inspected 506 of 807 running processes
+
+~/src/app · 4 linked worktrees · 5.6 GB
+  candidate   2.1 GB  ~/src/app/.worktrees/fix-login  [fix-login]
+                      branch kept · 1 local-only commit · upstream gone · changed 3 days ago
+  keep        1.9 GB  ~/src/app/.worktrees/feat-search  [feat-search]
+                      in use: node[4211], zsh[4198]
+  keep        1.3 GB  ~/src/app/.worktrees/spike  [spike]
+                      ignored: .env (1 file, 312 B) · 2 untracked
+  keep        0.3 GB  ~/src/app/.worktrees/review  (detached 7954cfbb7b3a)
+                      unreferenced detached HEAD
+
+disk  41 GB free of 494 GB (8%)  (filesystem of ~/src/app)
+1 candidate of 4 linked worktrees · 2.1 GB allocated · about 2.1 GB reclaimable
+next: residue explain PATH  ·  residue remove PATH  ·  keep one: git worktree lock PATH
+```
+
+A removal that does not pass exits 3 and leaves the directory in place. A removal that does pass leaves the branch. With `--trash`, `residue restore` puts the worktree back until the purge.
+
 ## Exit status
 
 | Code | Meaning |
@@ -493,15 +530,16 @@ CI runs five scripts on macOS, Linux x86_64 and arm64, and FreeBSD 14 as root an
 - **Stale entries are reported, not cleaned.** For a worktree whose directory is already gone, residue reports the leftover Git metadata as `stale` and tells you to run `git worktree prune`. For an orphaned checkout whose repository is gone, residue lists it and leaves it alone.
 - **residue is not a security boundary.** It runs as you, and assumes the other processes running as you are not trying to fool it.
 
-## Other tools
+## Where it fits
 
-Several tools already address this problem. Pick the one that matches how you work:
+residue is a standalone command, or a login service that runs that command. It does not create worktrees and it does not merge branches.
 
-- [Claude Code](https://code.claude.com/docs/en/worktrees) sweeps the worktrees it creates for subagents and background tasks, and locks the ones in use.
-- [Worktrunk](https://worktrunk.dev) manages the worktree lifecycle (create, switch, merge, remove) and can stop processes tied to a worktree.
-- [Agentdisk](https://github.com/laaielichter/Agentdisk) attributes disk use across agent tools and moves what it removes to a quarantine you can restore from.
-
-residue does one job: it removes linked worktrees from any tool, and only when every check above passes. It hands the deletion to Git, keeps what a scheduled sweep takes in a trash you can restore from until it expires, reports activity as one of three states on both macOS and Linux, keeps any ignored file that is not on the regenerable list, and depends on one crate (`libc`).
+| Tool | Use it when |
+| --- | --- |
+| [Claude Code](https://code.claude.com/docs/en/worktrees) | You only want the worktrees that tool created, swept and locked by that tool |
+| [Worktrunk](https://worktrunk.dev) | You want to create, switch, merge, and remove worktrees, and stop processes tied to one |
+| [Agentdisk](https://github.com/laaielichter/Agentdisk) | You want disk use attributed across agent tools, with a quarantine you restore from |
+| residue | You want linked worktrees from any tool removed only when every check passes, with Git doing the delete and a trash on a sweep |
 
 ## Contributing
 
