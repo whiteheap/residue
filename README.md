@@ -20,6 +20,17 @@ A repository's linked worktrees are checked, then reported. `scan` and `explain`
 
 residue finds linked Git worktrees left behind by coding agents and reports which ones are taking disk. The defining constraint is that it deletes a worktree only when every check passes: one blocked check keeps it, and one check it could not finish keeps it too. `scan` and `explain` never delete. Removal is a later command, and the deletion itself is `git worktree remove` without `--force`.
 
+A check ends in one of three states: it passes, it blocks, or it is unknown. The report then names the worktree:
+
+| Verdict | Meaning |
+| --- | --- |
+| `candidate` | Every check passed. This is the only verdict `remove` will act on. It is not a promise that a later change is impossible. |
+| `keep` | At least one check blocked. |
+| `unknown` | At least one check could not be finished, and none blocked. Residue keeps it. |
+| `stale` | Git still lists the worktree and the directory is gone, or Git marks it prunable. Reported, not removed. Run `git worktree prune` yourself. |
+
+Age is not one of these. A missing or unreadable last change is `unknown`, not inactive.
+
 ## When to reach for it
 
 | You want | Run |
@@ -27,11 +38,19 @@ residue finds linked Git worktrees left behind by coding agents and reports whic
 | A report of linked worktrees under a directory | `residue scan` |
 | Every check for one worktree | `residue explain PATH` |
 | To remove worktrees you name, after a prompt | `residue remove PATH` |
-| An unattended sweep of every candidate | `residue remove --all --yes --idle DURATION` |
+| An unattended sweep of every `candidate` | `residue remove --all --yes --idle DURATION` |
 | Removal when a branch lands, or when the disk is low | `residue watch`, or `residue service install` |
 | A worktree kept through every sweep | `git worktree lock PATH` |
 
 Not this tool: the main checkout, a package-manager store, a Docker build cache, or a toolchain cache. Those have their own commands, listed under [Limits](#limits).
+
+Each cleanup command below still has its full contract later in this file. The row is the boundary; the link is the reference.
+
+| Command | Needs | Will not delete | You can check |
+| --- | --- | --- | --- |
+| [`residue remove PATH`](#what-removal-deletes-and-what-it-keeps) | A terminal, or `--yes` from the session that owns the work | A block, an unknown, or any change since the plan. Exit 3, directory still there. | The branch remains. With `--trash`, `residue restore` puts it back until the purge. |
+| [`residue remove --all --yes --idle DURATION`](#run-it-on-a-schedule) | `--idle`. Without it the command is a usage error (exit 2). | The same refusals. A paused session with no process in the worktree is not treated as finished. | Entries land in the trash unless you pass `--no-trash`. |
+| [`residue watch`](#reclaim-storage-automatically) | Local refs. Residue does not fetch. | For a landed branch, an upstream that is back, missing, local, or not a resolved commit. The child is `remove --yes --idle --no-trash`, and for that case also `--only-if-upstream-gone`. | The log names what it removed or kept. |
 
 ## Prerequisites
 
