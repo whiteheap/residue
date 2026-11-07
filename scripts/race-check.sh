@@ -10,7 +10,8 @@
 # changed worktree must be skipped: exit status 3, a reason that says what
 # changed since the user confirmed, and the worktree still in place and
 # registered. The control cases change nothing and must be removed (or
-# moved to the trash). Runs on macOS and Linux; needs git and script.
+# moved to the trash). Runs on macOS, Linux and FreeBSD; needs bash, git and
+# script.
 set -euo pipefail
 
 bin=${1:-target/release/residue}
@@ -31,25 +32,32 @@ git config --global init.defaultBranch main
 failures=0
 passes=0
 
+# residue runs under `sh -c`, which prints its exit status after it on a
+# line of its own, `race-check-status N`. The status `script` returns is not
+# reliable: util-linux `script` 2.39.3 (Ubuntu 24.04) returned 0 for a run
+# that printed `skipped` and so exited 3, once in CI.
+run_status='"$@"; echo "race-check-status $?"'
+
 # The keyboard: types yes once $work/type appears, so `script` never sees
-# end of input before the prompt. It stops when the work directory is gone,
-# so an interrupted run leaves no process behind.
+# the end of its input before the prompt. Then:
+# - util-linux `script` (2.39.3, Ubuntu 24.04) spins, and stops copying
+#   output, when its command exits while its input is still open, so on
+#   Linux the input ends right after yes. residue reads one line and never
+#   sees the end of file, and Linux does not echo it.
+# - BSD and macOS `script` pass the end of input on as an end-of-file
+#   character, which the terminal echoes as ^D into residue's output, so
+#   there the input stays open until the status line is in the output.
+# It also stops at $work/done and when the work directory is gone, so an
+# interrupted run leaves no process behind.
 # (macOS `script` rejects a FIFO as its input, so this is a pipe.)
-# After yes, the BSD and macOS `script` pass the end of input on as an
-# end-of-file character, which the terminal echoes as ^D into the output,
-# so there the pipe stays open until $work/done appears. util-linux
-# `script` (2.39.3 in Ubuntu 24.04) does not exit after the command does
-# while its input is open: it spins. So on Linux the input ends right after
-# yes; residue reads one line and never sees the end of file, and Linux
-# does not echo it.
-keyboard() {
+keyboard() { # out-file
     until [ -e "$work/type" ]; do
         [ -d "$work" ] || return 0
         sleep 0.1
     done
     printf 'yes\n'
     [ "$(uname -s)" = Linux ] && return 0
-    until [ -e "$work/done" ]; do
+    until grep -q '^race-check-status ' "$1" 2>/dev/null || [ -e "$work/done" ]; do
         [ -d "$work" ] || return 0
         sleep 0.1
     done
@@ -65,10 +73,10 @@ start() { # out-file, residue arguments...
     case $(uname -s) in
     Linux)
         local line
-        line=$(printf '%q ' "$bin" "$@")
-        script -q -e -f -c "$line" /dev/null < <(keyboard) >"$out" 2>&1 &
+        line=$(printf '%q ' sh -c "$run_status" sh "$bin" "$@")
+        script -q -f -c "$line" /dev/null < <(keyboard "$out") >"$out" 2>&1 &
         ;;
-    *) script -q /dev/null "$bin" "$@" < <(keyboard) >"$out" 2>&1 & ;;
+    *) script -q /dev/null sh -c "$run_status" sh "$bin" "$@" < <(keyboard "$out") >"$out" 2>&1 & ;;
     esac
     pid=$!
 }
@@ -84,11 +92,12 @@ await_prompt() { # out-file
     return 1
 }
 
-finish() { # sets $status
+finish() { # sets $status: residue's exit status, or "none" without a status line
     touch "$work/type"
-    status=0
-    wait "$pid" || status=$?
+    wait "$pid" || true
     touch "$work/done"
+    status=$(tr -d '\r' <"$out" | sed -n 's/^race-check-status \([0-9][0-9]*\)$/\1/p' | tail -n 1)
+    status=${status:-none}
 }
 
 fail() {
@@ -136,13 +145,13 @@ run_case() {
     fi
     case $change in
     :)
-        [ "$status" -eq 0 ] || { fail "exit $status, want 0"; return; }
+        [ "$status" = 0 ] || { fail "exit $status, want 0"; return; }
         grep -q "$expect" "$out" || { fail "no line matching: $expect"; return; }
         [ ! -e "$wt" ] || { fail "the worktree is still at $wt"; return; }
         git -C "$repo" rev-parse -q --verify refs/heads/w >/dev/null || { fail "branch w is gone"; return; }
         ;;
     *)
-        [ "$status" -eq 3 ] || { fail "exit $status, want 3"; return; }
+        [ "$status" = 3 ] || { fail "exit $status, want 3"; return; }
         grep -q "$expect" "$out" || { fail "no line matching: $expect"; return; }
         [ -d "$wt" ] || { fail "the worktree is gone"; return; }
         registered || { fail "Git no longer lists the worktree at $wt"; return; }
