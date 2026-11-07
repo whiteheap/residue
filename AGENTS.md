@@ -41,6 +41,7 @@ These are the reasons people trust the tool. Do not weaken them without an expli
 | `src/service.rs` | `residue service`: the launchd agent and the systemd user service that run `watch` |
 | `scripts/race-check.sh` | The race check: changes a worktree while the release binary's prompt waits, under a pseudo-terminal |
 | `packaging/` | Linux packages (`nfpm.yaml`, `linux-packages.sh`), the signed apt, dnf and pacman repositories (`apt-repo.sh`, `rpm-repo.sh` with `rpm/residue.repo`, `arch-repo.sh`), their public key (`signing-key.asc`), and the AUR package (`aur/`) |
+| `site/` | The one-page website: static HTML and CSS in `site/public/`, its Cloudflare Workers Static Assets config, and `site/check.sh`. Prepared, not published; `site/README.md` has the checks and the publish steps. The README stays the contract: commands on the page are copied from it |
 
 ## Verify a change
 

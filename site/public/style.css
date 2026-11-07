@@ -1,0 +1,415 @@
+/* residue site. One stylesheet, system fonts, no script.
+   Grays only, written in oklch with no hue. Each color token holds its light
+   and dark value, so the page follows the reader's color scheme. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  min-width: 0;
+}
+
+:root {
+  color-scheme: light dark;
+
+  --bg: light-dark(oklch(1 0 none), oklch(0.145 0 none));
+  --fg: light-dark(oklch(0.2 0 none), oklch(0.97 0 none));
+  --muted: light-dark(oklch(0.45 0 none), oklch(0.74 0 none));
+  --line: light-dark(oklch(0.9 0 none), oklch(0.3 0 none));
+  --surface: light-dark(oklch(0.975 0 none), oklch(0.19 0 none));
+  --fg-hover: color-mix(in oklch, var(--fg), var(--bg) 18%);
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --gutter: clamp(1rem, 0.5rem + 2.5vw, 2rem);
+  --page: 64rem;
+  --measure: 40rem;
+  /* 32px at 320px wide, 52px from about 1120px. */
+  --text-hero: clamp(2rem, 1.5rem + 2.5vw, 3.25rem);
+  --space-section: clamp(3.5rem, 2.5rem + 5vw, 6rem);
+  --radius: 0.5rem;
+
+  scrollbar-gutter: stable;
+  text-wrap: pretty;
+  overflow-wrap: break-word;
+  font-synthesis: none;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  -webkit-text-size-adjust: 100%;
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  margin: 0;
+  min-height: 100svh;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: 1rem;
+  line-height: 1.6;
+}
+
+h1,
+h2,
+h3 {
+  text-wrap: balance;
+  margin: 0;
+}
+
+p,
+ul,
+ol {
+  margin: 0;
+}
+
+img,
+svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+a {
+  color: inherit;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+  touch-action: manipulation;
+}
+
+a:active {
+  color: var(--muted);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  a:hover {
+    text-decoration-thickness: 2px;
+  }
+}
+
+:focus-visible {
+  outline: max(2px, 0.08em) solid currentColor;
+  outline-offset: 0.25em;
+}
+
+code,
+pre {
+  font-family: var(--font-mono);
+}
+
+:not(pre) > code {
+  font-size: 0.875em;
+  padding: 0.1em 0.3em;
+  border: 1px solid var(--line);
+  border-radius: 0.25rem;
+  background: var(--surface);
+  /* A flag must not break after its hyphens: "--" then "force". */
+  white-space: nowrap;
+}
+
+pre {
+  margin: 0;
+  padding: 0.875rem 1rem;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+/* Layout */
+
+.wrap {
+  inline-size: min(100% - 2 * var(--gutter), var(--page));
+  margin-inline: auto;
+}
+
+.site-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1.5rem;
+  padding-block: 1rem;
+}
+
+.site-header nav {
+  display: flex;
+  gap: 0.25rem 1.25rem;
+  margin-inline-start: auto;
+}
+
+.site-header nav a,
+.site-footer nav a {
+  display: inline-block;
+  padding-block: 0.625rem;
+  color: var(--muted);
+  text-decoration: none;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .site-header nav a:hover,
+  .site-footer nav a:hover {
+    color: var(--fg);
+  }
+}
+
+.site-header nav a:active,
+.site-footer nav a:active {
+  color: var(--fg);
+}
+
+.wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.625rem;
+  padding-block: 0.375rem;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 1.0625rem;
+  text-decoration: none;
+}
+
+.wordmark img {
+  flex: none;
+  inline-size: 1.75rem;
+}
+
+/* Text beside the chart on a wide screen, above it on a narrow one. */
+.hero {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2.5rem 4rem;
+  padding-block-start: clamp(2rem, 1rem + 5vw, 5rem);
+}
+
+.hero-text {
+  display: grid;
+  gap: 1.5rem;
+  flex-basis: 0;
+  flex-grow: 999;
+  min-inline-size: min(100%, 30rem);
+}
+
+.hero h1 {
+  font-size: var(--text-hero);
+  font-weight: 650;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+}
+
+.lede {
+  max-inline-size: 36rem;
+  font-size: clamp(1.0625rem, 1rem + 0.3vw, 1.25rem);
+  color: var(--muted);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  min-block-size: 2.75rem;
+  padding-inline: 1.125rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font-weight: 550;
+  text-decoration: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.button-primary {
+  border-color: var(--fg);
+  background: var(--fg);
+  color: var(--bg);
+}
+
+/* The ring sits outside the button, on the page, so it takes the page's ink. */
+.button-primary:focus-visible {
+  outline-color: var(--fg);
+}
+
+.button:active {
+  transform: scale(0.97);
+  color: inherit;
+}
+
+.button-primary:active {
+  color: var(--bg);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .button:hover {
+    border-color: var(--muted);
+  }
+
+  .button-primary:hover {
+    border-color: var(--fg-hover);
+    background: var(--fg-hover);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .button {
+    transition:
+      transform 160ms var(--ease-out),
+      background-color 160ms var(--ease-out),
+      border-color 160ms var(--ease-out);
+  }
+}
+
+/* Drawn at 420 by 420; never wider, so its labels stay at their drawn size. */
+.diagram {
+  flex: 0 1 26.25rem;
+  margin-inline: auto;
+}
+
+/* Sections */
+
+.section {
+  display: grid;
+  gap: 1rem;
+  padding-block-start: var(--space-section);
+}
+
+.section > * {
+  max-inline-size: var(--measure);
+}
+
+.section h2 {
+  font-size: clamp(1.375rem, 1.2rem + 0.8vw, 1.75rem);
+  font-weight: 650;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+}
+
+.section h3 {
+  margin-block-start: 1rem;
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  font-weight: 500;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.section h2 + h3 {
+  margin-block-start: 0.5rem;
+}
+
+.section p {
+  color: var(--muted);
+}
+
+.section p :is(a, code) {
+  color: var(--fg);
+}
+
+.steps {
+  display: grid;
+  gap: 1.5rem;
+  padding-inline-start: 0;
+  list-style: none;
+  counter-reset: step;
+}
+
+.steps li {
+  display: grid;
+  grid-template-columns: 1.75rem 1fr;
+  gap: 0.25rem 0.875rem;
+  counter-increment: step;
+}
+
+.steps li::before {
+  content: counter(step);
+  grid-row: 1;
+  display: grid;
+  place-items: center;
+  block-size: 1.75rem;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1;
+  color: var(--muted);
+}
+
+.steps li > * {
+  grid-column: 2;
+}
+
+.steps h3 {
+  align-self: center;
+  margin-block-start: 0;
+  font-family: var(--font-sans);
+  font-size: 1.0625rem;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.caveat {
+  display: grid;
+  gap: 1rem;
+  padding: clamp(1.25rem, 0.75rem + 2vw, 2rem);
+  border: 1px solid var(--fg);
+  border-radius: var(--radius);
+}
+
+.caveat p {
+  color: var(--fg);
+}
+
+.caveat ul {
+  display: grid;
+  gap: 0.25rem;
+  padding-inline-start: 1.25rem;
+}
+
+.caveat li {
+  padding-block: 0.25rem;
+}
+
+.site-footer {
+  display: grid;
+  gap: 1rem;
+  margin-block-start: var(--space-section);
+  padding-block: 1.5rem 2.5rem;
+  border-block-start: 1px solid var(--line);
+  font-size: 0.875rem;
+  color: var(--muted);
+}
+
+.site-footer p {
+  max-inline-size: var(--measure);
+}
+
+.site-footer p a {
+  color: var(--fg);
+}
+
+.site-footer nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 1.25rem;
+}
+
+/* 404 */
+
+.not-found {
+  display: grid;
+  gap: 1.25rem;
+  padding-block-start: clamp(3rem, 2rem + 6vw, 7rem);
+}
+
+.not-found h1 {
+  font-size: var(--text-hero);
+  font-weight: 650;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+}
