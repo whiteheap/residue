@@ -47,6 +47,7 @@ These are the reasons people trust the tool. Do not weaken them without an expli
 ```sh
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
 cargo build --release
 sh .github/smoke.sh ./target/release/residue
 sh .github/watch-smoke.sh ./target/release/residue

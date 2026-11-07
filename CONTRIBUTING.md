@@ -41,11 +41,14 @@ Run what CI runs:
 ```sh
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
 cargo build --locked --release
 sh .github/smoke.sh ./target/release/residue
 sh .github/watch-smoke.sh ./target/release/residue
 bash scripts/race-check.sh
 ```
+
+`cargo test` runs the in-crate tests: pure checks of private decision code on synthetic data, such as the verdict fold in `src/inspect.rs`, with no filesystem, Git or processes. The shell scripts run the release binary against real Git repositories and processes. They test different things and neither replaces the other. CI runs `cargo test` on macOS and both Linux runners, and the shell scripts there and on FreeBSD.
 
 CI also runs `.github/service-smoke.sh`, which installs and removes a real login service; run it only on a machine where no `residue service` of yours is installed.
 
