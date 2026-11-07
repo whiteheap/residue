@@ -338,13 +338,16 @@ fn append(path: &Path, lines: &[Line]) -> Result<(), String> {
     // that both see the cut line leave one blank line, which a reader
     // ignores.
     let len = file.metadata().map_err(at)?.len();
-    let mut last = [b'\n'];
-    if len > 0 {
+    let cut = if len > 0 {
+        let mut last = [0];
         file.read_exact_at(&mut last, len - 1).map_err(at)?;
-    }
+        last[0] != b'\n'
+    } else {
+        false
+    };
     for (i, line) in lines.iter().enumerate() {
         let mut text = line.text();
-        if i == 0 && last[0] != b'\n' {
+        if i == 0 && cut {
             text.insert(0, '\n');
         }
         let written = file.write(text.as_bytes()).map_err(at)?;
