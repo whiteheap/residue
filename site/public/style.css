@@ -162,9 +162,12 @@ pre {
   color: var(--fg);
 }
 
-/* The residue wordmark, then "by whiteheap" with its mark. */
+/* The residue wordmark, then "by whiteheap" with its mark. The group takes
+   the space the nav leaves, so on a narrow screen the byline wraps under the
+   wordmark before the nav leaves the row. */
 .brand {
   display: flex;
+  flex: 1 1 0;
   flex-wrap: wrap;
   align-items: center;
   column-gap: 0.875rem;
