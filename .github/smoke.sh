@@ -14,8 +14,9 @@ case $residue in /*) ;; *) residue="$PWD/$residue" ;; esac
 S=$(mktemp -d "${TMPDIR:-/tmp}/residue-smoke.XXXXXX")
 busy=
 # `wait` returns the killed process's status; `|| true` keeps it from
-# becoming the script's exit status under `set -e`.
-trap 'if [ -n "$busy" ]; then kill "$busy" 2>/dev/null || true; wait "$busy" 2>/dev/null || true; fi; rm -rf "$S"' EXIT
+# becoming the script's exit status under `set -e`. illumos rm refuses a
+# directory above the working directory, hence the `cd /`.
+trap 'if [ -n "$busy" ]; then kill "$busy" 2>/dev/null || true; wait "$busy" 2>/dev/null || true; fi; cd /; rm -rf "$S"' EXIT
 
 git init -q -b main "$S/app"
 cd "$S/app"
