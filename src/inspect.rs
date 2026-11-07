@@ -1409,3 +1409,181 @@ impl Fingerprint {
         Some(format!("its Git directory changed since {since}"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! The verdict fold in `Report::finish`, on synthetic checks only: no
+    //! filesystem, Git, process probe or clock. The oracle is the contract
+    //! in the README ("What makes a worktree a candidate"): a stale entry is
+    //! stale; any failed check keeps the worktree; otherwise any check
+    //! residue could not complete, or no checks at all, makes it unknown;
+    //! only a non-empty set of passing checks makes a candidate.
+
+    use super::{Check, Report, Status};
+    use crate::git::Entry;
+    use Status::{Block as B, Pass as P, Unknown as U};
+    use std::path::PathBuf;
+
+    const IDS: [&str; 4] = ["identity", "activity", "tracked_changes", "ignored"];
+
+    fn entry() -> Entry {
+        Entry {
+            path: PathBuf::from("/nonexistent/residue-verdict-test"),
+            head: None,
+            branch: None,
+            bare: false,
+            detached: false,
+            locked: None,
+            prunable: None,
+        }
+    }
+
+    fn report(statuses: &[Status], stale: bool) -> Report {
+        let mut r = Report::new(&entry());
+        r.checks = statuses
+            .iter()
+            .enumerate()
+            .map(|(i, &status)| Check {
+                id: IDS[i % IDS.len()],
+                status,
+                short: String::new(),
+                detail: String::new(),
+            })
+            .collect();
+        if stale {
+            r.stale_reason = Some("the directory no longer exists".into());
+        }
+        r.finish()
+    }
+
+    /// The statuses as their JSON codes, for assertion messages.
+    fn show(statuses: &[Status]) -> Vec<&'static str> {
+        statuses.iter().map(|s| s.code()).collect()
+    }
+
+    fn verdict(statuses: &[Status]) -> &'static str {
+        report(statuses, false).verdict.code()
+    }
+
+    /// The README contract as a table over what a set of checks contains.
+    fn expected(statuses: &[Status]) -> &'static str {
+        let has = |s: Status| statuses.contains(&s);
+        match (statuses.is_empty(), has(B), has(U)) {
+            (true, _, _) => "unknown",
+            (false, true, _) => "keep",
+            (false, false, true) => "unknown",
+            (false, false, false) => "candidate",
+        }
+    }
+
+    /// Every sequence of up to `max` statuses.
+    fn sequences(max: usize) -> Vec<Vec<Status>> {
+        let mut all = vec![Vec::new()];
+        let mut layer = vec![Vec::new()];
+        for _ in 0..max {
+            let mut next = Vec::new();
+            for s in &layer {
+                for x in [P, B, U] {
+                    let mut t = s.clone();
+                    t.push(x);
+                    next.push(t);
+                }
+            }
+            all.extend(next.iter().cloned());
+            layer = next;
+        }
+        all
+    }
+
+    #[test]
+    fn no_checks_is_unknown_not_candidate() {
+        assert_eq!(verdict(&[]), "unknown");
+    }
+
+    #[test]
+    fn passing_checks_make_a_candidate() {
+        assert_eq!(verdict(&[P]), "candidate");
+        assert_eq!(verdict(&[P, P, P, P]), "candidate");
+    }
+
+    #[test]
+    fn a_failed_check_keeps() {
+        assert_eq!(verdict(&[B]), "keep");
+        assert_eq!(verdict(&[B, B]), "keep");
+        assert_eq!(verdict(&[P, B]), "keep");
+        assert_eq!(verdict(&[B, P, P]), "keep");
+    }
+
+    #[test]
+    fn an_unknown_check_without_a_failure_is_unknown() {
+        assert_eq!(verdict(&[U]), "unknown");
+        assert_eq!(verdict(&[U, U]), "unknown");
+        assert_eq!(verdict(&[P, U]), "unknown");
+        assert_eq!(verdict(&[U, P, P]), "unknown");
+    }
+
+    #[test]
+    fn a_failed_check_outranks_an_unknown_one() {
+        assert_eq!(verdict(&[B, U]), "keep");
+        assert_eq!(verdict(&[U, B]), "keep");
+        assert_eq!(verdict(&[P, B, U]), "keep");
+        assert_eq!(verdict(&[U, P, B]), "keep");
+    }
+
+    #[test]
+    fn stale_outranks_every_check() {
+        for statuses in [&[][..], &[P], &[B], &[U], &[P, B, U]] {
+            assert_eq!(
+                report(statuses, true).verdict.code(),
+                "stale",
+                "{:?}",
+                show(statuses)
+            );
+        }
+    }
+
+    #[test]
+    fn every_set_of_up_to_five_checks_matches_the_contract() {
+        for s in sequences(5) {
+            assert_eq!(verdict(&s), expected(&s), "{:?}", show(&s));
+        }
+    }
+
+    #[test]
+    fn order_does_not_change_the_verdict() {
+        for s in sequences(4) {
+            let mut reversed = s.clone();
+            reversed.reverse();
+            assert_eq!(verdict(&s), verdict(&reversed), "{:?}", show(&s));
+            for k in 0..s.len() {
+                let mut rotated = s.clone();
+                rotated.rotate_left(k);
+                assert_eq!(
+                    verdict(&s),
+                    verdict(&rotated),
+                    "{:?} rotated by {k}",
+                    show(&s)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn adding_a_failed_or_unknown_check_never_makes_a_candidate() {
+        for s in sequences(4) {
+            for x in [B, U] {
+                for at in 0..=s.len() {
+                    let mut t = s.clone();
+                    t.insert(at, x);
+                    assert_ne!(
+                        verdict(&t),
+                        "candidate",
+                        "{:?} with {} at {at}",
+                        show(&s),
+                        x.code()
+                    );
+                }
+            }
+        }
+    }
+}

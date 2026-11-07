@@ -24,6 +24,8 @@ jobs:
         run: cargo fmt --check
       - name: Lint
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: In-crate tests
+        run: cargo test --locked
       - name: Build
         run: cargo build --locked --release
       # A real, read-only run on this checkout: one linked worktree, scanned
