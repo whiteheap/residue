@@ -1,0 +1,22 @@
+// Cloudflare Workers Static Assets for the residue site. Prepared, not
+// deployed: no Cloudflare resource exists for it yet. site/README.md has the
+// publish steps and what each setting here decides.
+{
+  // Proposed Worker name. Check that the account has no Worker by this name
+  // before the first deploy.
+  "name": "residue",
+  "compatibility_date": "2026-11-07",
+  // No "main": there is no Worker script, so every request is a static asset
+  // request. Only site/public is uploaded, never the repository.
+  "assets": {
+    "directory": "./public",
+    // An unknown path gets public/404.html with status 404, not the home page.
+    "not_found_handling": "404-page",
+    "html_handling": "auto-trailing-slash"
+  },
+  // The first address is the account's workers.dev subdomain. To serve a
+  // custom domain instead, add "routes" and set this to false.
+  "workers_dev": true,
+  // No per-version preview URLs: an upload must not publish a second address.
+  "preview_urls": false
+}
