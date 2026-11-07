@@ -230,7 +230,8 @@ struct Mode {
     since: &'static str,
     /// `--all`: the PATHs are scan roots.
     sweep: bool,
-    /// `--only-if-upstream-gone`, checked at the plan and in the re-check.
+    /// `--only-if-upstream-gone`, checked at the plan, in the re-check and
+    /// after the move.
     only_if_upstream_gone: bool,
     started: i64,
 }
@@ -618,9 +619,9 @@ impl Unmet {
 }
 
 /// `--only-if-upstream-gone`: `Ok` only when the local refs show that the
-/// branch has an upstream and that it is gone. A detached HEAD, a branch
-/// with no upstream, an upstream that exists, and a lookup that failed all
-/// keep the worktree. residue never fetches, so this is the remote as of
+/// branch's upstream is a remote-tracking ref and that it is gone. A
+/// detached HEAD, a branch with no upstream, a local upstream, an upstream
+/// that exists, and a lookup that failed all keep the worktree. residue never fetches, so this is the remote as of
 /// the last fetch.
 fn judge_upstream(
     branch: Option<&str>,
@@ -632,7 +633,11 @@ fn judge_upstream(
         ));
     };
     match upstream {
-        Ok(Some(u)) if u.gone => Ok(()),
+        Ok(Some(u)) if u.gone && u.remote() => Ok(()),
+        Ok(Some(u)) if u.gone => Err(Unmet::NotGone(format!(
+            "its upstream {} is a local branch, not a remote-tracking ref, so its deletion is not work that landed",
+            clean(&u.name)
+        ))),
         Ok(Some(u)) => Err(Unmet::NotGone(format!(
             "its upstream {} exists in the local refs",
             clean(&u.name)
@@ -702,7 +707,7 @@ fn recheck(
     if only_if_upstream_gone {
         upstream_gone(&now).map_err(|unmet| match unmet {
             Unmet::NotGone(why) => Outcome::Skipped(format!("changed since {since}: {why}")),
-            Unmet::Unreadable(why) => Outcome::Failed(format!("--only-if-upstream-gone: {why}")),
+            Unmet::Unreadable(why) => Outcome::Skipped(format!("--only-if-upstream-gone: {why}")),
         })?;
     }
     Ok(listed.clone())

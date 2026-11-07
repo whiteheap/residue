@@ -46,9 +46,10 @@ Options:
                         confirmation; the purge is what frees the disk
   --only-if-upstream-gone
                         remove: keep any worktree whose branch's upstream is
-                        not gone, as the local refs show it at the plan and
-                        again right before the move (residue never fetches).
-                        `residue watch` passes it for a branch that landed
+                        not gone, as the local refs show it at the plan,
+                        right before the move and right before the deletion
+                        (residue never fetches). `residue watch` passes it
+                        for a branch that landed
   --regenerable RULE    Also treat ignored entries matching RULE as regenerable
                         output that removal may delete. A NAME or *.ext matches
                         at any depth; a PATH with a slash is anchored at the
@@ -146,8 +147,8 @@ pub struct Options {
     pub keep_trash: Option<Span>,
     pub regenerable: Vec<String>,
     /// `--only-if-upstream-gone`: remove only worktrees whose branch has an
-    /// upstream that the local refs show as gone, checked again right
-    /// before the move.
+    /// upstream that the local refs show as gone, checked at the plan, right
+    /// before the move and right before the deletion.
     pub only_if_upstream_gone: bool,
 }
 

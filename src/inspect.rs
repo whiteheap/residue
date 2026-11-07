@@ -182,8 +182,20 @@ impl LastChange {
 }
 
 pub struct Upstream {
+    /// As Git abbreviates it, such as `origin/fix`.
     pub name: String,
+    /// The full refname, such as `refs/remotes/origin/fix`, or
+    /// `refs/heads/main` for a local upstream.
+    pub full: String,
     pub gone: bool,
+}
+
+impl Upstream {
+    /// A remote-tracking ref, so `gone` means the branch was deleted on a
+    /// remote. A local upstream that is gone is a deleted local branch.
+    pub fn remote(&self) -> bool {
+        self.full.starts_with("refs/remotes/")
+    }
 }
 
 pub struct Report {
@@ -1115,6 +1127,7 @@ pub fn upstream(dir: &Path, branch: &str) -> Result<Option<Upstream>, String> {
     let gone = track.contains("gone") && ref_absent(dir, full, name)?;
     Ok(Some(Upstream {
         name: name.to_string(),
+        full: full.to_string(),
         gone,
     }))
 }
@@ -1140,7 +1153,7 @@ fn ref_absent(dir: &Path, full: &str, name: &str) -> Result<bool, String> {
     match shown.code {
         Some(1) => Ok(true),
         Some(0) => Err(format!(
-            "Git marks the upstream {name} gone, but {full} exists and does not resolve to a commit"
+            "Git marks the upstream {name} gone, but {full} exists: it does not resolve to a commit, or it came back just now"
         )),
         _ => Err(format!(
             "could not check whether {full} exists: {}",

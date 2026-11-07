@@ -18,9 +18,9 @@
 //! watch removes nothing more.
 //!
 //! A removal because work landed also passes `--only-if-upstream-gone`, so
-//! the child checks the reason itself, from fresh local refs, at its plan
-//! and again right before the move: an upstream that is back by then keeps
-//! the worktree. A disk-pressure removal does not need the upstream gone,
+//! the child checks the reason itself, from fresh local refs, at its plan,
+//! right before the move and right before the deletion: an upstream that
+//! is back by then keeps the worktree. A disk-pressure removal does not need the upstream gone,
 //! and does not pass it.
 //!
 //! It wakes on: a change under a repository's `refs/remotes`, `packed-refs`
@@ -327,6 +327,8 @@ struct Worktree {
     path: String,
     verdict: String,
     upstream: Option<String>,
+    /// Its upstream is a remote-tracking ref that is gone: the branch was
+    /// deleted on a remote, as after a merged pull request.
     upstream_gone: bool,
     last_change: Option<i64>,
     bytes: u64,
@@ -404,7 +406,10 @@ fn scan(exe: &Path, opts: &Options) -> Result<Snapshot, ScanError> {
                     .unwrap_or("")
                     .to_string(),
                 upstream: w.get("upstream").and_then(Value::str).map(str::to_string),
-                upstream_gone: w.get("upstream_gone").and_then(Value::bool) == Some(true),
+                upstream_gone: w.get("upstream_gone").and_then(Value::bool) == Some(true)
+                    && w.get("upstream_ref")
+                        .and_then(Value::str)
+                        .is_some_and(|r| r.starts_with("refs/remotes/")),
                 last_change: w
                     .get("last_change")
                     .and_then(|c| c.get("unix"))

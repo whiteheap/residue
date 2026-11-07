@@ -19,7 +19,8 @@
 #      is unchanged.
 #   6. watch passes the reason, and the child reads it at its plan, at the
 #      re-check before the move and after the move, right before deleting:
-#      a git wrapper restores the upstream right before each read in turn.
+#      a git wrapper restores the upstream right before each read in turn,
+#      and once during the re-measure that precedes the last read.
 #      A worktree kept that way is not taken as disk pressure in the same
 #      pass; the next pass judges pressure on its own terms.
 # Every branch stays, and nothing goes to the trash: watch deletes.
@@ -122,7 +123,8 @@ git config user.email smoke@example.com
 git config user.name smoke
 echo hello > README.md
 git add . && git commit -qm init && git push -q origin main
-for name in back gone none dirty treeref symref locked recent; do
+git branch basel
+for name in back gone none dirty treeref symref locked recent localup; do
   git worktree add -q "$S/child/.worktrees/$name" -b "$name"
   (cd "$S/child/.worktrees/$name" && echo "$name" >> README.md && git commit -qam "$name")
 done
@@ -137,6 +139,10 @@ git update-ref refs/remotes/origin/back "$(git rev-parse back)"
 # treeref and symref: Git says [gone] for these too, but the ref exists
 # and does not resolve to a commit. That is not a deleted branch.
 git update-ref refs/remotes/origin/treeref "$(git rev-parse 'HEAD^{tree}')"
+# localup: its upstream is the local branch basel, then deleted. A deleted
+# local branch is not work that landed on a remote.
+git -C .worktrees/localup branch -q --set-upstream-to=basel
+git branch -q -D basel
 git symbolic-ref refs/remotes/origin/symref refs/remotes/origin/missing
 echo edit >> .worktrees/dirty/README.md
 git worktree lock --reason "resume later" .worktrees/locked
@@ -167,6 +173,7 @@ kept none skipped "--only-if-upstream-gone: branch none has no upstream"
 kept detached skipped "--only-if-upstream-gone: it is on a detached HEAD, which has no upstream"
 kept treeref skipped "residue could not read the upstream of branch treeref: .*does not resolve to a commit"
 kept symref skipped "residue could not read the upstream of branch symref: .*is a symbolic ref"
+kept localup skipped "--only-if-upstream-gone: its upstream basel is a local branch, not a remote-tracking ref"
 # A failed check wins over the requirement: dirty has no upstream, and
 # locked and recent (changed within --idle) have a gone one.
 kept dirty refused "one or more checks did not pass"
@@ -182,7 +189,7 @@ set +e
 "$residue" remove --all --only-if-upstream-gone "$S/child" > /dev/null 2>&1; st=$?
 set -e
 [ "$st" = 2 ] || fail "--all with --only-if-upstream-gone: exit $st, want 2"
-for b in back gone none dirty treeref symref locked recent; do
+for b in back gone none dirty treeref symref locked recent localup; do
   git rev-parse --verify -q "$b" > /dev/null || fail "branch $b is gone"
 done
 
@@ -246,6 +253,21 @@ stage() { # N TEXT [WATCH OPTIONS]
 }
 stage 2 "changed since the plan: its upstream origin/race exists in the local refs"
 stage 3 "changed after residue moved it aside: its upstream origin/race exists in the local refs; it is back in place"
+# The read after the move must come after the re-measure, which can take
+# seconds: restore the upstream while residue runs `git status` in the
+# moved-aside directory, and the last read must still see it.
+landed_again
+cat > "$S/w6bin/git" << EOF
+#!/bin/sh
+case "\$*" in
+*residue-removing-*status*) "$real_git" -C "$S/w6" update-ref refs/remotes/origin/race "$race_sha" ;;
+esac
+exec "$real_git" "\$@"
+EOF
+wrapped_watch
+grep -q "kept .*worktrees/race (skipped): changed after residue moved it aside: its upstream origin/race exists in the local refs" "$S/log" || fail "stage 4: the upstream read after the move did not come after the re-measure"
+! grep -q "removed .*worktrees/race" "$S/log" || fail "stage 4: race was removed"
+[ -d .worktrees/race ] || fail "stage 4: race is gone"
 # The plan, with disk pressure in the same pass: kept, not taken as pressure.
 stage 1 "--only-if-upstream-gone: its upstream origin/race exists in the local refs" --min-free 99.9 --idle 1m
 # The next pass, without the wrapper: the upstream exists, so race did not
