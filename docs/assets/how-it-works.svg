@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Compact how-it-works chart for the README.
+  Flat grayscale, 1px rules, no gradients or shadows.
+  Light colors are the default. docs/assets/how-it-works.png
+  and how-it-works-dark.png are rasterized from this file.
+  Text uses Geist Mono when installed, otherwise a local mono.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 468" role="img" aria-labelledby="howTitle howDesc">
+  <title id="howTitle">How residue works</title>
+  <desc id="howDesc">scan and explain only read and do not delete. They report a candidate when every check passes, and keep the worktree when any check blocks or is unknown. remove runs the checks again and leaves the worktree in place when a check blocks, is unknown, or it changed since the plan. Otherwise it moves the worktree aside, checks the new path, and moves it back on any doubt. Only then does git worktree remove delete it, without --force, or the trash keeps it for restore. watch does not delete on its own. It chooses paths and runs that same remove.</desc>
+  <style>
+    .bg { fill: #ffffff; }
+    .frame, .rule { stroke: #141414; }
+    .ink { fill: #141414; }
+    .muted { fill: #3a3a3a; }
+    text { font-family: "Geist Mono", "JetBrains Mono", ui-monospace, "Cascadia Mono", monospace; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .frame, .rule { stroke: #f4f4f4; }
+      .ink { fill: #f4f4f4; }
+      .muted { fill: #d2d2d2; }
+    }
+  </style>
+  <rect class="bg" width="440" height="468"/>
+  <rect class="frame" x="0.5" y="0.5" width="439" height="467" fill="none" stroke-width="1"/>
+
+  <g font-size="11" letter-spacing="1.4">
+    <text class="ink" x="24" y="32">READ ONLY</text>
+  </g>
+  <text class="ink" x="24" y="56" font-size="16">scan / explain</text>
+  <text class="muted" x="24" y="80" font-size="13">Reads a linked worktree. Deletes nothing.</text>
+  <text class="ink" x="24" y="108" font-size="13">candidate</text>
+  <text class="muted" x="128" y="108" font-size="13">every check passed</text>
+  <text class="ink" x="24" y="128" font-size="13">keep</text>
+  <text class="muted" x="128" y="128" font-size="13">any block or unknown</text>
+
+  <line class="rule" x1="24" y1="152" x2="416" y2="152" stroke-width="1"/>
+
+  <g font-size="11" letter-spacing="1.4">
+    <text class="ink" x="24" y="180">REMOVE</text>
+  </g>
+  <text class="ink" x="24" y="204" font-size="16">fresh checks, then Git</text>
+  <text class="muted" x="24" y="230" font-size="13">Leaves it in place when a check blocks,</text>
+  <text class="muted" x="24" y="248" font-size="13">is unknown, or it changed since the plan.</text>
+  <text class="muted" x="24" y="274" font-size="13">Otherwise moves it aside, checks again,</text>
+  <text class="muted" x="24" y="292" font-size="13">and moves it back on any doubt.</text>
+  <text class="muted" x="24" y="318" font-size="13">Then git worktree remove, no --force,</text>
+  <text class="muted" x="24" y="336" font-size="13">or the trash, which restore can put back.</text>
+
+  <line class="rule" x1="24" y1="360" x2="416" y2="360" stroke-width="1"/>
+
+  <g font-size="11" letter-spacing="1.4">
+    <text class="ink" x="24" y="388">WATCH</text>
+  </g>
+  <text class="ink" x="24" y="412" font-size="16">chooses paths only</text>
+  <text class="muted" x="24" y="436" font-size="13">Runs that same remove. Deletes nothing itself.</text>
+</svg>

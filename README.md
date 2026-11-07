@@ -1,6 +1,18 @@
 # residue
 
-**Reclaim your storage from Git worktrees, automatically and safely.**
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.png">
+  <img src="docs/assets/logo.png" width="112" alt="Residue mark: three flat sheets stacked like linked worktrees, and a small square set apart beneath them.">
+</picture>
+
+**Coding agents leave Git worktrees on disk; residue removes one only when every check passes.**
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/how-it-works-dark.png">
+  <img src="docs/assets/how-it-works.png" width="440" alt="How residue works. scan and explain only read a linked worktree and delete nothing. A candidate requires every check to pass. Any block or any unknown keeps the worktree. remove runs the checks again and leaves the worktree in place when a check blocks, is unknown, or it changed since the plan. Otherwise residue moves it aside, checks the new path, and moves it back on any doubt. Only then does git worktree remove delete it, without --force, or the trash holds it for residue restore. watch does not delete on its own. It chooses paths and runs that same remove.">
+</picture>
+
+`scan` and `explain` only read. A worktree is a candidate only when every check passes; any block or any unknown keeps it. `remove` runs the checks again and leaves the worktree in place when a check blocks, is unknown, or it changed since the plan. Otherwise residue moves it aside, checks the new path, and moves it back on any doubt. Only then does `git worktree remove` delete it, without `--force`, or the trash holds it for `residue restore`. `watch` does not delete on its own: it chooses paths and runs that same `remove`. Age alone does not make a worktree inactive.
 
 Coding agents leave Git worktrees behind. Each one is a full checkout with its own `node_modules`, `target` and build output, and a machine that runs agents all day fills its disk with them. residue finds those worktrees, measures them, and removes one only when nothing in it would be lost.
 
