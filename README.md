@@ -444,7 +444,7 @@ A scan is a snapshot of one moment, `generated_at`. Worktrees created after the 
 
 ## Tested on
 
-These are the exact platforms and versions that ran. Apart from the race check (`scripts/race-check.sh`), which CI runs, residue has no automated test suite. Each row below was checked by running a release binary on real Git repositories.
+These are the exact platforms and versions that ran. Apart from the smoke tests and the race check (`scripts/race-check.sh`) that CI runs, residue has no automated test suite. Each row below was checked by running a release binary on real Git repositories.
 
 | Version | Platform | Git | What ran |
 | --- | --- | --- | --- |
@@ -458,7 +458,7 @@ These are the exact platforms and versions that ran. Apart from the race check (
 | 0.0.1 | Ubuntu 24.04.5 LTS, arm64 (Docker, Linux 7.0.14) | 2.43.0 | Static musl binary as a non-root user: `scan`, in-use detection through `/proc`, hard-link accounting, and `remove` with and without a terminal. As root on another user's repository, Git refused with "dubious ownership" and residue reported the error instead of guessing. |
 | 0.0.1 to 0.0.4 | GitHub Actions `macos-latest`, `ubuntu-24.04` (x86_64), `ubuntu-24.04-arm` | runner Git | Build, then `scan` and `explain` of a temporary worktree. No removal. |
 
-Not run: the Intel macOS binary (built by cross-compiling, never executed), NetBSD, OpenBSD, DragonFly and illumos (they build, but have no activity probe, so nothing is a candidate), and Windows (not supported). CI runs `.github/smoke.sh` (a clean candidate, a kept `.env`, a worktree a process is using, and a removal that keeps the branch) and `.github/watch-smoke.sh` (`watch` removing a worktree whose branch landed, once and as a running process woken by a `git fetch --prune`, and under disk pressure) on macOS, Linux x86_64 and arm64, and FreeBSD 14 as root and as an ordinary user, on every push. `.github/service-smoke.sh` installs, checks and uninstalls the launchd agent on macOS and the systemd user service on Linux.
+Not run: the Intel macOS binary (built by cross-compiling, never executed), NetBSD, OpenBSD, DragonFly and illumos (they build, but have no activity probe, so nothing is a candidate), and Windows (not supported). CI runs `.github/smoke.sh` (a clean candidate, a kept `.env`, a worktree a process is using, and a removal that keeps the branch) `.github/watch-smoke.sh` (`watch` removing a worktree whose branch landed, once and as a running process woken by a `git fetch --prune`, and under disk pressure, without the trash) and `scripts/race-check.sh` (five changes made while the prompt waits, each skipped, and two removals that changed nothing) on macOS, Linux x86_64 and arm64, and FreeBSD 14 as root and as an ordinary user, on every push. `.github/service-smoke.sh` installs, checks and uninstalls the launchd agent on macOS and the systemd user service on Linux.
 
 ## Limits
 

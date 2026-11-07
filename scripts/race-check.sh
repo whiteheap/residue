@@ -31,17 +31,24 @@ git config --global init.defaultBranch main
 failures=0
 passes=0
 
-# The keyboard: types yes once $work/type appears, then holds the pipe
-# open until $work/done does, so `script` never sees end of input early.
-# It stops when the work directory is gone, so an interrupted run leaves
-# no process behind.
+# The keyboard: types yes once $work/type appears, so `script` never sees
+# end of input before the prompt. It stops when the work directory is gone,
+# so an interrupted run leaves no process behind.
 # (macOS `script` rejects a FIFO as its input, so this is a pipe.)
+# After yes, the BSD and macOS `script` pass the end of input on as an
+# end-of-file character, which the terminal echoes as ^D into the output,
+# so there the pipe stays open until $work/done appears. util-linux
+# `script` (2.39.3 in Ubuntu 24.04) does not exit after the command does
+# while its input is open: it spins. So on Linux the input ends right after
+# yes; residue reads one line and never sees the end of file, and Linux
+# does not echo it.
 keyboard() {
     until [ -e "$work/type" ]; do
         [ -d "$work" ] || return 0
         sleep 0.1
     done
     printf 'yes\n'
+    [ "$(uname -s)" = Linux ] && return 0
     until [ -e "$work/done" ]; do
         [ -d "$work" ] || return 0
         sleep 0.1

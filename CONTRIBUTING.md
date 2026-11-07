@@ -42,12 +42,16 @@ Run what CI runs:
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked --release
+sh .github/smoke.sh ./target/release/residue
+sh .github/watch-smoke.sh ./target/release/residue
 bash scripts/race-check.sh
 ```
 
+CI also runs `.github/service-smoke.sh`, which installs and removes a real login service; run it only on a machine where no `residue service` of yours is installed.
+
 `scripts/race-check.sh` is the race check. For each case it builds a scratch repository with one candidate worktree, starts the release binary's `remove` under a pseudo-terminal (`script`), waits for the prompt, and then changes the worktree: an untracked file, an edit to a tracked file, a new file inside the ignored `node_modules/`, or a new commit, with and without `--trash`. Then it types `yes` and checks for exit status 3, a `changed since you confirmed` reason, and the worktree still in place and registered. Two control cases change nothing and must be removed or moved to the trash. It takes about 15 seconds, needs only bash, git and `script`, cleans up after itself, and takes another binary as its argument: `bash scripts/race-check.sh /path/to/residue`. Run it for any change to `remove`, the checks or the walk, and add a case when you add a way for a worktree to change.
 
-Beyond the race check, residue has no automated test suite, so every change is also checked by running the release binary on real repositories. This script builds a scratch repository with one linked worktree in each common state. Save it as `~/scratch.sh` and run `bash ~/scratch.sh`:
+Beyond the smoke tests and the race check, residue has no automated test suite, so every change is also checked by running the release binary on real repositories. This script builds a scratch repository with one linked worktree in each common state. Save it as `~/scratch.sh` and run `bash ~/scratch.sh`:
 
 ```sh
 set -eu
