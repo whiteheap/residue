@@ -1,44 +1,21 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Residue mark, traced from the generated stack-and-square and flattened
-  to solid fills. No gradients, shadows, or filters.
-  Light colors are the default. A dark-mode media query inverts them.
-  docs/assets/logo.png and logo-dark.png are rasterized from this file.
+  Residue mark. Same stack and separate square as the generated logo.
+  No background slab, no gradients, no shadows.
+  This file is the light-theme drawing. logo-dark.svg is the same
+  geometry with light strokes for a dark page.
 -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 268" role="img" aria-labelledby="logoTitle logoDesc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="16 56 200 202" role="img" aria-labelledby="logoTitle logoDesc">
   <title id="logoTitle">Residue</title>
   <desc id="logoDesc">Three flat sheets stacked like linked worktrees, with a small square set apart underneath.</desc>
-  <style>
-    .ink { stroke: #141414; }
-    .top { fill: #ffffff; }
-    .front-0 { fill: #f5f5f5; }
-    .front-1 { fill: #e4e4e4; }
-    .front-2 { fill: #c8c8c8; }
-    .side-0 { fill: #ececec; }
-    .side-1 { fill: #d4d4d4; }
-    .side-2 { fill: #b0b0b0; }
-    .square { fill: #ffffff; }
-    @media (prefers-color-scheme: dark) {
-      .ink { stroke: #f4f4f4; }
-      .top { fill: #0d1117; }
-      .front-0 { fill: #1c2128; }
-      .front-1 { fill: #30363d; }
-      .front-2 { fill: #484f58; }
-      .side-0 { fill: #161b22; }
-      .side-1 { fill: #262c34; }
-      .side-2 { fill: #3d444d; }
-      .square { fill: #0d1117; }
-    }
-  </style>
-  <g class="ink" stroke-width="4.25" stroke-linejoin="round" stroke-linecap="round" fill-rule="evenodd">
-    <!-- Right-hand edges, then fronts, then the top face. Seams are stroked once. -->
-    <polygon class="side-2" points="164,160 200,124 200,144 164,180"/>
-    <polygon class="side-1" points="164,140 200,104 200,124 164,160"/>
-    <polygon class="side-0" points="164,120 200,84 200,104 164,140"/>
-    <polygon class="front-2" points="32,148 164,160 164,180 32,168"/>
-    <polygon class="front-1" points="32,128 164,140 164,160 32,148"/>
-    <polygon class="front-0" points="32,108 164,120 164,140 32,128"/>
-    <polygon class="top" points="32,108 164,120 200,84 68,72"/>
+  <g stroke="#141414" stroke-width="4.25" stroke-linejoin="round" stroke-linecap="round" fill-rule="evenodd">
+    <polygon fill="#b0b0b0" points="164,160 200,124 200,144 164,180"/>
+    <polygon fill="#d4d4d4" points="164,140 200,104 200,124 164,160"/>
+    <polygon fill="#ececec" points="164,120 200,84 200,104 164,140"/>
+    <polygon fill="#c8c8c8" points="32,148 164,160 164,180 32,168"/>
+    <polygon fill="#e4e4e4" points="32,128 164,140 164,160 32,148"/>
+    <polygon fill="#f5f5f5" points="32,108 164,120 164,140 32,128"/>
+    <polygon fill="#ffffff" points="32,108 164,120 200,84 68,72"/>
     <g fill="none">
       <path d="M68 72 L200 84 L200 144 L164 180 L32 168 L32 108 L68 72 Z"/>
       <path d="M32 108 L164 120 L200 84"/>
@@ -46,6 +23,6 @@
       <path d="M32 128 L164 140 L200 104"/>
       <path d="M32 148 L164 160 L200 124"/>
     </g>
-    <rect class="square" x="100" y="208" width="34" height="34"/>
+    <rect fill="#ffffff" x="100" y="208" width="34" height="34"/>
   </g>
 </svg>

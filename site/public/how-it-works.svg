@@ -1,85 +1,63 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Conceptual chart: nodes and arrows, not a procedure listing.
-  Flat grayscale, 1px lines, no gradients or shadows.
-  Light colors are the default. docs/assets/how-it-works.png
-  and how-it-works-dark.png are rasterized from this file.
+  Concept chart. Transparent background, no outer frame, no gradients.
+  The block path leaves the left of "fresh checks" and ends at "stays".
+  The all-pass path is two arrows from the bottom of that node to
+  git remove and trash. Those arrows do not meet the block path.
+  README PNGs are rasterized with JetBrains Mono.
 -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 420" role="img" aria-labelledby="howTitle howDesc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 600" role="img" aria-labelledby="howTitle howDesc">
   <title id="howTitle">How residue works</title>
-  <desc id="howDesc">A repository's linked worktrees are checked and reported. scan and explain only read that report and stop; they do not lead to deletion. remove is a separate command, which you run or which watch chooses paths for. Fresh checks then leave the worktree in place on a block, an unknown, or a change. When every check passes, git worktree remove deletes it without --force, or it goes to the trash for restore. Passing is not a safety guarantee, and age alone does not mean inactive.</desc>
+  <desc id="howDesc">A repository's linked worktrees are checked and reported. scan and explain only read that report and stop. remove is a separate command, which you run or which watch chooses paths for. From fresh checks, the left arrow ends at stays when a check blocks, is unknown, or the worktree changed. A different pair of arrows, taken only when every check passes, goes to git worktree remove without --force or to the trash for restore. The block path does not continue to deletion.</desc>
   <defs>
-    <marker id="arrow" viewBox="0 0 8 8" refX="7.2" refY="4" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M0 0 L8 4 L0 8 Z" class="head"/>
+    <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0 L8 4 L0 8 Z" fill="#141414"/>
     </marker>
   </defs>
   <style>
-    .bg { fill: #ffffff; }
-    .frame, .box, .line { stroke: #141414; }
-    .box { fill: #ffffff; }
-    .ink { fill: #141414; }
-    .muted { fill: #3a3a3a; }
-    .head { fill: #141414; }
-    text { font-family: "Geist Mono", "JetBrains Mono", ui-monospace, "Cascadia Mono", monospace; }
-    @media (prefers-color-scheme: dark) {
-      .bg, .box { fill: #0d1117; }
-      .frame, .box, .line { stroke: #f4f4f4; }
-      .ink, .head { fill: #f4f4f4; }
-      .muted { fill: #d2d2d2; }
-    }
+    text { font-family: "JetBrains Mono", "Cascadia Mono", "Liberation Mono", monospace; }
   </style>
-  <rect class="bg" width="420" height="420"/>
-  <rect class="frame" x="0.5" y="0.5" width="419" height="419" fill="none" stroke-width="1"/>
-
-  <!-- repository -> linked worktrees -> report -->
-  <rect class="box" x="126" y="16" width="168" height="32" stroke-width="1"/>
-  <text class="ink" x="210" y="37" text-anchor="middle" font-size="13">repository</text>
-
-  <line class="line" x1="210" y1="48" x2="210" y2="70" stroke-width="1.25" marker-end="url(#arrow)"/>
-
-  <rect class="box" x="102" y="72" width="216" height="32" stroke-width="1"/>
-  <text class="ink" x="210" y="93" text-anchor="middle" font-size="13">linked worktrees</text>
-
-  <line class="line" x1="210" y1="104" x2="210" y2="126" stroke-width="1.25" marker-end="url(#arrow)"/>
-  <text class="muted" x="218" y="120" font-size="11">checks</text>
-
-  <rect class="box" x="150" y="128" width="120" height="32" stroke-width="1"/>
-  <text class="ink" x="210" y="149" text-anchor="middle" font-size="13">report</text>
-
-  <!-- read path ends; removal is a separate command -->
-  <polyline class="line" points="210,160 210,180 104,180 104,198" fill="none" stroke-width="1.25" marker-end="url(#arrow)"/>
-  <polyline class="line" points="210,180 318,180 318,198" fill="none" stroke-width="1.25" marker-end="url(#arrow)"/>
-  <text class="muted" x="28" y="174" font-size="11">read only</text>
-  <text class="muted" x="232" y="174" font-size="11">you or watch</text>
-
-  <rect class="box" x="16" y="200" width="176" height="48" stroke-width="1"/>
-  <text class="ink" x="104" y="220" text-anchor="middle" font-size="13">scan / explain</text>
-  <text class="muted" x="104" y="238" text-anchor="middle" font-size="11">reads. stops.</text>
-
-  <rect class="box" x="232" y="200" width="172" height="32" stroke-width="1"/>
-  <text class="ink" x="318" y="221" text-anchor="middle" font-size="13">remove</text>
-
-  <line class="line" x1="318" y1="232" x2="318" y2="266" stroke-width="1.25" marker-end="url(#arrow)"/>
-
-  <rect class="box" x="232" y="268" width="172" height="32" stroke-width="1"/>
-  <text class="ink" x="318" y="289" text-anchor="middle" font-size="13">fresh checks</text>
-
-  <!-- stay, or Git delete, or trash -->
-  <polyline class="line" points="318,300 318,322 90,322 90,344" fill="none" stroke-width="1.25" marker-end="url(#arrow)"/>
-  <polyline class="line" points="318,322 234,322 234,344" fill="none" stroke-width="1.25" marker-end="url(#arrow)"/>
-  <polyline class="line" points="318,322 363,322 363,344" fill="none" stroke-width="1.25" marker-end="url(#arrow)"/>
-  <text class="muted" x="16" y="314" font-size="11">block, unknown, or changed</text>
-  <text class="muted" x="268" y="314" font-size="11">all pass</text>
-
-  <rect class="box" x="16" y="346" width="148" height="44" stroke-width="1"/>
-  <text class="ink" x="90" y="373" text-anchor="middle" font-size="13">stays</text>
-
-  <rect class="box" x="176" y="346" width="116" height="44" stroke-width="1"/>
-  <text class="ink" x="234" y="364" text-anchor="middle" font-size="13">git remove</text>
-  <text class="muted" x="234" y="380" text-anchor="middle" font-size="11">no --force</text>
-  <text class="muted" x="307" y="373" text-anchor="middle" font-size="11">or</text>
-
-  <rect class="box" x="316" y="346" width="88" height="44" stroke-width="1"/>
-  <text class="ink" x="360" y="364" text-anchor="middle" font-size="13">trash</text>
-  <text class="muted" x="360" y="380" text-anchor="middle" font-size="11">restore</text>
+  <g fill="none" stroke="#141414" stroke-width="1.25">
+    <rect x="148" y="16" width="204" height="42"/>
+    <line x1="250" y1="58" x2="250" y2="84" marker-end="url(#arrow)"/>
+    <rect x="96" y="86" width="308" height="42"/>
+    <line x1="250" y1="128" x2="250" y2="158" marker-end="url(#arrow)"/>
+    <rect x="170" y="160" width="160" height="42"/>
+    <polyline points="250,202 250,228 118,228 118,252" marker-end="url(#arrow)"/>
+    <polyline points="250,228 382,228 382,252" marker-end="url(#arrow)"/>
+    <rect x="20" y="254" width="196" height="58"/>
+    <rect x="284" y="262" width="196" height="42"/>
+    <line x1="382" y1="304" x2="382" y2="340" marker-end="url(#arrow)"/>
+    <rect x="250" y="342" width="230" height="44"/>
+    <!-- block path ends at stays; it does not reach git remove or trash -->
+    <polyline points="250,386 250,424 102,424 102,468" marker-end="url(#arrow)"/>
+    <line x1="310" y1="386" x2="310" y2="468" marker-end="url(#arrow)"/>
+    <line x1="430" y1="386" x2="430" y2="468" marker-end="url(#arrow)"/>
+    <rect x="16" y="470" width="172" height="100"/>
+    <rect x="240" y="470" width="140" height="72"/>
+    <rect x="404" y="470" width="80" height="72"/>
+  </g>
+  <g fill="#141414" font-size="16">
+    <text x="250" y="43" text-anchor="middle">repository</text>
+    <text x="250" y="113" text-anchor="middle">linked worktrees</text>
+    <text x="250" y="187" text-anchor="middle">report</text>
+    <text x="118" y="278" text-anchor="middle">scan / explain</text>
+    <text x="382" y="289" text-anchor="middle">remove</text>
+    <text x="365" y="370" text-anchor="middle">fresh checks</text>
+    <text x="102" y="508" text-anchor="middle">stays</text>
+    <text x="310" y="500" text-anchor="middle">git remove</text>
+    <text x="444" y="500" text-anchor="middle">trash</text>
+  </g>
+  <g fill="#3a3a3a" font-size="14">
+    <text x="258" y="150">checks</text>
+    <text x="24" y="222">read only</text>
+    <text x="292" y="222">you or watch</text>
+    <text x="118" y="300" text-anchor="middle">reads. stops.</text>
+    <text x="102" y="532" text-anchor="middle">block, unknown,</text>
+    <text x="102" y="552" text-anchor="middle">or changed</text>
+    <text x="370" y="418" text-anchor="middle">all pass</text>
+    <text x="370" y="440" text-anchor="middle">or</text>
+    <text x="310" y="522" text-anchor="middle">no --force</text>
+    <text x="444" y="522" text-anchor="middle">restore</text>
+  </g>
 </svg>

@@ -8,6 +8,8 @@
 
 **Coding agents leave Git worktrees on disk; residue removes one only when every check passes.**
 
+Website: [residue.whiteheap.com](https://residue.whiteheap.com)
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/how-it-works-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="docs/assets/how-it-works.png">

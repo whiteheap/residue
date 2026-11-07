@@ -1,9 +1,7 @@
-// Cloudflare Workers Static Assets for the residue site. Prepared, not
-// deployed: no Cloudflare resource exists for it yet. site/README.md has the
-// publish steps and what each setting here decides.
+// Cloudflare Workers Static Assets for the residue site, served at
+// https://residue.whiteheap.com. site/README.md has the deploy steps and what
+// each setting here decides.
 {
-  // Proposed Worker name. Check that the account has no Worker by this name
-  // before the first deploy.
   "name": "residue",
   "compatibility_date": "2026-11-07",
   // No "main": there is no Worker script, so every request is a static asset
@@ -14,9 +12,11 @@
     "not_found_handling": "404-page",
     "html_handling": "auto-trailing-slash"
   },
-  // The first address is the account's workers.dev subdomain. To serve a
-  // custom domain instead, add "routes" and set this to false.
-  "workers_dev": true,
+  // A Custom Domain on the whiteheap.com zone, which is on the same account:
+  // Cloudflare creates its DNS record and certificate on deploy.
+  "routes": [{ "pattern": "residue.whiteheap.com", "custom_domain": true }],
+  // One address only: no workers.dev subdomain.
+  "workers_dev": false,
   // No per-version preview URLs: an upload must not publish a second address.
   "preview_urls": false
 }
