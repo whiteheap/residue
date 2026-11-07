@@ -20,9 +20,10 @@ Usage:
                              current directory, or put one ENTRY back (its name
                              from the list, the worktree's name or branch, or a
                              path)
-  residue watch ROOT...      Stay running; remove a worktree when its branch
-                             lands or the disk runs low (`residue watch --help`)
-  residue service install ROOT...
+  residue watch [ROOT...]    Stay running; remove a worktree when its branch
+                             lands or the disk runs low. Without a ROOT, the
+                             usual code folders (`residue watch --help`)
+  residue service install [ROOT...]
                              Run `residue watch` from login (launchd, systemd)
 
 Options:
@@ -48,7 +49,7 @@ Options:
                         remove: keep any worktree whose branch's upstream is
                         not gone, as the local refs show it at the plan,
                         right before the move and right before the deletion
-                        (residue never fetches). `residue watch` passes it
+                        (remove never fetches). `residue watch` passes it
                         for a branch that landed
   --regenerable RULE    Also treat ignored entries matching RULE as regenerable
                         output that removal may delete. A NAME or *.ext matches

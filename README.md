@@ -109,7 +109,7 @@ residue runs every check below on every linked worktree. A worktree is a **candi
 | `mount_point` | It contains a mount point |
 | `contents` | residue could not read some of its entries |
 
-Some facts never block, and residue reports each one separately instead of calling a worktree "safe": commits that are on the branch but on no remote-tracking ref, whether the branch's upstream is gone, the last change and what made it, and size. residue does not fetch, so "local-only" means local-only as of your last fetch.
+Some facts never block, and residue reports each one separately instead of calling a worktree "safe": commits that are on the branch but on no remote-tracking ref, whether the branch's upstream is gone, the last change and what made it, and size. `scan` and `explain` do not fetch, so "local-only" means local-only as of the last fetch.
 
 ## Remove a worktree
 
@@ -182,29 +182,37 @@ The trash does not free disk space: a trashed worktree takes all the space it to
 
 ## Automate cleanup
 
+Turn it on with one command:
+
+```sh
+residue service install
+```
+
+That starts `residue watch` now and at every login (launchd on macOS, systemd --user on Linux). With no ROOT it watches the usual code folders in your home folder that exist, and prints which: `~/src`, `~/code`, `~/Code`, `~/dev`, `~/Developer`, `~/projects`, `~/Projects`, `~/repos`, `~/git`, `~/github`, `~/GitHub`, `~/work`, `~/Work` and `~/workspace`. Name folders to watch only those: `residue service install ~/src`. `residue service uninstall` turns it off. One `watch` runs per user. While none is installed or running, `residue scan` at a terminal ends with a one-line reminder of this command.
+
 Try the dry run before anything is removed:
 
 ```sh
-residue watch --once --dry-run ~/src
-residue service install --dry-run ~/src
+residue watch --once --dry-run
+residue service install --dry-run
 ```
+
+The first prints what it would remove right now (for one folder: `residue watch --once --dry-run ~/src`); the second installs a service that only logs it. A dry run still fetches (below); add `--no-fetch` to leave the refs alone too.
 
 <a id="reclaim-storage-automatically"></a>
 
 ### Reclaim storage automatically
 
-`residue watch` removes in two cases only. It does not fetch.
+`residue watch` removes in two cases only.
 
 - **The work landed.** The upstream branch is gone in the local refs, and the worktree has not changed for `--grace` (default one hour). `watch` runs `residue remove --yes --idle --no-trash --only-if-upstream-gone`. The child reads those refs at the plan, again before the move aside, and again after the move. If the upstream is back, there is no upstream, the HEAD is detached, the upstream is local (`.`), or the ref exists but does not resolve to a commit, the worktree stays.
 - **The disk is low.** Free space on that filesystem is below `--min-free` (default 10%). Worktrees unchanged for `--idle` (default two days) go, largest first, until free space is five points above the threshold. The child is `residue remove --yes --idle --no-trash` without `--only-if-upstream-gone`.
 
 Both delete. They do not use the trash. The same run still purges that repository's trash entries older than seven days. Branches, commits, and locked worktrees stay. `scan` never starts `watch`.
 
-```sh
-residue service install ~/src
-```
+To see a branch deleted on the remote, `watch` fetches: about every 30 minutes (`--fetch-every`), `git fetch --prune --no-tags` for each remote that a worktree's branch tracks. The fetch never prompts. It runs without a terminal, and SSH runs with `BatchMode=yes` unless you set your own SSH command, so a fetch that needs a password or a passphrase fails, is logged, and changes nothing. A fetch changes only remote-tracking refs and writes no `FETCH_HEAD`, so it does not reset a worktree's idle clock. It is never a reason to remove: it only refreshes the refs the checks read. `--no-fetch` turns it off; then a deleted branch counts after your own `git fetch --prune`.
 
-That starts `residue watch ~/src` now and at login (launchd on macOS, systemd --user on Linux). One `watch` runs per user. Logs, linger, the five-minute free-space read, and the six-hour rescan are in [Automate residue](docs/automation.md#reclaim-storage-automatically).
+Logs, linger, the five-minute free-space read, the six-hour rescan and running `service install` again are in [Automate residue](docs/automation.md#reclaim-storage-automatically).
 
 <a id="run-it-on-a-schedule"></a>
 <a id="why---idle-matters"></a>
@@ -237,7 +245,7 @@ The launchd plist, the systemd unit and timer, how to stop them, and the sweep's
 | --- | --- |
 | Apt, dnf, pacman, archives, `cargo install` | [Install residue](docs/installation.md) |
 | PATH search, `--json` fields, exit codes, regenerable rules | [Command and configuration reference](docs/reference.md) |
-| launchd, systemd, idle clock, sweep exit status | [Automate residue](docs/automation.md) |
+| Default folders, fetching, launchd, systemd, idle clock, sweep exit status | [Automate residue](docs/automation.md) |
 | Platforms, what was not run, CI scripts | [Platforms and testing](docs/platforms-and-testing.md) |
 
 <a id="the-regenerable-list"></a>
@@ -256,7 +264,13 @@ Ignored does not mean disposable. An untracked file that is not ignored always k
 
 **A file showed up while the prompt was waiting. Is it deleted?** No. `remove` compares a fresh record with the plan and skips the worktree, naming the difference. In 0.0.4 a file added under `node_modules/` during that wait was deleted with the worktree. From 0.0.5 that case is a skip.
 
-**`watch` removed a worktree after the upstream branch came back.** That was fixed. For a landed branch, `watch` runs `remove --only-if-upstream-gone`, and the child checks the local refs at the plan, again before the move aside, and again after the move. If the upstream is back, the worktree stays. residue still does not fetch, so it only sees what is already in the local refs.
+**`watch` removed a worktree after the upstream branch came back.** That was fixed. For a landed branch, `watch` runs `remove --only-if-upstream-gone`, and the child checks the local refs at the plan, again before the move aside, and again after the move. If the upstream is back, the worktree stays. The child does not fetch, so it judges what is in the local refs at that moment.
+
+**Which folders does `watch` use without a ROOT?** Those of `~/src`, `~/code`, `~/Code`, `~/dev`, `~/Developer`, `~/projects`, `~/Projects`, `~/repos`, `~/git`, `~/github`, `~/GitHub`, `~/work`, `~/Work` and `~/workspace` that exist, each searched like any ROOT: four levels deep, on one filesystem, without following symbolic links. Never your home folder itself, which holds far more than code, and nothing under `Documents`, `Desktop` or `Downloads`, which macOS guards with a permission prompt. If none exists, `watch` and `service install` say so in one line and exit 2; name a folder then. `service install` writes the folders it found into the service, so the service watches the same ones at every start; run it again to pick up a folder created since.
+
+**What does running `residue service install` again do?** It replaces the service, so it is safe to run twice. Without a ROOT, it keeps the ROOTs you named for the service it replaces; a service on the usual code folders looks for them again. Options are not kept: the ones you do not give go back to their defaults, `--dry-run` included, and it says so when the service it replaced was a dry run. `residue service status` shows what the service runs and which folders it watches.
+
+**Does `watch` need my SSH key or password?** Only the way your own `git fetch` does. `watch` never prompts: a fetch that would ask for a password, a passphrase or a host key fails instead, is logged once, and changes nothing. A worktree is then judged on the refs it already has. Use an SSH agent or a credential helper, or pass `--no-fetch` and fetch yourself.
 
 **`git -c residue.regenerable=...` had no effect.** That is deliberate. A rule inherited through the environment would widen what residue deletes for every child process. residue ignores it, prints a note on stderr, and lists the values in `ignored_environment_rules`. Pass `--regenerable`, or `git config --add residue.regenerable`.
 
@@ -281,7 +295,7 @@ A process can also open the directory a moment after the snapshot; residue moves
 
 ### Limits
 
-- **Work landed means the local refs say so.** residue never fetches: a branch deleted on the remote counts once a `git fetch --prune` reaches the local refs, and one that comes back counts once a fetch brings it back. An upstream counts as gone only when its remote-tracking ref is absent. A loose ref that is a dangling symbolic link reads as absent to Git and so to residue, and a `git remote rename` in progress makes its branches look gone until it finishes; `watch` scans only after the refs have been quiet for 20 seconds, at most two minutes.
+- **Work landed means the local refs say so.** `scan`, `explain` and `remove` never fetch, and `watch` fetches each repository about every 30 minutes: a branch deleted on the remote counts once a fetch with prune, `watch`'s own or yours, reaches the local refs, and one that comes back counts once a fetch brings it back. An upstream counts as gone only when its remote-tracking ref is absent. A loose ref that is a dangling symbolic link reads as absent to Git and so to residue, and a `git remote rename` in progress makes its branches look gone until it finishes; `watch` scans only after the refs have been quiet for 20 seconds, at most two minutes.
 - **Freed space is an estimate.** residue counts each hard-linked file once and excludes files that also have links outside the worktree (such as pnpm's store). It cannot see APFS or Btrfs clones, snapshots, or deleted files a process still holds open, so the space actually freed can be smaller.
 - **residue reads every entry of every worktree it inspects.** That walk is the check behind `nested_repo`, `mount_point` and `contents`, and the sizes come from the same walk. So there is no option to skip it. On a 1.0 GB worktree with 46,572 entries (macOS, Apple silicon, warm cache), `residue explain` took 0.65 to 0.83 s, and `git worktree remove` of an identical copy took 2.7 to 3.0 s.
 - **The last check is not the deletion.** residue moves a worktree aside and checks it again before Git deletes it, which leaves a window from that check to the end of the deletion. A process that opens the hidden directory by its new name, or one the probe cannot see, can write into it then, and the write is deleted with it. [What removal deletes](#what-removal-deletes-and-what-it-keeps) has the detail. A sweep uses the trash, so what it takes by mistake stays restorable until the purge.

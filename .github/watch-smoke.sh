@@ -22,12 +22,19 @@
 #      a git wrapper restores the upstream right before each read in turn,
 #      and once during the re-measure that precedes the last read.
 #      A worktree kept that way is not taken as disk pressure in the same
-#      pass; the next pass judges pressure on its own terms.
+#      pass; the next pass judges pressure on its own terms. These runs
+#      pass --no-fetch: they set remote-tracking refs by hand.
+#   7. Without a ROOT, watch uses the code folders in HOME (a scratch one).
+#      A branch deleted on the remote with no local fetch: --no-fetch
+#      keeps its worktree; watch's own fetch prunes the ref, writes no
+#      FETCH_HEAD, and the worktree is removed. A remote it cannot reach is
+#      logged, its refs stay, and its worktree stays. A HOME with none of
+#      the folders is a usage error that names them.
 # Every branch stays, and nothing goes to the trash: watch deletes.
 # On NetBSD, OpenBSD and DragonFly (scripts/partial-probe.sh) no worktree
 # is a candidate: there it checks that every worktree is `unknown` for the
 # probe's reason and that dry, landed and disk-pressure runs remove none,
-# and skips 1-6 by name.
+# skips 1-6 by name, and runs 7 expecting no removal.
 set -eu
 
 residue=$1
@@ -71,6 +78,82 @@ age() {
 }
 age
 
+# 7. No ROOT, and watch's own fetch. Its own repositories, in a home
+# folder of its own. Runs last, and on NetBSD, OpenBSD and DragonFly too:
+# the fetch does not depend on the activity probe.
+fetch_case() {
+  # Canonical, so the log shows ~/src (macOS's TMPDIR is under a symlink).
+  H="$(cd "$S" && pwd -P)/home"
+  mkdir -p "$H/src"
+  for repo in app7 far; do
+    git init -q --bare -b main "$S/$repo.git"
+    git clone -q "$S/$repo.git" "$H/src/$repo" 2> /dev/null
+    git -C "$H/src/$repo" config user.email smoke@example.com
+    git -C "$H/src/$repo" config user.name smoke
+    echo hello > "$H/src/$repo/README.md"
+    git -C "$H/src/$repo" add README.md
+    git -C "$H/src/$repo" commit -qm init
+    git -C "$H/src/$repo" push -q origin main
+  done
+  for name in landed stays; do
+    git -C "$H/src/app7" worktree add -q "$H/src/app7/.worktrees/$name" -b "$name"
+    git -C "$H/src/app7/.worktrees/$name" push -q -u origin "$name"
+  done
+  git -C "$H/src/far" worktree add -q "$H/src/far/.worktrees/away" -b away
+  git -C "$H/src/far/.worktrees/away" push -q -u origin away
+  # Deleted on the remotes, with no fetch here: only watch's own fetch can
+  # see it. far's remote then becomes unreachable.
+  git -C "$S/app7.git" branch -q -D landed
+  git -C "$S/far.git" branch -q -D away
+  mv "$S/far.git" "$S/far-moved.git"
+  find "$H/src/app7/.worktrees" "$H/src/app7/.git/worktrees" "$H/src/far/.worktrees" "$H/src/far/.git/worktrees" \
+    -exec touch -t 202601010000 {} +
+
+  # --no-fetch: the local refs still have origin/landed, so nothing landed.
+  HOME="$H" "$residue" watch --once --no-fetch --grace 1m 2> "$S/log" || fail "7: the --no-fetch run failed"
+  grep -q "residue watch: watching ~/src (.*the usual code folders in your home folder" "$S/log" \
+    || fail "7: watch without a ROOT did not log ~/src as the usual code folders"
+  grep -q "Does not fetch (--no-fetch)" "$S/log" || fail "7: --no-fetch was not logged"
+  ! grep -q -E "fetched |removed " "$S/log" || fail "7: --no-fetch fetched or removed"
+  git -C "$H/src/app7" rev-parse -q --verify refs/remotes/origin/landed > /dev/null || fail "7: --no-fetch changed the refs"
+
+  # Fetching: watch prunes origin/landed, then removes landed. far's fetch
+  # fails: logged, its refs as they were, nothing removed for it.
+  HOME="$H" "$residue" watch --once --grace 1m 2> "$S/log" || fail "7: the fetching run failed"
+  grep -q "fetched ~/src/app7: origin/landed is gone from the remote" "$S/log" || fail "7: no line for the pruned origin/landed"
+  grep -q "fetch of origin in ~/src/far failed, so its remote-tracking refs stay as they were" "$S/log" \
+    || fail "7: the failed fetch was not logged"
+  ! git -C "$H/src/app7" rev-parse -q --verify refs/remotes/origin/landed > /dev/null || fail "7: origin/landed was not pruned"
+  git -C "$H/src/app7" rev-parse -q --verify refs/remotes/origin/stays > /dev/null || fail "7: origin/stays is gone"
+  git -C "$H/src/far" rev-parse -q --verify refs/remotes/origin/away > /dev/null || fail "7: the failed fetch changed far's refs"
+  [ -d "$H/src/far/.worktrees/away" ] || fail "7: away is gone after a failed fetch"
+  [ -d "$H/src/app7/.worktrees/stays" ] || fail "7: stays is gone"
+  for dir in "$H/src/app7/.git" "$H/src/app7/.git/worktrees/landed" "$H/src/far/.git"; do
+    [ ! -e "$dir/FETCH_HEAD" ] || fail "7: the fetch wrote $dir/FETCH_HEAD, which resets the idle clock"
+  done
+  if [ -n "$partial_probe" ]; then
+    ! grep -q "removed " "$S/log" || fail "7: removed a worktree with a partial probe"
+    [ -d "$H/src/app7/.worktrees/landed" ] || fail "7: landed is gone with a partial probe"
+  else
+    grep -q "removed ~/src/app7/.worktrees/landed (.*): its upstream branch origin/landed was deleted" "$S/log" \
+      || fail "7: landed was not removed after watch's fetch"
+    [ ! -e "$H/src/app7/.worktrees/landed" ] || fail "7: landed still exists"
+  fi
+  for b in landed stays; do
+    git -C "$H/src/app7" rev-parse --verify -q "$b" > /dev/null || fail "7: branch $b is gone"
+  done
+
+  # No ROOT and none of the folders: a one-line usage error naming them.
+  mkdir "$S/bare-home"
+  set +e
+  HOME="$S/bare-home" "$residue" watch --once 2> "$S/log"
+  st=$?
+  set -e
+  [ "$st" = 2 ] || fail "7: no ROOT and no code folder: exit $st, want 2"
+  grep -q "none of the usual code folders exists in your home folder (~/src, " "$S/log" || fail "7: the usage error does not name the folders"
+  echo "watch-smoke: 7. watch without a ROOT fetched, pruned and kept what it should"
+}
+
 # 1. fix landed; a dry run names it and removes nothing.
 git push -q origin --delete fix
 git fetch -q --prune
@@ -103,6 +186,7 @@ if [ -n "$partial_probe" ]; then
     "5. the removal child's --only-if-upstream-gone" "6. the child's three upstream reads"; do
     skip_partial "$case"
   done
+  fetch_case
   echo "watch-smoke: ok (every worktree kept as activity unknown)"
   exit 0
 fi
@@ -272,8 +356,11 @@ exec "$real_git" "\$@"
 EOF
   chmod +x "$S/w6bin/git"
 }
+# Case 6 sets origin/race by hand, as a fetch would, while the remote has
+# no race branch: watch's own `git fetch --prune` would delete it again, so
+# these runs pass --no-fetch. Case 7 checks the fetch.
 wrapped_watch() {
-  PATH="$S/w6bin:$PATH" "$residue" watch --once --grace 1m "$@" "$S/w6" 2> "$S/log" || fail "watch --once failed"
+  PATH="$S/w6bin:$PATH" "$residue" watch --once --no-fetch --grace 1m "$@" "$S/w6" 2> "$S/log" || fail "watch --once failed"
 }
 stage() { # N TEXT [WATCH OPTIONS]
   n=$1 text=$2
@@ -311,7 +398,9 @@ grep -q "kept .*worktrees/race (skipped): changed after residue moved it aside: 
 stage 1 "--only-if-upstream-gone: its upstream origin/race exists in the local refs" --min-free 99.9 --idle 1m
 # The next pass, without the wrapper: the upstream exists, so race did not
 # land, and disk pressure takes it on its own terms.
-"$residue" watch --once --grace 1m --min-free 99.9 --idle 1m "$S/w6" 2> "$S/log" || fail "the pressure pass failed"
+"$residue" watch --once --no-fetch --grace 1m --min-free 99.9 --idle 1m "$S/w6" 2> "$S/log" || fail "the pressure pass failed"
 grep -q "removed .*worktrees/race (.*): free space on its filesystem" "$S/log" || fail "pressure did not remove race on the next pass"
 git rev-parse --verify -q race > /dev/null || fail "branch race is gone"
+
+fetch_case
 echo "watch-smoke: ok"

@@ -1,6 +1,7 @@
 //! `residue scan` and `residue explain`, plus the path lookup `remove` shares.
 
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::activity::Snapshot;
@@ -321,6 +322,18 @@ pub fn scan(options: &Options) -> u8 {
         out.push_str(&style.dim(
             "next: residue explain PATH  ·  residue remove PATH  ·  keep one: git worktree lock PATH\n",
         ));
+        // Only for a person at a terminal: a pipe or a script reads the
+        // report, not advice.
+        if std::io::stdout().is_terminal() {
+            let dirs: Vec<&Path> = grouped
+                .iter()
+                .map(|g| g.repo.common_dir.as_path())
+                .collect();
+            if let Some(hint) = crate::service::hint(&dirs, &roots) {
+                out.push_str(&style.dim(&hint));
+                out.push('\n');
+            }
+        }
     }
     print!("{out}");
     0
@@ -501,7 +514,7 @@ pub fn explain_text(r: &Report, repo: &Repo, places: &Places, style: &Style) -> 
         "local-only commits",
         match &r.local_commits {
             Ok(Some(n)) => {
-                format!("{n} (compared with local remote-tracking refs; residue never fetches)")
+                format!("{n} (compared with local remote-tracking refs, as of the last fetch)")
             }
             Ok(None) => "unknown: the repository has no remote-tracking refs".into(),
             Err(e) => format!("unknown: {}", clean(e)),

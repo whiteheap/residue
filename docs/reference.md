@@ -11,8 +11,8 @@ residue remove PATH...           # confirm, check again, move aside, check, then
 residue remove --all PATH        # the same for every candidate a scan of PATH finds
 residue remove --trash PATH...   # move each one to the trash instead; --idle turns this on
 residue restore [ENTRY]          # list the trash, or put one worktree back
-residue watch ROOT...            # stay running; remove a worktree when its branch lands or the disk runs low
-residue service install ROOT...  # run `residue watch` from login
+residue watch [ROOT...]          # stay running; remove a worktree when its branch lands or the disk runs low
+residue service install [ROOT...]  # run `residue watch` from login; no ROOT: the usual code folders
 ```
 
 `scan` with no PATH looks at the current directory. If PATH is inside a repository, residue scans that repository. Otherwise it searches up to four levels below PATH. The search does not follow symbolic links, does not cross into another filesystem, and skips hidden directories, `node_modules`, `target` and `Library`. Linked worktrees come from Git's own list, so they are found wherever they live.

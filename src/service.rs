@@ -10,14 +10,18 @@ pub const HELP: &str = "\
 residue service: run `residue watch` in the background, from login.
 
 Usage:
-  residue service install [WATCH OPTIONS] ROOT...
+  residue service install [WATCH OPTIONS] [ROOT...]
   residue service status
   residue service uninstall
 
 install writes a launchd agent (macOS) or a systemd user service (Linux)
 that runs `residue watch` with these options and roots, starts it now, and
-starts it at every login. Running install again replaces it. Try it first
-with --dry-run: the service then logs what it would remove.
+starts it at every login. Without a ROOT it uses the usual code folders
+that exist in your home folder (`residue watch --help` lists them) and
+writes them into the service, so it watches the same folders on every
+start; install again to pick up a new one. Running install again replaces
+it. Try it first with --dry-run: the service then logs what it would
+remove. status shows what it runs and the last lines of its log.
 See `residue watch --help` for the options.
 ";
 
@@ -27,6 +31,14 @@ pub const LABEL: &str = "com.whiteheap.residue.watch";
 /// The systemd user unit on Linux.
 #[cfg(target_os = "linux")]
 pub const UNIT: &str = "residue-watch.service";
+
+/// The names Homebrew gives a `residue` service started with `brew
+/// services`, newest first: `sh.brew.NAME`, then the older
+/// `homebrew.mxcl.NAME` (launchd) and `homebrew.NAME` (systemd).
+#[cfg(target_os = "macos")]
+const HOMEBREW: &[&str] = &["sh.brew.residue.plist", "homebrew.mxcl.residue.plist"];
+#[cfg(target_os = "linux")]
+const HOMEBREW: &[&str] = &["sh.brew.residue.service", "homebrew.residue.service"];
 
 pub fn main(args: &[OsString]) -> u8 {
     match args.first().and_then(|a| a.to_str()) {
@@ -50,7 +62,7 @@ pub fn main(args: &[OsString]) -> u8 {
 }
 
 fn install(args: &[OsString]) -> u8 {
-    let opts = match Options::parse(args) {
+    let mut opts = match Options::parse(args) {
         Ok(Some(opts)) => opts,
         Ok(None) => {
             print!("{}", watch::HELP);
@@ -66,6 +78,25 @@ fn install(args: &[OsString]) -> u8 {
         eprintln!("residue service install: --once makes no sense for a service");
         return 2;
     }
+    if let Some(file) = homebrew_service() {
+        eprintln!(
+            "residue service install: Homebrew already runs residue watch as a service ({}), and only one watch runs per user. Keep that one, or stop it first: brew services stop residue",
+            output::clean(&file.to_string_lossy())
+        );
+        return 1;
+    }
+    let replaced = platform::installed();
+    let mut kept = false;
+    if opts.default_roots {
+        if let Some(roots) = replaced.as_ref().and_then(named_roots) {
+            opts.roots = roots;
+            opts.default_roots = false;
+            kept = true;
+        } else if let Err(message) = opts.use_default_roots("residue service install") {
+            eprintln!("residue service install: {}", output::clean(&message));
+            return 2;
+        }
+    }
     let exe = match program() {
         Ok(exe) => exe,
         Err(message) => {
@@ -73,7 +104,151 @@ fn install(args: &[OsString]) -> u8 {
             return 1;
         }
     };
-    platform::install(&exe, &opts)
+    let watches = format!(
+        "{}{}",
+        output::clean(&opts.shown_roots()),
+        if kept {
+            " (kept from the service it replaces; name ROOTs to change them)"
+        } else if opts.default_roots {
+            " (the code folders in your home folder; name ROOTs to choose others)"
+        } else {
+            ""
+        }
+    );
+    let code = platform::install(&exe, &opts, &watches);
+    // Options are not kept, only ROOTs: say so for the one that matters.
+    let was_dry_run = replaced
+        .as_ref()
+        .is_some_and(|r| r.program.iter().any(|a| a == "--dry-run"));
+    if code == 0 && was_dry_run && !opts.dry_run {
+        println!(
+            "The service it replaced only logged what it would remove (--dry-run). This one removes."
+        );
+    }
+    code
+}
+
+/// The ROOTs a user named for the installed service, when `service install`
+/// runs again without one: running it again keeps them. `None` when its
+/// roots were the default ones (then they are looked for again, so a code
+/// folder created since is added), or when none of them is still a folder.
+/// A root that is gone is dropped, with a note.
+fn named_roots(installed: &Installed) -> Option<Vec<PathBuf>> {
+    if installed.default_roots {
+        return None;
+    }
+    let args = installed.program.get(2..)?;
+    if installed.program.get(1).map(String::as_str) != Some("watch") {
+        return None;
+    }
+    let mut roots = Vec::new();
+    for root in watch::roots_in(args) {
+        match Path::new(&root).canonicalize() {
+            Ok(path) if path.is_dir() => roots.push(path),
+            _ => eprintln!(
+                "residue service install: {} is no longer a folder; the new service does not watch it",
+                output::clean(&output::home(&root))
+            ),
+        }
+    }
+    (!roots.is_empty()).then_some(roots)
+}
+
+/// What an installed service runs, read back from its file.
+pub struct Installed {
+    /// The program and its arguments: `/opt/homebrew/bin/residue watch ...`.
+    program: Vec<String>,
+    /// Its roots are the default code folders, not ones a user named
+    /// (`DEFAULT_MARK`).
+    default_roots: bool,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Installed {
+    /// The `runs:` and `watches:` lines of `service status`.
+    fn print(&self) {
+        let Some((exe, args)) = self.program.split_first() else {
+            return;
+        };
+        println!("runs: {}", output::clean(&shown(Path::new(exe), args)));
+        if args.first().map(String::as_str) == Some("watch") {
+            let roots: Vec<String> = watch::roots_in(&args[1..])
+                .iter()
+                .map(|r| output::home(r))
+                .collect();
+            println!(
+                "watches: {}{}",
+                output::clean(&roots.join(", ")),
+                if self.default_roots {
+                    " (the code folders in your home folder at install; install again to pick up a new one)"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+}
+
+/// Written into a service file whose roots are the default ones, so a later
+/// `service install` without a ROOT looks for them again instead of keeping
+/// them.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const DEFAULT_MARK: &str = "residue: default roots";
+
+/// The service file of a `brew services start residue`, if there is one.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn homebrew_service() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let dir = home()?.join("Library/LaunchAgents");
+    #[cfg(target_os = "linux")]
+    let dir = home()?.join(".config/systemd/user");
+    HOMEBREW
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|p| p.exists())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn homebrew_service() -> Option<PathBuf> {
+    None
+}
+
+/// The line `residue scan` ends with when automatic cleanup is off: no
+/// `residue service` or Homebrew service is installed, and no `residue
+/// watch` of this user is running. `None` when it is on, or when residue
+/// cannot tell. `common_dirs` are the repositories the scan found, and
+/// `scanned` the PATHs it scanned: when the default roots do not hold every
+/// repository, the command names the scanned PATHs, so following it covers
+/// what the user just looked at.
+pub fn hint(common_dirs: &[&Path], scanned: &[PathBuf]) -> Option<String> {
+    // Elsewhere `service install` cannot turn it on: it prints a command
+    // for the system's service manager.
+    if cfg!(not(any(target_os = "macos", target_os = "linux")))
+        || platform::file().is_some_and(|f| f.exists())
+        || homebrew_service().is_some()
+        || watch::lock_held() != Some(false)
+    {
+        return None;
+    }
+    let covered = watch::default_roots().is_ok_and(|roots| {
+        common_dirs
+            .iter()
+            .all(|dir| roots.iter().any(|root| dir.starts_with(root)))
+    });
+    let command = if covered {
+        "residue service install".to_string()
+    } else {
+        let paths: Vec<String> = scanned
+            .iter()
+            .map(|p| {
+                let p = p.canonicalize().unwrap_or_else(|_| p.clone());
+                let shown = output::shell(&p);
+                output::home(&shown)
+            })
+            .collect();
+        format!("residue service install {}", paths.join(" "))
+    };
+    Some(format!("Automatic cleanup is off. Turn it on: {command}"))
 }
 
 /// The path the service should start. When the `residue` on `PATH` is this
@@ -142,13 +317,14 @@ fn run(program: &str, args: &[&str]) -> Result<String, String> {
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::{LABEL, home, run, shown};
+    use super::{DEFAULT_MARK, Installed, LABEL, home, run, shown};
     use crate::watch::Options;
     use std::path::{Path, PathBuf};
 
     const LAUNCHCTL: &str = "/bin/launchctl";
 
-    fn plist() -> Option<PathBuf> {
+    /// The plist `install` writes.
+    pub fn file() -> Option<PathBuf> {
         Some(
             home()?
                 .join("Library/LaunchAgents")
@@ -172,8 +348,31 @@ mod platform {
             .replace('"', "&quot;")
     }
 
-    pub fn install(exe: &Path, opts: &Options) -> u8 {
-        let (Some(plist), Some(log)) = (plist(), log_file()) else {
+    fn unxml(text: &str) -> String {
+        text.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&amp;", "&")
+    }
+
+    /// What the installed plist runs, from its `ProgramArguments`.
+    pub fn installed() -> Option<Installed> {
+        let text = std::fs::read_to_string(file()?).ok()?;
+        let after = text.split_once("<key>ProgramArguments</key>")?.1;
+        let array = after.split_once("<array>")?.1.split_once("</array>")?.0;
+        let program = array
+            .split("<string>")
+            .skip(1)
+            .filter_map(|s| s.split_once("</string>").map(|(v, _)| unxml(v)))
+            .collect();
+        Some(Installed {
+            program,
+            default_roots: text.contains(DEFAULT_MARK),
+        })
+    }
+
+    pub fn install(exe: &Path, opts: &Options, watches: &str) -> u8 {
+        let (Some(plist), Some(log)) = (file(), log_file()) else {
             eprintln!("residue service install: HOME is not set");
             return 1;
         };
@@ -182,6 +381,13 @@ mod platform {
         for a in &args {
             program.push_str(&format!("    <string>{}</string>\n", xml(a)));
         }
+        let mark = if opts.default_roots {
+            format!(
+                "  <!-- {DEFAULT_MARK}: the code folders that existed in the home folder at install -->\n"
+            )
+        } else {
+            String::new()
+        };
         let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".into());
         let log_text = xml(&log.to_string_lossy());
         let body = format!(
@@ -191,7 +397,7 @@ mod platform {
 <dict>
   <key>Label</key>
   <string>{LABEL}</string>
-  <key>ProgramArguments</key>
+{mark}  <key>ProgramArguments</key>
   <array>
 {program}  </array>
   <key>EnvironmentVariables</key>
@@ -249,16 +455,17 @@ mod platform {
             return 1;
         }
         println!("installed and started the launchd agent {LABEL}");
-        println!("  runs:   {}", shown(exe, &args));
-        println!("  plist:  {}", plist.display());
-        println!("  log:    {}", log.display());
-        println!("  check:  residue service status");
-        println!("  remove: residue service uninstall");
+        println!("  watches: {watches}");
+        println!("  runs:    {}", shown(exe, &args));
+        println!("  plist:   {}", plist.display());
+        println!("  log:     {}", log.display());
+        println!("  check:   residue service status");
+        println!("  turn it off: residue service uninstall");
         0
     }
 
     pub fn uninstall() -> u8 {
-        let Some(plist) = plist() else {
+        let Some(plist) = file() else {
             eprintln!("residue service uninstall: HOME is not set");
             return 1;
         };
@@ -291,6 +498,9 @@ mod platform {
                     Some(pid) => println!("launchd agent {LABEL}: {state} (pid {pid})"),
                     None => println!("launchd agent {LABEL}: {state}"),
                 }
+                if let Some(installed) = installed() {
+                    installed.print();
+                }
                 if let Some(log) = log_file() {
                     println!("log: {}", log.display());
                     super::tail(&log);
@@ -299,6 +509,7 @@ mod platform {
             }
             Err(_) => {
                 println!("launchd agent {LABEL}: not installed");
+                super::homebrew_note();
                 3
             }
         }
@@ -307,13 +518,14 @@ mod platform {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::{UNIT, home, run, shown};
+    use super::{DEFAULT_MARK, Installed, UNIT, home, run, shown};
     use crate::watch::Options;
     use std::path::{Path, PathBuf};
 
     const SYSTEMCTL: &str = "systemctl";
 
-    fn unit_file() -> Option<PathBuf> {
+    /// The unit file `install` writes.
+    pub fn file() -> Option<PathBuf> {
         let config = std::env::var_os("XDG_CONFIG_HOME")
             .filter(|d| !d.is_empty())
             .map(PathBuf::from)
@@ -333,14 +545,57 @@ mod platform {
         )
     }
 
-    pub fn install(exe: &Path, opts: &Options) -> u8 {
+    /// The words of an `ExecStart=` value that `quote` wrote: each one
+    /// double-quoted (an unquoted word is taken as it is), `\\` and `\"`
+    /// inside quotes, `%%` and `$$` for `%` and `$`.
+    fn unquote(line: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut chars = line.chars().peekable();
+        loop {
+            while chars.next_if(|c| c.is_whitespace()).is_some() {}
+            let Some(first) = chars.next() else {
+                break;
+            };
+            let mut word = String::new();
+            if first == '"' {
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => word.extend(chars.next()),
+                        '"' => break,
+                        c => word.push(c),
+                    }
+                }
+            } else {
+                word.push(first);
+                while let Some(c) = chars.next_if(|c| !c.is_whitespace()) {
+                    word.push(c);
+                }
+            }
+            words.push(word.replace("%%", "%").replace("$$", "$"));
+        }
+        words
+    }
+
+    /// What the installed unit runs, from its `ExecStart=`.
+    pub fn installed() -> Option<Installed> {
+        let text = std::fs::read_to_string(file()?).ok()?;
+        let exec = text.lines().find_map(|l| l.strip_prefix("ExecStart="))?;
+        Some(Installed {
+            program: unquote(exec),
+            default_roots: text.contains(DEFAULT_MARK),
+        })
+    }
+
+    pub fn install(exe: &Path, opts: &Options, watches: &str) -> u8 {
         if let Err(e) = run(SYSTEMCTL, &["--user", "show-environment"]) {
             eprintln!("residue service install: no systemd user session ({e})");
-            eprintln!("Run this from your system's service manager instead:");
+            eprintln!(
+                "It would watch {watches}. Run this from your system's service manager instead:"
+            );
             eprintln!("  {}", shown(exe, &opts.to_args()));
             return 1;
         }
-        let Some(unit) = unit_file() else {
+        let Some(unit) = file() else {
             eprintln!("residue service install: HOME is not set");
             return 1;
         };
@@ -350,8 +605,15 @@ mod platform {
             .collect::<Vec<_>>()
             .join(" ");
         let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
+        let mark = if opts.default_roots {
+            format!(
+                "# {DEFAULT_MARK}: the code folders that existed in the home folder at install\n"
+            )
+        } else {
+            String::new()
+        };
         let body = format!(
-            "[Unit]\n\
+            "{mark}[Unit]\n\
              Description=residue watch: reclaim storage from Git worktrees\n\
              Documentation=https://github.com/whiteheap/residue\n\
              \n\
@@ -388,18 +650,19 @@ mod platform {
             }
         }
         println!("installed and started the systemd user service {UNIT}");
-        println!("  runs:   {}", shown(exe, &args));
-        println!("  unit:   {}", unit.display());
-        println!("  log:    journalctl --user -u {UNIT}");
-        println!("  check:  residue service status");
-        println!("  remove: residue service uninstall");
+        println!("  watches: {watches}");
+        println!("  runs:    {}", shown(exe, &args));
+        println!("  unit:    {}", unit.display());
+        println!("  log:     journalctl --user -u {UNIT}");
+        println!("  check:   residue service status");
+        println!("  turn it off: residue service uninstall");
         println!("User services stop when you log out. To keep it running, run once:");
         println!("  loginctl enable-linger \"$USER\"");
         0
     }
 
     pub fn uninstall() -> u8 {
-        let Some(unit) = unit_file() else {
+        let Some(unit) = file() else {
             eprintln!("residue service uninstall: HOME is not set");
             return 1;
         };
@@ -419,9 +682,10 @@ mod platform {
     }
 
     pub fn status() -> u8 {
-        let installed = unit_file().is_some_and(|u| u.exists());
+        let installed = file().is_some_and(|u| u.exists());
         if !installed {
             println!("systemd user service {UNIT}: not installed");
+            super::homebrew_note();
             return 3;
         }
         let state = match run(SYSTEMCTL, &["--user", "is-active", UNIT]) {
@@ -429,6 +693,9 @@ mod platform {
             Err(_) => "inactive".into(),
         };
         println!("systemd user service {UNIT}: {state}");
+        if let Some(installed) = self::installed() {
+            installed.print();
+        }
         if let Ok(log) = run(
             "journalctl",
             &["--user", "-u", UNIT, "-n", "5", "--no-pager", "-o", "cat"],
@@ -441,15 +708,23 @@ mod platform {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod platform {
-    use super::shown;
+    use super::{Installed, shown};
     use crate::watch::Options;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    pub fn install(exe: &Path, opts: &Options) -> u8 {
+    pub fn file() -> Option<PathBuf> {
+        None
+    }
+
+    pub fn installed() -> Option<Installed> {
+        None
+    }
+
+    pub fn install(exe: &Path, opts: &Options, watches: &str) -> u8 {
         eprintln!(
             "residue service install: residue knows launchd and systemd, and this system has neither."
         );
-        eprintln!("Run this from your system's service manager instead:");
+        eprintln!("It would watch {watches}. Run this from your system's service manager instead:");
         eprintln!("  {}", shown(exe, &opts.to_args()));
         1
     }
@@ -462,6 +737,18 @@ mod platform {
     pub fn status() -> u8 {
         eprintln!("residue service: residue installs services only with launchd and systemd");
         1
+    }
+}
+
+/// On `service status` when residue's own service is not installed: say so
+/// when Homebrew runs one instead.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn homebrew_note() {
+    if let Some(file) = homebrew_service() {
+        println!(
+            "Homebrew runs residue watch instead ({}): brew services info residue",
+            output::clean(&file.to_string_lossy())
+        );
     }
 }
 

@@ -85,8 +85,22 @@ pub fn run(cmd: &mut Command, timeout: Duration, max_output: usize) -> Result<Ca
     })
 }
 
-/// Kill and reap a child that overran its deadline.
+/// Kill and reap a child that overran its deadline. A child that leads its
+/// own process group (one started in a new session, as `git::fetch` does)
+/// is killed with its whole group, so a program it started, such as SSH,
+/// does not outlive it holding the output pipes open.
 fn stop(child: &mut Child) {
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: plain system calls on integers. The child is not reaped
+        // yet, so its pid, and the group it leads, cannot be reused.
+        // kill fails only when the group is already gone; the kill below
+        // still runs.
+        unsafe {
+            if libc::getpgid(pid) == pid {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
     // kill() fails only when the child has already exited, and wait() then
     // reaps it at once. Both results are irrelevant here: the caller is
     // already reporting the timeout or wait error that made it stop the child.
