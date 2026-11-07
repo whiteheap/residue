@@ -181,9 +181,10 @@ A preview has `stats` with zeros and nulls. The `watch` log names what each remo
 
 - `schema`, `version`, `generated_at`, and `ledger`, the ledger's path.
 - `since`: the ledger's earliest line, or null for an empty ledger.
+- `estimate_note`: the sentence the text report ends with, that every size is an estimate and why, for a client to show as it is.
 - `freed`: `all_time`, `last_30_days` and `last_7_days`, each `{"bytes", "worktrees", "by"}`, where `by` is `{"remove", "sweep", "watch", "other"}`, each `{"bytes", "worktrees"}`; `other` counts lines with no `by`. The windows end at `generated_at`.
-- `weeks`: twelve `{"start", "end", "bytes", "worktrees"}`, oldest first, seven days each, the last ending at `generated_at`. A line dated later, from a clock that has since moved back, counts in the last.
-- `repositories`: every repository with a `freed` line, most bytes first: `{"path", "common_dir", "bytes", "worktrees", "last_freed_at"}`. `path` is the folder that holds `.git`, or the Git directory itself for a bare repository.
+- `weeks`: twelve `{"start", "end", "bytes", "worktrees", "by"}`, oldest first, seven days each, the last ending at `generated_at`, with `by` as in `freed`. A line dated later, from a clock that has since moved back, counts in the last.
+- `repositories`: every repository with a `freed` line, most bytes first: `{"path", "common_dir", "bytes", "worktrees", "by", "last_freed_at"}`, with `by` as in `freed`. `path` is the folder that holds `.git`, or the Git directory itself for a bare repository.
 - `trashed`: `{"bytes", "worktrees"}` moved into the trash, all time.
 - `trash_now`: `{"entries", "bytes", "repositories"}`, the trash entries that hold a worktree now, read from the trash folders of the repositories the ledger names.
 - `restored`: `{"worktrees", "from_trash", "from_removal_records"}`.

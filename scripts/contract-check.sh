@@ -774,7 +774,11 @@ stats_ok() {
             and ([.freed.all_time, .freed.last_30_days, .freed.last_7_days][]
                 | (.bytes | type) == "number" and (.worktrees | type) == "number"
                   and (.by | keys) == ["other", "remove", "sweep", "watch"])
+            and (.estimate_note | type) == "string"
+            and (.estimate_note | startswith("Sizes are estimates"))
             and (.weeks | length) == 12
+            and all(.weeks[]; (.by | keys) == ["other", "remove", "sweep", "watch"])
+            and all(.repositories[]; (.by | keys) == ["other", "remove", "sweep", "watch"])
             and (.repositories | type) == "array"
             and (.trashed.worktrees | type) == "number"
             and (.trash_now.entries | type) == "number"
@@ -826,7 +830,7 @@ fi
 run stats --json
 if [ "$status" != 0 ]; then fail "exit $status, want 0"
 elif ! stats_ok; then fail "stdout is not one valid residue.stats/v1 document"
-elif ! jq -e '.skipped_lines == 2 and .freed.all_time == {"bytes": 1000, "worktrees": 1, "by": {"remove": {"bytes": 0, "worktrees": 0}, "sweep": {"bytes": 0, "worktrees": 0}, "watch": {"bytes": 1000, "worktrees": 1}, "other": {"bytes": 0, "worktrees": 0}}} and .since == "2026-01-01T00:00:00Z"' "$out" >/dev/null; then fail "want 1 worktree once and 2 skipped lines: $(jq -c '{freed: .freed.all_time, skipped_lines, since}' "$out")"
+elif ! jq -e '.skipped_lines == 2 and .repositories[0].by.watch == {"bytes": 1000, "worktrees": 1} and .freed.all_time == {"bytes": 1000, "worktrees": 1, "by": {"remove": {"bytes": 0, "worktrees": 0}, "sweep": {"bytes": 0, "worktrees": 0}, "watch": {"bytes": 1000, "worktrees": 1}, "other": {"bytes": 0, "worktrees": 0}}} and .since == "2026-01-01T00:00:00Z"' "$out" >/dev/null; then fail "want 1 worktree once and 2 skipped lines: $(jq -c '{freed: .freed.all_time, skipped_lines, since}' "$out")"
 elif [ -s "$err" ]; then fail "stderr is not empty"
 else
     run stats
@@ -855,7 +859,7 @@ if [ -z "$partial_probe" ]; then
               and .reason == "remove" and .entry == $entry and .repo == $repo
               and .worktree == "w" and (.seeded | not))
         ' >/dev/null; then fail "the ledger: $(cat "$ledger" 2>/dev/null)"
-    elif ! stats_has --arg path "$(cd "$repo" && pwd -P)" '.freed.all_time.worktrees == 1 and .freed.all_time.by.remove.worktrees == 1 and .freed.last_7_days.worktrees == 1 and .weeks[11].worktrees == 1 and .repositories[0].path == $path and .last_freed_at.remove != null'; then fail "residue stats: $(stats_show) $(jq -c .repositories "$work/$name.stats" 2>/dev/null)"
+    elif ! stats_has --arg path "$(cd "$repo" && pwd -P)" '.freed.all_time.worktrees == 1 and .freed.all_time.by.remove.worktrees == 1 and .freed.last_7_days.worktrees == 1 and .weeks[11].worktrees == 1 and .weeks[11].by.remove.worktrees == 1 and .weeks[11].by.watch.worktrees == 0 and .repositories[0].by.remove.worktrees == 1 and .repositories[0].by.watch.worktrees == 0 and .repositories[0].path == $path and .last_freed_at.remove != null'; then fail "residue stats: $(stats_show) $(jq -c .repositories "$work/$name.stats" 2>/dev/null)"
     elif common_ok; then ok; fi
 
     name=stats-trash-and-purge

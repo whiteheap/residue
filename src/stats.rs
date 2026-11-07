@@ -665,7 +665,13 @@ impl Freed {
     }
 
     fn json(&self) -> Json {
-        Json::Obj(vec![
+        Json::Obj(self.fields())
+    }
+
+    /// `bytes`, `worktrees` and `by`: the shape every span, week and
+    /// repository of `residue stats --json` shares.
+    fn fields(&self) -> Vec<(&'static str, Json)> {
+        vec![
             ("bytes", Json::UInt(self.all.bytes)),
             ("worktrees", Json::UInt(self.all.worktrees)),
             (
@@ -677,13 +683,13 @@ impl Freed {
                         .collect(),
                 ),
             ),
-        ])
+        ]
     }
 }
 
 pub struct Repository {
     pub common_dir: String,
-    pub freed: Sum,
+    pub freed: Freed,
     pub last: i64,
 }
 
@@ -708,7 +714,7 @@ pub struct Stats {
     pub last_7_days: Freed,
     /// The start of each 7-day window and what it freed, oldest first; the
     /// last one ends now.
-    pub weeks: Vec<(i64, Sum)>,
+    pub weeks: Vec<(i64, Freed)>,
     /// Most freed first.
     pub repositories: Vec<Repository>,
     pub trashed: Sum,
@@ -729,7 +735,7 @@ pub fn tally(ledger: &Ledger, now: i64) -> Stats {
         last_30_days: Freed::default(),
         last_7_days: Freed::default(),
         weeks: (0..WEEKS)
-            .map(|k| (first_week + k * 7 * DAY, Sum::default()))
+            .map(|k| (first_week + k * 7 * DAY, Freed::default()))
             .collect(),
         repositories: Vec::new(),
         trashed: Sum::default(),
@@ -740,7 +746,7 @@ pub fn tally(ledger: &Ledger, now: i64) -> Stats {
         last_by: [None; 4],
         skipped: ledger.skipped,
     };
-    let mut repos: BTreeMap<&str, (Sum, i64)> = BTreeMap::new();
+    let mut repos: BTreeMap<&str, (Freed, i64)> = BTreeMap::new();
     for line in &ledger.lines {
         match line.event {
             Event::Freed => {
@@ -755,10 +761,12 @@ pub fn tally(ledger: &Ledger, now: i64) -> Stats {
                     // A line from a clock ahead of this one counts in the
                     // last window.
                     let k = ((line.at - first_week) / (7 * DAY)).min(WEEKS - 1);
-                    stats.weeks[k as usize].1.add(line.bytes);
+                    stats.weeks[k as usize].1.add(line);
                 }
-                let repo = repos.entry(&line.repo).or_insert((Sum::default(), line.at));
-                repo.0.add(line.bytes);
+                let repo = repos
+                    .entry(&line.repo)
+                    .or_insert((Freed::default(), line.at));
+                repo.0.add(line);
                 repo.1 = repo.1.max(line.at);
                 stats.last = stats.last.max(Some(line.at));
                 let slot = &mut stats.last_by[by_slot(line.by.as_deref())];
@@ -785,9 +793,10 @@ pub fn tally(ledger: &Ledger, now: i64) -> Stats {
         .collect();
     stats.repositories.sort_by(|a, b| {
         b.freed
+            .all
             .bytes
-            .cmp(&a.freed.bytes)
-            .then(b.freed.worktrees.cmp(&a.freed.worktrees))
+            .cmp(&a.freed.all.bytes)
+            .then(b.freed.all.worktrees.cmp(&a.freed.all.worktrees))
             .then(a.common_dir.cmp(&b.common_dir))
     });
     stats
@@ -854,6 +863,7 @@ pub fn service_line(installed: bool) -> Option<String> {
 
 /// What is in the trash now, in the repositories the ledger names: entries
 /// whose worktree is still there, and their reclaimable size.
+#[derive(Default)]
 struct TrashNow {
     entries: u64,
     bytes: u64,
@@ -862,11 +872,7 @@ struct TrashNow {
 
 fn trash_now(ledger: &Ledger, errors: &mut Vec<String>) -> TrashNow {
     let repos: BTreeSet<&str> = ledger.lines.iter().map(|l| l.repo.as_str()).collect();
-    let mut now = TrashNow {
-        entries: 0,
-        bytes: 0,
-        repositories: 0,
-    };
+    let mut now = TrashNow::default();
     for repo in repos {
         let dir = Path::new(repo);
         // Only the entries are read, never Git: the command directory is
@@ -921,6 +927,9 @@ fn json(ledger: &Ledger, stats: &Stats, trash: &TrashNow, errors: &[String], sta
         ("generated_at", Json::str(output::rfc3339(started))),
         ("ledger", Json::path(&ledger.path)),
         ("since", time(stats.since)),
+        // The sentence the text report ends with, for a client to show as
+        // it is.
+        ("estimate_note", Json::str(ESTIMATE)),
         (
             "freed",
             Json::Obj(vec![
@@ -935,13 +944,13 @@ fn json(ledger: &Ledger, stats: &Stats, trash: &TrashNow, errors: &[String], sta
                 stats
                     .weeks
                     .iter()
-                    .map(|(start, sum)| {
-                        Json::Obj(vec![
+                    .map(|(start, freed)| {
+                        let mut fields = vec![
                             ("start", Json::str(output::rfc3339(*start))),
                             ("end", Json::str(output::rfc3339(start + 7 * DAY))),
-                            ("bytes", Json::UInt(sum.bytes)),
-                            ("worktrees", Json::UInt(sum.worktrees)),
-                        ])
+                        ];
+                        fields.extend(freed.fields());
+                        Json::Obj(fields)
                     })
                     .collect(),
             ),
@@ -953,13 +962,13 @@ fn json(ledger: &Ledger, stats: &Stats, trash: &TrashNow, errors: &[String], sta
                     .repositories
                     .iter()
                     .map(|r| {
-                        Json::Obj(vec![
+                        let mut fields = vec![
                             ("path", Json::path(r.path())),
                             ("common_dir", Json::str(r.common_dir.clone())),
-                            ("bytes", Json::UInt(r.freed.bytes)),
-                            ("worktrees", Json::UInt(r.freed.worktrees)),
-                            ("last_freed_at", Json::str(output::rfc3339(r.last))),
-                        ])
+                        ];
+                        fields.extend(r.freed.fields());
+                        fields.push(("last_freed_at", Json::str(output::rfc3339(r.last))));
+                        Json::Obj(fields)
                     })
                     .collect(),
             ),
@@ -1081,7 +1090,7 @@ fn text(
                 .repositories
                 .iter()
                 .take(TOP)
-                .map(|r| row(&places.show(r.path()), r.freed))
+                .map(|r| row(&places.show(r.path()), r.freed.all))
                 .collect();
             section(&mut out, &style, "by repository, all time", &repos);
             if stats.repositories.len() > TOP {
@@ -1339,23 +1348,27 @@ mod tests {
         assert_eq!(stats.last_by[2], Some(now - DAY));
         assert_eq!(stats.last, Some(now + DAY));
         // 12 windows, the last ending now; the future line lands in it.
+        // Each window and each repository splits by command, as the spans
+        // do: by hand against automatic cleanup, per week and repository.
+        let sum = |bytes, worktrees| Sum { bytes, worktrees };
+        let none = Sum::default();
         assert_eq!(stats.weeks.len(), 12);
         assert_eq!(stats.weeks[11].0 + 7 * DAY, now);
         assert_eq!(
             stats.weeks[11].1,
-            Sum {
-                bytes: 101,
-                worktrees: 2
+            Freed {
+                all: sum(101, 2),
+                by: [none, none, sum(100, 1), sum(1, 1)],
             }
         );
         assert_eq!(
             stats.weeks[10].1,
-            Sum {
-                bytes: 20,
-                worktrees: 1
+            Freed {
+                all: sum(20, 1),
+                by: [sum(20, 1), none, none, none],
             }
         );
-        let in_weeks: u64 = stats.weeks.iter().map(|w| w.1.worktrees).sum();
+        let in_weeks: u64 = stats.weeks.iter().map(|w| w.1.all.worktrees).sum();
         assert_eq!(
             in_weeks, 4,
             "the line 90 days old is before the first window"
@@ -1364,12 +1377,29 @@ mod tests {
         assert_eq!(stats.repositories[0].path(), Path::new("/src/app"));
         assert_eq!(
             stats.repositories[0].freed,
-            Sum {
-                bytes: 104,
-                worktrees: 4
+            Freed {
+                all: sum(104, 4),
+                by: [none, sum(0, 1), sum(100, 1), sum(4, 2)],
             }
         );
         assert_eq!(stats.repositories[1].path(), Path::new("/srv/bare.git"));
+        assert_eq!(
+            stats.repositories[1].freed.by,
+            [sum(20, 1), none, none, none]
+        );
+        // The JSON carries the same split, and the estimate sentence.
+        let doc = json(&ledger, &stats, &TrashNow::default(), &[], now).render();
+        let doc = jsonread::parse(&doc).unwrap();
+        assert_eq!(
+            doc.get("estimate_note").and_then(Value::str),
+            Some(ESTIMATE)
+        );
+        let week = &doc.get("weeks").map(Value::items).unwrap()[11];
+        let watch = week.get("by").and_then(|b| b.get("watch")).unwrap();
+        assert_eq!(watch.get("bytes").and_then(Value::i64), Some(100));
+        let repo = &doc.get("repositories").map(Value::items).unwrap()[1];
+        let remove = repo.get("by").and_then(|b| b.get("remove")).unwrap();
+        assert_eq!(remove.get("worktrees").and_then(Value::i64), Some(1));
         assert_eq!((stats.restored, stats.restored_from_records), (1, 1));
     }
 
