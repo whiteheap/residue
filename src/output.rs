@@ -465,6 +465,9 @@ fn usage_json(u: &Usage) -> Json {
 
 pub fn space_json(s: &Space) -> Json {
     Json::Obj(vec![
+        // A decimal string, not a number: dev_t can exceed 2^53, which a
+        // JavaScript reader would round.
+        ("device", Json::str(s.device.to_string())),
         ("free_bytes", Json::UInt(s.free)),
         ("total_bytes", Json::UInt(s.total)),
         ("free_inodes", Json::UInt(s.free_inodes)),
