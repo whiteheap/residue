@@ -53,7 +53,7 @@ What it checks:
 
 - Every download is HTTPS only, TLS 1.2 or later, including redirects.
 - The release archive must match its line in the release's `SHA256SUMS`, or nothing is installed. When `gh` is installed and logged in, the archive's [build-provenance attestation](#release-archives-and-packages) must verify against `whiteheap/residue` too; otherwise the summary says it was skipped and why.
-- The signing key it adds for apt, dnf or pacman must match the SHA-256 pinned in the script, the key `1AEA B314 3511 8A1F E575  D36E E155 3632 FC32 554A`. dnf gets that key from the script (`rpm --import`), never from a prompt.
+- The signing key it adds for apt, dnf or pacman must match the SHA-256 pinned in the script, the key `1AEA B314 3511 8A1F E575  D36E E155 3632 FC32 554A`. Each package manager trusts only that key for residue's repository: apt through `signed-by`, pacman through `--lsign-key`, and dnf through the repository file the script writes, whose `gpgkey` names the checked key as the local file `/etc/pki/rpm-gpg/RPM-GPG-KEY-residue`, so dnf never imports a key from a URL.
 - Every command that changes the machine is printed (`+ ...`) before it runs.
 - The whole script is functions called on its last line, so a download cut short runs nothing.
 
@@ -63,7 +63,7 @@ To undo it, the summary prints the commands for the channel it used. In short:
 residue service uninstall
 brew uninstall residue                    # Homebrew
 sudo apt-get remove residue               # apt; then remove /etc/apt/sources.list.d/residue.list and /etc/apt/keyrings/residue.gpg
-sudo dnf remove residue                   # dnf; then remove /etc/yum.repos.d/residue.repo
+sudo dnf remove residue                   # dnf; then remove /etc/yum.repos.d/residue.repo and /etc/pki/rpm-gpg/RPM-GPG-KEY-residue
 sudo pacman -R residue                    # pacman; then remove the [residue] section from /etc/pacman.conf
 rm ~/.local/bin/residue                   # archive, or the --prefix you chose
 ```

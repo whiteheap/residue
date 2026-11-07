@@ -22,6 +22,8 @@ PAGES=https://whiteheap.github.io/residue
 KEY_FPR=1AEAB31435118A1FE575D36EE1553632FC32554A
 KEY_ASC_SHA256=f63c31e514d7f8b87a2a61e7fe4833d6708c734fe3093286a505055482471554
 KEY_GPG_SHA256=1347e2c9b519414386f5997651a6bae055d0df86eb002b6e2b95ea946172e2cc
+# Where dnf finds that key: the repository file names this local file, not a URL.
+RPM_KEY=/etc/pki/rpm-gpg/RPM-GPG-KEY-residue
 # The first release whose `residue service install` needs no folder (#28).
 SERVICE_NO_ROOT_SINCE=0.0.7
 
@@ -155,14 +157,18 @@ install_apt() {
 
 install_dnf() {
   [ "$dry_run" = 1 ] || fetch_key "$PAGES/residue-signing-key.asc" "$tmp/residue.asc" "$KEY_ASC_SHA256"
-  [ "$dry_run" = 1 ] || fetch "$PAGES/rpm/residue.repo" "$tmp/residue.repo"
-  # Importing the checked key first means dnf never has to trust one it fetched.
-  as_root rpm --import "$tmp/residue.asc"
+  # packaging/rpm/residue.repo, except that gpgkey names the checked key as a
+  # local file. A gpgkey URL would let `dnf -y` import whatever key it serves.
+  printf '%s\n' '[residue]' 'name=residue' "baseurl=$PAGES/rpm/\$basearch" 'enabled=1' \
+    'gpgcheck=1' 'repo_gpgcheck=1' "gpgkey=file://$RPM_KEY" >"$tmp/residue.repo"
+  as_root install -d -m 0755 "${RPM_KEY%/*}"
+  as_root install -m 0644 "$tmp/residue.asc" "$RPM_KEY"
+  as_root rpm --import "$RPM_KEY"
   as_root install -m 0644 "$tmp/residue.repo" /etc/yum.repos.d/residue.repo
   if rpm -q residue >/dev/null 2>&1; then as_root dnf upgrade -y residue; else as_root dnf install -y residue; fi
   bin=/usr/bin/residue
   updates="dnf upgrade"
-  undo="${sudo:+sudo }dnf remove residue; ${sudo:+sudo }rm /etc/yum.repos.d/residue.repo"
+  undo="${sudo:+sudo }dnf remove residue; ${sudo:+sudo }rm /etc/yum.repos.d/residue.repo $RPM_KEY"
 }
 
 install_pacman() {
