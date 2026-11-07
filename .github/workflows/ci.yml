@@ -48,6 +48,8 @@ jobs:
       # its prompt, answer yes, and check that residue removes nothing.
       - name: Race check
         run: bash scripts/race-check.sh target/release/residue
+      - name: Contract check
+        run: bash scripts/contract-check.sh target/release/residue
 
   # FreeBSD runs in a virtual machine. residue's probe there is the base
   # system's procstat, so nothing beyond Rust and Git is installed, plus bash
@@ -62,7 +64,7 @@ jobs:
         with:
           release: "14"
           copyback: false
-          prepare: pkg install -y rust git bash
+          prepare: pkg install -y rust git bash jq
           run: |
             freebsd-version
             rustc --version
@@ -70,7 +72,9 @@ jobs:
             sh .github/smoke.sh ./target/release/residue
             sh .github/watch-smoke.sh ./target/release/residue
             bash scripts/race-check.sh ./target/release/residue
+            bash scripts/contract-check.sh ./target/release/residue
             pw useradd smoke -m
             su smoke -c "sh $PWD/.github/smoke.sh $PWD/target/release/residue"
             su smoke -c "sh $PWD/.github/watch-smoke.sh $PWD/target/release/residue"
             su smoke -c "bash $PWD/scripts/race-check.sh $PWD/target/release/residue"
+            su smoke -c "bash $PWD/scripts/contract-check.sh $PWD/target/release/residue"

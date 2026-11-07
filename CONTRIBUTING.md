@@ -46,6 +46,7 @@ cargo build --locked --release
 sh .github/smoke.sh ./target/release/residue
 sh .github/watch-smoke.sh ./target/release/residue
 bash scripts/race-check.sh
+bash scripts/contract-check.sh
 ```
 
 `cargo test` runs the in-crate tests: pure checks of private decision code on synthetic data, such as the verdict fold in `src/inspect.rs`, with no filesystem, Git or processes. The shell scripts run the release binary against real Git repositories and processes. They test different things and neither replaces the other. CI runs `cargo test` on macOS and both Linux runners, and the shell scripts there and on FreeBSD.
