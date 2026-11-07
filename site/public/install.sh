@@ -7,7 +7,9 @@
 # It installs or upgrades residue through the best channel here: Homebrew on
 # macOS; the signed apt, dnf or pacman repository on Linux when it can act as
 # root; otherwise the release archive, checked against SHA256SUMS and, when gh
-# is logged in, its build-provenance attestation. Then it runs `residue
+# is logged in, its build-provenance attestation. When the latest release has
+# no archive for this machine yet (FreeBSD's arrive minutes after a release),
+# it takes the newest release that has one and says so. Then it runs `residue
 # service install`, and prints what it did and how to undo it. Each command
 # that changes the machine is printed (+ ...) before it runs. Everything is in
 # functions called on the last line, so a download cut short runs nothing.
@@ -69,6 +71,10 @@ as_root() { if [ -n "$sudo" ]; then run sudo "$@"; else run "$@"; fi; }
 
 # HTTPS only, TLS 1.2 or later, on every redirect too.
 fetch() { curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$2" "$1"; }
+
+# The same, but it prints the HTTP status and leaves what a 404 means to the
+# caller. 000 means no server answered; curl says why on stderr.
+fetch_status() { curl --proto '=https' --tlsv1.2 -sSL --retry 3 -o "$2" -w '%{http_code}' "$1" || true; }
 
 sha256() {
   if has sha256sum; then sha256sum "$1" | cut -d' ' -f1
@@ -208,14 +214,76 @@ target() {
   esac
 }
 
+# Does release $tag list this machine's archive? Downloads its SHA256SUMS to
+# $tmp/SHA256SUMS, sets $name, $base and $want (the archive's checksum), and
+# fails when SHA256SUMS has no line for it. A FreeBSD archive arrives some
+# minutes after its release is published (packages.yml), with that line.
+listed() {
+  name=residue-$tag-$triple
+  base=https://github.com/$REPO/releases/download/$tag
+  code=$(fetch_status "$base/SHA256SUMS" "$tmp/SHA256SUMS")
+  case $code in
+    200) ;;
+    404) if [ "$exact" = 1 ]; then die "there is no release $tag of residue. The releases: https://github.com/$REPO/releases"; fi
+      die "release $tag has no SHA256SUMS right now; it may be in the middle of an update. Run this script again in a few minutes." ;;
+    *) die "could not download $base/SHA256SUMS (HTTP $code). Nothing was installed." ;;
+  esac
+  want=$(awk -v f="$name.tar.gz" '$2 == f { print $1 }' "$tmp/SHA256SUMS")
+  [ -n "$want" ]
+}
+
+# Set $older to the newest release other than $latest whose assets include
+# this machine's archive, from one GitHub API call that lists releases, newest
+# first. $latest is skipped: packages.yml uploads its archives a second before
+# the SHA256SUMS that names them, so $latest can list the archive while
+# `listed` fails. Empty when the call fails ($api is its HTTP status) or none
+# of them has it.
+find_older() {
+  older=
+  api=$(curl --proto '=https' --tlsv1.2 -sSL -o "$tmp/releases.json" -w '%{http_code}' \
+    "https://api.github.com/repos/$REPO/releases?per_page=10") || true
+  [ "$api" = 200 ] || return 0
+  url=$(grep -o "\"browser_download_url\": *\"https://github.com/$REPO/releases/download/v[0-9][0-9.]*/residue-v[0-9][0-9.]*-$triple\.tar\.gz\"" \
+    "$tmp/releases.json" | grep -Fv "/download/$latest/" | head -n 1)
+  url=${url%/*}
+  older=${url##*/}
+}
+
 install_archive() {
   triple=$(target)
-  if [ -z "$tag" ]; then
+  if [ -n "$tag" ]; then
+    exact=1
+  else
+    exact=0
     # The latest release, from the redirect GitHub answers: no API, no limit.
     tag=$(curl --proto '=https' --tlsv1.2 -fsSLI -o /dev/null -w '%{url_effective}' \
       "https://github.com/$REPO/releases/latest")
     tag=${tag##*/}
     case $tag in v[0-9]*) ;; *) die "could not find the latest release of $REPO" ;; esac
+  fi
+  if ! listed; then
+    # --version is exact: never another release.
+    [ "$exact" = 0 ] || die "residue $tag has no archive for $triple. The releases and their archives: https://github.com/$REPO/releases"
+    # The latest release has no archive for this machine yet. The apt, dnf and
+    # pacman repositories still serve the previous release then, so install
+    # the newest release that has one, as they do.
+    latest=$tag
+    late=
+    case $triple in *-freebsd) late=" FreeBSD archives are built after a release is published and are usually there within half an hour." ;; esac
+    find_older
+    if [ -z "$older" ]; then
+      if [ "$api" = 200 ]; then why="none of the 10 newest releases has one"
+      elif [ "${api:-000}" = 000 ]; then why="GitHub's API did not answer which earlier release has one"
+      else why="GitHub's API did not say which earlier release has one (HTTP $api)"
+      fi
+      say "install.sh: residue $latest has no archive for $triple yet, and $why.$late" >&2
+      say "Run this script again later, or install an earlier release now by its tag (https://github.com/$REPO/releases):" >&2
+      say "  curl -fsSL https://residue.whiteheap.com/install.sh | sh -s -- --version vX.Y.Z" >&2
+      exit 1
+    fi
+    tag=$older
+    listed || die "SHA256SUMS of $tag lists no $name.tar.gz"
+    say "residue $latest has no archive for $triple yet.$late Using $tag, the newest release that has one. To update to $latest, run this script again later."
   fi
   bin=$prefix/residue
   updates="run this script again"
@@ -224,16 +292,17 @@ install_archive() {
     say "residue ${tag#v} is already installed at $bin."
     return 0
   fi
-  name=residue-$tag-$triple
-  base=https://github.com/$REPO/releases/download/$tag
   if [ "$dry_run" = 1 ]; then
-    say "+ download $base/$name.tar.gz and SHA256SUMS; check the checksum and attestation"
+    say "+ download $base/$name.tar.gz; check it against SHA256SUMS and its attestation"
   else
     say "Downloading $name.tar.gz"
-    fetch "$base/$name.tar.gz" "$tmp/$name.tar.gz"
-    fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS"
-    want=$(awk -v f="$name.tar.gz" '$2 == f { print $1 }' "$tmp/SHA256SUMS")
-    [ -n "$want" ] || die "SHA256SUMS of $tag lists no $name.tar.gz"
+    code=$(fetch_status "$base/$name.tar.gz" "$tmp/$name.tar.gz")
+    case $code in
+      200) ;;
+      # SHA256SUMS names it, so it is seconds away.
+      404) die "$name.tar.gz is not on release $tag yet, though its SHA256SUMS names it. Run this script again in a minute." ;;
+      *) die "could not download $base/$name.tar.gz (HTTP $code). Nothing was installed." ;;
+    esac
     [ "$(sha256 "$tmp/$name.tar.gz")" = "$want" ] || die "$name.tar.gz does not match SHA256SUMS; nothing was installed"
     say "Checksum: matches SHA256SUMS"
     if ! has gh; then

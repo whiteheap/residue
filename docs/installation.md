@@ -30,6 +30,8 @@ It installs residue through the first channel that fits, or upgrades it when it 
 
 A package repository needs root: the script uses it when it runs as root, when `sudo` works without a password, or when `sudo` can ask for yours on the terminal. Otherwise it falls back to the archive, which needs no root. On Arch, `pacman -Syu` upgrades the whole system, as Arch requires; with a terminal, pacman shows the transaction and asks first.
 
+Right after a release, its FreeBSD archives are still being built, usually for under half an hour. In that window the script installs the newest release that has this machine's archive, names both versions, and tells you to run it again later to update; the apt, dnf and pacman repositories serve the previous release in that window too. If it cannot tell which release that is, for example because GitHub's API did not answer, it stops and prints the command to install a release by its tag.
+
 Then it runs `residue service install`, which starts `residue watch` now and at every login ([Automate cleanup](../README.md#automate-cleanup)). From 0.0.7 that needs no folder: it watches the usual code folders in your home folder. An older residue needs the folder that holds your repositories, so the script prints the command to run instead. A service you installed before is left as it is, with its own folders. On FreeBSD and other systems without launchd or systemd, the script says so and installs nothing more.
 
 It ends with a summary: the version and path it installed, the channel and how updates arrive, whether cleanup is on, and how to undo it.
@@ -39,8 +41,8 @@ It ends with a summary: the version and path it installed, the channel and how u
 | `--no-service` | Install only; do not run `residue service install`. Same as `RESIDUE_NO_SERVICE=1` |
 | `--archive` | Use the release archive, never a package manager or `sudo` |
 | `--prefix DIR` | Install the archive's `residue` into DIR (default `~/.local/bin`). Implies `--archive` |
-| `--version vX.Y.Z` | Install that release's archive instead of the latest. Implies `--archive` |
-| `--dry-run` | Print the commands that would change anything, and run none. It still reads what is installed and which release is the latest |
+| `--version vX.Y.Z` | Install that release's archive instead of the latest, and no other: when that release has no archive for this machine, the script says so and stops. Implies `--archive` |
+| `--dry-run` | Print the commands that would change anything, and run none. It still reads what is installed, which release is the latest and that release's `SHA256SUMS` |
 | `-h`, `--help` | Show the options |
 
 Pass options after `sh -s --`:
