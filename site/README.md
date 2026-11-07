@@ -1,6 +1,6 @@
 # The residue site
 
-One static page that introduces residue and sends readers to the [README](../README.md), which stays the user contract. It is prepared for Cloudflare Workers Static Assets and **not published**: no Cloudflare resource exists for it, and no address serves it yet.
+One static page that introduces residue and sends readers to the [README](../README.md), which stays the user contract. It is served at https://residue.whiteheap.com by Cloudflare Workers Static Assets: the Worker `residue` on the account that holds the `whiteheap.com` zone.
 
 | Path | What it holds |
 | --- | --- |
@@ -9,7 +9,7 @@ One static page that introduces residue and sends readers to the [README](../REA
 | `public/style.css` | All styles. System fonts, grays only, light and dark from the reader's setting |
 | `public/logo.svg`, `public/how-it-works.svg` and their `-dark.svg` pair | Copies of `docs/assets/`, the owner. Each page picks the dark one with `<picture>` when the reader's setting is dark. `logo.svg` is also the favicon |
 | `public/_headers` | Response headers: Content Security Policy, `nosniff`, no framing, referrer and permissions policies. Cloudflare applies it and does not serve it |
-| `wrangler.jsonc` | The Worker: assets only, no script, `public/` as the only upload, 404 page, workers.dev on, preview URLs off |
+| `wrangler.jsonc` | The Worker: assets only, no script, `public/` as the only upload, 404 page, the Custom Domain `residue.whiteheap.com`, workers.dev and preview URLs off |
 | `check.sh` | The static checks below |
 
 No JavaScript, no web font, no analytics, no cookies, no forms, nothing loaded from another origin. Keep it that way: the Content Security Policy blocks anything else.
@@ -43,13 +43,13 @@ curl -sI http://127.0.0.1:8799/missing   # 404, the body is public/404.html
 
 Then look at it at a phone width and a desktop width, in light and dark, and tab through it with the keyboard.
 
-## Publish
+## Deploy
 
-Not done. Publishing creates a public address, so it waits for the maintainer's approval, and so does every step below that talks to Cloudflare. Recheck the [Cloudflare docs](https://developers.cloudflare.com/workers/static-assets/) and the account's plan before the first deploy.
+A deploy changes a public page, so it waits for the maintainer's approval, and so does every step below that talks to Cloudflare. The maintainer approved the first deploy, to `residue.whiteheap.com`, on 2026-11-07.
 
 Cloudflare documents that "requests to static assets are free and unlimited" and that storing assets has no additional cost ([billing and limitations](https://developers.cloudflare.com/workers/static-assets/billing-and-limitations/)). This Worker has no script and no `run_worker_first`, so every request, the 404 page included, is answered from the assets and none runs Worker code. That statement covers this static page only: not a custom domain's registration, not Workers Builds, not any later dynamic feature.
 
-1. Log in to the Cloudflare account that should own the site, or export a `CLOUDFLARE_API_TOKEN` with the Workers Scripts edit permission. Check which account Wrangler will use:
+1. Log in to the Cloudflare account that holds the `whiteheap.com` zone, or export a `CLOUDFLARE_API_TOKEN` with the Workers Scripts and Workers Routes edit permissions. Check which account Wrangler will use:
 
    ```sh
    cd site
@@ -57,32 +57,24 @@ Cloudflare documents that "requests to static assets are free and unlimited" and
    npx --yes wrangler@4.158.0 whoami
    ```
 
-2. Check that the account has no Worker named `residue` already: a deploy would replace its code. If this lists deployments, the name is taken; pick another `name` in `wrangler.jsonc`:
-
-   ```sh
-   npx --yes wrangler@4.158.0 deployments list --name residue
-   ```
-
-3. From a clean checkout of the reviewed commit on `main`, run `sh site/check.sh`, then deploy. Wrangler uploads `site/public` and nothing else, and prints the address (`https://residue.<account subdomain>.workers.dev`) and the version ID:
+2. From a clean checkout of the reviewed commit on `main`, run `sh site/check.sh`, then deploy. Wrangler uploads `site/public` and nothing else, attaches the Custom Domain (Cloudflare creates its DNS record and certificate; it refuses a hostname that already has a record), and prints the version ID:
 
    ```sh
    cd site
    npx --yes wrangler@4.158.0 deploy --message "site at $(git rev-parse --short HEAD)"
    ```
 
-4. Record the address, the version ID, the commit and the time in the pull request or issue that approved it. Then smoke it:
+3. Record the version ID, the commit and the time in the pull request or issue that approved it. Then smoke it:
 
    ```sh
-   URL=https://residue.ACCOUNT.workers.dev
+   URL=https://residue.whiteheap.com
    curl -sI "$URL/"            # 200, text/html, content-security-policy present
    curl -sI "$URL/style.css"   # 200, text/css
    curl -sI "$URL/logo.svg"    # 200, image/svg+xml
    curl -sI "$URL/missing"     # 404
    ```
 
-5. Only now that a real address exists: add `<link rel="canonical">` and Open Graph tags with it to `public/index.html`, decide whether search engines should index it, and add a link to it from the README.
-
-To serve a custom domain instead of workers.dev, add `"routes": [{ "pattern": "DOMAIN", "custom_domain": true }]` to `wrangler.jsonc` and set `"workers_dev": false`. The domain must be a zone on the same account.
+The page has `<link rel="canonical">` and Open Graph tags with that address, and no `noindex`: search engines may index it. The README links to it.
 
 Leave https://whiteheap.github.io/residue/ alone. GitHub Pages serves the signed apt, dnf and pacman repositories there; this site never replaces or redirects it.
 
@@ -95,4 +87,4 @@ npx --yes wrangler@4.158.0 versions list --name residue
 npx --yes wrangler@4.158.0 rollback VERSION_ID --name residue --message "why"
 ```
 
-The first deploy has no earlier version. To take the site down, set `"workers_dev": false` in `wrangler.jsonc` and deploy again, which turns the workers.dev address off, or delete the Worker with `npx --yes wrangler@4.158.0 delete residue`. Both are public changes and need the same approval as a deploy. Reverting a commit changes nothing that is deployed until the next deploy.
+The first deploy has no earlier version. To take the site down, remove `residue.whiteheap.com` from the Worker's Settings > Domains & Routes in the Cloudflare dashboard, and the `routes` entry from `wrangler.jsonc` so the next deploy does not attach it again, or delete the Worker with `npx --yes wrangler@4.158.0 delete residue`. Both are public changes and need the same approval as a deploy. Reverting a commit changes nothing that is deployed until the next deploy.

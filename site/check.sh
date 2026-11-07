@@ -124,7 +124,8 @@ if grep -Eil '<(script|form|iframe|object|embed)' "$public"/*.html "$public"/*.s
 else
   ok "no script, form or embed"
 fi
-if grep -Eil '(src|srcset)="(https?:)?//|<link[^>]+href="(https?:)?//|@import|url\((["'"'"']?)(https?:)?//' "$public"/*.html "$public"/*.css; then
+# rel="canonical" names the page's own address; it loads nothing.
+if grep -Ei '(src|srcset)="(https?:)?//|<link[^>]+href="(https?:)?//|@import|url\((["'"'"']?)(https?:)?//' "$public"/*.html "$public"/*.css | grep -v 'rel="canonical" href="https://residue\.whiteheap\.com/"'; then
   fail "a file above loads a resource from another origin"
 else
   ok "every resource loads from the site itself"
