@@ -8,7 +8,8 @@
 # week into the past: `fix` and `wip` were pushed, `local` never was.
 #   1. --once --dry-run logs that it would remove `fix`, and removes nothing.
 #   2. After `fix`'s upstream branch is deleted and pruned, --once removes
-#      `fix` and keeps `wip` and `local`.
+#      `fix` and keeps `wip` and `local`; the log says what it freed, and
+#      `residue stats` counts it under watch.
 #   3. A running watch notices `wip`'s upstream being deleted (a fetch
 #      --prune, no polling) and removes it within two minutes.
 #   4. --min-free 99.9 (disk pressure) removes the idle `local`.
@@ -49,9 +50,12 @@ here=$(cd "$(dirname "$0")" && pwd)
 S=$(mktemp -d "${TMPDIR:-/tmp}/residue-watch.XXXXXX")
 watcher=
 trap 'if [ -n "$watcher" ]; then kill "$watcher" 2>/dev/null || true; wait "$watcher" 2>/dev/null || true; fi; rm -rf "$S"' EXIT
-# The lock of a real `residue service` is not touched.
+# The lock of a real `residue service` is not touched, and the stats ledger
+# is the scratch home folder's, never the caller's.
 XDG_STATE_HOME="$S/state"
-export XDG_STATE_HOME
+HOME="$S/home"
+export XDG_STATE_HOME HOME
+mkdir -p "$HOME"
 # Commits and reflog entries a week old.
 GIT_AUTHOR_DATE="2026-01-01T00:00:00Z"
 GIT_COMMITTER_DATE="2026-01-01T00:00:00Z"
@@ -206,6 +210,10 @@ grep -q "removed .*worktrees/fix" "$S/log" || fail "fix was not removed"
 [ ! -e .worktrees/fix ] || fail "fix still exists"
 [ -d .worktrees/wip ] && [ -d .worktrees/local ] || fail "removed more than fix"
 [ ! -e .git/residue-trash ] || fail "watch moved fix to the trash instead of deleting it"
+grep -q "residue watch: freed about .* (residue has freed about .* on this machine since " "$S/log" \
+  || fail "the log does not say what removing fix freed"
+"$residue" stats --json | grep -q '"watch":[{]"bytes":[0-9]*,"worktrees":1[}]' \
+  || fail "residue stats does not count fix under watch"
 
 # 3. A running watch reacts to wip's upstream being pruned.
 "$residue" watch --grace 1m "$S" 2> "$S/log" &
