@@ -31,7 +31,7 @@ A ROOT you name replaces the list. `service install` writes the folders it found
 
 `residue service install` replaces the service it finds, so running it twice leaves one service. Without a ROOT, it keeps the ROOTs you named for the service it replaces, and drops any that is no longer a folder, with a note; a service on the usual code folders looks for them again. To change the folders, name them. Options are not kept: each one you do not give goes back to its default, `--dry-run` included, and the command says so when the service it replaced was a dry run.
 
-If `brew services start residue` already runs `watch`, `service install` says so and exits 1: only one `watch` runs per user. Keep Homebrew's, or stop it first with `brew services stop residue`.
+residue's Homebrew formula defines no service, so turn on automatic cleanup with `residue service install`, not `brew services`. If a Homebrew service for residue exists anyway, from a formula of your own, `service install` says so and exits 1: only one `watch` runs per user. Stop that one first with `brew services stop residue`.
 
 ### Fetching
 
