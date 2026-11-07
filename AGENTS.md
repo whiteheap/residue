@@ -28,7 +28,7 @@ These are the reasons people trust the tool. Do not weaken them without an expli
 | `src/remove.rs` | The remove plan, confirmation, re-check, move aside, execution, the trash purge, and interrupted-removal recovery (`Leftover`) |
 | `src/trash.rs` | The trash: entries and their records, `residue restore`, and the purge |
 | `src/inspect.rs` | Every check and the verdict |
-| `src/activity.rs` | The process probe (`lsof` on macOS, `/proc` on Linux, `procstat` on FreeBSD) |
+| `src/activity.rs` | The process probe (`lsof` on macOS, `/proc` on Linux, `procstat` on FreeBSD, `ps` plus a working-directory sysctl per process on NetBSD, OpenBSD and DragonFly, `/proc/PID/path` on illumos) |
 | `src/git.rs` | Hardened Git invocation and porcelain parsers |
 | `src/fsinfo.rs` | Disk usage walk and free space |
 | `src/policy.rs` | Regenerable rules (names and paths) for ignored entries |
@@ -57,7 +57,7 @@ bash scripts/contract-check.sh ./target/release/residue
 bash scripts/recovery-check.sh ./target/release/residue
 ```
 
-CI runs the format, lint, test and build steps, both smoke tests, the race, contract and recovery checks on macOS, Linux x86_64 and arm64, and the build, both smoke tests and the race, contract and recovery checks in a FreeBSD 14 virtual machine as root and as an ordinary user. It runs `.github/service-smoke.sh` (install, status, uninstall) on macOS and Linux x86_64.
+CI runs the format, lint, test and build steps, both smoke tests, the race, contract and recovery checks on macOS, Linux x86_64 and arm64, and the build, both smoke tests and the race, contract and recovery checks in FreeBSD 14, NetBSD 10, OpenBSD 7.8 and DragonFly 6.4 virtual machines as root and as an ordinary user. An OmniOS (illumos) virtual machine runs the build, `.github/smoke.sh` and the contract and recovery checks, as root and as an ordinary user: illumos has no change events for the watch smoke test's two-minute limit, and its `script` cannot drive the race check. NetBSD and OpenBSD run the race check through `.github/script-adapter/script`, which translates the `script -q FILE CMD...` call into their `script -c` form. It runs `.github/service-smoke.sh` (install, status, uninstall) on macOS and Linux x86_64.
 
 Then run the binary on real repositories. Make a scratch repository with worktrees in the states your change touches; [CONTRIBUTING.md](CONTRIBUTING.md#verify-a-change) has a script that builds one with each common state. The README's "Tested on" table lists the states each version covered. Run `scan`, `explain` and `remove`, and record the exact platform and Git version that ran. For Linux from a Mac: `cargo zigbuild --release --target aarch64-unknown-linux-musl`, then run the binary in an `ubuntu:24.04` container as a non-root user.
 

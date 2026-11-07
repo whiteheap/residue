@@ -1,0 +1,28 @@
+#!/bin/sh
+# CI only. scripts/race-check.sh starts residue as `script -q FILE CMD...`,
+# the FreeBSD, DragonFly and macOS form. NetBSD's script(1) takes the
+# command as one string after -c, and OpenBSD's takes -c and has no -q. The
+# NetBSD and OpenBSD jobs put this directory first on PATH so the race check
+# runs unchanged; it goes once race-check.sh handles those two itself.
+#
+# `stty sane` first: OpenBSD's script copies the terminal settings of its
+# standard input to the new terminal, and when that input is a pipe it
+# copies an all-zero termios, which leaves the terminal non-canonical with
+# VMIN 0, so residue's read of the answer returns end of file at once.
+# The speed too: that termios has speed 0, and `stty sane` keeps the speed,
+# and setting an output speed of 0 hangs the terminal up.
+set -eu
+[ "${1:-}" = -q ] && shift
+file=$1
+shift
+cmd='stty sane 38400; exec'
+for arg; do
+  cmd="$cmd '$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")'"
+done
+case $(uname -s) in
+# NetBSD runs -c under $SHELL, which can be csh for root.
+NetBSD) SHELL=/bin/sh exec /usr/bin/script -q -c "$cmd" "$file" ;;
+# OpenBSD runs -c under sh, and prints its start and end lines.
+OpenBSD) exec /usr/bin/script -c "$cmd" "$file" ;;
+*) exec /usr/bin/script -q "$file" "$@" ;;
+esac

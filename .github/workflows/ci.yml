@@ -82,3 +82,127 @@ jobs:
             su smoke -c "bash $PWD/scripts/race-check.sh $PWD/target/release/residue"
             su smoke -c "bash $PWD/scripts/contract-check.sh $PWD/target/release/residue"
             su smoke -c "bash $PWD/scripts/recovery-check.sh $PWD/target/release/residue"
+
+  # NetBSD, OpenBSD and DragonFly run in virtual machines too. Their probe is
+  # the base system's ps plus one sysctl per process (kern.proc_cwd and its
+  # NetBSD and DragonFly forms), so only Rust, Git, bash and jq are
+  # installed. Each runs the build, both smoke tests, the race check, the
+  # contract check and the recovery check as root and as an ordinary user.
+  # As an ordinary user OpenBSD names only that user's working directories;
+  # NetBSD and DragonFly name every process's by default.
+  netbsd:
+    name: netbsd-10
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: vmactions/netbsd-vm@5957cf330aef2e6ddc63c604364c99ce2e02b91d # v1.5.3
+        with:
+          release: "10"
+          copyback: false
+          prepare: /usr/sbin/pkg_add rust git-base bash jq
+          run: |
+            # /tmp is tmpfs, which reports itself 100% free, so the watch
+            # smoke test's disk-pressure case needs a disk-backed TMPDIR.
+            export TMPDIR=/var/tmp
+            uname -a
+            rustc --version
+            cargo build --locked --release
+            sh .github/smoke.sh ./target/release/residue
+            sh .github/watch-smoke.sh ./target/release/residue
+            PATH="$PWD/.github/script-adapter:$PATH" bash scripts/race-check.sh ./target/release/residue
+            bash scripts/contract-check.sh ./target/release/residue
+            bash scripts/recovery-check.sh ./target/release/residue
+            useradd -m -s /bin/sh smoke
+            su smoke -c "TMPDIR=/var/tmp sh $PWD/.github/smoke.sh $PWD/target/release/residue"
+            su smoke -c "TMPDIR=/var/tmp sh $PWD/.github/watch-smoke.sh $PWD/target/release/residue"
+            su smoke -c "TMPDIR=/var/tmp PATH=$PWD/.github/script-adapter:\$PATH bash $PWD/scripts/race-check.sh $PWD/target/release/residue"
+            su smoke -c "TMPDIR=/var/tmp bash $PWD/scripts/contract-check.sh $PWD/target/release/residue"
+            su smoke -c "TMPDIR=/var/tmp bash $PWD/scripts/recovery-check.sh $PWD/target/release/residue"
+
+  openbsd:
+    name: openbsd-7
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: vmactions/openbsd-vm@f1ca8bc8ecc5b6ef7218e5b914836e067e1546d3 # v1.4.9
+        with:
+          release: "7.8"
+          copyback: false
+          prepare: pkg_add rust git bash jq
+          run: |
+            uname -a
+            rustc --version
+            cargo build --locked --release
+            sh .github/smoke.sh ./target/release/residue
+            sh .github/watch-smoke.sh ./target/release/residue
+            PATH="$PWD/.github/script-adapter:$PATH" bash scripts/race-check.sh ./target/release/residue
+            bash scripts/contract-check.sh ./target/release/residue
+            bash scripts/recovery-check.sh ./target/release/residue
+            useradd -m -s /bin/sh smoke
+            su smoke -c "sh $PWD/.github/smoke.sh $PWD/target/release/residue"
+            su smoke -c "sh $PWD/.github/watch-smoke.sh $PWD/target/release/residue"
+            su smoke -c "PATH=$PWD/.github/script-adapter:\$PATH bash $PWD/scripts/race-check.sh $PWD/target/release/residue"
+            su smoke -c "bash $PWD/scripts/contract-check.sh $PWD/target/release/residue"
+            su smoke -c "bash $PWD/scripts/recovery-check.sh $PWD/target/release/residue"
+
+  dragonfly:
+    name: dragonfly-6
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: vmactions/dragonflybsd-vm@4ab776fa9f914fbea72f13715b451e77e7ef5c41 # v1.3.4
+        with:
+          release: "6.4"
+          copyback: false
+          prepare: pkg install -y rust git bash jq
+          run: |
+            # /tmp is tmpfs, which reports itself 100% free, so the watch
+            # smoke test's disk-pressure case needs a disk-backed TMPDIR.
+            export TMPDIR=/var/tmp
+            uname -a
+            rustc --version
+            cargo build --locked --release
+            sh .github/smoke.sh ./target/release/residue
+            sh .github/watch-smoke.sh ./target/release/residue
+            bash scripts/race-check.sh ./target/release/residue
+            bash scripts/contract-check.sh ./target/release/residue
+            bash scripts/recovery-check.sh ./target/release/residue
+            pw useradd smoke -m
+            su smoke -c "TMPDIR=/var/tmp sh $PWD/.github/smoke.sh $PWD/target/release/residue"
+            su smoke -c "TMPDIR=/var/tmp sh $PWD/.github/watch-smoke.sh $PWD/target/release/residue"
+            su smoke -c "TMPDIR=/var/tmp bash $PWD/scripts/race-check.sh $PWD/target/release/residue"
+            su smoke -c "TMPDIR=/var/tmp bash $PWD/scripts/contract-check.sh $PWD/target/release/residue"
+            su smoke -c "TMPDIR=/var/tmp bash $PWD/scripts/recovery-check.sh $PWD/target/release/residue"
+
+  # illumos (OmniOS) reads /proc/<pid>/path. It runs the build, the smoke
+  # test, the contract check and the recovery check as root and as an
+  # ordinary user. Not the
+  # watch smoke test: illumos has no inotify or kqueue, so a running watch
+  # wakes on its five-minute timer, past that test's two-minute limit. Not
+  # the race check: illumos script(1) cannot run a command, and the base
+  # system has no other way to give residue a terminal.
+  illumos:
+    name: omnios-r151054
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: vmactions/omnios-vm@aeee92416495d9685b2997d954f6b063ae5b832d # v1.3.8
+        with:
+          release: "r151054-build"
+          copyback: false
+          prepare: |
+            pkg install developer/versioning/git || [ $? -eq 4 ]
+            pkg install jq || pkg install ooce/text/jq || [ $? -eq 4 ]
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          run: |
+            . "$HOME/.cargo/env"
+            uname -a
+            rustc --version
+            cargo build --locked --release
+            sh .github/smoke.sh ./target/release/residue
+            bash scripts/contract-check.sh ./target/release/residue
+            bash scripts/recovery-check.sh ./target/release/residue
+            useradd -m -d /export/home/smoke -s /bin/sh smoke
+            su smoke -c "HOME=/export/home/smoke sh $PWD/.github/smoke.sh $PWD/target/release/residue"
+            su smoke -c "HOME=/export/home/smoke bash $PWD/scripts/contract-check.sh $PWD/target/release/residue"
+            su smoke -c "HOME=/export/home/smoke bash $PWD/scripts/recovery-check.sh $PWD/target/release/residue"
