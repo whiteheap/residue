@@ -188,7 +188,7 @@ Turn it on with one command:
 residue service install
 ```
 
-That starts `residue watch` now and at every login (launchd on macOS, systemd --user on Linux). With no ROOT it watches the usual code folders in your home folder that exist, and prints which: `~/src`, `~/code`, `~/Code`, `~/dev`, `~/Developer`, `~/projects`, `~/Projects`, `~/repos`, `~/git`, `~/github`, `~/GitHub`, `~/work`, `~/Work` and `~/workspace`. Name the folders to choose others: `residue service install ~/elsewhere`. `residue service uninstall` turns it off. One `watch` runs per user. While none is installed or running, `residue scan` at a terminal ends with a one-line reminder of this command.
+That starts `residue watch` now and at every login (launchd on macOS, systemd --user on Linux). With no ROOT it watches the usual code folders in your home folder that exist, and prints which: `~/src`, `~/code`, `~/Code`, `~/dev`, `~/Developer`, `~/projects`, `~/Projects`, `~/repos`, `~/git`, `~/github`, `~/GitHub`, `~/work`, `~/Work` and `~/workspace`. Name folders to watch only those: `residue service install ~/src`. `residue service uninstall` turns it off. One `watch` runs per user. While none is installed or running, `residue scan` at a terminal ends with a one-line reminder of this command.
 
 Try the dry run before anything is removed:
 
@@ -197,7 +197,7 @@ residue watch --once --dry-run
 residue service install --dry-run
 ```
 
-The first prints what it would remove right now; the second installs a service that only logs it. A dry run still fetches (below); add `--no-fetch` to leave the refs alone too.
+The first prints what it would remove right now (for one folder: `residue watch --once --dry-run ~/src`); the second installs a service that only logs it. A dry run still fetches (below); add `--no-fetch` to leave the refs alone too.
 
 <a id="reclaim-storage-automatically"></a>
 
