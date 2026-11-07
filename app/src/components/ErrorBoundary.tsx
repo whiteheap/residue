@@ -7,7 +7,11 @@ interface Props {
   actions?: ReactNode;
   /**
    * Set for a dialog's boundary: the panel is drawn in a dialog of its own,
-   * with Close, which calls this. Without it the panel takes the screen.
+   * whose one way out is Close, which calls this. It offers no "Try again":
+   * drawing the dialog again would start its flow again (the removal dialog
+   * plans anew, the save dialog reads anew) after its action may have run,
+   * while Close returns to the screen's own fresh read. Without it the panel
+   * takes the screen.
    */
   onClose?: () => void;
   children: ReactNode;
@@ -57,15 +61,16 @@ export class ErrorBoundary extends Component<Props, State> {
           </details>
         ) : null}
         <div className="error-panel-actions">
-          <Button variant="secondary" onClick={this.reset}>
-            Try again
-          </Button>
-          {actions}
           {onClose ? (
             <Button variant="secondary" onClick={onClose}>
               Close
             </Button>
-          ) : null}
+          ) : (
+            <Button variant="secondary" onClick={this.reset}>
+              Try again
+            </Button>
+          )}
+          {actions}
         </div>
       </>
     );
