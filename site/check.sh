@@ -2,14 +2,19 @@
 # Static checks for the residue site. Run from anywhere: sh site/check.sh
 # Reads files only; needs no network and no Cloudflare account.
 #
-# 1. site/public holds only the files the site serves.
-# 2. The logo and the chart, light and dark, are byte-identical to
-#    docs/assets, their owner.
+# 1. site/public holds only the files the site serves, with no subdirectory.
+# 2. The logo, light and dark, and the dark chart are byte-identical to
+#    docs/assets, their owner. The fonts and their license are the files of
+#    @fontsource/ibm-plex-mono 5.3.0, by SHA-256.
 # 3. Every command on the page appears verbatim in README.md, and so does the
 #    minimum Git version.
 # 4. Every local path and #fragment the pages link to exists.
 # 5. Every README anchor the pages link to is a README heading.
-# 6. No script, no third-party resource, no form.
+# 6. One script only, /hero.js, same origin, and it loads and stores nothing.
+#    No inline script or handler, no third-party resource, no form.
+# 7. The fonts load from the site itself, with font-display: swap, the 400
+#    weight is preloaded, and the Content Security Policy is the exact one
+#    below.
 set -u
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -28,18 +33,21 @@ ok() {
   printf 'ok   %s\n' "$*"
 }
 
-# 1. The publish directory allowlist.
+# 1. The publish directory allowlist. Flat: smoke.sh fetches each file as
+#    /NAME, so a subdirectory is listed here and fails.
 expected='404.html
 _headers
+hero.js
 how-it-works-dark.svg
-how-it-works.svg
+ibm-plex-mono-OFL.txt
+ibm-plex-mono-latin-400-normal.woff2
+ibm-plex-mono-latin-500-normal.woff2
 index.html
 logo-dark.svg
 logo.svg
 style.css
-whiteheap-mark-black.svg
 whiteheap-mark-white.svg'
-actual=$(cd "$public" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)
+actual=$(cd "$public" && find . -mindepth 1 | sed 's|^\./||' | LC_ALL=C sort)
 if [ "$actual" = "$expected" ]; then
   ok "site/public holds only the allowlisted files"
 else
@@ -48,14 +56,37 @@ else
   printf "%s\n" "$actual" | diff -u "$scratch/expected" - || true
 fi
 
-# 2. Copies of the README artwork.
-for asset in logo.svg logo-dark.svg how-it-works.svg how-it-works-dark.svg; do
+# 2. Copies of the README artwork. The page is dark only; logo.svg stays as
+#    the favicon, which sits on the browser's own light or dark tab bar.
+for asset in logo.svg logo-dark.svg how-it-works-dark.svg; do
   if cmp -s "$root/docs/assets/$asset" "$public/$asset"; then
     ok "$asset matches docs/assets/$asset"
   else
     fail "$asset differs from docs/assets/$asset; copy it again"
   fi
 done
+
+# The fonts and their license, from @fontsource/ibm-plex-mono 5.3.0 (npm pack
+# @fontsource/ibm-plex-mono@5.3.0: files/ and LICENSE). To update them, copy
+# the files again and replace these hashes in the same pull request.
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d ' ' -f 1
+  else
+    shasum -a 256 "$1" | cut -d ' ' -f 1
+  fi
+}
+while read -r want file; do
+  if [ "$(sha256 "$public/$file")" = "$want" ]; then
+    ok "$file is the @fontsource/ibm-plex-mono 5.3.0 file"
+  else
+    fail "$file is not the @fontsource/ibm-plex-mono 5.3.0 file its hash in site/check.sh names"
+  fi
+done <<'FONTS'
+08949f728dc52d528e69b1667d15c89a5686a4ee9a296ff90983985f99c380f7 ibm-plex-mono-latin-400-normal.woff2
+01d285447409c8a588692162439a038b8cbd7871309ee20267b0d2d91c6e8e22 ibm-plex-mono-latin-500-normal.woff2
+23b0a9d0c6d3f140a0b77e483c5cfa6bba574325ef5cb189ed9f2fec4884533f ibm-plex-mono-OFL.txt
+FONTS
 
 # 3. Commands and facts come from the README.
 commands=$(sed -n 's|.*<pre[^>]*><code>\(.*\)</code></pre>.*|\1|p' "$public/index.html")
@@ -106,6 +137,19 @@ for page in "$public"/*.html; do
     fi
   done
 done
+# The stylesheet's url()s: each one an absolute path to a file here.
+for ref in $(grep -oE 'url\([^)]*\)' "$public/style.css" | sed 's/^url(//; s/)$//; s/^["'"'"']//; s/["'"'"']$//' | sort -u); do
+  case $ref in
+    /*)
+      if [ -f "$public$ref" ]; then
+        ok "style.css: $ref exists"
+      else
+        fail "style.css: $ref has no file in site/public"
+      fi
+      ;;
+    *) fail "style.css: url($ref) is not a path on the site itself" ;;
+  esac
+done
 
 # 5. README anchors, slugged the way GitHub does it: lowercase, punctuation
 #    other than hyphens dropped, spaces to hyphens.
@@ -120,11 +164,46 @@ for anchor in $(grep -oh 'https://github.com/whiteheap/residue#[^"]*' "$public"/
   fi
 done
 
-# 6. Nothing runs and nothing loads from elsewhere.
-if grep -Eil '<(script|form|iframe|object|embed)' "$public"/*.html "$public"/*.svg; then
-  fail "a page or image above has a script, form or embed"
+# 6. One script, from the site itself, and nothing else runs. The Content
+#    Security Policy (rule 7) enforces this in the browser; these lines keep
+#    a change that would need a looser policy from reaching it.
+script='<script src="/hero.js" defer></script>'
+for page in "$public"/*.html; do
+  name=$(basename "$page")
+  tags=$(grep -oi '<script' "$page" | wc -l | tr -d ' ')
+  exact=$(grep -oF "$script" "$page" | wc -l | tr -d ' ')
+  if [ "$tags" -eq "$exact" ] && [ "$tags" -le 1 ]; then
+    ok "$name: no script other than /hero.js"
+  else
+    fail "$name: a script other than one $script"
+  fi
+done
+if grep -qF "$script" "$public/index.html"; then
+  ok "index.html loads /hero.js"
 else
-  ok "no script, form or embed"
+  fail "index.html does not load the hero with $script"
+fi
+if grep -Eil '<script|<foreignObject' "$public"/*.svg; then
+  fail "an image above has a script or foreignObject"
+else
+  ok "no script in an image"
+fi
+if grep -EiH '<[^>]*[[:space:]]on[a-z]+[[:space:]]*=|javascript:' "$public"/*.html "$public"/*.svg; then
+  fail "a file above has an inline event handler or a javascript: URL"
+else
+  ok "no inline event handler or javascript: URL"
+fi
+if grep -Eil '<(form|iframe|frame|object|embed)' "$public"/*.html "$public"/*.svg; then
+  fail "a page or image above has a form or embed"
+else
+  ok "no form or embed"
+fi
+# hero.js draws on its canvas and does nothing else: no request, no storage,
+# no new element, no code built from a string.
+if grep -En 'fetch\(|XMLHttpRequest|WebSocket|EventSource|sendBeacon|import|eval\(|Function\(|cookie|[lL]ocalStorage|sessionStorage|indexedDB|createElement|innerHTML|insertAdjacent|document\.write|://' "$public/hero.js"; then
+  fail "hero.js, at the lines above, could load, store or run something"
+else
+  ok "hero.js loads, stores and runs nothing else"
 fi
 # rel="canonical" names the page's own address; it loads nothing.
 if grep -Ei '(src|srcset)="(https?:)?//|<link[^>]+href="(https?:)?//|@import|url\((["'"'"']?)(https?:)?//' "$public"/*.html "$public"/*.css | grep -v 'rel="canonical" href="https://residue\.whiteheap\.com/"'; then
@@ -132,6 +211,31 @@ if grep -Ei '(src|srcset)="(https?:)?//|<link[^>]+href="(https?:)?//|@import|url
 else
   ok "every resource loads from the site itself"
 fi
+
+# 7. Fonts and the Content Security Policy. The policy allows the site's own
+#    script, styles, images and fonts, and nothing else. Change it here and in
+#    public/_headers together.
+csp="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+if [ "$(sed -n 's/^  Content-Security-Policy: //p' "$public/_headers")" = "$csp" ]; then
+  ok "_headers has the Content Security Policy, exactly"
+else
+  fail "_headers' Content-Security-Policy is not exactly: $csp"
+fi
+faces=$(grep -c '@font-face' "$public/style.css")
+swaps=$(grep -c 'font-display: swap;' "$public/style.css")
+if [ "$faces" -gt 0 ] && [ "$faces" -eq "$swaps" ]; then
+  ok "each of the $faces @font-face rules has font-display: swap"
+else
+  fail "style.css has $faces @font-face rules and $swaps font-display: swap"
+fi
+preload='<link rel="preload" href="/ibm-plex-mono-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>'
+for page in "$public"/*.html; do
+  if grep -qF "$preload" "$page"; then
+    ok "$(basename "$page") preloads the 400 weight"
+  else
+    fail "$(basename "$page") does not preload the 400 weight with $preload"
+  fi
+done
 
 if [ "$failures" -eq 0 ]; then
   printf 'site check passed\n'

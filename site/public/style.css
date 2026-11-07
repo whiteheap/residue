@@ -1,6 +1,24 @@
-/* residue site. One stylesheet, system fonts, no script.
-   Grays only, written in oklch with no hue. Each color token holds its light
-   and dark value, so the page follows the reader's color scheme. */
+/* residue site. One stylesheet, in the look of whiteheap.com: black, grays in
+   oklch with no hue, IBM Plex Mono for the wordmark, headings, labels and code,
+   the system sans for reading. Dark only. */
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/ibm-plex-mono-latin-400-normal.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/ibm-plex-mono-latin-500-normal.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
 
 *,
 *::before,
@@ -10,25 +28,30 @@
 }
 
 :root {
-  color-scheme: light dark;
+  color-scheme: dark;
 
-  --bg: light-dark(oklch(1 0 none), oklch(0.145 0 none));
-  --fg: light-dark(oklch(0.2 0 none), oklch(0.97 0 none));
-  --muted: light-dark(oklch(0.45 0 none), oklch(0.74 0 none));
-  --line: light-dark(oklch(0.9 0 none), oklch(0.3 0 none));
-  --surface: light-dark(oklch(0.975 0 none), oklch(0.19 0 none));
-  --fg-hover: color-mix(in oklch, var(--fg), var(--bg) 18%);
+  /* The whiteheap.com palette, and the surface and ring of its buttons. */
+  --bg: oklch(0 0 none);
+  --fg: oklch(0.97 0 none);
+  --muted: oklch(0.72 0 none);
+  --faint: oklch(0.56 0 none);
+  --line: oklch(0.26 0 none);
+  --surface: oklch(0.17 0 none);
+  --ring: oklch(0.32 0 none);
+  --tint: oklch(0.269 0 none);
 
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --font-sans: -apple-system, system-ui, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", Arial, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 
   --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
-  --gutter: clamp(1rem, 0.5rem + 2.5vw, 2rem);
-  --page: 64rem;
-  --measure: 40rem;
-  /* 32px at 320px wide, 52px from about 1120px. */
-  --text-hero: clamp(2rem, 1.5rem + 2.5vw, 3.25rem);
-  --space-section: clamp(3.5rem, 2.5rem + 5vw, 6rem);
+  --gutter: clamp(1rem, 0.4rem + 3vw, 3rem);
+  --measure: 72rem;
+  --prose: 40rem;
+  /* 22px at 320px wide, 36px at 1440px. */
+  --text-hero: clamp(1.375rem, 1.125rem + 1.25vw, 2.25rem);
+  --space-section: clamp(4rem, 2.5rem + 6vw, 8rem);
+  /* The header: 1rem of padding above and below a 2.25rem button row. */
+  --header-block: 4.25rem;
   --radius: 0.5rem;
 
   scrollbar-gutter: stable;
@@ -60,7 +83,8 @@ h3 {
 
 p,
 ul,
-ol {
+ol,
+pre {
   margin: 0;
 }
 
@@ -73,6 +97,7 @@ svg {
 
 a {
   color: inherit;
+  text-decoration-color: var(--faint);
   text-decoration-thickness: 1px;
   text-underline-offset: 0.2em;
   touch-action: manipulation;
@@ -84,7 +109,7 @@ a:active {
 
 @media (hover: hover) and (pointer: fine) {
   a:hover {
-    text-decoration-thickness: 2px;
+    text-decoration-color: currentColor;
   }
 }
 
@@ -100,77 +125,71 @@ pre {
 
 :not(pre) > code {
   font-size: 0.875em;
-  padding: 0.1em 0.3em;
-  border: 1px solid var(--line);
+  padding: 0.1em 0.35em;
   border-radius: 0.25rem;
   background: var(--surface);
+  box-shadow: inset 0 0 0 1px var(--line);
+  color: var(--fg);
   /* A flag must not break after its hyphens: "--" then "force". */
   white-space: nowrap;
 }
 
 pre {
-  margin: 0;
   padding: 0.875rem 1rem;
   overflow-x: auto;
-  border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--surface);
+  box-shadow: inset 0 0 0 1px var(--ring);
   font-size: 0.875rem;
   line-height: 1.5;
+}
+
+/* A prompt the reader sees but does not copy: generated text is not part of
+   a selection. */
+pre code::before {
+  content: "$ ";
+  color: var(--faint);
 }
 
 /* Layout */
 
 .wrap {
-  inline-size: min(100% - 2 * var(--gutter), var(--page));
+  inline-size: min(100% - 2 * var(--gutter), var(--measure));
   margin-inline: auto;
 }
 
 .site-header {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  gap: 0.5rem 1.5rem;
-  padding-block: 1rem;
+  gap: 1rem;
+  block-size: var(--header-block);
 }
 
 .site-header nav {
   display: flex;
-  gap: 0.25rem 1.25rem;
   margin-inline-start: auto;
 }
 
-.site-header nav a,
-.site-footer nav a {
-  display: inline-block;
-  padding-block: 0.625rem;
-  color: var(--muted);
+/* The residue wordmark, then "by whiteheap" with its mark. */
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.625rem;
+  font-family: var(--font-mono);
+  font-weight: 500;
+  font-size: 1rem;
   text-decoration: none;
 }
 
-@media (hover: hover) and (pointer: fine) {
-  .site-header nav a:hover,
-  .site-footer nav a:hover,
-  .byline:hover {
-    color: var(--fg);
-  }
-}
-
-.site-header nav a:active,
-.site-footer nav a:active,
-.byline:active {
-  color: var(--fg);
-}
-
-/* The residue wordmark, then "by whiteheap" with its mark. The group takes
-   the space the nav leaves, so on a narrow screen the byline wraps under the
-   wordmark before the nav leaves the row. */
-.brand {
-  display: flex;
-  flex: 1 1 0;
-  flex-wrap: wrap;
-  align-items: center;
-  column-gap: 0.875rem;
+.wordmark img {
+  flex: none;
+  inline-size: 1.75rem;
 }
 
 .byline {
@@ -178,116 +197,93 @@ pre {
   align-items: baseline;
   gap: 0.375em;
   padding-block: 0.625rem;
-  font-size: 0.875rem;
-  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  color: var(--faint);
   text-decoration: none;
 }
 
-.byline picture {
-  flex: none;
-}
-
 /* The mark leaves a cell of space around its drawing, so 1.3cap shows the
-   pyramid at about the height of the capitals beside it. Black or white
-   only, as the brand kit asks; the light or dark file follows the setting. */
+   pyramid at about the height of the capitals beside it. */
 .byline img {
+  flex: none;
   block-size: 1.3cap;
   inline-size: auto;
 }
 
-.wordmark {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.625rem;
-  padding-block: 0.375rem;
-  font-family: var(--font-mono);
-  font-weight: 600;
-  font-size: 1.0625rem;
-  text-decoration: none;
+.byline:active {
+  color: var(--fg);
 }
 
-.wordmark picture {
-  flex: none;
-  inline-size: 1.75rem;
+@media (hover: hover) and (pointer: fine) {
+  .byline:hover {
+    color: var(--muted);
+  }
 }
 
-/* Text beside the chart on a wide screen, above it on a narrow one. */
-.hero {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 2.5rem 4rem;
-  padding-block-start: clamp(2rem, 1rem + 5vw, 5rem);
+.wordmark:active {
+  transform: scale(0.97);
 }
 
-.hero-text {
-  display: grid;
-  gap: 1.5rem;
-  flex-basis: 0;
-  flex-grow: 999;
-  min-inline-size: min(100%, 30rem);
+@media (prefers-reduced-motion: no-preference) {
+  .wordmark {
+    transition: transform 160ms var(--ease-out);
+  }
 }
 
-.hero h1 {
-  font-size: var(--text-hero);
-  font-weight: 650;
-  line-height: 1.1;
-  letter-spacing: -0.02em;
-}
-
-.lede {
-  max-inline-size: 36rem;
-  font-size: clamp(1.0625rem, 1rem + 0.3vw, 1.25rem);
-  color: var(--muted);
-}
-
-.actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.75rem;
-}
-
+/* Buttons in the look of Kumo's secondary and ghost LinkButton. */
 .button {
+  position: relative;
   display: inline-flex;
   align-items: center;
-  min-block-size: 2.75rem;
-  padding-inline: 1.125rem;
-  border: 1px solid var(--line);
+  gap: 0.375rem;
+  block-size: 2.25rem;
+  padding-inline: 0.75rem;
   border-radius: var(--radius);
-  font-weight: 550;
+  font-family: var(--font-sans);
+  font-size: 0.875rem;
+  font-weight: 500;
+  line-height: 1;
+  color: var(--fg);
   text-decoration: none;
+  white-space: nowrap;
   user-select: none;
   -webkit-user-select: none;
 }
 
-.button-primary {
-  border-color: var(--fg);
-  background: var(--fg);
-  color: var(--bg);
+/* At least 44px to tap, though it shows 36px. */
+.button::after {
+  content: "";
+  position: absolute;
+  inset: min(0px, (100% - 44px) / 2);
 }
 
-/* The ring sits outside the button, on the page, so it takes the page's ink. */
-.button-primary:focus-visible {
-  outline-color: var(--fg);
+.button:has(svg) {
+  padding-inline-start: 0.625rem;
+}
+
+.button svg {
+  flex: none;
+  inline-size: 0.875rem;
+  block-size: 0.875rem;
+}
+
+.button-secondary {
+  background: var(--surface);
+  box-shadow:
+    0 0 0 1px var(--ring),
+    0 1px 2px oklch(0 0 none / 0.05);
 }
 
 .button:active {
   transform: scale(0.97);
-  color: inherit;
-}
-
-.button-primary:active {
-  color: var(--bg);
+  color: var(--fg);
+  background: var(--tint);
 }
 
 @media (hover: hover) and (pointer: fine) {
   .button:hover {
-    border-color: var(--muted);
-  }
-
-  .button-primary:hover {
-    border-color: var(--fg-hover);
-    background: var(--fg-hover);
+    background: var(--tint);
   }
 }
 
@@ -295,85 +291,318 @@ pre {
   .button {
     transition:
       transform 160ms var(--ease-out),
-      background-color 160ms var(--ease-out),
-      border-color 160ms var(--ease-out);
+      background-color 160ms var(--ease-out);
   }
 }
 
-/* Shown at 420 by 504 (drawn at 500 by 600); never wider, so its labels stay
-   at that size. A light and a dark drawing, picked by the reader's setting. */
-.diagram {
-  flex: 0 1 26.25rem;
-  margin-inline: auto;
+/* The pixel stack and the text share one grid cell. On a portrait screen the
+   stack sits in the upper part and the text at the bottom; on a landscape one
+   the text sits left and the stack right. hero.js uses the same ratio. svh,
+   not dvh: a hero that resized as a phone's toolbar slides away would lay the
+   stack out again mid-scroll. */
+.hero {
+  container: hero / size;
+  display: grid;
+  /* One track the size of the hero: an auto track would grow to the
+     canvas's intrinsic size. */
+  grid-template: minmax(0, 1fr) / minmax(0, 1fr);
+  block-size: clamp(min(32rem, 100svh - var(--header-block)), 78svh, 44rem);
+  overflow: clip;
 }
 
-/* Sections */
+/* On a landscape screen the first section's start shows below the hero. */
+@media (min-aspect-ratio: 1 / 1) {
+  .hero {
+    block-size: clamp(24rem, 100svh - var(--header-block) - 8rem, 38rem);
+  }
+}
+
+.hero > * {
+  grid-area: 1 / 1;
+}
+
+/* With scripting off nothing draws the stack, so the hero is only as tall as
+   its text. */
+@media (scripting: none) {
+  .hero {
+    container-type: normal;
+    block-size: auto;
+    padding-block: clamp(3rem, 2rem + 5vw, 6rem) clamp(1rem, 0.5rem + 2vw, 2rem);
+  }
+
+  .hero-field {
+    display: none;
+  }
+}
+
+/* Fades in under the header and out into the page. */
+.hero-field {
+  display: block;
+  inline-size: 100%;
+  block-size: 100%;
+  image-rendering: pixelated;
+  mask-image: linear-gradient(to bottom, transparent, black 8%, black 90%, transparent);
+}
+
+/* Positioned, so it paints above the masked canvas: a mask makes the canvas
+   a stacking context, which paints over unpositioned siblings. */
+.hero-content {
+  position: relative;
+  display: grid;
+  align-content: center;
+  justify-items: start;
+  gap: 1.25rem;
+}
+
+@container hero (aspect-ratio < 23 / 20) {
+  .hero-content {
+    align-content: end;
+    padding-block-end: clamp(1.5rem, 5cqb, 3.5rem);
+  }
+}
+
+.hero-title {
+  font-family: var(--font-mono);
+  font-weight: 400;
+  font-size: var(--text-hero);
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  max-inline-size: 23ch;
+}
+
+.lede {
+  max-inline-size: 32rem;
+  font-size: clamp(1rem, 0.95rem + 0.25vw, 1.125rem);
+  color: var(--muted);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  padding-block-start: 0.5rem;
+}
+
+/* The install command, the hero's one action. The box fits its command and
+   grows to a one-liner of about 60 characters before it wraps; "read the
+   formula" sits beside it, or under it on a narrow screen. */
+.install {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem 1.25rem;
+  padding-block-start: 0.5rem;
+}
+
+.command {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  max-inline-size: 44rem;
+  padding-inline-end: 0.375rem;
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.command pre {
+  flex: 1 1 auto;
+  padding: 0.75rem 0.5rem 0.75rem 1rem;
+  background: none;
+  box-shadow: none;
+  font-size: 0.9375rem;
+  /* A long one-liner wraps on a phone instead of hiding behind a scroll. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* One click selects the whole command, with or without the copy button. */
+.command code {
+  user-select: all;
+  -webkit-user-select: all;
+}
+
+.copy {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 0.375rem;
+  block-size: 2rem;
+  padding-inline: 0.5rem 0.625rem;
+  border: 0;
+  border-radius: calc(var(--radius) - 0.125rem);
+  background: none;
+  color: var(--muted);
+  font-family: var(--font-sans);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: manipulation;
+}
+
+.copy[hidden] {
+  display: none;
+}
+
+/* At least 44px to tap. */
+.copy::after {
+  content: "";
+  position: absolute;
+  inset: min(0px, (100% - 44px) / 2);
+}
+
+.copy svg {
+  flex: none;
+  inline-size: 0.875rem;
+  block-size: 0.875rem;
+}
+
+.copy .copy-done,
+.copy[data-state="done"] .copy-idle {
+  display: none;
+}
+
+.copy[data-state="done"] .copy-done {
+  display: block;
+}
+
+.copy:active {
+  transform: scale(0.97);
+  background: var(--tint);
+  color: var(--fg);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .copy:hover {
+    background: var(--tint);
+    color: var(--fg);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .copy {
+    transition:
+      transform 160ms var(--ease-out),
+      background-color 160ms var(--ease-out);
+  }
+}
+
+.install-source,
+.install-note {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  color: var(--faint);
+}
+
+.install-source:active,
+.install-note a:active {
+  color: var(--fg);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .install-source:hover,
+  .install-note a:hover {
+    color: var(--muted);
+  }
+}
+
+/* Sections: the label beside the content on a wide screen, above it on a
+   narrow one. */
 
 .section {
-  display: grid;
-  gap: 1rem;
   padding-block-start: var(--space-section);
 }
 
-.section > * {
-  max-inline-size: var(--measure);
+.hero + .section {
+  padding-block-start: clamp(2rem, 1rem + 4vw, 4rem);
 }
 
-.section h2 {
-  font-size: clamp(1.375rem, 1.2rem + 0.8vw, 1.75rem);
-  font-weight: 650;
-  line-height: 1.25;
-  letter-spacing: -0.01em;
+.split {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem 3rem;
 }
 
-.section h3 {
-  margin-block-start: 1rem;
+.split > :first-child {
+  flex: 0 0 11rem;
+}
+
+.split > :last-child {
+  flex-basis: 0;
+  flex-grow: 999;
+  min-inline-size: min(100%, 32rem);
+}
+
+.label {
   font-family: var(--font-mono);
+  font-weight: 400;
   font-size: 0.875rem;
+  line-height: 1.75;
+  color: var(--faint);
+}
+
+.flow {
+  display: grid;
+  gap: 1rem;
+  max-inline-size: var(--prose);
+}
+
+.flow > p {
+  color: var(--muted);
+}
+
+/* The claim a section opens with, at whiteheap.com's prose size. */
+.flow > .lead {
+  font-size: clamp(1.0625rem, 1rem + 0.3vw, 1.25rem);
+  color: var(--fg);
+}
+
+.points {
+  display: grid;
+  gap: 0.75rem;
+  padding-inline-start: 1.25rem;
+  color: var(--muted);
+}
+
+.points li::marker {
+  color: var(--faint);
+}
+
+.points strong {
   font-weight: 500;
-  line-height: 1.5;
-  color: var(--muted);
+  color: var(--fg);
 }
 
-.section h2 + h3 {
-  margin-block-start: 0.5rem;
-}
-
-.section p {
-  color: var(--muted);
-}
-
-.section p :is(a, code) {
+.flow :is(.points, p) :is(a, code) {
   color: var(--fg);
 }
 
 .steps {
   display: grid;
-  gap: 1.5rem;
+  gap: 1.75rem;
   padding-inline-start: 0;
+  margin-block-end: 0.75rem;
   list-style: none;
   counter-reset: step;
 }
 
 .steps li {
   display: grid;
-  grid-template-columns: 1.75rem 1fr;
-  gap: 0.25rem 0.875rem;
+  grid-template-columns: 2rem 1fr;
+  gap: 0.375rem 0.75rem;
   counter-increment: step;
 }
 
 .steps li::before {
-  content: counter(step);
+  content: counter(step, decimal-leading-zero);
   grid-row: 1;
-  display: grid;
-  place-items: center;
-  block-size: 1.75rem;
-  border: 1px solid var(--line);
-  border-radius: 50%;
   font-family: var(--font-mono);
-  font-size: 0.8125rem;
-  line-height: 1;
-  color: var(--muted);
+  font-size: 0.875rem;
+  line-height: 1.5rem;
+  color: var(--faint);
 }
 
 .steps li > * {
@@ -381,71 +610,106 @@ pre {
 }
 
 .steps h3 {
-  align-self: center;
-  margin-block-start: 0;
-  font-family: var(--font-sans);
-  font-size: 1.0625rem;
-  font-weight: 600;
-  color: var(--fg);
+  grid-row: 1;
+  font-family: var(--font-mono);
+  font-weight: 500;
+  font-size: 1rem;
+  line-height: 1.5rem;
+}
+
+.steps p {
+  color: var(--muted);
+}
+
+/* Shown at 420 by 504 (drawn at 500 by 600); never wider, so its labels stay
+   at that size. */
+.diagram {
+  inline-size: 26.25rem;
+  margin-block-start: 1.5rem;
 }
 
 .caveat {
   display: grid;
-  gap: 1rem;
+  gap: 1.25rem;
+  max-inline-size: var(--prose);
   padding: clamp(1.25rem, 0.75rem + 2vw, 2rem);
-  border: 1px solid var(--fg);
   border-radius: var(--radius);
-}
-
-.caveat p {
-  color: var(--fg);
+  box-shadow: inset 0 0 0 1px var(--ring);
 }
 
 .caveat ul {
   display: grid;
   gap: 0.25rem;
   padding-inline-start: 1.25rem;
+  color: var(--muted);
 }
 
 .caveat li {
   padding-block: 0.25rem;
 }
 
+.caveat li::marker {
+  color: var(--faint);
+}
+
+.caveat a {
+  color: var(--fg);
+}
+
 .site-footer {
-  display: grid;
-  gap: 1rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: start;
+  gap: 0.75rem 2rem;
   margin-block-start: var(--space-section);
-  padding-block: 1.5rem 2.5rem;
+  padding-block: 1.5rem 2rem;
   border-block-start: 1px solid var(--line);
-  font-size: 0.875rem;
-  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  color: var(--faint);
 }
 
 .site-footer p {
-  max-inline-size: var(--measure);
+  flex: 1 1 24rem;
+  max-inline-size: 36rem;
 }
 
 .site-footer p a {
-  color: var(--fg);
+  color: var(--muted);
 }
 
 .site-footer nav {
   display: flex;
   flex-wrap: wrap;
   gap: 0 1.25rem;
+  margin-inline-start: auto;
+}
+
+.site-footer nav a {
+  padding-block: 0.375rem;
+  text-decoration: none;
+}
+
+.site-footer a:active {
+  color: var(--fg);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .site-footer a:hover {
+    color: var(--fg);
+  }
 }
 
 /* 404 */
 
 .not-found {
   display: grid;
+  justify-items: start;
   gap: 1.25rem;
-  padding-block-start: clamp(3rem, 2rem + 6vw, 7rem);
+  padding-block-start: clamp(4rem, 2rem + 8vw, 9rem);
 }
 
-.not-found h1 {
-  font-size: var(--text-hero);
-  font-weight: 650;
-  line-height: 1.1;
-  letter-spacing: -0.02em;
+.not-found p {
+  color: var(--muted);
 }
