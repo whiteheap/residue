@@ -386,7 +386,8 @@ fn name_of(path: &Path) -> Option<String> {
 /// The `freed` line a removal record stands for. None for a record that
 /// cannot be read or has no `info`, an interrupted removal (Git still lists
 /// the worktree, so nothing is freed), a worktree that is back at its path
-/// (whatever its removal freed is taken again), and the record of a run
+/// (whatever its removal freed is taken again), one residue cannot tell is
+/// back or gone (`unknown`), and the record of a run
 /// still going: its deletion can yet fail and take the record back, and
 /// that run writes its own line.
 fn record_line(item: &removed::Item, now: i64) -> Option<Line> {
@@ -395,7 +396,8 @@ fn record_line(item: &removed::Item, now: i64) -> Option<Line> {
         removed::State::Incomplete
         | removed::State::Unreadable
         | removed::State::Interrupted
-        | removed::State::Back => return None,
+        | removed::State::Back
+        | removed::State::Unknown => return None,
     }
     let r = item.record.as_ref().ok()?;
     let running =
@@ -1504,7 +1506,7 @@ mod tests {
             head_reflog: false,
             modified: Some(removed_at),
             registered: None,
-            back: false,
+            back: removed::Back::No,
         }
     }
 
@@ -1566,7 +1568,11 @@ mod tests {
         );
         // Git lists its worktree at its path again: nothing is freed.
         let mut back = record("fix-7", 700, None);
-        back.back = true;
+        back.back = removed::Back::Yes;
+        // Git lists a worktree there that residue could not compare: it
+        // cannot tell, so nothing is seeded.
+        let mut unsure = record("fix-8", 800, None);
+        unsure.back = removed::Back::Unknown("no such commit".into());
         let records = [
             record("fix-1", 100, None),
             record("fix-2", 200, None),
@@ -1575,6 +1581,7 @@ mod tests {
             going,
             old_pid,
             back,
+            unsure,
         ];
         let found: Vec<Line> = records
             .iter()

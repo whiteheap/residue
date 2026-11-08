@@ -121,11 +121,14 @@ export interface RemovalRecord {
   /**
    * `removed`: the worktree is gone, and restore recreates it. `interrupted`:
    * the removal did not finish, and Git still lists the worktree. `back`: Git
-   * lists the worktree at `original_path` again, so there is nothing to
-   * restore. `incomplete` and `unreadable`: residue cannot use the record
-   * (`incomplete`, `error`).
+   * lists the worktree at `original_path` again, at the recorded HEAD or
+   * ahead of it; restore puts back what it lacks of the record (its mark,
+   * config.worktree and HEAD reflog). `unknown`: a worktree is there on its
+   * branch, but residue could not compare its HEAD (`back_error`), so restore
+   * offers only `--to`. `incomplete` and `unreadable`: residue cannot use the
+   * record (`incomplete`, `error`). A newer residue may add a state.
    */
-  state: "removed" | "interrupted" | "back" | "incomplete" | "unreadable";
+  state: "removed" | "interrupted" | "back" | "unknown" | "incomplete" | "unreadable";
   original_path: string | null;
   aside_path: string | null;
   branch: string | null;
@@ -148,6 +151,8 @@ export interface RemovalRecord {
   not_kept: NotKept[];
   /** No `info` file: a run stopped while it wrote the record. */
   incomplete: boolean;
+  /** Why residue cannot tell whether the worktree is back (`state` `unknown`); null otherwise. */
+  back_error: string | null;
   residue_version: string | null;
   error: string | null;
 }
@@ -286,7 +291,13 @@ export interface Removal {
 }
 
 /** How a restored worktree came back. */
-export type Checkout = "moved_back" | "checked_out_branch" | "recreated_branch" | "new_branch" | "detached";
+export type Checkout =
+  | "moved_back"
+  | "checked_out_branch"
+  | "recreated_branch"
+  | "new_branch"
+  | "detached"
+  | "already_back";
 
 export interface RestoreDocument {
   schema: "residue.restore/v1";
@@ -343,6 +354,7 @@ export type Restorable = {
       notKept: NotKept[];
       asidePath: string | null;
       incomplete: boolean;
+      backError: string | null;
       /** The `--keep-removed` it was written with, as `RemovalRecord` has it. */
       keep: string | null;
       keepSeconds: number | null;

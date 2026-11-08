@@ -1291,31 +1291,51 @@ enum Standing<'a> {
 /// Git deletes the checkout, then its own directory for the worktree, each
 /// in the order the filesystem lists the files and stopping at the first
 /// it cannot delete, so it can list a worktree part of which is gone.
+/// Another writer can add a worktree at one of the paths meanwhile (a
+/// `git worktree add` at the path a purge's trash entry came from): a
+/// listed path counts as this worktree only when its Git directory is the
+/// one the record was written for (`Written::is_its_git_dir`), so another
+/// worktree's HEAD never stands in for this one's. A listed path whose
+/// Git directory residue cannot read may be this worktree, part of which
+/// is gone: it is the answer unless another path is this worktree.
 fn standing<'a>(written: &removed::Written, main: &Path, paths: &[&'a Path]) -> Standing<'a> {
     let list = match git::worktrees(main) {
         Ok(list) => list,
         Err(e) => return Standing::Unknown(e),
     };
-    let listed = paths.iter().copied().find_map(|p| {
-        list.iter()
-            .find(|e| e.path == p || git::canonical(&e.path).ok().as_deref() == Some(p))
-            .map(|e| (p, e.head.clone()))
-    });
-    let Some((at, head)) = listed else {
-        return Standing::Unlisted;
-    };
-    if !checkout_present(at) {
-        return Standing::Lacking(at, "its files are gone".to_string());
+    let mut unsure = None;
+    for &at in paths {
+        let Some(entry) = list
+            .iter()
+            .find(|e| e.path == at || git::canonical(&e.path).ok().as_deref() == Some(at))
+        else {
+            continue;
+        };
+        if !checkout_present(at) {
+            unsure.get_or_insert(Standing::Lacking(at, "its files are gone".to_string()));
+            continue;
+        }
+        // Git lists a worktree whose `commondir` is gone with its HEAD, but
+        // cannot use it.
+        let id = match git::identity(at) {
+            Ok(id) => id,
+            Err(e) => {
+                unsure.get_or_insert(Standing::Lacking(
+                    at,
+                    format!("Git can no longer use it ({e})"),
+                ));
+                continue;
+            }
+        };
+        if !written.is_its_git_dir(&id.git_dir) {
+            continue;
+        }
+        return match written.lacks(entry.head.as_deref()) {
+            None => Standing::Whole(at),
+            Some(why) => Standing::Lacking(at, why),
+        };
     }
-    // Git lists a worktree whose `commondir` is gone with its HEAD, but
-    // cannot use it.
-    if let Err(e) = git::identity(at) {
-        return Standing::Lacking(at, format!("Git can no longer use it ({e})"));
-    }
-    match written.lacks(head.as_deref()) {
-        None => Standing::Whole(at),
-        Some(why) => Standing::Lacking(at, why),
-    }
+    unsure.unwrap_or(Standing::Unlisted)
 }
 
 /// After a deletion that did not complete: when nothing of the worktree

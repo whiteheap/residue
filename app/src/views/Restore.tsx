@@ -50,6 +50,7 @@ function restorables(listings: Listing[]): Restorable[] {
         notKept: r.not_kept,
         asidePath: r.aside_path,
         incomplete: r.incomplete,
+        backError: r.back_error,
         keep: r.keep,
         keepSeconds: r.keep_seconds,
       });
@@ -66,7 +67,10 @@ function recordNote(item: Extract<Restorable, { kind: "removed" }>, home: string
     }. Restore moves it back.`;
   }
   if (item.state === "back") {
-    return `It is back${item.originalPath ? ` at ${tilde(item.originalPath, home)}` : ""}, so there is nothing to restore.`;
+    return `It is back${item.originalPath ? ` at ${tilde(item.originalPath, home)}` : ""}. Restore puts back what it lacks from this record.`;
+  }
+  if (item.state === "unknown") {
+    return `residue cannot tell whether it is back: ${item.backError ?? "it could not compare its HEAD"}.`;
   }
   if (item.notKept.length === 0) return null;
   return `Comes back without its ignored files: ${item.notKept
@@ -109,6 +113,8 @@ function restoredText(doc: RestoreDocument, item: Restorable, home: string | und
         return `${branch ?? "its branch"} no longer contains the recorded HEAD, so restore created ${done.new_branch ?? "a new branch"} there; ${branch ?? "the branch"} is unchanged`;
       case "detached":
         return `detached at ${shortHead(done.head) ?? "the recorded HEAD"}, as it was`;
+      case "already_back":
+        return "where Git already listed it";
       default:
         return null;
     }
@@ -262,10 +268,12 @@ export function Restore({
                 // A record residue cannot read has no branch to show, detached or not.
                 const branch = item.error ? name : (shortBranch(item.branch) ?? "detached");
                 const note = item.kind === "removed" && !item.error ? recordNote(item, home) : null;
-                // residue cannot restore from a record it cannot read, and a
-                // worktree that is back at its path has nothing to restore.
+                // Only the states residue knows it can restore from: not a
+                // record it cannot read, nor one it cannot tell is back, nor
+                // a state a newer residue adds.
                 const restorable =
-                  item.kind === "trash" || (!item.error && !item.incomplete && item.state !== "back");
+                  item.kind === "trash" ||
+                  (!item.error && (item.state === "removed" || item.state === "interrupted" || item.state === "back"));
                 const kept = item.kind === "trash" && !item.error ? trashAge(item.at, now, keepSeconds) : null;
                 const held = item.kind === "removed" ? recordKeep(item, now) : null;
                 return (
@@ -284,7 +292,9 @@ export function Restore({
                                 "removed",
                                 ageOf(item.at, now),
                                 removedBy(item.reason),
-                                item.freed != null ? `· ${bytes(item.freed)} freed` : null,
+                                // A worktree back at its path, or maybe back, took again what its removal freed.
+                                item.freed != null && item.state !== "back" && item.state !== "unknown"
+                                  ? `· ${bytes(item.freed)} freed` : null,
                               ]
                                 .filter(Boolean)
                                 .join(" ")}

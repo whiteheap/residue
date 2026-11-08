@@ -1,4 +1,4 @@
-//! `residue watch`: stay running and reclaim storage from linked worktrees
+//! `.filter(|r| matches!(r.get("state").and_then(Value::str), Some("back" | "unknown")))esidue watch`: stay running and reclaim storage from linked worktrees
 //! when it is safe and worth it, reacting to events instead of a schedule.
 //!
 //! Two things lead to a removal. Work landed: a worktree's upstream branch
@@ -1053,14 +1053,20 @@ fn restored(worktree: &Value) -> bool {
 /// The original paths of the repository's removal records whose worktree
 /// is back there (`state` `back`): a restore stopped before it wrote its
 /// marker, or one that kept its record, or a move back whose record could
-/// not be dropped. The landed rule keeps those worktrees as it keeps a
-/// marked one, while the record lives.
+/// not be dropped; and of those residue cannot tell are back (`state`
+/// `unknown`). The landed rule keeps those worktrees as it keeps a marked
+/// one, while the record lives.
 fn back_paths(repo: &Value) -> Vec<PathBuf> {
     repo.get("removed")
         .map(Value::items)
         .unwrap_or(&[])
         .iter()
-        .filter(|r| r.get("state").and_then(Value::str) == Some("back"))
+        .filter(|r| {
+            matches!(
+                r.get("state").and_then(Value::str),
+                Some("back" | "unknown")
+            )
+        })
         .filter_map(|r| r.get("original_path").and_then(Value::str))
         .map(PathBuf::from)
         .collect()

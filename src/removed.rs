@@ -505,10 +505,24 @@ pub struct Item {
     /// that failed part way can have deleted part of its files and of its
     /// Git directory, which the record keeps.
     pub registered: Option<Entry>,
-    /// Git lists a worktree at the record's original path again, on its
-    /// branch (or detached, as it was) at the recorded HEAD or ahead of
-    /// it: a restore or a move back put it there (`is_back`).
-    pub back: bool,
+    /// Whether Git lists this record's worktree at its original path
+    /// again (`is_back`).
+    pub back: Back,
+}
+
+/// Whether Git lists a record's worktree at its original path again.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Back {
+    /// No worktree with its checkout is there, or one on another branch,
+    /// or one whose HEAD does not contain the recorded one.
+    No,
+    /// One is there, on the recorded branch (detached when the record
+    /// is), at the recorded HEAD or ahead of it.
+    Yes,
+    /// One is there on the recorded branch, but Git could not compare its
+    /// HEAD with the recorded one: residue cannot tell, so it calls the
+    /// record neither back nor removed.
+    Unknown(String),
 }
 
 /// Where a removal record stands, read from its files and from Git's list
@@ -523,6 +537,9 @@ pub enum State {
     Interrupted,
     /// Git lists the worktree at its original path again.
     Back,
+    /// A worktree is at its original path on its branch, and residue
+    /// could not tell whether it holds the recorded HEAD (`Back::Unknown`).
+    Unknown,
     /// The worktree is gone; `residue restore` recreates it.
     Removed,
 }
@@ -534,6 +551,7 @@ impl State {
             State::Unreadable => "unreadable",
             State::Interrupted => "interrupted",
             State::Back => "back",
+            State::Unknown => "unknown",
             State::Removed => "removed",
         }
     }
@@ -565,7 +583,8 @@ impl Item {
             (Err(_), true) => State::Incomplete,
             (Err(_), false) => State::Unreadable,
             (Ok(_), _) if self.interrupted() => State::Interrupted,
-            (Ok(_), _) if self.back => State::Back,
+            (Ok(_), _) if self.back == Back::Yes => State::Back,
+            (Ok(_), _) if matches!(self.back, Back::Unknown(_)) => State::Unknown,
             (Ok(_), _) => State::Removed,
         }
     }
@@ -646,8 +665,10 @@ fn list(
                 })
                 .map(|e| (*e).clone())
         });
-        let back =
-            registered.is_none() && record.as_ref().is_ok_and(|r| is_back(r, live, command_dir));
+        let back = match (&registered, &record) {
+            (None, Ok(r)) => is_back(r, live, command_dir),
+            _ => Back::No,
+        };
         items.push(Item {
             name,
             common_dir: common_dir.to_path_buf(),
@@ -672,35 +693,44 @@ fn list(
 }
 
 /// Git lists a worktree at the record's original path whose checkout is
-/// there, on the recorded branch (detached when the record is), and whose
-/// HEAD is the recorded HEAD or contains it. A restore that kept its record,
-/// one stopped before it wrote its marker, a move back whose record could
-/// not be dropped, and a trash restore that lands during a purge all leave
-/// that. A new worktree on another branch at the same path is not one, and
-/// neither is one whose HEAD Git cannot compare with the recorded one.
-fn is_back(record: &Record, live: &[Entry], command_dir: &Path) -> bool {
+/// there (the `.git` file that ties it to its Git directory), on the
+/// recorded branch (detached when the record is), and whose HEAD is the
+/// recorded HEAD or contains it. A restore that kept its record, one
+/// stopped before it wrote its marker, a worktree added there by hand, a
+/// move back whose record could not be dropped, and a trash restore that
+/// lands during a purge all leave that. A new worktree on another branch
+/// at the same path is not one, and neither is a locked one whose folder
+/// is gone, which Git never marks prunable. One whose HEAD Git cannot
+/// compare with the recorded one is `Back::Unknown`.
+fn is_back(record: &Record, live: &[Entry], command_dir: &Path) -> Back {
     let Some(entry) = live.iter().find(|e| {
         e.prunable.is_none()
             && (e.path == record.original
                 || git::canonical(&e.path).ok().as_deref() == Some(record.original.as_path()))
     }) else {
-        return false;
+        return Back::No;
     };
+    if !fs::symlink_metadata(entry.path.join(".git")).is_ok_and(|m| m.is_file()) {
+        return Back::No;
+    }
     let Some(head) = entry.head.as_deref() else {
-        return false;
+        return Back::No;
     };
     if entry.branch != record.branch {
-        return false;
+        return Back::No;
     }
-    head == record.head || git::is_ancestor(command_dir, &record.head, head).unwrap_or(false)
-}
-
-/// Why `residue restore` does not restore a record whose worktree is back.
-fn back_text(record: &Record) -> String {
-    format!(
-        "Git lists its worktree at {} again, at the recorded HEAD or ahead of it, so there is nothing to restore; a remove run forgets this record after --keep-removed",
-        record.original.display()
-    )
+    if head == record.head {
+        return Back::Yes;
+    }
+    match git::is_ancestor(command_dir, &record.head, head) {
+        Ok(true) => Back::Yes,
+        Ok(false) => Back::No,
+        Err(e) => Back::Unknown(format!(
+            "Git lists a worktree at {} on its branch, and residue could not compare its HEAD with the recorded {} ({e})",
+            record.original.display(),
+            &record.head[..record.head.len().min(12)]
+        )),
+    }
 }
 
 /// A record residue has written and not yet given up.
@@ -713,6 +743,10 @@ pub struct Written {
     /// The worktree's own Git directory, and the `config.worktree` and HEAD
     /// reflog the record copied from it.
     git_dir: Option<PathBuf>,
+    /// That directory as it was when the record was written: its canonical
+    /// path, device and inode, so [`Written::is_its_git_dir`] can tell it
+    /// from a directory Git made again under the same name.
+    git_dir_id: Option<(PathBuf, u64, u64)>,
     config: Option<Vec<u8>>,
     reflog: Option<Vec<u8>>,
 }
@@ -727,6 +761,16 @@ impl Written {
             &self.dir,
             &refs_of(&self.name, &self.head, &self.kept),
         )
+    }
+
+    /// Whether `git_dir`, the Git directory of a worktree Git lists, is
+    /// this worktree's own: the same canonical path and the same directory
+    /// (device and inode), not another worktree added at the same path, or
+    /// one Git made again under the same name once this one's was deleted.
+    /// When residue could not read it as the record was written, no
+    /// directory is, so the record stays.
+    pub fn is_its_git_dir(&self, git_dir: &Path) -> bool {
+        self.git_dir_id.is_some() && dir_id(git_dir) == self.git_dir_id
     }
 
     /// What the worktree Git still lists, with `head` as its HEAD, lacks
@@ -874,6 +918,7 @@ pub fn create(
             kept: record.kept.clone(),
             command_dir: command_dir.to_path_buf(),
             git_dir: git_dir.map(Path::to_path_buf),
+            git_dir_id: git_dir.and_then(dir_id),
             config,
             reflog,
         });
@@ -882,6 +927,14 @@ pub fn create(
         "{}: too many records named {base}-{stamp}",
         root.display()
     ))
+}
+
+/// A directory's canonical path, device and inode; `None` when it cannot
+/// be read.
+fn dir_id(dir: &Path) -> Option<(PathBuf, u64, u64)> {
+    let path = fs::canonicalize(dir).ok()?;
+    let meta = fs::metadata(&path).ok()?;
+    meta.is_dir().then(|| (path, meta.dev(), meta.ino()))
 }
 
 /// The file at `path`, `None` when there is no path or no file.
@@ -1095,6 +1148,11 @@ pub enum How {
         tip: String,
     },
     Detached,
+    /// Git listed it at its path already, on its branch or detached as the
+    /// record is, at `tip`: the restore put back only what it lacked.
+    AlreadyBack {
+        tip: String,
+    },
 }
 
 impl How {
@@ -1105,6 +1163,7 @@ impl How {
             How::Recreated => "recreated_branch",
             How::NewBranch { .. } => "new_branch",
             How::Detached => "detached",
+            How::AlreadyBack { .. } => "already_back",
         }
     }
 }
@@ -1147,15 +1206,25 @@ fn whereabouts(entry: &Entry, main: &Entry, trash_root: &Path) -> String {
 /// Bring back the worktree one record describes, at `to` or where it was,
 /// then drop the record and its refs once the worktree holds all they
 /// held. `listed` is every worktree Git lists for the repository, the main
-/// one first.
+/// one first. A worktree that is back at its path already (`Back::Yes`: a
+/// restore that stopped after `git worktree add`, one that kept its
+/// record, or a `git worktree add` by hand) gets the steps it may lack:
+/// the restored mark, its config.worktree, the recorded HEAD reflog in
+/// front of its own. Each leaves alone what is already there, and the
+/// record goes only once the worktree holds what it keeps, as for any
+/// restore.
 pub fn restore(item: &Item, to: Option<&Path>, listed: &[Entry]) -> Result<Restored, String> {
     let record = item.record.as_ref().map_err(|e| e.clone())?;
-    if item.back && to.is_none() {
-        return Err(back_text(record));
+    let back = to.is_none() && item.back == Back::Yes;
+    if let (None, Back::Unknown(e)) = (to, &item.back) {
+        return Err(format!(
+            "{e}, so it cannot tell whether that worktree holds what this record keeps; move that worktree away, or restore somewhere else with --to PATH"
+        ));
     }
     let dest = to.unwrap_or(&record.original);
     match fs::symlink_metadata(dest) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        _ if back => {}
         Ok(_) => {
             return Err(format!(
                 "{} exists; move it away first, or restore somewhere else with --to PATH",
@@ -1168,19 +1237,27 @@ pub fn restore(item: &Item, to: Option<&Path>, listed: &[Entry]) -> Result<Resto
     // meanwhile, and nothing else holds the copies.
     let (config, reflog) = read_copies(item)?;
     let mut restored = match &item.registered {
+        _ if back => already_back(record, listed)?,
         Some(registered) => move_back(item, record, registered, dest)?,
         None => recreate(item, record, dest, listed)?,
     };
     // A worktree moved back kept its own Git directory, though a removal
     // that failed part way may have deleted its reflog or config.worktree
-    // from it. A recreated one has a new one. Either way, until the
-    // recorded config.worktree and reflog are in it, and it holds the
-    // commits the refs keep, the record stays.
-    let recreated = item.registered.is_none();
+    // from it. A recreated one has a new one. One already back has either:
+    // only what it lacks goes in. Either way, until the recorded
+    // config.worktree and reflog are in it, and it holds the commits the
+    // refs keep, the record stays.
+    let recreated = item.registered.is_none() && !back;
     let mut keep_record = false;
     match git::identity(&restored.path) {
         Ok(id) => {
-            if let Err(e) = mark(&id.git_dir, &format!("removal record {}", item.name)) {
+            // A mark already there stays: it says when it was restored.
+            let marking = if back && matches!(marked(&id.git_dir), Ok(Some(_))) {
+                Ok(())
+            } else {
+                mark(&id.git_dir, &format!("removal record {}", item.name))
+            };
+            if let Err(e) = marking {
                 restored.notes.push(format!(
                     "could not mark it as restored ({e}); `residue watch` may remove it again once its upstream is gone: lock it with `git worktree lock` to keep it"
                 ));
@@ -1365,7 +1442,7 @@ fn holds(record: &Record, path: &Path, main: &Path, how: &mut How) -> Result<(),
     let short = |c: &str| c[..c.len().min(12)].to_string();
     let mut check = || -> Result<Option<String>, String> {
         let now = git::commit_of(path, "HEAD")?.ok_or("it has no HEAD commit")?;
-        if let How::Branch { tip } = how {
+        if let How::Branch { tip } | How::AlreadyBack { tip } = how {
             tip.clone_from(&now);
         }
         if !git::is_ancestor(path, &record.head, &now)? {
@@ -1407,6 +1484,34 @@ fn clear_steps(main: &Path, aside: &Path, ours: bool) -> String {
         "{unlock}delete {}, run `{git} prune`, then run this restore again",
         aside.display()
     )
+}
+
+/// The worktree Git lists at the record's original path, which the listing
+/// found back there: read again from `listed`, as Git lists it now, so a
+/// worktree moved away or switched to another branch meanwhile is not
+/// taken for it. `holds` then checks its HEAD.
+fn already_back(record: &Record, listed: &[Entry]) -> Result<Restored, String> {
+    let entry = listed
+        .iter()
+        .find(|e| {
+            e.path == record.original
+                || git::canonical(&e.path).ok().as_deref() == Some(record.original.as_path())
+        })
+        .filter(|e| e.branch == record.branch)
+        .ok_or_else(|| {
+            format!(
+                "Git no longer lists its worktree at {} on its branch; run residue restore again to see where it stands",
+                record.original.display()
+            )
+        })?;
+    Ok(Restored {
+        path: entry.path.clone(),
+        how: How::AlreadyBack {
+            tip: entry.head.clone().unwrap_or_default(),
+        },
+        branch: entry.branch.clone(),
+        notes: Vec::new(),
+    })
 }
 
 /// A worktree an interrupted run left where the deletion started: move it
@@ -1839,6 +1944,14 @@ pub fn item_json(item: &Item) -> Json {
             })),
         ),
         ("incomplete", Json::Bool(item.incomplete)),
+        // Why residue cannot tell whether the worktree is back (`unknown`).
+        (
+            "back_error",
+            match &item.back {
+                Back::Unknown(e) => Json::str(e.clone()),
+                Back::No | Back::Yes => Json::Null,
+            },
+        ),
         (
             "pid",
             Json::opt(r.and_then(|r| r.pid), |p| Json::UInt(u64::from(p))),
@@ -1931,7 +2044,7 @@ mod tests {
             head_reflog: false,
             modified: None,
             registered: None,
-            back: false,
+            back: Back::No,
         };
         let day = 86_400;
         let removed = sample().removed;
