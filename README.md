@@ -321,7 +321,17 @@ The launchd plist, the systemd unit and timer, how to stop them, and the sweep's
 
 ## Mac app
 
-The Mac app is residue in a window. It lists the linked worktrees under your code folders with their size and verdict, shows why each one is kept, moves the ones that can go to the trash, restores them, and turns automatic cleanup on or off. Every check, size and removal comes from the residue binary inside the app, which is this release's own residue, with the same version.
+The Mac app is residue in a window. It lists the linked worktrees under your code folders with their size and verdict, shows why each one is kept, moves the ones that can go to the trash, restores them, shows what residue has freed, and turns automatic cleanup on or off. Every check, size and removal comes from the residue binary inside the app, which is this release's own residue, with the same version.
+
+<p>
+<img src="docs/screenshots/worktrees.png" width="830" alt="The Worktrees screen: 1.3 GB reclaimable, 7 of 12 linked worktrees can go, about 1.0 GB freed in the last 7 days. A treemap sizes each worktree by the space removing it gives back, grouped by repository: white for can go, gray for kept, hatched for unknown. Below it, each worktree's checks and verdict.">
+</p>
+
+<p>
+<img src="docs/screenshots/freed.png" width="830" alt="The Freed screen: 1.0 GB freed in the last 7 days, 2.4 GB in the last 30, 6.5 GB all time, a column for each of the last 12 weeks, and the space each command freed: residue watch, residue remove --all and residue remove by hand.">
+</p>
+
+Both screenshots show example repositories and a made-up history of removals. The Restore screen, with its trash entries and removal records: [docs/screenshots/restore.png](docs/screenshots/restore.png).
 
 Download [residue-macos.dmg](https://github.com/whiteheap/residue/releases/latest/download/residue-macos.dmg), open it, and drag residue to Applications. Every release from 0.0.8 on has it, and the link always serves the latest one. It needs macOS 13 or later, and runs natively on Apple silicon and Intel.
 
@@ -337,8 +347,9 @@ Control-click > Open no longer skips this step: since macOS 15, Apple requires t
 
 ### What the app runs
 
-- **Removal** always uses the trash (`residue remove --trash`), and nothing moves until you confirm the plan residue shows: the worktrees it moves, the trash entries older than 7 days it purges, and the removal records older than 30 days it forgets. The branch and its commits always stay.
-- **Restore** is `residue restore`, and it lists the trash and the removal records, newest first. A trashed worktree comes back with every file until a later removal or automatic cleanup in that repository purges it. The purge, and every deletion by automatic cleanup, leaves a removal record, and Restore recreates the worktree from it on its branch and HEAD until a later removal forgets the record: after 30 days, or the service's `--keep-removed` for automatic cleanup. The screen says which applies. Its ignored files, such as `node_modules/`, do not come back, and the record's row names them before you click: [Restore a removed worktree](#restore-a-removed-worktree).
+- **Removal** always uses the trash (`residue remove --trash`), and nothing moves until you confirm the plan residue shows: the worktrees it moves, the trash entries older than 7 days it purges, and the removal records it forgets, each older than both 30 days and the `--keep-removed` it was written with. The branch and its commits always stay.
+- **Restore** is `residue restore`, and it lists the trash and the removal records, newest first. A trashed worktree comes back with every file until a later removal or automatic cleanup in that repository purges it. The purge, and every deletion by automatic cleanup, leaves a removal record, and Restore recreates the worktree from it on its branch and HEAD until a later removal forgets the record. No run forgets one before the `--keep-removed` it was written with: 30 days for the app's removals, the service's for automatic cleanup. Each record's row gives the date it lasts until, at least. Its ignored files, such as `node_modules/`, do not come back, and the record's row names them before you click: [Restore a removed worktree](#restore-a-removed-worktree).
+- **Freed** is `residue stats --json`: what residue freed on this machine in the last 7 and 30 days, all time and since the app was last open, each of the last 12 weeks, and by command. Each size is the estimate residue measured before the removal: [How much space it freed](#how-much-space-it-freed).
 - **Automatic cleanup** is `residue service install FOLDERS` and `residue service uninstall`: the same `com.whiteheap.residue.watch` service as [Automate cleanup](#automate-cleanup), so the app shows a service you installed from a terminal, and the other way round. It deletes instead of using the trash; the app says so before you turn it on. Saving other folders keeps the service's options as written, including ones the app does not know. Preview runs one pass the way the saved service would, with `--dry-run`, fetching first unless the service sets `--no-fetch`.
 - The service records the binary that installed it, so the app never installs it from the copy inside the app. It uses a `residue` you installed that is at least as new as the app's, such as `/opt/homebrew/bin/residue`, or else a copy at `~/Library/Application Support/com.whiteheap.residue/bin/residue`, which stays when the app moves or is deleted. The Automatic cleanup screen shows which binary the service runs and the command that turns it off from a terminal. Deleting the app leaves the service running.
 
