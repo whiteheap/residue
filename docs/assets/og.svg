@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The site's social image (dark): what a link to residue.whiteheap.com shows
+  on X, Slack, LinkedIn and other link previews. Source of og.png, 1200 by
+  630: run sh docs/assets/render.sh og.svg, then copy og.png to site/public
+  (site/check.sh compares them).
+  The logo is logo-dark.svg beside this file, so a change to the logo needs
+  only a new render. The name is the site's wordmark, and the headline is the
+  site's h1, the first sentence of the repository's GitHub description:
+  change it with the h1, and the og:image:alt in site/public/index.html with
+  it. Drawn at half size; render.sh renders at twice that.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 315" width="600" height="315" role="img" aria-labelledby="og-title">
+  <title id="og-title">residue: Reclaim your storage from Git worktrees, automatically and safely.</title>
+  <rect width="600" height="315" fill="#000000"/>
+  <image href="logo-dark.svg" x="402" y="70" width="168" height="170"/>
+  <text x="36" y="86" fill="#f5f5f5" font-family="'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="500" font-size="32" letter-spacing="-0.32">residue</text>
+  <text fill="#f5f5f5" font-family="'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace" font-size="26" letter-spacing="-0.26">
+    <tspan x="36" y="150">Reclaim your storage</tspan>
+    <tspan x="36" y="184">from Git worktrees,</tspan>
+    <tspan x="36" y="218">automatically and</tspan>
+    <tspan x="36" y="252">safely.</tspan>
+  </text>
+</svg>
