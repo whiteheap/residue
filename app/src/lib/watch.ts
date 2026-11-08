@@ -42,13 +42,13 @@ export function diskLow(settings: WatchSettings): { below: string; until: string
 export function fetchWords(fetch: WatchFetch, version: string | null): string {
   switch (fetch.mode) {
     case "every":
-      return `It fetches the remotes its worktrees' branches track about every ${duration(fetch.value)}, with --prune, so it sees a branch deleted on the remote without your own fetch.`;
+      return `It fetches about every ${duration(fetch.value)}, with --prune, so it sees a branch deleted on the remote without your own fetch.`;
     case "off":
       return "It does not fetch (--no-fetch): it sees a branch deleted on the remote after your next git fetch --prune.";
     case "never":
-      return `${version ?? "This residue"} never fetches: it sees a branch deleted on the remote after your next git fetch --prune. residue ${fetch.since} and newer fetch about every ${duration(fetch.every)} unless --no-fetch is set.`;
+      return `${version ?? "This residue"} never fetches: it sees a branch deleted on the remote after your next git fetch --prune. residue ${fetch.since} and newer fetch about every ${duration(fetch.every)}, unless --no-fetch.`;
     default:
-      return `The app could not read which residue version runs it. Before ${fetch.since}, residue never fetches, so it sees a branch deleted on the remote after your next git fetch --prune; ${fetch.since} and newer fetch about every ${duration(fetch.every)} unless --no-fetch is set.`;
+      return `Unknown residue version: before ${fetch.since}, residue never fetches, and sees a branch deleted on the remote after your next git fetch --prune. residue ${fetch.since} and newer fetch about every ${duration(fetch.every)}, unless --no-fetch.`;
   }
 }
 

@@ -79,8 +79,7 @@ export function RemoveDialog({
         {phase.step === "planning" ? (
           <>
             <Dialog.Description className="dialog-text">
-              residue is checking {plural(paths.length, "worktree")} again before it shows you
-              the plan. Nothing moves yet.
+              Checking {plural(paths.length, "worktree")} again. Nothing moves yet.
             </Dialog.Description>
             <Loading title="Checking again" />
           </>
@@ -144,8 +143,8 @@ function Plan({
     <>
       <Dialog.Description className="dialog-text">
         {ready.length > 0
-          ? `residue moves ${plural(ready.length, "worktree")} into its repository's trash. Each branch and its commits stay. Restore puts a worktree back from the trash until residue deletes it from there after ${span(plan.trash.keep_seconds)}, then from the removal record that leaves, for at least ${recordsKept}, without its ignored files.`
-          : "residue would keep every one of these worktrees, so nothing moves."}
+          ? `Branches and commits stay. Restore brings a worktree back whole for at least ${span(plan.trash.keep_seconds)}, then from its removal record, without ignored files, for at least ${recordsKept}.`
+          : "residue keeps all of these, so nothing moves."}
       </Dialog.Description>
 
       {ready.length > 0 ? (
@@ -166,9 +165,8 @@ function Plan({
             })}
           </ul>
           <p className="hint">
-            The trash frees no space yet: a trashed worktree keeps its {bytes(total)} until
-            residue deletes it, {span(plan.trash.keep_seconds)} from now, during a later removal or automatic
-            cleanup in that repository.
+            Frees no space yet: the first removal or automatic cleanup in its repository after{" "}
+            {span(plan.trash.keep_seconds)} deletes it and frees the {bytes(total)}.
           </p>
         </section>
       ) : null}
@@ -197,9 +195,8 @@ function Plan({
         <section className="plan-section">
           <h3>Deleted from the trash</h3>
           <p className="hint">
-            The same run deletes these trash entries, older than {span(plan.trash.keep_seconds)}. Each
-            leaves a removal record, listed in Restore for at least {recordsKept}: it recreates the
-            worktree on its branch and HEAD, without its ignored files.
+            Older than {span(plan.trash.keep_seconds)}. Each leaves a removal record: Restore recreates
+            the worktree from it, without ignored files, for at least {recordsKept}.
           </p>
           <ul className="plan-list">
             {purges.map((p) => (
@@ -217,12 +214,10 @@ function Plan({
         <section className="plan-section">
           <h3>Removal records forgotten</h3>
           <p className="hint">
-            The same run forgets these removal records, each older than both {recordsKept} (
-            <Flags flags={["--keep-removed"]} />) and the <Flags flags={["--keep-removed"]} /> it
-            was written with. Each worktree was deleted already. Forgetting deletes its record and
-            the ref that keeps its HEAD, so Restore can no longer bring it back. Branches stay. A commit only the record
-            held, such as one on a branch deleted since, is left to the next git gc, which can
-            delete it.
+            Each is older than both {recordsKept} (<Flags flags={["--keep-removed"]} />) and the{" "}
+            <Flags flags={["--keep-removed"]} /> it was written with. Restore can no longer bring these
+            back. Branches stay; a commit only the record held, such as one on a deleted branch, is
+            left to the next git gc, which can delete it.
           </p>
           <ul className="plan-list">
             {forgets.map((f) => (
@@ -269,7 +264,7 @@ function Plan({
             disabled={running}
             onClick={() => onConfirm(ready.map((r) => r.path))}
           >
-            {running ? "Moving…" : `Move ${plural(ready.length, "worktree")} to trash`}
+            {running ? "Moving…" : `Move ${plural(ready.length, "worktree")} to the trash`}
           </SolidButton>
         ) : null}
       </div>
@@ -334,7 +329,7 @@ function Result({
         <p className="hint">
           Deleted {plural(purged.length, "old trash entry", "old trash entries")}, freeing{" "}
           {bytes(purged.reduce((s, p) => s + (p.entry.reclaimable_bytes ?? 0), 0))}. Each left a
-          removal record, listed in Restore.
+          removal record in Restore.
         </p>
       ) : null}
       {forgotten.length > 0 ? (

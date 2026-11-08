@@ -10,7 +10,7 @@ export const VERDICT_LABEL: Record<Verdict, string> = {
 
 export const VERDICT_HELP: Record<Verdict, string> = {
   candidate: "Every check passed. residue checks it again before it moves it.",
-  keep: "At least one check blocked, so residue keeps it.",
+  keep: "A check blocked, so residue keeps it.",
   unknown: "residue could not finish a check, so it keeps it.",
   stale: "Git lists it, but its directory is missing or does not match.",
 };

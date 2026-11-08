@@ -35,7 +35,7 @@ export function Freed({
     <>
       <PageHeader
         title="Freed"
-        description="The space residue has freed on this machine, by any of its commands, from its stats ledger."
+        description="What residue freed on this machine, by any of its commands."
         actions={
           <Button variant="secondary" icon={<ArrowClockwise />} loading={loading} disabled={loading} onClick={onReload}>
             Read again
@@ -59,14 +59,14 @@ export function Freed({
           <>
             {freedAny && doc.since ? (
               <section className="block" aria-labelledby="freed-spans">
-                <h2 id="freed-spans">Freed on this machine since {localDay(doc.since)}</h2>
+                <h2 id="freed-spans">Freed since {localDay(doc.since)}</h2>
                 <dl className="kpis">
                   <Kpi label="Last 7 days" sum={doc.freed.last_7_days} />
                   <Kpi label="Last 30 days" sum={doc.freed.last_30_days} />
                   <Kpi label="All time" sum={doc.freed.all_time} />
                   {sinceOpen ? (
                     <Kpi
-                      label="Since the app was last open"
+                      label="Since last open"
                       sum={sinceOpen}
                       note={localTime(sinceOpen.since)}
                     />
@@ -77,17 +77,17 @@ export function Freed({
             ) : (
               <Empty
                 icon={<ChartBar size={32} />}
-                title="residue has not counted any freed space on this machine yet."
-                description="It counts what it frees from version 0.0.8 on. A removal by the app, by residue remove in a terminal, or by automatic cleanup is counted here once it deletes a worktree. A move into the trash frees nothing until a later removal purges it."
+                title="No freed space counted yet"
+                description="Space counts here once residue 0.0.8 or newer deletes a worktree. A move into the trash frees nothing until a later removal purges it."
               />
             )}
 
             {freedAny ? (
               <Figure
                 label="Freed each week"
-                head={<h2 className="viz-title">Each week, the last {doc.weeks.length}</h2>}
+                head={<h2 className="viz-title">Last {doc.weeks.length} weeks</h2>}
                 busy={loading}
-                caption="Each column is a week, the latest ending now. The tallest carries its value; a pointer over a week shows its commands."
+                caption="One column per week, the latest ending now. Point at a week for its commands."
               >
                 {doc.weeks.some((w) => w.worktrees > 0) ? (
                   <>
