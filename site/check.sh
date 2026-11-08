@@ -9,7 +9,8 @@
 #    license are the files of @fontsource/ibm-plex-mono 5.3.0, by SHA-256.
 # 3. Every command on the page and in llms.txt appears verbatim in README.md,
 #    and so does the minimum Git version.
-# 4. Every local path and #fragment the pages link to exists.
+# 4. Every local path and #fragment the pages link to exists, as a file or as
+#    a redirect in _redirects.
 # 5. Every README anchor the pages and llms.txt link to is a README heading.
 # 6. One script only, /hero.js, same origin, and it loads and stores nothing.
 #    No inline script or handler, no third-party resource, no form. The one
@@ -56,6 +57,7 @@ expected='.well-known
 .well-known/security.txt
 404.html
 _headers
+_redirects
 apple-touch-icon.png
 b0581e2550b0bcc904c146120f116cc0.txt
 hero.js
@@ -155,6 +157,8 @@ for page in "$public"/*.html; do
     esac
     if [ -f "$public$path" ]; then
       ok "$name: $ref exists"
+    elif grep -v '^#' "$public/_redirects" | cut -d ' ' -f 1 | grep -qxF -- "$path"; then
+      ok "$name: $ref is a redirect in _redirects"
     else
       fail "$name: $ref has no file in site/public"
     fi

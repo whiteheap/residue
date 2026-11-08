@@ -1,0 +1,5 @@
+# Redirects. Cloudflare reads this file at deploy time and does not serve it,
+# like _headers. Each line: SOURCE DESTINATION CODE. The Mac app's DMG keeps
+# one name across releases, so this always answers with the one in the newest
+# residue release.
+/download/macos https://github.com/whiteheap/residue/releases/latest/download/residue-macos.dmg 302
