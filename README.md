@@ -2,14 +2,6 @@
 
 <p>
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.png">
-  <source media="(prefers-color-scheme: light)" srcset="docs/assets/logo.png">
-  <img src="docs/assets/logo.png" width="112" alt="Residue mark: three flat sheets stacked like linked worktrees, and a small square set apart underneath.">
-</picture>
-</p>
-
-<p>
-<picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="docs/assets/hero.png">
   <img src="docs/assets/hero.png" width="830" alt="Reclaim your storage from Git worktrees, automatically and safely.">

@@ -1,12 +1,13 @@
 #!/bin/sh
-# Renders the README artwork: each SVG in docs/assets to the PNG of the same
-# name beside it, at twice its drawn size, on a transparent background.
+# Renders the README artwork: each PNG in docs/assets that README.md shows,
+# from the SVG of the same name beside it, at twice its drawn size, on a
+# transparent background.
 # GitHub shows the PNGs, because it strips the styles and fonts an SVG would
 # need. Text is set in IBM Plex Mono from the site's own copy of the font
 # (site/public, pinned by site/check.sh), so a render looks the same on any
 # machine that has Chrome.
 #
-#   sh docs/assets/render.sh                  every SVG here
+#   sh docs/assets/render.sh                  every PNG the README shows
 #   sh docs/assets/render.sh hero.svg ...     only these
 #
 # Needs Google Chrome or Chromium. Set CHROME to its binary when it is not in
@@ -57,7 +58,7 @@ face() {
 faces=$(face 400; face 500)
 
 if [ "$#" -eq 0 ]; then
-  set -- "$here"/*.svg
+  set -- $(sed -n 's,.*docs/assets/\([a-z0-9-]*\)\.png.*,\1.svg,p' "$here/../../README.md" | sort -u)
 fi
 
 for svg in "$@"; do
