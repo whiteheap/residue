@@ -153,8 +153,12 @@ mod platform {
     pub fn take() -> Snapshot {
         let mut cmd = Command::new("/usr/sbin/lsof");
         // -n -P: no DNS or port lookups. -F pcn: machine-readable fields for
-        // pid, command and name; lsof adds the fd field on its own.
-        cmd.args(["-n", "-P", "-F", "pcn"]).env("LC_ALL", "C");
+        // pid, command and name; lsof adds the fd field on its own. lsof
+        // lists itself too, so it runs in `/`: in residue's directory, its
+        // own row would mark the worktree residue runs in as in use by lsof.
+        cmd.args(["-n", "-P", "-F", "pcn"])
+            .env("LC_ALL", "C")
+            .current_dir("/");
         let out = match run::run(&mut cmd, Duration::from_secs(30), 512 << 20) {
             Ok(out) => out,
             Err(RunError::NotFound) => {
@@ -182,6 +186,8 @@ mod platform {
         let mut pid: Option<u32> = None;
         let mut command = String::new();
         let mut inspected = 0;
+        // Whether lsof could read everything of the current process.
+        let mut whole = false;
         for line in out.stdout.split(|b| *b == b'\n') {
             let Some((&field, value)) = line.split_first() else {
                 continue;
@@ -198,9 +204,12 @@ mod platform {
                             "lsof printed a process id residue cannot read".into(),
                         );
                     };
+                    if pid.is_some() && whole {
+                        inspected += 1;
+                    }
                     pid = Some(p);
                     command.clear();
-                    inspected += 1;
+                    whole = true;
                 }
                 b'c' => command = String::from_utf8_lossy(value).into_owned(),
                 b'n' if value.first() == Some(&b'/') => {
@@ -217,8 +226,12 @@ mod platform {
                         path: value.to_vec(),
                     });
                 }
+                b'n' if unread(value) => whole = false,
                 _ => {}
             }
+        }
+        if pid.is_some() && whole {
+            inspected += 1;
         }
         Snapshot {
             backend: BACKEND,
@@ -231,17 +244,89 @@ mod platform {
         }
     }
 
-    /// The number of running processes, to state how much lsof could see.
+    /// True for a name lsof prints in place of something it could not read,
+    /// which could be a path inside a worktree. Apple's lsof (`lsof-76`,
+    /// `dialects/darwin/libproc/dproc.c`, `dfile.c`, `dsock.c`) prints them
+    /// in the name column: `cwd|rtd info error: `, `FD info error: `,
+    /// `FILEPORT info error: `, `region info error: ` and `thread info
+    /// error: ` followed by the error, `no more information` for a file it
+    /// may not name, and `PREFIX: ERROR` (`err2nm`) for a descriptor it could
+    /// not read. A descriptor closed between listing and reading
+    /// (`: FD unavailable`) is gone, so it is not a gap.
+    fn unread(name: &[u8]) -> bool {
+        const ERR2NM: [&[u8]; 6] = [
+            b"vnode: ",
+            b"socket: ",
+            b"pipe: ",
+            b"kqueue: ",
+            b"semaphore: ",
+            b"POSIX shared memory: ",
+        ];
+        if name.windows(13).any(|w| w == b" info error: ") || name == b"no more information" {
+            return true;
+        }
+        ERR2NM.iter().any(|prefix| name.starts_with(prefix)) && !name.ends_with(b": FD unavailable")
+    }
+
+    /// The number of processes, to state how much lsof could see: every pid
+    /// the kernel lists, zombies and `kernel_task` (pid 0) included. That is
+    /// the number `ps -A` printed before, which lists itself and not pid 0.
+    /// `proc_listallpids` writes at most the number of processes plus 20
+    /// (`proc_listpids` in xnu's `bsd/kern/proc_info.c`) and returns how
+    /// many pids it wrote (`libsyscall/wrappers/libproc/libproc.c`); a full
+    /// buffer may have been cut short, so it is asked again, larger.
     fn count_processes() -> Option<usize> {
-        let mut cmd = Command::new("/bin/ps");
-        cmd.args(["-A", "-o", "pid="]);
-        let out = run::run(&mut cmd, Duration::from_secs(10), 16 << 20).ok()?;
-        out.status.success().then(|| {
-            out.stdout
-                .split(|b| *b == b'\n')
-                .filter(|l| l.iter().any(u8::is_ascii_digit))
-                .count()
-        })
+        // SAFETY: a null buffer of size 0 asks only for the number of pids
+        // to make room for; nothing is written.
+        let mut room = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        for _ in 0..4 {
+            let len = usize::try_from(room).ok()?.checked_add(64)?;
+            let mut pids: Vec<libc::c_int> = vec![0; len];
+            let bytes = libc::c_int::try_from(len * std::mem::size_of::<libc::c_int>()).ok()?;
+            // SAFETY: `pids` is writable for `bytes` bytes, and the kernel
+            // writes at most `bytes`.
+            let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+            let n = usize::try_from(n).ok()?;
+            if n < len {
+                return Some(n);
+            }
+            room = libc::c_int::try_from(len * 2).ok()?;
+        }
+        None
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{count_processes, unread};
+
+        #[test]
+        fn a_name_lsof_could_not_read_is_a_gap_and_a_closed_descriptor_is_not() {
+            for gap in [
+                &b"cwd|rtd info error: Operation not permitted"[..],
+                b"FD info error: Operation not permitted",
+                b"region info error: Bad address",
+                b"no more information",
+                b"vnode: process unavailable",
+                b"socket: Operation not permitted",
+            ] {
+                assert!(unread(gap), "{}", String::from_utf8_lossy(gap));
+            }
+            for name in [
+                &b"vnode: FD unavailable"[..],
+                b"->0x5a1c2f0e3d4b6a1f",
+                b"*:5432",
+                b"no address",
+                b"count=0, state=0x8",
+                b"(revoked)",
+            ] {
+                assert!(!unread(name), "{}", String::from_utf8_lossy(name));
+            }
+        }
+
+        #[test]
+        fn the_process_count_includes_this_process() {
+            assert!(count_processes().is_some_and(|n| n >= 1));
+        }
     }
 }
 

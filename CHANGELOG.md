@@ -8,6 +8,7 @@
 - residue uses about 5 MB less memory to inspect a large worktree. It keeps only the entries it needs from `git ls-files`, not the whole list: `explain` of a 59,888-file worktree peaked at 10.5 to 11.0 MB of residue's own memory, down from 15.3 to 16.4 MB (#78).
 - The Mac app's text is brief: short headings, a sentence or two under each, buttons that name what they do, and every caveat kept beside its action. Restore and Automatic cleanup move the rules on forgetting removal records into a disclosure. Restore shows about 25% fewer words, Automatic cleanup about 30% fewer (#77).
 - The Mac app uses less CPU and memory. Moving the pointer over the Worktrees map redraws only its tooltip, a long list of worktrees is drawn only where you can see it, its stylesheet is half the size, and it keeps residue's reports as text instead of parsing them twice (#75).
+- On macOS, `explain` run from inside a worktree no longer names lsof as a process using it: lsof now runs in `/`. residue counts the running processes with `proc_listallpids` in place of starting `ps`, so a snapshot starts one program, not two, and a process whose working directory or files lsof could not read no longer counts as inspected (#85).
 
 ## 0.0.9 (2026-11-08)
 
