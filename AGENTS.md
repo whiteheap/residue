@@ -92,6 +92,10 @@ A change to `src/remove.rs`, `src/trash.rs`, `src/removed.rs` or `src/restore.rs
 
 Then run the binary on real repositories. Make a scratch repository with worktrees in the states your change touches; [CONTRIBUTING.md](CONTRIBUTING.md#verify-a-change) has a script that builds one with each common state. The README's "Tested on" table lists the states each version covered. Run `scan`, `explain` and `remove`, and record the exact platform and Git version that ran. For Linux from a Mac: `cargo zigbuild --release --target aarch64-unknown-linux-musl`, then run the binary in an `ubuntu:24.04` container as a non-root user.
 
+## A security issue
+
+A bug that [SECURITY.md](SECURITY.md) calls a security issue goes into a draft security advisory (**Security**, **Advisories**, **New draft security advisory**), never a public issue. Its pull request and commits say what changes, not how to make residue lose data. Publish the advisory with the release that fixes it, naming that release. #135 to #139 went out as public issues on 2026-11-08, before this rule.
+
 ## Release
 
 1. On a branch, bump `version` in `Cargo.toml`, run `cargo build` to update `Cargo.lock`, turn `## Unreleased` in `CHANGELOG.md` into a `## X.Y.Z (date)` section (add the section if there is no `## Unreleased`), and update the `--tag` in the `cargo install` lines of the README and `docs/installation.md`. The Mac app takes its version from `Cargo.toml` too, so nothing in `app/` changes. The release notes come from that section, so it opens with what a user gets: one line, then a short list of the main changes and anything that works differently from the last release, each with its issue number. The detailed entries follow under `### Details`. Open a pull request. `main` is protected: a change lands only through a pull request, with the `macos-latest`, `ubuntu-24.04` and `ubuntu-24.04-arm` checks green, and never by a direct or force push. Wait for `freebsd-14` too, though the ruleset does not require it. Squash merge it.
