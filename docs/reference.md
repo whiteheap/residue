@@ -56,7 +56,7 @@ Only Git config files count: the repository's own config, your global config and
 
 ```text
 residue: note: ignored residue.regenerable set through the environment (git -c, GIT_CONFIG_COUNT, GIT_CONFIG_PARAMETERS or GIT_CONFIG): "web/.tscache"
-residue: note: residue reads rules only from Git config files, the residue config file and --regenerable. Pass --regenerable RULE for one run, or run `git config --add residue.regenerable RULE` in the repository to keep the rule
+residue: note: instead, pass --regenerable RULE, or keep it with `git config --add residue.regenerable RULE`
 ```
 
 residue never reads rules from a file committed to the repository. A repository you clone must not be able to declare your files disposable, and `git clone` never copies Git config.
@@ -162,7 +162,7 @@ The ledger never decides anything. residue reads and writes it only as a regular
 
 ### In a remove run
 
-A run that deleted or moved something ends with one line: `freed about 812 MB (residue has freed about 14.2 GB on this machine since 2026-10-02)`, or `moved about 812 MB to the trash, freed once a remove run purges it after 7d (...)`, or both joined by `and`. The date is local. Its `remove --json` document ends with `stats`:
+A run that deleted or moved something ends with one line: `freed about 812 MB (about 14.2 GB on this machine since 2026-10-02)`, or `moved about 812 MB to the trash, freed when a remove run purges it after 7d (...)`, or both joined by `and`. The date is local. Its `remove --json` document ends with `stats`:
 
 | Field | Value |
 | --- | --- |
@@ -173,7 +173,7 @@ A run that deleted or moved something ends with one line: `freed about 812 MB (r
 | `ledger` | The ledger's path, or null when the run wrote nothing |
 | `error` | Why the ledger is not up to date, which is also in `warnings`, or null |
 
-A preview has `stats` with zeros and nulls. The `watch` log names what each removal freed: `residue watch: freed about 812 MB (residue has freed about 14.2 GB on this machine since 2026-10-02)`, with the UTC date, as the log's own times are UTC. `scan` at a terminal ends with `residue has freed about 14.2 GB on this machine since 2026-10-02, from 31 worktrees; about 2.1 GB in the last 7 days · residue stats` once anything was freed. On macOS and Linux, `residue service status` shows a `freed:` line for automatic cleanup: what `watch` freed in the last seven days and when it last removed a worktree.
+A preview has `stats` with zeros and nulls. The `watch` log names what each removal freed: `residue watch: freed about 812 MB (about 14.2 GB on this machine since 2026-10-02)`, with the UTC date, as the log's own times are UTC. `scan` at a terminal ends with `freed about 14.2 GB from 31 worktrees since 2026-10-02; 2.1 GB in the last 7 days · residue stats` once anything was freed. On macOS and Linux, `residue service status` shows a `freed:` line for automatic cleanup: what `watch` freed in the last seven days and when it last removed a worktree.
 
 ### `residue stats --json`
 

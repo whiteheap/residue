@@ -45,16 +45,16 @@ export function removalLine(stats: RemoveStats, keep: string): string | null {
   if (stats.freed_worktrees > 0) parts.push(`freed about ${bytes(stats.freed_bytes)}`);
   if (stats.trashed_worktrees > 0) {
     parts.push(
-      `moved about ${bytes(stats.trashed_bytes)} to the trash, freed once a remove run purges it after ${keep}`,
+      `moved about ${bytes(stats.trashed_bytes)} to the trash, freed when a remove run purges it after ${keep}`,
     );
   }
   if (parts.length === 0) return null;
   const total =
     stats.total_freed_worktrees === null || stats.total_freed_bytes === null || stats.since === null
-      ? "residue could not update its stats ledger; see the warning"
+      ? "stats ledger not updated; see the warning"
       : stats.total_freed_worktrees === 0
-        ? "residue has not counted any freed space on this machine yet"
-        : `residue has freed about ${bytes(stats.total_freed_bytes)} on this machine since ${localDay(stats.since)}`;
+        ? "nothing counted on this machine yet"
+        : `about ${bytes(stats.total_freed_bytes)} on this machine since ${localDay(stats.since)}`;
   return `${parts.join(" and ")} (${total})`;
 }
 

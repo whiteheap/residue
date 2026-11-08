@@ -45,8 +45,8 @@ A fetch changes only remote-tracking refs. It is never a reason to remove: it on
 
 ```text
 2026-11-07T18:41:14Z residue watch: fetched ~/src/app: origin/fix-login is gone from the remote
-2026-11-07T18:41:17Z residue watch: removed ~/src/app/.worktrees/fix-login (8.2 KB): its upstream branch origin/fix-login was deleted and it was unchanged for 1h; restore: residue restore /Users/me/src/app/.git/residue-removed/fix-login-20261107T184117Z
-2026-11-07T18:41:17Z residue watch: freed about 8.2 KB (residue has freed about 14.2 GB on this machine since 2026-10-02)
+2026-11-07T18:41:17Z residue watch: removed ~/src/app/.worktrees/fix-login (8.2 KB): origin/fix-login was deleted, unchanged for 1h; restore: residue restore /Users/me/src/app/.git/residue-removed/fix-login-20261107T184117Z
+2026-11-07T18:41:17Z residue watch: freed about 8.2 KB (about 14.2 GB on this machine since 2026-10-02)
 ```
 
 `--no-fetch` turns it off. Then `watch` sees a deleted branch after your own `git fetch --prune`; `git config --global fetch.prune true` makes every fetch prune. `scan`, `explain` and `remove` never fetch.
@@ -59,7 +59,7 @@ A fetch changes only remote-tracking refs. It is never a reason to remove: it on
 residue service install --keep-removed 12w
 ```
 
-`residue service status` then shows `removal records: kept 12w (--keep-removed)`, and the `watching` line at the top of the log ends with `Keeps each removal record 12w (--keep-removed).` A service installed before `watch` took the option shows `removal records: kept 30d (--keep-removed, the default)`. Running `residue service install` again without the option goes back to `30d`, and says so: `The service it replaced kept removal records 12w (--keep-removed). This one keeps new ones 30d; records already written keep their own.`
+`residue service status` then shows `removal records: kept 12w (--keep-removed)`, and the `watching` line at the top of the log carries `· removal records: 12w ·`. A service installed before `watch` took the option shows `removal records: kept 30d (--keep-removed, the default)`. Running `residue service install` again without the option goes back to `30d`, and says so in two lines: `removal records: new ones kept 30d (was 12w); written ones keep their own`, then `to keep 12w: residue service install --keep-removed 12w`.
 
 No run forgets a record before the `--keep-removed` it was written with. A run forgets the records in its repositories that are older than both that and its own `--keep-removed`, so a `residue remove` you run yourself, with its default `30d`, leaves a record written with `12w` until it is twelve weeks old. A record older than both is forgotten by the next removal in its repository, not on the day it expires, so in a repository where nothing more is removed it stays. A record residue 0.0.7 or earlier wrote has no `keep`, and the run's value alone decides. Forgetting a record can lose commits only its refs held: [What `--keep-removed` can lose](../README.md#restore-a-removed-worktree).
 
@@ -72,7 +72,7 @@ residue service status                     # is it running, what it watches, how
 residue service uninstall
 ```
 
-A dry run still fetches; add `--no-fetch` to leave the refs alone too. The log is `~/Library/Logs/residue/watch.log` on macOS and `journalctl --user -u residue-watch` on Linux. After each removal it logs what the removal freed and the total for this machine, with the UTC date, like the log's own times. `residue service status` has a `freed:` line: what automatic cleanup freed in the last seven days and when it last removed a worktree, such as `freed: about 2.1 GB from 4 worktrees in the last 7 days; automatic cleanup last removed one 2026-11-07 04:12 +02:00 (5 hours ago)`. `residue stats` has the rest; [Stats](reference.md#stats) says how it is counted. A Linux user service stops when you log out unless you run `loginctl enable-linger "$USER"` once. On other systems, `residue service install` prints the `residue watch` command to run from your system's service manager. [Why `--idle` matters](#why---idle-matters) explains what counts as a change, and why a paused agent session needs a wait. If you would rather sweep at a fixed time, see [Run it on a schedule](#run-it-on-a-schedule).
+A dry run still fetches; add `--no-fetch` to leave the refs alone too. The log is `~/Library/Logs/residue/watch.log` on macOS and `journalctl --user -u residue-watch` on Linux. After each removal it logs what the removal freed and the total for this machine, with the UTC date, like the log's own times. `residue service status` has a `freed:` line: what automatic cleanup freed in the last seven days and when it last removed a worktree, such as `freed: about 2.1 GB from 4 worktrees in the last 7 days; last removal 2026-11-07 04:12 +02:00 (5 hours ago)`. `residue stats` has the rest; [Stats](reference.md#stats) says how it is counted. A Linux user service stops when you log out unless you run `loginctl enable-linger "$USER"` once. On other systems, `residue service install` prints the `residue watch` command to run from your system's service manager. [Why `--idle` matters](#why---idle-matters) explains what counts as a change, and why a paused agent session needs a wait. If you would rather sweep at a fixed time, see [Run it on a schedule](#run-it-on-a-schedule).
 
 ## Run it on a schedule
 

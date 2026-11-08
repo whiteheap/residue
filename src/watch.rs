@@ -62,64 +62,42 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 pub const HELP: &str = "\
-residue watch: stay running and reclaim storage from Git worktrees as soon
-as it is safe and worth it. No schedule: it reacts to Git and the disk.
+residue watch: stay running; clean up when a branch lands or the disk is low.
 
 Usage:
   residue watch [OPTIONS] [ROOT...]
 
-ROOT is a folder that holds repositories. Without one, it watches the
-usual code folders that exist in your home folder, and logs which:
-~/src ~/code ~/Code ~/dev ~/Developer ~/projects ~/Projects ~/repos ~/git
-~/github ~/GitHub ~/work ~/Work ~/workspace
+ROOT is a folder of repositories. Without one, the ones of these that exist:
+  ~/src ~/code ~/Code ~/dev ~/Developer ~/projects ~/Projects ~/repos ~/git
+  ~/github ~/GitHub ~/work ~/Work ~/workspace
 
-It removes a linked worktree of a repository at or under ROOT when:
-  its work landed  its upstream branch was deleted (a merged pull request,
-                   or `git push --delete`) and it has not changed for --grace
-  the disk is low  free space on its filesystem is below --min-free; then
-                   worktrees unchanged for --idle go, largest first, until
-                   free space is 5 points above --min-free
-
-To see a branch deleted on the remote, it runs `git fetch --prune
---no-tags` about every --fetch-every, for each remote that a worktree's
-branch tracks. It never prompts: Git and SSH run without a terminal, and
-SSH with BatchMode=yes unless you set your own SSH command, so a fetch
-that needs a password, a passphrase or a host key answer fails instead.
-A fetch changes only remote-tracking refs. One that fails is logged and
-changes nothing.
-
-Each removal is `residue remove --yes --idle --no-trash`, with
---only-if-upstream-gone when its branch landed: every check runs,
-and runs again right before the deletion. It deletes rather than using the
-trash, and purges that repository's trash entries older than 7 days.
-Branches and commits are always kept.
-Each removal first writes a removal record, and its log line ends with
-`restore: residue restore RECORD`, which recreates the worktree on its
-branch and HEAD for at least --keep-removed (30 days by default). A
-restored worktree is never removed again because its branch landed; disk
-pressure still removes it.
+It removes a candidate worktree when:
+  its branch landed  its upstream branch was deleted; unchanged for --grace
+  the disk is low    free space is below --min-free; unchanged for --idle,
+                     largest first, until free space is 5 points above it
 
 Options:
-  --grace DURATION        Once its branch landed, keep a worktree that
-                          changed within DURATION (default 1h)
-  --idle DURATION         When the disk is low, keep a worktree that changed
-                          within DURATION (default 2d)
-  --min-free PERCENT      The disk is low below PERCENT free (default 10)
-  --keep-removed DURATION Keep each removal record it writes, and with it
-                          `residue restore`, for at least DURATION (default
-                          30d). No run forgets a record before the DURATION
-                          it was written with; branches stay
-  --fetch-every DURATION  Fetch each repository about this often (default
-                          30m), each on its own clock
-  --no-fetch              Never fetch: a deleted branch is seen after your
-                          own `git fetch --prune`
-  --dry-run               Log what it would remove, and remove nothing (it
-                          still fetches unless --no-fetch)
-  --once                  Fetch, decide and act once, then exit
-  -h, --help              Show this help
+  --grace DURATION         Branch landed: keep it if changed within this (1h)
+  --idle DURATION          Disk low: keep it if changed within this (2d)
+  --min-free PERCENT       The disk is low below PERCENT free (10)
+  --keep-removed DURATION  Keep removal records at least this long (30d)
+  --fetch-every DURATION   Fetch each repository about this often (30m)
+  --no-fetch               Never fetch; a deleted branch shows after your fetch
+  --dry-run                Log what it would remove; remove nothing
+  --once                   Fetch, decide and act once, then exit
+  -h, --help               Show this help
 
-DURATION is a whole number and a unit: m, h, d or w (30m, 1h, 2d, 1w).
-Install it as a login service: residue service install [ROOT...]
+DURATION is a whole number and m, h, d or w: 30m, 1h, 2d, 1w.
+
+Examples:
+  residue watch --once --dry-run   preview one pass (it still fetches)
+  residue service install          run it from login
+
+Removal:  every check of `residue remove`, then a removal record to restore from
+Trash:    not used; entries older than 7d are purged
+Kept:     branches and commits; a restored worktree, unless the disk is low
+Fetch:    never prompts, so one that needs a password fails and is logged
+Details:  https://github.com/whiteheap/residue/blob/main/docs/automation.md
 ";
 
 /// The folders in the home folder that `watch` and `service install` use
@@ -189,7 +167,7 @@ pub fn default_roots() -> Result<Vec<PathBuf>, String> {
 fn no_default_roots(command: &str) -> String {
     let names: Vec<String> = DEFAULT_ROOTS.iter().map(|n| format!("~/{n}")).collect();
     format!(
-        "no ROOT given, and none of the usual code folders exists in your home folder ({}); name the folder that holds your repositories: {command} ~/path/to/repos",
+        "none of the usual code folders exists in your home folder ({}); name yours: {command} ~/path/to/repos",
         names.join(", ")
     )
 }
@@ -245,11 +223,8 @@ pub struct Span {
 
 impl Span {
     pub fn parse(flag: &str, text: &str) -> Result<Span, String> {
-        let invalid = || {
-            format!(
-                "{flag} {text:?}: use a whole number and one unit, m, h, d or w, such as 30m, 1h, 2d or 1w"
-            )
-        };
+        let invalid =
+            || format!("{flag} {text:?}: use a whole number and a unit, such as 30m, 1h, 2d or 1w");
         let unit = text.chars().last().ok_or_else(invalid)?;
         let seconds = match unit {
             'm' => 60,
@@ -462,12 +437,13 @@ pub fn main(args: &[OsString]) -> u8 {
             return 1;
         }
     };
+    // One line of labels and values; `residue watch --help` explains each.
     log(&format!(
-        "watching {} ({}{}). Removes a worktree when its upstream branch is deleted and it is unchanged for {}, and, below {}% free space, worktrees unchanged for {}, largest first. Keeps each removal record {} (--keep-removed). {}{}",
+        "watching {} ({}{}) · removes: landed and unchanged {}, or below {}% free and unchanged {} · removal records: {} · fetch: {}{}",
         opts.shown_roots(),
         events::BACKEND,
         if opts.default_roots {
-            "; the usual code folders in your home folder, name ROOTs to choose others"
+            "; the usual code folders; name ROOTs to change"
         } else {
             ""
         },
@@ -476,14 +452,11 @@ pub fn main(args: &[OsString]) -> u8 {
         opts.idle.text,
         opts.keep_removed.text,
         match &opts.fetch_every {
-            Some(every) => format!(
-                "Fetches the remotes its worktrees' branches track about every {}, with --prune.",
-                every.text
-            ),
-            None => "Does not fetch (--no-fetch).".to_string(),
+            Some(every) => format!("every {}", every.text),
+            None => "off (--no-fetch)".to_string(),
         },
         if opts.dry_run {
-            " Dry run: nothing is removed."
+            " · dry run: removes nothing"
         } else {
             ""
         }
@@ -779,7 +752,7 @@ fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> usize 
             /* require_upstream_gone */ true,
             |w| {
                 format!(
-                    "its upstream branch {} was deleted and it was unchanged for {}",
+                    "{} was deleted, unchanged for {}",
                     w.upstream.as_deref().unwrap_or("(unknown)"),
                     opts.grace.text
                 )
@@ -816,7 +789,7 @@ fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> usize 
         }
         if chosen.is_empty() {
             let note = format!(
-                "free space on the filesystem of {} is {pct:.1}%, below {}%, but no worktree on it is a candidate unchanged for {}",
+                "{}: {pct:.1}% free, below {}%, and no candidate unchanged for {}",
                 output::home(&sample),
                 opts.min_free,
                 opts.idle.text
@@ -836,7 +809,7 @@ fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> usize 
             /* require_upstream_gone */ false,
             |_| {
                 format!(
-                    "free space on its filesystem is {pct:.1}%, below {}%, and it was unchanged for {}",
+                    "{pct:.1}% free, below {}%, unchanged for {}",
                     opts.min_free, opts.idle.text
                 )
             },
@@ -936,7 +909,7 @@ fn remove(
                 removed += 1;
                 let entry = result.get("trash_entry").and_then(Value::str).unwrap_or("");
                 log(&format!(
-                    "moved {} to the trash ({size}): {reason}; put it back with: residue restore {}",
+                    "moved {} to the trash ({size}): {reason}; restore: residue restore {}",
                     output::home(path),
                     output::shell(Path::new(entry))
                 ));
@@ -1044,7 +1017,7 @@ fn log_freed(stats: &Value) {
             stats.get("since").and_then(Value::str),
         ) {
             (Some(total), Some(since)) => format!(
-                " (residue has freed about {} on this machine since {})",
+                " (about {} on this machine since {})",
                 output::bytes(total),
                 since.get(..10).unwrap_or(since)
             ),
@@ -1403,7 +1376,7 @@ impl Fetcher {
                     repo,
                     remote,
                     &format!(
-                        "fetch of {remote} in {shown} failed, so its remote-tracking refs stay as they were ({e})"
+                        "fetch of {remote} in {shown} failed; its refs stay as they were ({e})"
                     ),
                     every,
                 ),

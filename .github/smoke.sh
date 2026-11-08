@@ -69,7 +69,7 @@ if [ -z "$partial_probe" ]; then
   out=$("$residue" remove --yes .worktrees/clean)
   printf '%s\n' "$out"
   # It ends with what it freed and the total in the stats ledger.
-  expect '^freed about .* \(residue has freed about .* on this machine since [0-9][0-9-]*\)$'
+  expect '^freed about .* \(about .* on this machine since [0-9][0-9-]*\)$'
   test ! -e .worktrees/clean
   git rev-parse --verify -q clean > /dev/null
   # Its removal record brings it back, on its branch.

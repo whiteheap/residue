@@ -156,11 +156,11 @@ impl Leftover {
     pub fn text(&self, places: &Places, style: &Style) -> String {
         let line = match (&self.unusable, &self.record) {
             (Some(why), Some(_)) => format!(
-                "Git can no longer use it ({why}), so it cannot move it back; restore says what to clear, then recreates it: {}",
+                "Git can no longer use it ({why}); restore says what to clear, then recreates it: {}",
                 clean(&self.recovery)
             ),
             (Some(why), None) => format!(
-                "Git can no longer use it ({why}), so it can neither move it back nor remove it, and no removal record names it; copy out what you need, then delete it and run `git worktree prune` in its repository"
+                "Git can no longer use it ({why}), and no removal record names it; copy out what you need, delete it, then run `git worktree prune` in its repository"
             ),
             (None, _) if self.present => format!("put it back: {}", clean(&self.recovery)),
             (None, _) => format!(
@@ -228,7 +228,8 @@ pub fn unusable(entry: &Entry) -> Option<String> {
 }
 
 /// The heading over a list of [`Leftover`]s.
-pub const LEFTOVER_TITLE: &str = "interrupted removals (a residue run moved these aside to delete them and stopped; if it stopped during the delete, part may be gone):";
+pub const LEFTOVER_TITLE: &str =
+    "interrupted removals (moved aside, then stopped; part may already be deleted):";
 
 /// The one line that puts a moved worktree back by hand.
 pub fn recovery(main: &Path, moved: &Path, original: &Path, locked: bool) -> String {
@@ -430,8 +431,15 @@ pub fn remove(options: &Options) -> u8 {
         .filter(|&i| purges[i].outcome.is_none())
         .collect();
     if !options.json {
+        // The header names the one activity snapshot every check of the plan
+        // used, as `scan` and `explain` do.
         print!(
-            "{}",
+            "{}{}",
+            style.dim(&format!(
+                "{} · activity: {}\n",
+                commands::header(mode.started),
+                clean(&snapshot.scope())
+            )),
             plan_text(&items, &purges, &forgets, &errors, &mode, &places, &style)
         );
     }
@@ -541,6 +549,8 @@ pub fn remove(options: &Options) -> u8 {
             fields.push(("stats", run.json()));
         }
         println!("{}", doc.render());
+    } else if declined.as_deref() == Some(NO_TERMINAL) {
+        println!("{NO_TERMINAL_TEXT}");
     } else if let Some(why) = declined {
         println!("nothing removed: {}", clean(&why));
     } else if ready.is_empty() && purgeable.is_empty() && forgets.is_empty() && options.all {
@@ -791,13 +801,18 @@ fn sweep(roots: &[PathBuf]) -> (Vec<Item>, Vec<String>, Vec<Repo>) {
     (items, found.errors, found.repos)
 }
 
+/// Why a run without `--yes` and without a terminal removes nothing: the
+/// JSON `reason`, unchanged. Text prints [`NO_TERMINAL_TEXT`] instead.
+const NO_TERMINAL: &str = "stdin is not a terminal, so residue cannot ask for confirmation; pass --yes only from the session that owns these worktrees and knows its task is finished, or from a scheduled `residue remove --all --idle`";
+
+/// The same, as the two lines a text run ends with: what happened, then
+/// what to do.
+const NO_TERMINAL_TEXT: &str = "nothing removed: stdin is not a terminal, so residue cannot ask\nnext: run it in a terminal, or pass --yes from the session that owns them, once its task is done";
+
 fn confirm(worktrees: usize, purges: usize, forgets: usize, trash: bool) -> Result<bool, String> {
     let stdin = io::stdin();
     if !stdin.is_terminal() {
-        return Err(
-            "stdin is not a terminal, so residue cannot ask for confirmation; pass --yes only from the session that owns these worktrees and knows its task is finished, or from a scheduled `residue remove --all --idle`"
-                .into(),
-        );
+        return Err(NO_TERMINAL.into());
     }
     let style = Style::stderr();
     let mut err = io::stderr();
@@ -1522,7 +1537,6 @@ fn plan_text(
         .filter(|&i| purges[i].outcome.is_none())
         .collect();
     let mut out = String::new();
-    out.push_str(&style.dim(&format!("{}\n", commands::header(mode.started))));
     if !ready.is_empty() {
         let title = if mode.trash {
             format!("will move to the trash ({}):", ready.len())
@@ -1532,15 +1546,20 @@ fn plan_text(
         out.push_str(&format!("\n{}\n", style.bold(&title)));
         if mode.trash {
             out.push_str(&style.dim(&format!(
-                "  `residue restore` puts one back. A remove run purges entries older than {} (--keep-trash), which frees the disk.\n",
+                "  put one back: residue restore · purged after {} (--keep-trash), which frees the disk\n",
                 mode.keep.text
             )));
         } else {
             out.push_str(&style.dim(&format!(
-                "  `residue restore` recreates one at its path, on its branch and HEAD, for {} (--keep-removed); the ignored files it deletes are not kept.\n",
+                "  `residue restore` brings one back for {} (--keep-removed), without its ignored files\n",
                 mode.keep_removed.text
             )));
         }
+        // Every worktree here passed the activity check against the one
+        // snapshot in the header, so its caveat is said once.
+        out.push_str(&style.dim(
+            "  no process observed using them; processes residue cannot see are not checked\n",
+        ));
         for &i in &ready {
             let (Some(t), Some(r)) = (&items[i].target, &items[i].report) else {
                 continue;
@@ -1574,9 +1593,6 @@ fn plan_text(
                     ));
                 }
             }
-            if let Some(scope) = r.checks.iter().find(|c| c.id == "activity") {
-                out.push_str(&format!("    {}\n", style.dim(&clean(&scope.detail))));
-            }
         }
     }
     if !purgeable.is_empty() {
@@ -1601,9 +1617,9 @@ fn plan_text(
                 mode.keep_removed.text
             ))
         ));
-        out.push_str(&style.dim(
-            "  each worktree was deleted already; forgetting deletes its record and the ref that keeps its HEAD, so `residue restore` can no longer bring it back\n",
-        ));
+        out.push_str(
+            &style.dim("  after this, `residue restore` cannot bring these back; branches stay\n"),
+        );
         for f in forgets {
             out.push_str(&forget_summary(&f.item, places, style));
         }
@@ -1730,7 +1746,7 @@ fn outcome_line(item: &Item, outcome: &Outcome, places: &Places) -> String {
             restore_hint(record)
         ),
         Outcome::Trashed(entry) => format!(
-            "moved {shown} to the trash{branch}; put it back with: residue restore {}",
+            "moved {shown} to the trash{branch}; restore: residue restore {}",
             output::shell(entry)
         ),
         Outcome::Skipped(why) => format!("skipped {shown}: {}", clean(why)),

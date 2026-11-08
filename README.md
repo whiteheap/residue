@@ -159,7 +159,7 @@ The move narrows the window between the last check and the deletion; it does not
 If residue is killed between the move and the end of the deletion, the worktree stays under its hidden name and Git still lists it. The next `residue scan` lists it under `interrupted removals`, with the one command that puts it back:
 
 ```text
-interrupted removals (a residue run moved these aside to delete them and stopped; if it stopped during the delete, part may be gone):
+interrupted removals (moved aside, then stopped; part may already be deleted):
   .worktrees/.fix-login.residue-removing-4242  was .worktrees/fix-login
     put it back: git -C /Users/me/src/app worktree unlock /Users/me/src/app/.worktrees/.fix-login.residue-removing-4242 && git -C /Users/me/src/app worktree move /Users/me/src/app/.worktrees/.fix-login.residue-removing-4242 /Users/me/src/app/.worktrees/fix-login
 ```
@@ -170,7 +170,7 @@ A run killed during the delete can leave a worktree that Git can no longer use: 
 
 ```text
   .worktrees/.fix-login.residue-removing-4242  was .worktrees/fix-login
-    Git can no longer use it (its .git file is gone), so it cannot move it back; restore says what to clear, then recreates it: residue restore /Users/me/src/app/.git/residue-removed/fix-login-20261107T040000Z
+    Git can no longer use it (its .git file is gone); restore says what to clear, then recreates it: residue restore /Users/me/src/app/.git/residue-removed/fix-login-20261107T040000Z
 ```
 
 If stdin is not a terminal, residue does not delete anything unless you pass `--yes`. Pass `--yes` only from the session that owns the worktree and knows its task is finished, such as an agent's last step or a launcher tearing down a task, or from a scheduled `remove --all --idle` as [Run it on a schedule](#run-it-on-a-schedule) describes. Every check still runs. Without `--idle`, a session that is paused looks exactly like a finished one, so `remove --all --yes` refuses to run without it.
@@ -245,7 +245,7 @@ A `remove` that deletes something ends with what it freed and what residue has f
 
 ```text
 removed .worktrees/fix-login (branch fix-login kept); about 812 MB reclaimable; restore: residue restore /Users/me/src/app/.git/residue-removed/fix-login-20261107T040000Z
-freed about 812 MB (residue has freed about 14.2 GB on this machine since 2026-10-02)
+freed about 812 MB (about 14.2 GB on this machine since 2026-10-02)
 ```
 
 A move into the trash frees nothing yet, and the line says so: the space counts once a remove run purges the entry. A preview, or a run that removes nothing, prints no such line. `scan` ends with the total, the `watch` log says what each removal freed, and `residue service status` shows what automatic cleanup freed in the last seven days.

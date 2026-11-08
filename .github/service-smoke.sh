@@ -54,15 +54,17 @@ printf '%s\n' "$status" | grep -q 'residue watch: watching' || fail "no log line
 printf '%s\n' "$status" | grep -qx "watches: $root" || fail "status does not show the root" "$status"
 printf '%s\n' "$status" | grep -q "^runs: .* --keep-removed 12w " || fail "the service does not record --keep-removed" "$status"
 printf '%s\n' "$status" | grep -qx "removal records: kept 12w (--keep-removed)" || fail "status does not show --keep-removed" "$status"
-printf '%s\n' "$status" | grep -q "residue watch: watching .* Keeps each removal record 12w (--keep-removed)" \
+printf '%s\n' "$status" | grep -q "residue watch: watching .* · removal records: 12w ·" \
   || fail "the running watch did not get --keep-removed" "$status"
 
 # 2. Again without a ROOT: the root a user named is kept.
 out=$("$residue" service install --dry-run)
 printf '%s\n' "$out"
 printf '%s\n' "$out" | grep -q "watches: $root (kept from the service it replaces" || fail "install without a ROOT did not keep the root" "$out"
-printf '%s\n' "$out" | grep -qx "The service it replaced kept removal records 12w (--keep-removed). This one keeps new ones 30d; records already written keep their own. Pass --keep-removed 12w to keep the old value." \
+printf '%s\n' "$out" | grep -qx "removal records: new ones kept 30d (was 12w); written ones keep their own" \
   || fail "install did not say --keep-removed went back to its default" "$out"
+printf '%s\n' "$out" | grep -qx "to keep 12w: residue service install --keep-removed 12w" \
+  || fail "install did not say how to keep the old --keep-removed" "$out"
 status=$("$residue" service status)
 printf '%s\n' "$status" | grep -qx "watches: $root" || fail "status lost the kept root" "$status"
 printf '%s\n' "$status" | grep -qx "removal records: kept 30d (--keep-removed)" \
@@ -84,7 +86,7 @@ case $st in
   status=$("$residue" service status)
   printf '%s\n' "$status"
   printf '%s\n' "$status" | head -1 | grep -Eq ': (running|active)' || fail "the default-root service is not running" "$status"
-  printf '%s\n' "$status" | grep -q "^watches: ~/.*(the code folders in your home folder at install" \
+  printf '%s\n' "$status" | grep -q "^watches: ~/.*(the code folders at install" \
     || fail "status does not show the default roots as such" "$status"
   printf '%s\n' "$status" | grep -q "^runs: .* --no-fetch --dry-run /" || fail "the service does not record its roots" "$status"
   out=$("$residue" service install --dry-run --no-fetch)
