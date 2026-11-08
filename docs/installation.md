@@ -128,9 +128,9 @@ gh attestation verify residue_amd64.deb --repo whiteheap/residue
 With Rust 1.85 or later:
 
 ```sh
-cargo install --locked --git https://github.com/whiteheap/residue --tag v0.0.7 residue
+cargo install --locked --git https://github.com/whiteheap/residue --tag v0.0.8 residue
 ```
 
-The last word is the package name. Cargo searches the whole repository for packages, and from the release after 0.0.7 the repository also holds the Mac app's, so without the name `cargo install` stops with "multiple packages with binaries found".
+The last word is the package name. Cargo searches the whole repository for packages, and from 0.0.8 on the repository also holds the Mac app's, so without the name `cargo install` stops with "multiple packages with binaries found".
 
 residue needs `git` 2.36 or later on `PATH`.

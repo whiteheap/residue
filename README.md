@@ -52,7 +52,7 @@ brew install whiteheap/tap/residue
 
 `~/src/app` in the examples is a repository path. `PATH` is a linked worktree, not a subdirectory inside one.
 
-Signed apt, dnf, and pacman repositories, the key fingerprint, release archives, and `cargo install --locked --git https://github.com/whiteheap/residue --tag v0.0.7 residue` are in [Install residue](docs/installation.md). On a Mac, the [Mac app](#mac-app) shows the same in a window, with residue inside.
+Signed apt, dnf, and pacman repositories, the key fingerprint, release archives, and `cargo install --locked --git https://github.com/whiteheap/residue --tag v0.0.8 residue` are in [Install residue](docs/installation.md). On a Mac, the [Mac app](#mac-app) shows the same in a window, with residue inside.
 
 ## Inspect a worktree
 
