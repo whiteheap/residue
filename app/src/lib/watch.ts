@@ -51,6 +51,7 @@ export function settingFlags(settings: WatchSettings): { set: string[]; defaults
   add("--grace", settings.grace);
   add("--idle", settings.idle);
   add("--min-free", settings.min_free);
+  add("--keep-removed", settings.keep_removed);
   if (settings.fetch.mode === "every") add("--fetch-every", settings.fetch);
   else if (settings.fetch.mode === "off") set.push("--no-fetch");
   return { set, defaults };
@@ -63,6 +64,7 @@ export function settingLines(settings: WatchSettings, version: string | null): R
     "Keeps a landed worktree for": duration(settings.grace.value),
     "Disk low below": diskLow(settings).below,
     "When low, keeps a worktree changed within": duration(settings.idle.value),
+    "Keeps removal records for": duration(settings.keep_removed.value),
     Fetching:
       fetch.mode === "every"
         ? `about every ${duration(fetch.value)}`

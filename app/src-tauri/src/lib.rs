@@ -116,6 +116,9 @@ struct AppInfo {
     /// `residue remove --keep-trash` when none is given, which the app's
     /// removals and automatic cleanup use.
     default_keep_trash: &'static str,
+    /// `residue remove --keep-removed` when none is given, which the app's
+    /// removals use.
+    default_keep_removed: &'static str,
 }
 
 #[tauri::command]
@@ -131,6 +134,7 @@ async fn app_info(app: tauri::AppHandle, state: AppState<'_>) -> Result<AppInfo,
             path_source: env::path().1,
             dev_service_preview: s.dev.enabled,
             default_keep_trash: service::DEFAULT_KEEP_TRASH,
+            default_keep_removed: service::DEFAULT_KEEP_REMOVED,
         })
     })
     .await
@@ -307,21 +311,21 @@ async fn service_status(state: AppState<'_>) -> Result<service::Status, CliError
     .await
 }
 
-/// Turn the service on, or save other folders. `keep` is the options the
-/// window showed a save would keep (`Status.plan.keep`); when the service
-/// changed since, nothing is installed.
+/// Turn the service on, or save other folders. `basis` is the one the window
+/// showed (`Status.basis`); when a fresh read differs, nothing is installed
+/// and the result is `changed`, with what changed and the fresh status.
 #[tauri::command]
 async fn service_install(
     state: AppState<'_>,
     roots: Vec<String>,
     dry_run: bool,
-    keep: Vec<String>,
-) -> Result<service::Change, CliError> {
+    basis: service::Basis,
+) -> Result<service::Save, CliError> {
     blocking(&state, move |s| {
         let roots = settings::folders(&roots)?;
         let version = s.bundled_version()?;
         let ctx = s.service_context(&version);
-        service::install(&ctx, &s.dev, &roots, dry_run, &keep)
+        service::install(&ctx, &s.dev, &roots, dry_run, &basis)
     })
     .await
 }
@@ -335,8 +339,9 @@ async fn service_uninstall(state: AppState<'_>) -> Result<service::Change, CliEr
     .await
 }
 
-/// `residue watch --once --dry-run ROOT...` with the options a save keeps:
-/// what automatic cleanup would remove now. It removes nothing.
+/// `residue watch --once --dry-run ROOT...` with every option a save keeps,
+/// run by the binary a save installs with: what automatic cleanup would
+/// remove now, fetching first as the service does. It removes nothing.
 #[tauri::command]
 async fn service_preview(
     state: AppState<'_>,
@@ -345,9 +350,7 @@ async fn service_preview(
     blocking(&state, move |s| {
         let roots = settings::folders(&roots)?;
         let version = s.bundled_version()?;
-        let ctx = s.service_context(&version);
-        let current = service::status(&ctx, &s.dev)?;
-        service::preview(&ctx, &roots, &current.plan.keep)
+        service::preview(&s.service_context(&version), &s.dev, &roots)
     })
     .await
 }

@@ -1,6 +1,6 @@
 # The residue Mac app
 
-This folder holds the Mac app: a window over the residue CLI that lists the linked worktrees under your code folders, moves the ones that can go to the trash, restores them, and turns automatic cleanup on or off. What it does for users, the download and the first launch are in the [README](../README.md#mac-app), which is the contract. This file is for building and changing the app.
+This folder holds the Mac app: a window over the residue CLI that lists the linked worktrees under your code folders, moves the ones that can go to the trash, restores them from the trash or from a removal record, and turns automatic cleanup on or off. What it does for users, the download and the first launch are in the [README](../README.md#mac-app), which is the contract. This file is for building and changing the app.
 
 The app never reimplements a check, a size or a deletion. Every action runs the residue binary bundled inside the app, with explicit arguments, and reads its JSON. That binary is built from this repository, at the same commit as the app, and has the same version. It is Tauri 2: Rust in `src-tauri/`, React and TypeScript in `src/` (Kumo components, Phosphor icons, Tailwind 4). [AGENTS.md](AGENTS.md) has the invariants.
 
@@ -55,7 +55,7 @@ Then it checks the bundle: the identifier `com.whiteheap.residue`, the name `res
 These environment variables change what a debug build (`pnpm tauri dev`) does. Release builds ignore them.
 
 - `RESIDUE_APP_DEV_SERVICE=preview`: the Automatic cleanup switch never runs `residue service install` or `uninstall`. launchd acts on your real login session, and the service label is shared with any residue service already running, so a real install or uninstall would replace or remove it. In preview the switch shows the command it would run and the output of `residue watch --once --dry-run`, which removes nothing. Use it whenever you work on that screen on a machine that runs residue's service.
-- `RESIDUE_APP_DEV_AGENT_FILE=PLIST`, with the preview on: the preview starts as if `PLIST` were the installed service, so you can see how the screen reads a service another residue version wrote. The app only reads the file. Make one in a temporary folder with `plutil -create xml1 PLIST` and `plutil -insert ProgramArguments -json '["/opt/homebrew/bin/residue","watch","--no-fetch","/tmp/x"]' PLIST`.
+- `RESIDUE_APP_DEV_AGENT_FILE=PLIST`, with the preview on: the preview reads `PLIST` as the installed service's agent file, so you can see how the screen reads a service another residue version wrote. It reads the file again on every read, as it reads the real one, until you use the switch: change the file while the save dialog is open, and Save refuses and shows what changed. The app only reads the file. Make one in a temporary folder with `plutil -create xml1 PLIST` and `plutil -insert ProgramArguments -json '["/opt/homebrew/bin/residue","watch","--no-fetch","/tmp/x"]' PLIST`.
 - `RESIDUE_APP_DEV_SNAPSHOT_DIR=DIR`: write a name into `DIR/request` and the app saves a picture of its window to `DIR/NAME.tiff`, for checking the UI from a terminal that macOS does not allow to record the screen. `sips -s format png DIR/NAME.tiff --out DIR/NAME.png` converts it.
 
 ## Release

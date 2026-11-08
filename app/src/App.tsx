@@ -5,7 +5,7 @@ import {
   TreeStructure,
   type Icon,
 } from "@phosphor-icons/react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@cloudflare/kumo";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Mark } from "./components/Mark";
@@ -56,7 +56,24 @@ export function App() {
   const scanDoc = scanQ.dataKey === rootsKey ? scanQ.data : undefined;
   const rescan = scanQ.reload;
 
+  // What opened the detail (`data-opener`), so leaving the detail returns
+  // focus there, as a keyboard or screen reader user left it.
+  const opener = useRef<string | null>(null);
+  const open = useCallback((path: string) => {
+    const from = document.activeElement?.closest<HTMLElement>("[data-opener]");
+    opener.current = from?.dataset.opener ?? `row:${path}`;
+    setDetail(path);
+  }, []);
+  useEffect(() => {
+    if (detail !== null || opener.current === null) return;
+    const key = opener.current;
+    opener.current = null;
+    document.querySelector<HTMLElement>(`[data-opener="${CSS.escape(key)}"]`)?.focus();
+  }, [detail]);
+
   const go = useCallback((v: View) => {
+    // Another screen: nothing on it opened a detail.
+    opener.current = null;
     setView(v);
     setDetail(null);
   }, []);
@@ -193,7 +210,7 @@ export function App() {
                   selected={selected}
                   onSelect={select}
                   onRescan={rescan}
-                  onOpen={setDetail}
+                  onOpen={open}
                   onRemove={setRemoving}
                   onChooseFolders={() => go("folders")}
                 />
@@ -203,6 +220,7 @@ export function App() {
                 roots={roots}
                 home={home}
                 keepTrash={info?.default_keep_trash}
+                keepRemoved={info?.default_keep_removed}
                 refreshKey={refreshKey}
                 onRestored={rescan}
               />
@@ -222,17 +240,26 @@ export function App() {
       </main>
 
       {removing ? (
-        <RemoveDialog
-          paths={removing}
-          home={home}
-          onClose={() => setRemoving(null)}
-          onRemoved={(doc) => {
-            const moved = new Set(doc.results.filter((r) => r.result === "trashed").map((r) => r.path));
-            setSelected((sel) => new Set([...sel].filter((p) => !moved.has(p))));
-            if (detail && moved.has(detail)) setDetail(null);
+        // The dialog's own boundary: a failure to draw a result after a
+        // confirmed move stays in the dialog, and closing it scans again.
+        <ErrorBoundary
+          onClose={() => {
+            setRemoving(null);
             rescan();
           }}
-        />
+        >
+          <RemoveDialog
+            paths={removing}
+            home={home}
+            onClose={() => setRemoving(null)}
+            onRemoved={(doc) => {
+              const moved = new Set(doc.results.filter((r) => r.result === "trashed").map((r) => r.path));
+              setSelected((sel) => new Set([...sel].filter((p) => !moved.has(p))));
+              if (detail && moved.has(detail)) setDetail(null);
+              rescan();
+            }}
+          />
+        </ErrorBoundary>
       ) : null}
     </div>
   );

@@ -96,6 +96,43 @@ export interface TrashItem {
   error: string | null;
 }
 
+/** An ignored entry a deletion took, which restore does not bring back. */
+export interface NotKept {
+  path: string;
+  files: number | null;
+  bytes: number | null;
+}
+
+/**
+ * A removal record: what residue keeps of a worktree it deleted, so
+ * `residue restore` can recreate it on its branch and HEAD.
+ */
+export interface RemovalRecord {
+  kind: "removed";
+  entry: string;
+  entry_path: string;
+  ref: string;
+  /** `interrupted`: the removal did not finish, and Git still lists the worktree. */
+  state: "removed" | "interrupted";
+  original_path: string | null;
+  aside_path: string | null;
+  branch: string | null;
+  head: string | null;
+  upstream: string | null;
+  /** `remove`, `sweep`, `watch_landed`, `watch_low_disk`, `trash_purge`; a newer residue may add one. */
+  reason: string | null;
+  /** The command that removed it: `remove`, `sweep`, `watch`. */
+  by: string | null;
+  removed_at: string | null;
+  allocated_bytes: number | null;
+  reclaimable_bytes: number | null;
+  not_kept: NotKept[];
+  /** No `info` file: a run stopped while it wrote the record. */
+  incomplete: boolean;
+  residue_version: string | null;
+  error: string | null;
+}
+
 export interface Repository {
   common_dir: string;
   main_path: string;
@@ -136,26 +173,41 @@ export interface ExplainDocument {
 export type RemoveResult = "removed" | "trashed" | "refused" | "skipped" | "failed" | "invalid";
 export type PurgeResult = "purged" | "kept" | "skipped" | "failed" | "invalid" | "not_attempted";
 
+/** In a plan (no `--yes`), a record the run would forget is `skipped`. */
+export type ForgetResult = "forgotten" | "skipped" | "failed" | "not_attempted";
+
 export interface RemoveDocument {
   schema: "residue.remove/v1";
   version: string;
   generated_at: string;
   activity: ActivityScope;
   trash: { enabled: boolean; keep: string; keep_seconds: number };
+  /** The records this run writes, and `--keep-removed`: how long records are kept. */
+  removal_records: { reason: string; by: string; keep: string; keep_seconds: number };
   results: {
     path: string;
     result: RemoveResult;
     reason: string | null;
     trash_entry: string | null;
+    removal_record: string | null;
     worktree: Worktree | null;
   }[];
   purged: {
     result: PurgeResult;
     reason: string | null;
     entry: TrashItem;
+    removal_record: string | null;
     worktree: Worktree | null;
   }[];
+  /** Records older than `--keep-removed` in the repositories the run covers. */
+  forgotten: {
+    result: ForgetResult;
+    reason: string | null;
+    entry: RemovalRecord;
+  }[];
   errors: string[];
+  /** Records residue could not read or forget; never a reason the run failed. */
+  warnings: string[];
 }
 
 export interface Removal {
@@ -163,12 +215,30 @@ export interface Removal {
   exit_code: number | null;
 }
 
+/** How a restored worktree came back. */
+export type Checkout = "moved_back" | "checked_out_branch" | "recreated_branch" | "new_branch" | "detached";
+
 export interface RestoreDocument {
   schema: "residue.restore/v1";
   version: string;
   generated_at: string;
   restored: string | null;
+  /** After a restore: how it came back. */
+  restore: {
+    kind: "trash" | "removed";
+    entry: string;
+    path: string;
+    branch: string | null;
+    head: string | null;
+    checkout: Checkout;
+    moved_from: string | null;
+    new_branch: string | null;
+    branch_tip: string | null;
+    not_kept: NotKept[];
+    notes: string[];
+  } | null;
   trash: TrashItem[];
+  removed: RemovalRecord[];
   errors: string[];
 }
 
@@ -180,12 +250,10 @@ export interface Listing {
 }
 
 /**
- * Something the Restore screen can bring back. Since 0.0.7 a listing also
- * has the removal records of worktrees residue deleted (`removed`); the
- * screen reads only `trash` so far, so every row is `kind: "trash"`.
+ * Something the Restore screen can bring back: a trash entry, whose files
+ * are still on disk, or a removal record of a worktree residue deleted.
  */
-export interface Restorable {
-  kind: "trash" | "removed";
+export type Restorable = {
   /** The scan folder whose listing returned it; restore runs there. */
   root: string;
   name: string;
@@ -193,10 +261,20 @@ export interface Restorable {
   originalPath: string | null;
   branch: string | null;
   at: string | null;
-  bytes: number | null;
-  registered: boolean;
   error: string | null;
-}
+} & (
+  | { kind: "trash"; bytes: number | null; registered: boolean }
+  | {
+      kind: "removed";
+      state: RemovalRecord["state"];
+      reason: string | null;
+      /** What the deletion freed (`allocated_bytes`). */
+      freed: number | null;
+      notKept: NotKept[];
+      asidePath: string | null;
+      incomplete: boolean;
+    }
+);
 
 export type ErrorKind = "missing" | "failed" | "timeout" | "bad_output" | "invalid";
 
@@ -218,6 +296,8 @@ export interface AppInfo {
   dev_service_preview: boolean;
   /** `residue remove --keep-trash` when none is given: `7d`. */
   default_keep_trash: string;
+  /** `residue remove --keep-removed` when none is given: `30d`. */
+  default_keep_removed: string;
 }
 
 export interface Settings {
@@ -248,6 +328,8 @@ export interface WatchSettings {
   min_free: WatchSetting;
   fetch: WatchFetch;
   keep_trash: WatchSetting;
+  /** How long the removal records of its repositories are kept: `--keep-removed`, or residue's `30d`. */
+  keep_removed: WatchSetting;
 }
 
 export interface ServiceProgram {
@@ -256,10 +338,12 @@ export interface ServiceProgram {
   version: string | null;
   managed: boolean;
   roots: string[];
-  /** The options a save passes on, as written. */
+  /** The options a save passes on, as written, including those the app does not know. */
   options: string[];
+  /** The options among `options` the app does not know, with their values: a save passes them on. */
+  other_options: string[];
   dry_run: boolean;
-  /** Arguments the app does not know; while there are any, it does not save. */
+  /** Arguments that are neither options nor folders; while there are any, the app does not save. */
   unknown: string[];
   settings: WatchSettings;
 }
@@ -277,6 +361,27 @@ export interface ServicePlan {
   blocked: string | null;
 }
 
+/**
+ * What a save is planned from: everything the save dialog shows about what a
+ * save installs and the service it replaces. The dialog sends it back with
+ * the save, and a fresh read that differs in any of it installs nothing.
+ */
+export interface ServiceBasis {
+  installed: boolean;
+  /** The binary a save installs with, and its `residue --version`. */
+  binary: string;
+  version: string | null;
+  /** The options a save passes on. */
+  keep: string[];
+  /** The service a save replaces, when launchd runs one and its agent file can be read. */
+  running: {
+    binary: string;
+    version: string | null;
+    roots: string[];
+    dry_run: boolean;
+  } | null;
+}
+
 export interface ServiceStatus {
   installed: boolean;
   state: string | null;
@@ -288,6 +393,7 @@ export interface ServiceStatus {
   log_error: string | null;
   program: ServiceProgram | null;
   plan: ServicePlan;
+  basis: ServiceBasis;
   dev_dry_run: boolean;
 }
 
@@ -298,11 +404,22 @@ export interface ServiceChange {
   status: ServiceStatus;
 }
 
-/** `residue watch --once --dry-run`, which removes nothing. */
+/**
+ * A save: installed (in the development preview, only shown), or refused
+ * because a fresh read differs from the basis the dialog showed, with one line
+ * per change (`what: before → after`) and the service as it is now.
+ */
+export type ServiceSave =
+  | { outcome: "saved"; change: ServiceChange }
+  | { outcome: "changed"; changes: string[]; status: ServiceStatus };
+
+/**
+ * `residue watch --once --dry-run` with every option a save passes on, run by
+ * the binary a save installs with. It removes nothing.
+ */
 export interface ServicePreview {
   command: string;
   lines: string[];
-  /** Options of the service the preview did not pass. */
-  left_out: string[];
-  left_out_reason: string | null;
+  /** Whether it fetched first, as the service does. */
+  fetch: WatchFetch;
 }

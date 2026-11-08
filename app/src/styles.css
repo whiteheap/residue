@@ -505,6 +505,22 @@ dd {
   padding-block: 0.6rem;
 }
 
+/* Who removed a worktree and why is read in full, never cut off. */
+.restore-rows .row-reason {
+  white-space: normal;
+}
+
+/* What a restore does not bring back, read before the click. */
+.row-note {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+/* An option in a sentence stays on one line: browsers break after a hyphen. */
+.flag {
+  white-space: nowrap;
+}
+
 .folder-rows .row-name {
   max-inline-size: none;
   font-weight: 400;
@@ -568,7 +584,13 @@ dd {
 }
 
 .notice ul {
+  display: grid;
+  gap: 0.3rem;
   padding-inline-start: 1.1rem;
+}
+
+.notice p + ul {
+  margin-block-start: 0.35rem;
 }
 
 .notice.dev {

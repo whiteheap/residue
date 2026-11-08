@@ -367,6 +367,8 @@ function Row({
       <button
         type="button"
         className="row-main"
+        // Back from the detail returns focus here (App.tsx).
+        data-opener={`row:${w.path}`}
         aria-labelledby={`${id}-name`}
         aria-describedby={`${id}-verdict ${id}-reason`}
         onClick={() => onOpen(w.path)}

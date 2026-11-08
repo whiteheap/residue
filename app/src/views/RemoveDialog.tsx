@@ -3,8 +3,10 @@ import { Trash } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { ErrorPanel, Loading, SolidButton } from "../components/ui";
 import { api, asCliError } from "../lib/api";
-import { baseName, bytes, plural, span, tilde } from "../lib/format";
+import { ageOf, baseName, bytes, plural, span, tilde } from "../lib/format";
+import { removedBy } from "../lib/records";
 import type { CliError, RemoveDocument } from "../lib/types";
+import { documentTime } from "../lib/useCli";
 import { displayPath, keptBy, checkLabel } from "../lib/worktree";
 
 type Phase =
@@ -17,8 +19,9 @@ type Phase =
 /**
  * Move worktrees to the trash. First residue's own plan (`residue remove
  * --trash --json PATH...` without --yes, which removes nothing): each worktree
- * checked again, and the expired trash entries the run would purge. The user
- * confirms exactly that list; then the same command with --yes.
+ * checked again, the expired trash entries the run would purge, and the
+ * removal records it would forget. The user confirms exactly that list; then
+ * the same command with --yes.
  */
 export function RemoveDialog({
   paths,
@@ -127,13 +130,17 @@ function Plan({
   const ready = plan.results.filter((r) => r.result === "skipped" && r.worktree?.verdict === "candidate");
   const kept = plan.results.filter((r) => !ready.includes(r));
   const purges = plan.purged.filter((p) => p.result === "skipped");
+  // Without --yes, a record the run would forget is skipped too.
+  const forgets = plan.forgotten.filter((f) => f.result === "skipped");
   const total = ready.reduce((sum, r) => sum + (r.worktree?.size?.reclaimable_bytes ?? 0), 0);
+  const now = documentTime(plan.generated_at);
+  const recordsKept = span(plan.removal_records.keep_seconds);
 
   return (
     <>
       <Dialog.Description className="dialog-text">
         {ready.length > 0
-          ? `residue moves ${plural(ready.length, "worktree")} into its repository's trash. Each branch and its commits stay. Restore puts a worktree back until residue deletes it from the trash after ${span(plan.trash.keep_seconds)}.`
+          ? `residue moves ${plural(ready.length, "worktree")} into its repository's trash. Each branch and its commits stay. Restore puts a worktree back from the trash until residue deletes it from there after ${span(plan.trash.keep_seconds)}, then from the removal record that leaves, for ${recordsKept}, without its ignored files.`
           : "residue would keep every one of these worktrees, so nothing moves."}
       </Dialog.Description>
 
@@ -186,9 +193,9 @@ function Plan({
         <section className="plan-section">
           <h3>Deleted from the trash</h3>
           <p className="hint">
-            The same run deletes these trash entries, older than {span(plan.trash.keep_seconds)}. The app
-            cannot put them back afterwards. Each leaves a removal record: residue restore in a terminal
-            recreates the worktree on its branch and HEAD, without its ignored files.
+            The same run deletes these trash entries, older than {span(plan.trash.keep_seconds)}. Each
+            leaves a removal record, listed in Restore for {recordsKept}: it recreates the worktree on
+            its branch and HEAD, without its ignored files.
           </p>
           <ul className="plan-list">
             {purges.map((p) => (
@@ -202,12 +209,48 @@ function Plan({
         </section>
       ) : null}
 
+      {forgets.length > 0 ? (
+        <section className="plan-section">
+          <h3>Removal records forgotten</h3>
+          <p className="hint">
+            The same run forgets these removal records, older than {recordsKept} (--keep-removed). Each
+            worktree was deleted already. Forgetting deletes its record and the ref that keeps its
+            HEAD, so Restore can no longer bring it back. Branches stay. A commit only the record
+            held, such as one on a branch deleted since, is left to the next git gc, which can
+            delete it.
+          </p>
+          <ul className="plan-list">
+            {forgets.map((f) => (
+              <li key={f.entry.entry_path}>
+                <span className="plan-name">{baseName(f.entry.original_path ?? f.entry.entry)}</span>
+                <span className="plan-path">
+                  {/* An unfinished record residue cannot read is forgotten an hour on; its error says why. */}
+                  {f.entry.error ??
+                    ["removed", ageOf(f.entry.removed_at, now), removedBy(f.entry.reason)].filter(Boolean).join(" ")}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+
       {plan.errors.length > 0 ? (
         <ul className="plan-errors">
           {plan.errors.map((e) => (
             <li key={e}>{e}</li>
           ))}
         </ul>
+      ) : null}
+
+      {plan.warnings.length > 0 ? (
+        <section className="plan-section">
+          <h3>Warnings</h3>
+          <ul className="plan-errors">
+            {plan.warnings.map((w) => (
+              <li key={w}>{w}</li>
+            ))}
+          </ul>
+        </section>
       ) : null}
 
       <div className="dialog-buttons">
@@ -241,6 +284,7 @@ const RESULT_TEXT: Record<string, string> = {
 function Result({ doc, home, onClose }: { doc: RemoveDocument; home: string | undefined; onClose: () => void }) {
   const moved = doc.results.filter((r) => r.result === "trashed");
   const purged = doc.purged.filter((p) => p.result === "purged");
+  const forgotten = doc.forgotten.filter((f) => f.result === "forgotten");
   const other = doc.results.filter((r) => r.result !== "trashed");
   return (
     <>
@@ -266,7 +310,14 @@ function Result({ doc, home, onClose }: { doc: RemoveDocument; home: string | un
       {purged.length > 0 ? (
         <p className="hint">
           Deleted {plural(purged.length, "old trash entry", "old trash entries")}, freeing{" "}
-          {bytes(purged.reduce((s, p) => s + (p.entry.reclaimable_bytes ?? 0), 0))}.
+          {bytes(purged.reduce((s, p) => s + (p.entry.reclaimable_bytes ?? 0), 0))}. Each left a
+          removal record, listed in Restore.
+        </p>
+      ) : null}
+      {forgotten.length > 0 ? (
+        <p className="hint">
+          Forgot {plural(forgotten.length, "removal record")} older than{" "}
+          {span(doc.removal_records.keep_seconds)}.
         </p>
       ) : null}
       {other.length > 0 || doc.errors.length > 0 ? (
@@ -275,6 +326,16 @@ function Result({ doc, home, onClose }: { doc: RemoveDocument; home: string | un
             <li key={e}>{e}</li>
           ))}
         </ul>
+      ) : null}
+      {doc.warnings.length > 0 ? (
+        <section className="plan-section">
+          <h3>Warnings</h3>
+          <ul className="plan-errors">
+            {doc.warnings.map((w) => (
+              <li key={w}>{w}</li>
+            ))}
+          </ul>
+        </section>
       ) : null}
       <div className="dialog-buttons">
         <SolidButton onClick={onClose}>
