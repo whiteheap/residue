@@ -9,7 +9,7 @@ section: devel
 priority: optional
 maintainer: Trevor I. Lasn <trevorlasn@gmail.com>
 vendor: Whiteheap
-homepage: https://github.com/whiteheap/residue
+homepage: https://github.com/whiteheap/residue-cli
 license: MIT
 description: |-
   Find the Git worktrees coding agents leave behind, and remove one only when

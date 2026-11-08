@@ -52,7 +52,7 @@ Restore:       each deletion writes a removal record first; `residue restore`
                brings the worktree back for 30d, without its ignored files
 Rules:         ~/.config/residue/regenerable, one RULE per line
 Exit status:   0 ok, 1 error, 2 usage, 3 remove refused or skipped a path
-Details:       https://github.com/whiteheap/residue#readme
+Details:       https://github.com/whiteheap/residue-cli#readme
 ";
 
 /// A length of time given on the command line, such as `--idle 2d` or

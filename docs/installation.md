@@ -54,7 +54,7 @@ curl -fsSL https://residue.whiteheap.com/install.sh | sh -s -- --no-service
 What it checks:
 
 - Every download is HTTPS only, TLS 1.2 or later, including redirects.
-- The release archive must match its line in the release's `SHA256SUMS`, or nothing is installed. When `gh` is installed and logged in, the archive's [build-provenance attestation](#release-archives-and-packages) must verify against `whiteheap/residue` too; otherwise the summary says it was skipped and why.
+- The release archive must match its line in the release's `SHA256SUMS`, or nothing is installed. When `gh` is installed and logged in, the archive's [build-provenance attestation](#release-archives-and-packages) must verify against `whiteheap/residue-cli` too, or `whiteheap/residue` for 0.0.10 and earlier; otherwise the summary says it was skipped and why.
 - The signing key it adds for apt, dnf or pacman must match the SHA-256 pinned in the script, the key `1AEA B314 3511 8A1F E575  D36E E155 3632 FC32 554A`. Each package manager trusts only that key for residue's repository: apt through `signed-by`, pacman through `--lsign-key`, and dnf through the repository file the script writes, whose `gpgkey` names the checked key as the local file `/etc/pki/rpm-gpg/RPM-GPG-KEY-residue`, so dnf never imports a key from a URL.
 - Every command that changes the machine is printed (`+ ...`) before it runs.
 - The whole script is functions called on its last line, so a download cut short runs nothing.
@@ -113,22 +113,24 @@ printf '\n[residue]\nServer = https://whiteheap.github.io/residue/arch/$arch\n' 
 sudo pacman -Syu residue
 ```
 
-All three are signed with the key `1AEA B314 3511 8A1F E575  D36E E155 3632 FC32 554A`. Each package installs `/usr/bin/residue` and pulls in Git if it is missing. To install one release without adding a repository, every release also carries `residue_amd64.deb`, `residue.x86_64.rpm` and `residue-x86_64.pkg.tar.zst` (and their arm64 builds) on the [releases page](https://github.com/whiteheap/residue/releases/latest).
+All three are signed with the key `1AEA B314 3511 8A1F E575  D36E E155 3632 FC32 554A`. Each package installs `/usr/bin/residue` and pulls in Git if it is missing. To install one release without adding a repository, every release also carries `residue_amd64.deb`, `residue.x86_64.rpm` and `residue-x86_64.pkg.tar.zst` (and their arm64 builds) on the [releases page](https://github.com/whiteheap/residue-cli/releases/latest).
 
 ### Release archives and packages
 
 Prebuilt binaries for macOS (Apple silicon and Intel), static Linux (x86_64 and arm64) and FreeBSD (x86_64 and aarch64) are on the releases page too. So is the Mac app, `residue-macos.dmg`, from 0.0.8 on (README, [Mac app](../README.md#mac-app)). Each archive, package and DMG has a SHA-256 checksum in `SHA256SUMS` and a GitHub build-provenance attestation:
 
 ```sh
-gh attestation verify residue_amd64.deb --repo whiteheap/residue
+gh attestation verify residue_amd64.deb --repo whiteheap/residue-cli
 ```
+
+For 0.0.10 and earlier, built before the rename, use `--repo whiteheap/residue`.
 
 ### From source
 
 With Rust 1.85 or later:
 
 ```sh
-cargo install --locked --git https://github.com/whiteheap/residue --tag v0.0.10 residue
+cargo install --locked --git https://github.com/whiteheap/residue-cli --tag v0.0.10 residue
 ```
 
 The last word is the package name. Cargo searches the whole repository for packages, and from 0.0.8 on the repository also holds the Mac app's, so without the name `cargo install` stops with "multiple packages with binaries found".

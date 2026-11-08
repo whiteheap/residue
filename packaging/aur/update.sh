@@ -16,7 +16,7 @@ fi
 tag=$1
 version=${tag#v}
 dir=$(cd "$(dirname "$0")" && pwd)
-sums=$(gh release download "$tag" --repo whiteheap/residue --pattern SHA256SUMS --output -)
+sums=$(gh release download "$tag" --repo whiteheap/residue-cli --pattern SHA256SUMS --output -)
 sum() {
   local line
   line=$(printf '%s\n' "$sums" | grep " residue-$tag-$1-unknown-linux-musl.tar.gz\$")

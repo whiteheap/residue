@@ -656,7 +656,7 @@ mod platform {
         let body = format!(
             "{mark}[Unit]\n\
              Description=residue watch: reclaim storage from Git worktrees\n\
-             Documentation=https://github.com/whiteheap/residue\n\
+             Documentation=https://github.com/whiteheap/residue-cli\n\
              \n\
              [Service]\n\
              ExecStart={exec}\n\

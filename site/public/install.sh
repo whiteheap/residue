@@ -13,10 +13,15 @@
 # service install`, and prints what it did and how to undo it. Each command
 # that changes the machine is printed (+ ...) before it runs. Everything is in
 # functions called on the last line, so a download cut short runs nothing.
-# Source: https://github.com/whiteheap/residue/blob/main/site/public/install.sh
+# Source: https://github.com/whiteheap/residue-cli/blob/main/site/public/install.sh
 set -eu
 
-REPO=whiteheap/residue
+REPO=whiteheap/residue-cli
+# Releases up to 0.0.10 were built before the rename, so their attestations
+# name the old repository (#127).
+OLD_REPO=whiteheap/residue
+OLD_REPO_UNTIL=0.0.10
+# The package repositories keep the old name's address (#127).
 PAGES=https://whiteheap.github.io/residue
 # The package signing key (docs/installation.md). The two files it is
 # published as are pinned by SHA-256; site/check.sh checks both pins against
@@ -305,13 +310,21 @@ install_archive() {
     esac
     [ "$(sha256 "$tmp/$name.tar.gz")" = "$want" ] || die "$name.tar.gz does not match SHA256SUMS; nothing was installed"
     say "Checksum: matches SHA256SUMS"
+    # Up to OLD_REPO_UNTIL the old name first, then REPO, for an archive
+    # attested again after the rename (a packages.yml re-run). Each verify
+    # takes seconds, so a later release tries only REPO. gh's reasons are kept
+    # for the error.
     if ! has gh; then
       attestation="skipped (gh is not installed)"
     elif ! gh auth status >/dev/null 2>&1; then
       attestation="skipped (gh is not logged in)"
-    elif gh attestation verify "$tmp/$name.tar.gz" --repo "$REPO" >/dev/null; then
+    elif at_least "$OLD_REPO_UNTIL" "${tag#v}" &&
+      gh attestation verify "$tmp/$name.tar.gz" --repo "$OLD_REPO" >/dev/null 2>>"$tmp/attestation.err"; then
+      attestation="verified, built by $OLD_REPO's release workflow ($REPO's name up to $OLD_REPO_UNTIL)"
+    elif gh attestation verify "$tmp/$name.tar.gz" --repo "$REPO" >/dev/null 2>>"$tmp/attestation.err"; then
       attestation="verified, built by $REPO's release workflow"
     else
+      cat "$tmp/attestation.err" >&2
       die "the build-provenance attestation of $name.tar.gz did not verify; nothing was installed"
     fi
     say "Attestation: $attestation"

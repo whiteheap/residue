@@ -26,8 +26,8 @@ You need Rust 1.85 or later with `rustfmt` and `clippy`, Git 2.36 or later, and 
 
 ```sh
 rustup toolchain install stable --component rustfmt,clippy
-git clone https://github.com/whiteheap/residue
-cd residue
+git clone https://github.com/whiteheap/residue-cli
+cd residue-cli
 cargo build
 ./target/debug/residue --help
 ```
@@ -234,10 +234,10 @@ Main at c61d629 on 2026-11-08: Apple M4 Max, 14 cores, 36 GB, macOS 26.3.1, Appl
 
 The Mac app's commands are in [app/AGENTS.md](app/AGENTS.md#cost): `footprint -p PID` for the app, its WebContent and its GPU process, and `ps -o time= -p PID` before and after a fixed task. The latest numbers come from the pull requests that changed them, on release builds with a scratch `HOME` on the same Mac:
 
-- One repository with 300 linked worktrees, after a scan: the app 34 to 35 MB, WebContent 113 to 117 MB, GPU 17 to 18 MB. A rescan costs WebContent 0.12 to 0.17 s of CPU ([#90](https://github.com/whiteheap/residue/pull/90)).
-- 20 s of pointer movement over the Worktrees map: WebContent 1.88 to 2.19 s of CPU (#90). Along a worktree's bar, with 150 worktrees: WebContent 1.00 s user and 0.22 s system CPU (medians), and, in a debug build with counters, 87 to 96 renders of the bar ([#113](https://github.com/whiteheap/residue/pull/113)).
+- One repository with 300 linked worktrees, after a scan: the app 34 to 35 MB, WebContent 113 to 117 MB, GPU 17 to 18 MB. A rescan costs WebContent 0.12 to 0.17 s of CPU ([#90](https://github.com/whiteheap/residue-cli/pull/90)).
+- 20 s of pointer movement over the Worktrees map: WebContent 1.88 to 2.19 s of CPU (#90). Along a worktree's bar, with 150 worktrees: WebContent 1.00 s user and 0.22 s system CPU (medians), and, in a debug build with counters, 87 to 96 renders of the bar ([#113](https://github.com/whiteheap/residue-cli/pull/113)).
 
-The website's home page (`site/`) and every file it loads come to 39,125 bytes with Brotli, not counting headers: HTML 6,355, `style.css` 4,446, `hero.js` 5,920, two fonts 8,480 and 8,612, and four SVGs 5,312, one of them the how-it-works drawing, which loads lazily. Measured on 2026-11-08 with `curl -s -o /dev/null -H 'Accept-Encoding: br' -w '%{size_download}\n' URL` for each file. With the hero on screen, the page's main thread is busy 135 to 161 ms in 10 s (median 148; headless Chrome at 1440 by 900, [#87](https://github.com/whiteheap/residue/pull/87)): the change in `TaskDuration` from the Chrome DevTools Protocol's `Performance.getMetrics` over 10 s after the page settles.
+The website's home page (`site/`) and every file it loads come to 39,125 bytes with Brotli, not counting headers: HTML 6,355, `style.css` 4,446, `hero.js` 5,920, two fonts 8,480 and 8,612, and four SVGs 5,312, one of them the how-it-works drawing, which loads lazily. Measured on 2026-11-08 with `curl -s -o /dev/null -H 'Accept-Encoding: br' -w '%{size_download}\n' URL` for each file. With the hero on screen, the page's main thread is busy 135 to 161 ms in 10 s (median 148; headless Chrome at 1440 by 900, [#87](https://github.com/whiteheap/residue-cli/pull/87)): the change in `TaskDuration` from the Chrome DevTools Protocol's `Performance.getMetrics` over 10 s after the page settles.
 
 Found something slow, in residue, a library or a tool it runs? Open an issue with the measurement and the command that repeats it, before there is a fix.
 
