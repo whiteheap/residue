@@ -105,9 +105,9 @@ impl Run<'_> {
         let stdout = child.stdout.take().map(reader);
         let stderr = child.stderr.take().map(reader);
         let started = Instant::now();
-        // Look often at first, so a quick command returns at once, then less
-        // often: a scan that runs for minutes wakes this thread 10 times a
-        // second, not 40.
+        // Look often at first, so a quick command returns at once, then every
+        // 25 ms, as before: a longer pause would delay the answer to every slow
+        // command to save almost no CPU.
         let mut pause = Duration::from_millis(1);
         let status = loop {
             match child.try_wait() {
@@ -134,7 +134,7 @@ impl Run<'_> {
                 }
                 Ok(None) => {
                     thread::sleep(pause);
-                    pause = (pause * 2).min(Duration::from_millis(100));
+                    pause = (pause * 2).min(Duration::from_millis(25));
                 }
                 Err(e) => {
                     return Err(CliError {
