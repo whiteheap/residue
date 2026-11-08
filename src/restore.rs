@@ -40,7 +40,17 @@ pub fn command(options: &Options) -> u8 {
     }
     let places = Places::new();
     let Some(wanted) = options.paths.first() else {
-        let found = gather(&[PathBuf::from(".")]);
+        let search = match Search::here() {
+            Ok(s) => s,
+            Err(e) => return fail(&e),
+        };
+        let found = gather(&search.roots);
+        if search.code_folders {
+            eprintln!(
+                "residue: note: listed the repositories in {}; residue does not search the rest of your home folder: run residue restore inside a repository to list its own",
+                search.place(&places)
+            );
+        }
         if let Err(e) = seed(&found) {
             eprintln!(
                 "residue: warning: the stats ledger is not up to date ({})",
@@ -77,9 +87,10 @@ pub fn command(options: &Options) -> u8 {
     let (found, pick) = match chosen {
         Some(c) => c,
         None => {
-            // A path ENTRY that is not where it points leaves the current
-            // directory to search, but never the home folder or a folder
-            // above it, for the reason `repository_of` gives.
+            // A path ENTRY that is not where it points, or a name, leaves
+            // the current directory to search, but never the home folder or
+            // a folder above it, for the reason `repository_of` gives: from
+            // there a name is looked up in the usual code folders (`Search`).
             if at_or_above_home(Path::new(".")) {
                 if let Some(e) = unsearched {
                     return fail(&e);
@@ -92,10 +103,18 @@ pub fn command(options: &Options) -> u8 {
                     ));
                 }
             }
-            let found = gather(&[PathBuf::from(".")]);
+            let search = match Search::here() {
+                Ok(s) => s,
+                Err(e) => return fail(&e),
+            };
+            let found = gather(&search.roots);
             match choose(&found, wanted) {
                 Ok(pick) => (found, pick),
-                Err(miss) => return fail(&unsearched.unwrap_or_else(|| miss.text(wanted))),
+                Err(miss) => {
+                    return fail(
+                        &unsearched.unwrap_or_else(|| miss.text(wanted, &search, &places)),
+                    );
+                }
             }
         }
     };
@@ -185,6 +204,44 @@ fn at_or_above_home(dir: &Path) -> bool {
         .filter(|h| !h.is_empty())
         .and_then(|h| git::canonical(Path::new(&h)).ok());
     dir.parent().is_none() || home.is_some_and(|h| h.starts_with(&dir))
+}
+
+/// Where the list, and a name no path resolves, are looked up: the
+/// repositories at or under the current directory; or, at or above the
+/// home folder, those in the usual code folders in it that exist
+/// (`watch::default_roots`, where `watch` removes from without a ROOT).
+/// Never the home folder itself, for the reason `repository_of` gives.
+struct Search {
+    roots: Vec<PathBuf>,
+    /// `roots` are the code folders, not the current directory.
+    code_folders: bool,
+}
+
+impl Search {
+    fn here() -> Result<Search, String> {
+        if !at_or_above_home(Path::new(".")) {
+            return Ok(Search {
+                roots: vec![PathBuf::from(".")],
+                code_folders: false,
+            });
+        }
+        match crate::watch::default_roots() {
+            Ok(roots) if !roots.is_empty() => Ok(Search {
+                roots,
+                code_folders: true,
+            }),
+            _ => Err("this is your home folder or a folder above it, which residue does not search, and none of the usual code folders is in your home folder (`residue watch --help` lists them); run residue restore inside a repository, or pass an entry's path".into()),
+        }
+    }
+
+    /// The code folders it looked in, for a message.
+    fn place(&self, places: &Places) -> String {
+        let shown: Vec<String> = self.roots.iter().map(|r| places.show(r)).collect();
+        format!(
+            "the usual code folders in your home folder ({})",
+            shown.join(", ")
+        )
+    }
 }
 
 /// `path` made absolute against a directory that exists: its parent
@@ -286,10 +343,14 @@ enum Miss {
 }
 
 impl Miss {
-    /// The message for a search of the repositories at or under the
-    /// current directory.
-    fn text(self, wanted: &Path) -> String {
+    /// The message for a search of the repositories `search` covers.
+    fn text(self, wanted: &Path, search: &Search, places: &Places) -> String {
         match self {
+            Miss::Nothing if search.code_folders => format!(
+                "nothing named {} in the trash or the removal records of the repositories in {}, and residue does not search the rest of your home folder; run residue restore inside its repository, or pass the entry's path it lists there",
+                wanted.display(),
+                search.place(places)
+            ),
             Miss::Nothing => format!(
                 "nothing named {} in the trash or the removal records of the repositories at or under the current directory; `residue restore` lists them",
                 wanted.display()
@@ -661,10 +722,11 @@ fn removed_row(item: &removed::Item, now: i64, places: &Places, style: &Style) -
                 ))
             ));
             if item.interrupted() {
-                let how = if item.head_gone() {
-                    "Git can no longer read its HEAD; restore says how to bring it back"
-                } else {
-                    "restore moves it back"
+                let how = match item.registered.as_ref().and_then(crate::remove::unusable) {
+                    Some(why) => format!(
+                        "Git can no longer use it ({why}); restore says how to bring it back"
+                    ),
+                    None => "restore moves it back".to_string(),
                 };
                 out.push_str(&format!(
                     "    {}\n",

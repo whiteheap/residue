@@ -20,8 +20,9 @@ Usage:
   residue remove --all PATH...
                              The same for every candidate a scan of PATH finds
   residue restore [ENTRY]    List what residue can put back in the repositories
-                             at or under the current directory (trash entries
-                             and removal records), or put one ENTRY back (its
+                             at or under the current directory (from the home
+                             folder, in its usual code folders): trash entries
+                             and removal records. Or put one ENTRY back (its
                              name from the list, the worktree's name or branch,
                              or a path)
   residue stats              Show how much disk residue has freed on this
