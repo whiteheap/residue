@@ -70,7 +70,7 @@ export function Automatic({
     <>
       <PageHeader
         title="Automatic cleanup"
-        description="residue watch runs at login and removes worktrees whose work landed, or when the disk runs low."
+        description="residue watch runs at login and removes worktrees whose work landed, or idle ones when the disk runs low."
         actions={
           <Button variant="secondary" icon={<ArrowClockwise />} loading={loading} disabled={loading} onClick={load}>
             Refresh
@@ -319,7 +319,7 @@ function FreeSpace({
           <p className="viz-caption">
             Each disk the scanned repositories are on, from the last scan.
             {levels
-              ? ` The marks show where automatic cleanup ${on ? "starts" : "would start"} removing idle worktrees, and where it stops.`
+              ? ` The marks show where automatic cleanup ${on ? "starts" : "would start"} removing idle worktrees, and where it ${on ? "stops" : "would stop"}.`
               : ""}
             {byTotals
               ? " This residue does not name each repository's disk, so disks of the same size show as one."
@@ -388,7 +388,7 @@ function WhatItRemoves({
       </h2>
       <ul className="plain-list bullets">
         <li>
-          Work landed: its upstream branch is gone and it is unchanged for{" "}
+          Work landed: worktrees whose upstream branch is gone, unchanged for{" "}
           {duration(settings.grace.value)}. {fetchWords(settings.fetch, version)}
         </li>
         <li>
@@ -435,7 +435,7 @@ function WhatItRemoves({
         {defaults.length > 0 ? (
           <>
             {set.length > 0
-              ? " residue's defaults for the rest: "
+              ? " The rest are residue's defaults: "
               : running
                 ? " It uses residue's defaults: "
                 : "Turning it on uses residue's defaults: "}
@@ -753,8 +753,8 @@ function SaveForm({
           </>
         ) : (
           <p className="hint">
-            One pass of the service as saved, with <Flags flags={["--dry-run"]} />, which removes
-            nothing. {previewFetch(settings.fetch, false)}
+            Runs one pass of the service with these settings and <Flags flags={["--dry-run"]} />,
+            so it removes nothing. {previewFetch(settings.fetch, false)}
           </p>
         )}
       </section>
