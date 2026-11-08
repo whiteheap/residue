@@ -1,0 +1,19 @@
+# One mutant per line: the guard it removes (Mut("NAME") in Removal.tla),
+# the setup (Start, the Faults set, the actors that do not run; After is
+# always {}), and the rule that must break. check.sh first checks that the
+# rule holds in that setup without the mutant, so each line shows that the
+# guard keeps it.
+#
+# MUTANT               START  FAULTS    OFF     RULE
+NoVerify               orig   {}        {}      OnlyCheckedStateDeleted
+NoFingerprint          orig   {}        {}      OnlyCheckedStateDeleted
+PurgeNoRecheck         trash  {}        {}      OnlyCheckedStateDeleted
+NoRecord               orig   {}        {}      ReflogCommitsKept
+SettleAlwaysUndoes     orig   {}        {}      ReflogCommitsKept
+SettleAlwaysUndoes     orig   {}        {}      RecordDroppedOnlyWhenWhole
+MoveBackWhileRunning   orig   {}        {}      NotDeletedOnceBack
+MoveBackNoNote         orig   {"kill"}  {}      RestoreTellsTheTruth
+PutBackAlwaysUnlocks   orig   {}        {"rr"}  OnlyOwnLocksLifted
+# The same guards in the unraced setups, so they too reach the deletion.
+NoVerify               orig   {"kill","orphan"}  {"rr"}  OnlyCheckedStateDeleted
+PurgeNoRecheck         trash  {"kill","orphan"}  {"tr"}  OnlyCheckedStateDeleted

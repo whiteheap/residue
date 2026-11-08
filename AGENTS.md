@@ -88,6 +88,8 @@ CI runs the format, lint, test and build steps, both smoke tests, the race, cont
 
 A change to `app/`, or to the CLI it bundles (`src/`, `Cargo.toml`, `Cargo.lock`), also runs `.github/workflows/app.yml` on macOS: the app's type-check, lint, format, clippy and universal build. It is not a required check, and its job name, `app-macos-universal`, is none of the required ones. [app/README.md](app/README.md#checks) has its commands.
 
+A change to `src/remove.rs`, `src/trash.rs`, `src/removed.rs` or `src/restore.rs`, or to how `src/git.rs`, `src/run.rs` or `src/watch.rs` move, lock, unlock or remove a worktree or stop a remove run, also runs `bash .agents/skills/verify-removal-races/check.sh`, about a minute. It model-checks every order of the steps of a removal, a purge, both restores and Git's own delete, and fails when a rule breaks that did not before. It reads the model, not the Rust: update the model in the same change, as [its skill](.agents/skills/verify-removal-races/SKILL.md) says, and that skill lists the races it has found. `.github/workflows/model.yml` runs it when the model changes; it is not a required check.
+
 Then run the binary on real repositories. Make a scratch repository with worktrees in the states your change touches; [CONTRIBUTING.md](CONTRIBUTING.md#verify-a-change) has a script that builds one with each common state. The README's "Tested on" table lists the states each version covered. Run `scan`, `explain` and `remove`, and record the exact platform and Git version that ran. For Linux from a Mac: `cargo zigbuild --release --target aarch64-unknown-linux-musl`, then run the binary in an `ubuntu:24.04` container as a non-root user.
 
 ## Release
