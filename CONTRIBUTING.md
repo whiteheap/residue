@@ -131,6 +131,26 @@ git config --global user.name dev && git config --global user.email dev@example.
 
 Then run `bash /scratch.sh` and the same `residue` commands, without the `./target/release/` prefix.
 
+## State machines
+
+residue stores no state field. Its store is Git and the filesystem, and each lifecycle's state is read from what is there: which directory a worktree is in, its lock reason, whether Git lists it, and which record files and refs exist.
+
+| Lifecycle | Its states are read in | Its moves are made by |
+| --- | --- | --- |
+| A worktree being removed: linked, moved aside (`.NAME.residue-removing-PID`, locked `residue: removing`), in the trash (locked `residue: in trash`), deleted | `discover::Repo::new` | `remove::execute`, `Moved::put_back`, `remove::purge`, `trash::restore`, `removed::restore` |
+| A removal record: incomplete, interrupted, removed | `removed::list`, `removed::Item` | `removed::create`, `Written::undo`, `removed::forget`, `removed::restore` |
+| A trash entry: being made (no `info` yet), holds its worktree, holds only its record (a purge clears it an hour after it was made) | `trash::list`, `trash::Item` | `trash::create`, `trash::restore`, `trash::purge`, `trash::discard` |
+| The restored marker | `removed::marked` | `removed::mark` |
+
+The stats ledger only appends one line per event, so it has no moves. `watch` keeps its timers in memory.
+
+A change that adds a state or a move:
+
+- reads the state where the table says, and again right before it acts, never from an earlier listing;
+- makes each move one Git command (`git worktree move`, `lock`, `remove`, `update-ref` with old values) or one `rename(2)`, `mkdir(2)` or `O_EXCL` create, so a second writer's move fails. That failure is reported, never taken as success;
+- writes a record ahead of a deletion only as intent: what Git and the filesystem show decides the state, and a record whose deletion did not happen is undone or reads as interrupted;
+- adds the state to this table and to the owner's `Item`, and to the JSON `state` and `app/src/lib/types.ts` when the app reads it, and adds a `scripts/recovery-check.sh` or `scripts/race-check.sh` case for the move and for another writer that gets there first.
+
 ## Open a pull request
 
 1. Branch from `main` and keep one change per pull request.

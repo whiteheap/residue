@@ -24,13 +24,27 @@
 /*.txt
   Content-Type: text/plain; charset=utf-8
 
-# The fonts and the drawings: a returning reader keeps them a day without
-# asking again. They change rarely, and a day-old font or drawing still fits
-# the page. The pages, style.css and hero.js keep Cloudflare's default,
-# max-age=0 with must-revalidate: they change together and must match, and
-# their names carry no version.
-/*.woff2
-  Cache-Control: public, max-age=86400
+# style.css, hero.js and the fonts: a returning reader keeps them a year and
+# never asks again. Every reference to one ends in ?v= and the first 12 hex
+# digits of its SHA-256, so a change makes a new URL; site/check.sh rule 10
+# fails when a version is missing or stale. Each rule names one file: a rule
+# also covers the 404 page served for a missing path it matches, and that
+# page must not be kept a year. The pages keep Cloudflare's default,
+# max-age=0 with must-revalidate, so a reader always gets the newest page
+# and, through it, the newest URLs.
+/style.css
+  Cache-Control: public, max-age=31536000, immutable
 
+/hero.js
+  Cache-Control: public, max-age=31536000, immutable
+
+/ibm-plex-mono-latin-400-normal.woff2
+  Cache-Control: public, max-age=31536000, immutable
+
+/ibm-plex-mono-latin-500-normal.woff2
+  Cache-Control: public, max-age=31536000, immutable
+
+# The drawings: a returning reader keeps them a day without asking again.
+# They change rarely, and a day-old drawing still fits the page.
 /*.svg
   Cache-Control: public, max-age=86400
