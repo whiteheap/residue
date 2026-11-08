@@ -403,10 +403,13 @@ function WhatItRemoves({
         running process stays. Automatic cleanup deletes the worktree instead of using the trash,
         because freeing the disk is its job. The branch and its commits stay, and a locked worktree
         stays. In each repository it removes from, it also deletes trash entries older than{" "}
-        {duration(settings.keep_trash.value)}, residue's default <Flags flags={["--keep-trash"]} />, and
-        forgets the removal records older than {duration(settings.keep_removed.value)},{" "}
+        {duration(settings.keep_trash.value)}, residue's default <Flags flags={["--keep-trash"]} />. It
+        keeps each removal record it writes for at least {duration(settings.keep_removed.value)},{" "}
         {settings.keep_removed.default ? "residue's default " : "its "}
-        <Flags flags={["--keep-removed"]} />. Until then, Restore recreates a worktree it deleted.
+        <Flags flags={["--keep-removed"]} />, and until a later removal forgets the record, Restore
+        recreates a worktree it deleted. No run forgets a record before the{" "}
+        <Flags flags={["--keep-removed"]} /> it was written with, and automatic cleanup forgets one
+        only once it is also older than its own.
       </p>
       <p className="hint">
         {set.length === 0 ? (

@@ -34,13 +34,15 @@
 
     /* Charts carry meaning by emphasis, never by hue: bright, gray, hatched,
        and a recessive gray for aggregates. Each fill has its ink, the text
-       color that reads on it. */
+       color that reads on it, at 4.5:1 or more in every state: white on the
+       gray is 6.0:1, and 9.2:1 on its hover, which darkens. The gray and the
+       aggregate gray stay 0.18 apart in lightness. */
     --viz-bright: var(--fg);
     --viz-bright-ink: var(--bg);
-    --viz-gray: var(--faint);
+    --viz-gray: oklch(0.5 0 none);
     --viz-gray-ink: oklch(1 0 none);
     --viz-hatch: var(--bg);
-    --viz-rest: var(--line-strong);
+    --viz-rest: oklch(0.32 0 none);
     --viz-rest-ink: var(--fg);
     --viz-frame: var(--raise-1);
     --viz-frame-ink: var(--muted);
@@ -1236,7 +1238,8 @@ li:not([data-result="trashed"]) > .plan-result {
 .viz-fill[data-tone="gray"],
 .viz-fill[data-tone="hatched"] {
   --fill: var(--viz-gray);
-  --fill-hover: color-mix(in oklch, var(--viz-gray) 80%, var(--viz-gray-ink));
+  /* Darker, never lighter: white on a lighter gray falls below 4.5:1. */
+  --fill-hover: color-mix(in oklch, var(--viz-gray) 80%, oklch(0 0 none));
 }
 
 .viz-fill[data-tone="rest"] {
@@ -1388,6 +1391,169 @@ li:not([data-result="trashed"]) > .plan-result {
   fill: var(--bg);
 }
 
+/* A solid chip of the gray fill under a hatched tile's label. */
+.viz-chip {
+  fill: var(--viz-gray);
+  pointer-events: none;
+}
+
+/* Weekly columns: one tone, a recessive baseline, labels in text colors. */
+.viz-baseline {
+  stroke: var(--viz-tick);
+  stroke-width: 1px;
+}
+
+.viz-hit {
+  fill: transparent;
+}
+
+.viz-columns .viz-column-value {
+  fill: var(--fg);
+}
+
+.viz-tick-label {
+  fill: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  pointer-events: none;
+}
+
+.viz-title {
+  margin: 0;
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+.viz-details {
+  margin-block-start: 0.6rem;
+  font-size: 0.75rem;
+}
+
+.viz-details summary {
+  inline-size: fit-content;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.viz-table {
+  margin-block-start: 0.5rem;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.viz-table th,
+.viz-table td {
+  padding-block: 0.3rem;
+  padding-inline: 0 1.5rem;
+  border-block-end: 1px solid var(--line);
+  text-align: start;
+  font-weight: 400;
+}
+
+.viz-table thead th {
+  color: var(--faint);
+  font-size: 0.6875rem;
+}
+
+.viz-table td {
+  text-align: end;
+}
+
+/* Ranked bars: a list, each item its name and value over a bar. */
+.viz-ranked {
+  display: grid;
+  gap: 0.75rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.viz-ranked li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.3rem 1rem;
+  font-size: 0.8125rem;
+}
+
+.viz-ranked-name {
+  font-family: var(--font-mono);
+}
+
+.viz-ranked-value {
+  color: var(--muted);
+  text-align: end;
+}
+
+.viz-ranked-track {
+  grid-column: 1 / -1;
+  block-size: 0.75rem;
+}
+
+.viz-ranked-bar {
+  display: block;
+  min-inline-size: 2px;
+  block-size: 100%;
+  border-start-end-radius: 4px;
+  border-end-end-radius: 4px;
+  background: var(--viz-bright);
+}
+
+/* The Freed screen's spans: a figure each, in a row that wraps. */
+.kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: 0.75rem;
+  margin: 0;
+}
+
+.kpi {
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.kpi dd {
+  margin: 0;
+}
+
+.kpi-figure {
+  margin-block-start: 0.4rem;
+  font-family: var(--font-mono);
+  font-size: clamp(1.25rem, 1rem + 0.8vw, 1.6rem);
+  font-weight: 500;
+  letter-spacing: -0.02em;
+}
+
+.kpi-note {
+  margin-block-start: 0.3rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+/* A value that opens another screen, set like the text around it. */
+.link-button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  text-decoration: underline;
+  text-decoration-color: var(--line-strong);
+  text-underline-offset: 0.2em;
+  cursor: pointer;
+}
+
+.link-button:focus-visible {
+  outline: 2px solid var(--fg);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+.link-button:active {
+  opacity: 0.7;
+}
+
 .disks {
   display: grid;
   gap: 1.1rem;
@@ -1469,7 +1635,8 @@ li:not([data-result="trashed"]) > .plan-result {
 
   .viz-plot svg,
   .viz-meter svg,
-  .viz-swatch {
+  .viz-swatch,
+  .viz-ranked-track {
     forced-color-adjust: none;
   }
 
@@ -1507,8 +1674,15 @@ li:not([data-result="trashed"]) > .plan-result {
 
   .viz-tile:hover > .viz-fill,
   .viz-tree:not([data-single]) .viz-repo:hover > .viz-fill,
-  .viz-part:hover > .viz-fill {
+  .viz-part:hover > .viz-fill,
+  .viz-column[data-hover] > .viz-fill {
     fill: var(--fill-hover);
+  }
+
+  .link-button:hover,
+  .viz-details summary:hover {
+    color: var(--fg);
+    text-decoration-color: currentColor;
   }
 
   .viz-tree:not([data-single]) .viz-repo:hover > .viz-frame {

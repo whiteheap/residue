@@ -13,6 +13,7 @@ import type {
   ServiceSave,
   ServiceStatus,
   Settings,
+  StatsDocument,
 } from "./types";
 
 /** Every rejection from a command is a CliError; anything else is wrapped. */
@@ -54,4 +55,5 @@ export const api = {
     call<ServiceSave>("service_install", { roots, dryRun, basis }),
   serviceUninstall: () => call<ServiceChange>("service_uninstall"),
   servicePreview: (roots: string[]) => call<ServicePreview>("service_preview", { roots }),
+  stats: () => call<StatsDocument>("stats"),
 };

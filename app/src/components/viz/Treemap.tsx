@@ -451,6 +451,8 @@ function Tile({
       role="treeitem"
       className="viz-node viz-tile"
       data-node={leaf.id}
+      // Leaving the worktree's checks focuses this tile again (App).
+      data-opener={leaf.kind === "worktree" ? `tile:${leaf.worktree.path}` : undefined}
       data-tone={tone}
       aria-level={2}
       aria-setsize={size}
@@ -459,7 +461,7 @@ function Tile({
       {...props}
     >
       <Mark tone={tone} hatch={hatch} x={x0} y={y0} width={w} height={h} radius={3} />
-      <Labels name={name} value={sized ? value : null} x={x0} y={y0} h={h} />
+      <Labels name={name} value={sized ? value : null} x={x0} y={y0} h={h} chip={tone === "hatched"} />
       <rect className="viz-ring" x={x0 + 1} y={y0 + 1} width={Math.max(0, w - 2)} height={Math.max(0, h - 2)} rx={3} />
     </g>
   );
@@ -505,13 +507,43 @@ function More({
   );
 }
 
-/** A block's name and, under it when there is room, its value. */
-function Labels({ name, value, x, y, h }: { name: string | null; value: string | null; x: number; y: number; h: number }) {
+/**
+ * A block's name and, under it when there is room, its value. On a hatched
+ * block they sit on a solid chip of the gray fill, so no line of the hatch
+ * crosses the text.
+ */
+function Labels({
+  name,
+  value,
+  x,
+  y,
+  h,
+  chip = false,
+}: {
+  name: string | null;
+  value: string | null;
+  x: number;
+  y: number;
+  h: number;
+  chip?: boolean;
+}) {
+  const shown = name && h >= 20 ? name : null;
+  const lines = [shown, value].filter((t): t is string => t !== null);
   return (
     <>
-      {name && h >= 20 ? (
+      {chip && lines.length > 0 ? (
+        <rect
+          className="viz-chip"
+          x={x + 3}
+          y={y + 4}
+          width={Math.max(...lines.map(labelWidth)) + 6}
+          height={value ? 30 : 15}
+          rx={2}
+        />
+      ) : null}
+      {shown ? (
         <text className="viz-label" x={x + 6} y={y + 15}>
-          {name}
+          {shown}
         </text>
       ) : null}
       {value ? (

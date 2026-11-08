@@ -13,7 +13,7 @@ import {
   isPermissionError,
 } from "../components/ui";
 import { baseName, bytes, inside, plural, tilde } from "../lib/format";
-import type { CliError, Repository, ScanDocument, Worktree } from "../lib/types";
+import type { CliError, FreedSum, Repository, ScanDocument, Worktree } from "../lib/types";
 import { documentTime } from "../lib/useCli";
 import { matches, type Filter } from "../lib/viz";
 import { branchLabel, displayPath, sizeOf, summary } from "../lib/worktree";
@@ -41,6 +41,8 @@ export function Worktrees({
   onOpen,
   onRemove,
   onChooseFolders,
+  freed,
+  onFreed,
 }: {
   doc: ScanDocument | undefined;
   error: CliError | undefined;
@@ -58,6 +60,9 @@ export function Worktrees({
   onOpen: (path: string) => void;
   onRemove: (paths: string[]) => void;
   onChooseFolders: () => void;
+  /** What residue freed in the last 7 days and its estimate note; "unavailable" when its stats could not be read, null while they are read. */
+  freed: { week: FreedSum; note: string } | "unavailable" | null;
+  onFreed: () => void;
 }) {
   const now = documentTime(doc?.generated_at) ?? 0;
 
@@ -154,7 +159,7 @@ export function Worktrees({
 
         {doc ? (
           <>
-            <Summary doc={doc} scanning={scanning} />
+            <Summary doc={doc} scanning={scanning} freed={freed} onFreed={onFreed} />
             {doc.errors.length > 0 ? <ScanErrors errors={doc.errors} /> : null}
             {doc.summary.linked_worktrees === 0 ? (
               <Empty
@@ -226,7 +231,17 @@ export function Worktrees({
   );
 }
 
-function Summary({ doc, scanning }: { doc: ScanDocument; scanning: boolean }) {
+function Summary({
+  doc,
+  scanning,
+  freed,
+  onFreed,
+}: {
+  doc: ScanDocument;
+  scanning: boolean;
+  freed: { week: FreedSum; note: string } | "unavailable" | null;
+  onFreed: () => void;
+}) {
   const s = doc.summary;
   const a = doc.activity;
   return (
@@ -245,6 +260,23 @@ function Summary({ doc, scanning }: { doc: ScanDocument; scanning: boolean }) {
         <div>
           <dt>In the trash</dt>
           <dd>{plural(s.trash_entries, "entry", "entries")}</dd>
+        </div>
+        <div>
+          <dt>Freed, last 7 days</dt>
+          <dd>
+            {freed === null ? (
+              "reading…"
+            ) : freed === "unavailable" ? (
+              "unavailable"
+            ) : (
+              // The note says how residue measures sizes; the Freed screen shows it in full.
+              <button type="button" className="link-button" title={freed.note} onClick={onFreed}>
+                {freed.week.worktrees > 0
+                  ? `about ${bytes(freed.week.bytes)}, ${plural(freed.week.worktrees, "worktree")}`
+                  : "nothing"}
+              </button>
+            )}
+          </dd>
         </div>
         <div>
           <dt>Activity check</dt>

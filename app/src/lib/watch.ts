@@ -74,7 +74,7 @@ export function settingLines(settings: WatchSettings, version: string | null): R
     "Keeps a landed worktree for": duration(settings.grace.value),
     "Disk low below": diskLow(settings).below,
     "When low, keeps a worktree changed within": duration(settings.idle.value),
-    "Keeps removal records for": duration(settings.keep_removed.value),
+    "Keeps its removal records for at least": duration(settings.keep_removed.value),
     Fetching:
       fetch.mode === "every"
         ? `about every ${duration(fetch.value)}`

@@ -130,6 +130,13 @@ export interface RemovalRecord {
   /** The command that removed it: `remove`, `sweep`, `watch`. */
   by: string | null;
   removed_at: string | null;
+  /**
+   * The `--keep-removed` the record was written with (`30d`), and in
+   * seconds: no run forgets it before `removed_at` plus that. Null for a
+   * record written before residue kept it.
+   */
+  keep: string | null;
+  keep_seconds: number | null;
   allocated_bytes: number | null;
   reclaimable_bytes: number | null;
   not_kept: NotKept[];
@@ -212,8 +219,59 @@ export interface RemoveDocument {
     entry: RemovalRecord;
   }[];
   errors: string[];
-  /** Records residue could not read or forget; never a reason the run failed. */
+  /** Records residue could not read or forget, or a ledger it could not write; never a reason the run failed. */
   warnings: string[];
+  /** What this run freed and moved, and residue's total from its stats ledger (#38). */
+  stats: RemoveStats;
+}
+
+/** `remove --json` `stats`. The totals are null when residue could not update its ledger (`error`). */
+export interface RemoveStats {
+  freed_bytes: number;
+  freed_worktrees: number;
+  trashed_bytes: number;
+  trashed_worktrees: number;
+  total_freed_bytes: number | null;
+  total_freed_worktrees: number | null;
+  since: string | null;
+  ledger: string | null;
+  error: string | null;
+}
+
+/** Known sizes only: a ledger line without one counts as a worktree and 0 bytes. */
+export interface FreedSum {
+  bytes: number;
+  worktrees: number;
+}
+
+/** The commands residue splits what it freed by; `other` is a record that names none. */
+export type FreedBy = "remove" | "sweep" | "watch" | "other";
+
+export interface Freed extends FreedSum {
+  by: Record<FreedBy, FreedSum>;
+}
+
+/** `residue stats --json`: what residue has freed on this machine, from its ledger (#38). */
+export interface StatsDocument {
+  schema: "residue.stats/v1";
+  version: string;
+  generated_at: string;
+  ledger: string;
+  /** The ledger's first line; null when it is empty. */
+  since: string | null;
+  /** residue's sentence on how sizes are measured, to show where totals appear. */
+  estimate_note: string;
+  freed: { all_time: Freed; last_30_days: Freed; last_7_days: Freed };
+  /** Twelve weeks, oldest first; the last one ends at `generated_at`. */
+  weeks: (Freed & { start: string; end: string })[];
+  repositories: (Freed & { path: string; common_dir: string; last_freed_at: string })[];
+  /** Moved to the trash: not freed until a purge deletes it. */
+  trashed: FreedSum;
+  trash_now: { entries: number; bytes: number; repositories: number };
+  restored: { worktrees: number; from_trash: number; from_removal_records: number };
+  last_freed_at: Record<"all" | FreedBy, string | null>;
+  skipped_lines: number;
+  errors: string[];
 }
 
 export interface Removal {
@@ -279,6 +337,9 @@ export type Restorable = {
       notKept: NotKept[];
       asidePath: string | null;
       incomplete: boolean;
+      /** The `--keep-removed` it was written with, as `RemovalRecord` has it. */
+      keep: string | null;
+      keepSeconds: number | null;
     }
 );
 

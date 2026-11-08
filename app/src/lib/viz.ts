@@ -431,11 +431,19 @@ export interface TrashAge {
   keep: number;
   /** Age over the keep window, at most 1. */
   fraction: number;
-  /** Older than the keep window: the next cleanup in its repository deletes it, leaving a removal record. */
+  /**
+   * Older than the keep window. The next cleanup in its repository deletes
+   * such a trash entry, leaving a removal record; such a record, a later
+   * removal forgets once it is older than that removal's own --keep-removed.
+   */
   eligible: boolean;
 }
 
-/** How far a trash entry is through the keep window; null when residue gave no time. */
+/**
+ * How far an entry is through its keep window: a trash entry through
+ * `--keep-trash`, a removal record through the `--keep-removed` it was
+ * written with. Null when residue gave no time or no window.
+ */
 export function trashAge(at: string | null, nowSeconds: number | null, keepSeconds: number | null): TrashAge | null {
   if (!at || nowSeconds == null || keepSeconds == null || keepSeconds <= 0) return null;
   const t = Date.parse(at);
