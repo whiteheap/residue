@@ -417,7 +417,6 @@ residue is a standalone command, or a login service that runs that command. It d
 | --- | --- |
 | [Claude Code](https://code.claude.com/docs/en/worktrees) | You only want the worktrees that tool created, swept and locked by that tool |
 | [Worktrunk](https://worktrunk.dev) | You want to create, switch, merge, and remove worktrees, and stop processes tied to one |
-| [Agentdisk](https://github.com/laaielichter/Agentdisk) | You want disk use attributed across agent tools, with a quarantine you restore from |
 | residue | You want linked worktrees from any tool removed only when every check passes, with Git doing the delete and a trash on a sweep |
 
 ## Contributing
