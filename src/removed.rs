@@ -21,7 +21,9 @@
 //! `git branch -D` deletes a branch's reflog with the branch, and reflogs
 //! expire. Worktree-private refs and an operation in progress already keep
 //! a worktree from removal (`inspect`), so the reflog is all the Git
-//! directory adds.
+//! directory adds. A reftable repository has no `logs/HEAD` file: Git
+//! reads the commits that reflog names for residue (`reflog_only` says
+//! which, and which it cannot), and there is no copy.
 //!
 //! A removal writes the record and its refs after it moves the worktree
 //! aside and before its check at the new path, which drops them again
@@ -37,7 +39,8 @@
 //! the branch at the recorded HEAD or ahead of it is checked out, a branch
 //! that is gone is recreated there, and a branch that no longer contains
 //! the recorded HEAD keeps its commits while a new branch is made at the
-//! recorded HEAD. The recorded reflog goes back in front of the new one.
+//! recorded HEAD. The recorded reflog goes back in front of the new one;
+//! in a reftable repository, which has none, restore says so.
 //! Ignored entries, such as `node_modules/`, are not restored; the
 //! project's own install makes them again. The record and its refs are
 //! dropped only once the restored worktree holds everything they held.
@@ -81,6 +84,9 @@ const CONFIG: &str = "config.worktree";
 /// A copy of the worktree's HEAD reflog, `logs/HEAD` in its Git directory,
 /// when it had one (Git's files ref backend keeps it there).
 const REFLOG: &str = "HEAD.reflog";
+/// What a restore in a reftable repository says, which has no `logs/HEAD`
+/// to copy or put back.
+const REFTABLE_REFLOG_NOTE: &str = "its HEAD reflog was not put back: in a reftable repository Git adds a reflog entry only as the newest one, so the old entries cannot go back in front of the new one, and `git reflog` there starts at this restore";
 /// An entry with no `info` (the run that made it stopped first) and no ref
 /// is cleared once its directory is this old, in seconds: a run writing
 /// one takes milliseconds, so an hour cannot catch one at work.
@@ -788,16 +794,27 @@ fn write_entry(dir: &Path, files: &[(&str, &[u8])], info: &[u8]) -> Result<(), S
 ///
 /// With no `logs/HEAD` file, as in a reftable repository, where `git
 /// worktree remove` deletes the worktree's reflog all the same, Git reads
-/// that reflog from the worktree at `worktree` instead. Git prints only
-/// each entry's new value, so the old value of its oldest entry, when no
-/// entry names it as new, is not kept there.
+/// that reflog from the worktree at `worktree` instead: each entry's new
+/// value and the oldest entry's old value. Git reads no other old value
+/// on its own, and one after a gap in the middle (an entry expired, or
+/// deleted with `git reflog delete`) names a commit no entry names as
+/// new. So every commit the reflogs Git reads at `worktree` name that the
+/// ones it reads at `main` do not counts too: only the worktree's own
+/// reflog names it. Left out is such an old value that another reflog
+/// also names, a branch's say: that reflog keeps it after the removal,
+/// and a later `git branch -D` can lose it.
 fn reflog_only(reflog: Option<&[u8]>, worktree: &Path, main: &Path) -> Result<Vec<String>, String> {
     let named = match reflog {
         Some(bytes) => reflog_ids(bytes),
         None => {
+            let shared: HashSet<String> = git::reflogs_commits(main)?.into_iter().collect();
+            let own = git::reflogs_commits(worktree)?
+                .into_iter()
+                .filter(|id| !shared.contains(id));
             let mut seen = HashSet::new();
             git::head_reflog_commits(worktree)?
                 .into_iter()
+                .chain(own)
                 .filter(|id| seen.insert(id.clone()))
                 .collect()
         }
@@ -1044,6 +1061,17 @@ pub fn restore(item: &Item, to: Option<&Path>, listed: &[Entry]) -> Result<Resto
                         restored.notes.push(note);
                         keep_record = true;
                     }
+                }
+            }
+            // A reftable repository has no `logs/HEAD` file, so the record
+            // has no copy to put back, and Git offers no way to.
+            if recreated && !item.head_reflog {
+                match git::is_reftable(&restored.path) {
+                    Ok(true) => restored.notes.push(REFTABLE_REFLOG_NOTE.into()),
+                    Ok(false) => {}
+                    Err(e) => restored.notes.push(format!(
+                        "could not tell whether the repository keeps its refs in reftable ({e}), where its HEAD reflog cannot be put back"
+                    )),
                 }
             }
             Some(id.git_dir)

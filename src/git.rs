@@ -88,11 +88,14 @@ fn describe(args: &[&OsStr]) -> String {
     format!("git {}", words.join(" "))
 }
 
+/// What [`first_line`] says for a command that wrote nothing to stderr.
+const NO_ERROR_OUTPUT: &str = "no error output";
+
 fn first_line(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     text.lines()
         .find(|l| !l.trim().is_empty())
-        .unwrap_or("no error output")
+        .unwrap_or(NO_ERROR_OUTPUT)
         .trim()
         .to_string()
 }
@@ -930,19 +933,102 @@ pub fn refs_named(dir: &Path, patterns: &[&str]) -> Result<Vec<(String, String)>
     Ok(refs)
 }
 
-/// The commits the HEAD reflog of the worktree at `dir` names, newest
-/// first, as Git reads them, for a reflog that is no file (reftable): each
-/// entry's new value, in lowercase. A worktree with no HEAD reflog answers
+/// The commits the HEAD reflog of the worktree at `dir` names, as Git
+/// reads them, for a reflog that is no file (reftable), in lowercase: each
+/// entry's new value, newest first, then the old value of the oldest
+/// entry. No entry names that one as new once the entries before it are
+/// gone (expired, or deleted with `git reflog delete`), and Git gives it
+/// as `HEAD@{N}`, N the number of entries. Git reads no other old value,
+/// so one that an entry after a gap in the middle names is not here
+/// (`reflogs_commits` finds those). A worktree with no HEAD reflog answers
 /// with none. A commit Git no longer has is left out (`--ignore-missing`).
 pub fn head_reflog_commits(dir: &Path) -> Result<Vec<String>, String> {
     let out = git(
         dir,
         &["rev-list", "--ignore-missing", "--walk-reflogs", "HEAD"],
     )?;
+    let mut commits: Vec<String> = lines(&out)
+        .into_iter()
+        .map(|l| String::from_utf8_lossy(l).to_ascii_lowercase())
+        .collect();
+    // No line: no HEAD reflog, where every `HEAD@{k}` exits 1.
+    if commits.is_empty() {
+        return Ok(commits);
+    }
+    // rev-list prints a line for each entry whose new value is a commit, so
+    // the oldest entry's index is the number of lines or more. Past the
+    // last commit entry, `HEAD@{k}` is the new value of an entry rev-list
+    // skipped, then the old value of the oldest entry, then nothing:
+    // `rev-parse --verify --quiet` exits 128 and prints nothing, as it does
+    // for a null old value (the entry that created the ref). Some entries
+    // past the last line are all a reflog has; a Git that answers more
+    // stops the removal rather than keep residue asking.
+    const PAST_THE_LAST_LINE: usize = 64;
+    let listed = commits.len();
+    for k in listed..listed + PAST_THE_LAST_LINE {
+        let selector = format!("HEAD@{{{k}}}^{{commit}}");
+        let exit = git_exit(
+            dir,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &selector,
+            ],
+        )?;
+        match exit.code {
+            Some(0) => commits.push(
+                String::from_utf8_lossy(&exit.stdout)
+                    .trim()
+                    .to_ascii_lowercase(),
+            ),
+            // An entry whose new value is no commit Git has.
+            Some(1) => {}
+            Some(128) if exit.stderr == NO_ERROR_OUTPUT => return Ok(commits),
+            _ => {
+                return Err(format!(
+                    "git rev-parse --verify HEAD@{{{k}}} failed: {}",
+                    exit.stderr
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "git rev-parse --verify still answers for HEAD@{{{}}}, {PAST_THE_LAST_LINE} entries past the last one git rev-list --walk-reflogs listed, and residue asks no further",
+        listed + PAST_THE_LAST_LINE - 1
+    ))
+}
+
+/// Every commit the reflogs Git reads in the worktree at `dir` name, as
+/// the old or the new value of an entry, in lowercase: those of the refs
+/// all worktrees share, and the worktree's own (HEAD's, and its private
+/// refs'), never another worktree's. `--single-worktree` must come before
+/// `--reflog`, which reads every worktree's otherwise. A commit Git no
+/// longer has is left out.
+pub fn reflogs_commits(dir: &Path) -> Result<Vec<String>, String> {
+    let out = git(
+        dir,
+        &[
+            "rev-list",
+            "--no-walk",
+            "--ignore-missing",
+            "--single-worktree",
+            "--reflog",
+        ],
+    )?;
     Ok(lines(&out)
         .into_iter()
         .map(|l| String::from_utf8_lossy(l).to_ascii_lowercase())
         .collect())
+}
+
+/// The repository at `dir` keeps its refs in reftable: `git rev-parse
+/// --show-ref-format` (Git 2.45 and later) says so. An earlier Git, which
+/// cannot read reftable, prints the option back instead.
+pub fn is_reftable(dir: &Path) -> Result<bool, String> {
+    let out = git(dir, &["rev-parse", "--show-ref-format"])?;
+    Ok(String::from_utf8_lossy(&out).trim() == "reftable")
 }
 
 /// Those of `commits` that no ref outside `refs/residue/` and no
