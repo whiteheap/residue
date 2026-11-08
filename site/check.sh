@@ -5,8 +5,9 @@
 # 1. site/public holds only the files the site serves; its one subdirectory
 #    is .well-known.
 # 2. The logo, light and dark, the dark chart, the social image and the PNG
-#    icons are byte-identical to docs/assets, their owner. The fonts and their
-#    license are the files of @fontsource/ibm-plex-mono 5.3.0, by SHA-256.
+#    icons are byte-identical to docs/assets, their owner. By SHA-256, the
+#    fonts are the ones site/fonts.sh cuts from @fontsource/ibm-plex-mono
+#    5.3.0, and the license is that package's.
 # 3. Every command on the page and in llms.txt appears verbatim in README.md,
 #    and so does the minimum Git version.
 # 4. Every local path and #fragment the pages link to exists, as a file or as
@@ -35,6 +36,9 @@
 #    changes: every reference to it, in the pages and in style.css, ends in
 #    ?v= and the first 12 hex digits of its SHA-256. No other local reference
 #    has a query, and no page is kept a year.
+# 11. The fonts hold every character the site draws: each character in the
+#    pages, hero.js, style.css and the SVGs that docs/assets/render.sh draws
+#    in these fonts, entities decoded, is one site/fonts.sh cut them to.
 set -u
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -100,9 +104,11 @@ for asset in logo.svg logo-dark.svg how-it-works-dark.svg og.png apple-touch-ico
   fi
 done
 
-# The fonts and their license, from @fontsource/ibm-plex-mono 5.3.0 (npm pack
-# @fontsource/ibm-plex-mono@5.3.0: files/ and LICENSE). To update them, copy
-# the files again and replace these hashes in the same pull request.
+# The fonts and their license. site/fonts.sh cuts the fonts from
+# @fontsource/ibm-plex-mono 5.3.0 to the characters in fonts_cover (rule 11)
+# and prints fonts_cover and the fonts' hashes: write them here in the same
+# pull request. The license is LICENSE in that package.
+fonts_cover=20-7E,A0,B7
 sha256() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | cut -d ' ' -f 1
@@ -112,13 +118,13 @@ sha256() {
 }
 while read -r want file; do
   if [ "$(sha256 "$public/$file")" = "$want" ]; then
-    ok "$file is the @fontsource/ibm-plex-mono 5.3.0 file"
+    ok "$file matches its hash in site/check.sh"
   else
-    fail "$file is not the @fontsource/ibm-plex-mono 5.3.0 file its hash in site/check.sh names"
+    fail "$file does not match its hash in site/check.sh; the fonts come from sh site/fonts.sh, the license from @fontsource/ibm-plex-mono 5.3.0"
   fi
 done <<'FONTS'
-08949f728dc52d528e69b1667d15c89a5686a4ee9a296ff90983985f99c380f7 ibm-plex-mono-latin-400-normal.woff2
-01d285447409c8a588692162439a038b8cbd7871309ee20267b0d2d91c6e8e22 ibm-plex-mono-latin-500-normal.woff2
+7462c637d97517a25f5b1d5982859b1a6f648d4da06d63b79f7345f6fdac0b6a ibm-plex-mono-latin-400-normal.woff2
+e9329f3a72f74710f76bf6dfbefc7d1be3f9fa064a9fe92949b509d026263d6b ibm-plex-mono-latin-500-normal.woff2
 23b0a9d0c6d3f140a0b77e483c5cfa6bba574325ef5cb189ed9f2fec4884533f ibm-plex-mono-OFL.txt
 FONTS
 
@@ -657,6 +663,55 @@ LC_ALL=C sort -u "$scratch/refs" | while read -r name ref; do
   fi
 done | tee "$scratch/versions"
 failures=$((failures + $(grep -c '^FAIL' "$scratch/versions")))
+
+# 11. Characters. The fonts hold only the characters in fonts_cover, so each
+#     character the site may draw in them must be one: every character in
+#     the pages, hero.js, style.css and the SVGs that docs/assets/render.sh
+#     draws in them (it renders the README's images and the social image),
+#     with each HTML entity decoded. Text a browser shows in its own font,
+#     such as the title, is counted too. Tab, line feed and carriage return
+#     draw nothing. A character outside fonts_cover would be drawn in
+#     another font.
+characters='
+  def hex: ascii_downcase | explode | reduce .[] as $c (0; . * 16 + (if $c >= 97 then $c - 87 else $c - 48 end));
+  def tohex: if . < 16 then "0123456789ABCDEF"[.:. + 1] else (. / 16 | floor | tohex) + (. % 16 | tohex) end;
+  def named: {amp: 38, lt: 60, gt: 62, quot: 34, apos: 39, nbsp: 160, middot: 183, copy: 169};
+  ($cover | split(",") | map(split("-") | map(hex) | [.[0], (.[1] // .[0])])) as $ranges
+  | [explode[],
+     (scan("&(#[0-9]+|#[xX][0-9a-fA-F]+|[A-Za-z][A-Za-z0-9]*);") | .[0]
+      | if test("^#[xX]") then .[2:] | hex
+        elif startswith("#") then .[1:] | tonumber
+        else named[.] // "&\(.);" end)]
+  | unique
+  | map(select(. != 9 and . != 10 and . != 13))
+  | (map(select(type == "number" and (. as $c | all($ranges[]; $c < .[0] or $c > .[1])))
+         | . as $c | ($c | tohex | "U+" + "0000"[length:] + .) + " (" + ([$c] | implode) + ")")) as $outside
+  | map(select(type == "string")) as $unknown
+  | [if $outside == [] then empty else ($outside | join(", ")) + ", which the fonts lack: write each in ASCII, or add each to unicodes in site/fonts.sh, run sh site/fonts.sh, and write the lines it prints into site/check.sh" end,
+     if $unknown == [] then empty else ($unknown | join(", ")) + ", an entity this check cannot read: write the character, or its numeric entity" end]
+  | join("; ")'
+# fonts_cover records what site/fonts.sh cut; a change to its unicodes
+# without a run leaves the fonts as they were.
+script_cover=$(sed -n 's/^unicodes=//p' "$root/site/fonts.sh")
+if [ "$script_cover" = "$fonts_cover" ]; then
+  ok "fonts_cover is unicodes in site/fonts.sh"
+else
+  fail "fonts_cover is $fonts_cover and unicodes in site/fonts.sh is $script_cover; run sh site/fonts.sh and write the lines it prints into site/check.sh"
+fi
+if ! command -v jq >/dev/null 2>&1; then
+  fail "jq is not installed; this check needs it to read the characters the fonts must hold"
+else
+  for file in "$public"/*.html "$public/hero.js" "$public/style.css" "$root"/docs/assets/*.svg; do
+    name=${file#"$root"/}
+    if ! outside=$(jq -Rrs --arg cover "$fonts_cover" "$characters" "$file"); then
+      fail "$name: jq could not read it"
+    elif [ -n "$outside" ]; then
+      fail "$name has $outside"
+    else
+      ok "the fonts hold every character in $name"
+    fi
+  done
+fi
 
 if [ "$failures" -eq 0 ]; then
   printf 'site check passed\n'
