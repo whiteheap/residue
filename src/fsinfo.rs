@@ -35,6 +35,8 @@ pub struct Usage {
     pub newest_path: Option<PathBuf>,
     pub unreadable: u64,
     pub first_error: Option<String>,
+    /// Each entry named `.git`, in any case, other than the root's own
+    /// link: another repository or checkout, or files Git does not list.
     pub nested_repos: Vec<PathBuf>,
     pub mount_points: Vec<PathBuf>,
     /// One result per bucket passed to [`measure`], in the same order.
@@ -163,8 +165,15 @@ pub fn measure(
                     continue;
                 }
             };
-            if item.git && dir != root {
-                usage.nested_repos.push(dir.clone());
+            // Any case of `.git`, at any level, as Git skips the name when
+            // `core.ignorecase` is set, which hides the files inside from
+            // `git status` (#102). Only the root's own link, named exactly
+            // `.git`, is not one. A case-sensitive configuration lists a
+            // `.GIT` folder's files, so there this keeps a worktree that
+            // need not be kept: the safe direction. So does the root's link
+            // stored in another case, on a case-insensitive file system.
+            if item.git_name && (dir != root || path.file_name().is_some_and(|n| n != ".git")) {
+                usage.nested_repos.push(path.clone());
             }
             let mut here = place;
             if here.bucket.is_none() {
@@ -370,8 +379,6 @@ impl From<&Metadata> for Stat {
 /// One entry of a directory listing.
 struct Listed {
     path: PathBuf,
-    /// The entry is named `.git`.
-    git: bool,
     /// The entry is named `.git` in any case, as Git matches the name when
     /// `core.ignorecase` is set.
     git_name: bool,
@@ -389,7 +396,6 @@ fn list_std(dir: &Path) -> io::Result<Listing> {
     let mut out = Vec::new();
     for item in fs::read_dir(dir)? {
         out.push(item.map(|item| Listed {
-            git: item.file_name() == ".git",
             git_name: item.file_name().as_bytes().eq_ignore_ascii_case(b".git"),
             path: item.path(),
             stat: item.metadata().map(|meta| Stat::from(&meta)),
@@ -520,7 +526,6 @@ mod bulk {
                     None => fstatat(fd.0, entry.name),
                 };
                 out.push(Ok(Listed {
-                    git: entry.name == b".git",
                     git_name: entry.name.eq_ignore_ascii_case(b".git"),
                     path,
                     stat,
