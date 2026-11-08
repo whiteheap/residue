@@ -499,13 +499,26 @@ pub struct Status {
     /// Each ignored entry as text (for display and rule matching), and as
     /// the exact relative path without a trailing slash (for the size walk).
     pub ignored: Vec<(String, PathBuf)>,
-    /// True when `ignored` comes from `--ignored=matching`, which [`status`]
-    /// takes only when it lists what `--ignored=traditional` lists, plus
-    /// the empty ignored directories traditional mode hides.
+    /// True when `ignored` comes from `--ignored=matching`, apart from the
+    /// entries under `limited`. [`status`] takes that list only where it
+    /// lists what `--ignored=traditional` lists, plus the empty ignored
+    /// directories traditional mode hides.
     pub matching: bool,
+    /// The folders whose ignored entries come from a traditional run
+    /// limited to them, so `ignored` holds just what traditional mode
+    /// prints there.
+    pub limited: Vec<PathBuf>,
     /// What [`hidden_from_status`] returns, when `status` read `git
     /// ls-files -v` for its own check, so the caller need not read it again.
     pub hidden: Option<Result<Vec<String>, String>>,
+}
+
+impl Status {
+    /// Whether `--ignored=traditional` printed the ignored entry at `rel`:
+    /// the whole list came from it, or the entry is in a limited folder.
+    pub fn traditional_listed(&self, rel: &Path) -> bool {
+        !self.matching || self.limited.iter().any(|folder| rel.starts_with(folder))
+    }
 }
 
 /// Staged, modified, untracked and ignored entries, as `git status
@@ -520,19 +533,22 @@ pub struct Status {
 ///
 /// - Git collapses an untracked directory that holds only ignored entries.
 ///   Traditional mode lists the directory, matching mode what is in it. Git
-///   collapses only a directory with no index entry below it, so when the
-///   parent folder of every ignored entry below the top level has one, no
-///   entry is inside a collapsed directory. [`index_scan`] answers that from
-///   the `git ls-files -v` the `index_flags` check reads anyway. When a
-///   folder has none, or the read fails, this runs traditional mode, as
-///   residue always did.
+///   collapses only a directory with no index entry below it, so where the
+///   parent folder of an ignored entry below the top level has one, the
+///   entry is in no collapsed directory. [`index_scan`] answers that from
+///   the `git ls-files -v` the `index_flags` check reads anyway. The
+///   topmost folders with none are listed again by one traditional run
+///   limited to them ([`limited_status`]), and its entries replace matching
+///   mode's there (#120). When the read or that run fails, or the folders
+///   pass [`MAX_LIMITED`] or [`MAX_LIMITED_BYTES`], this runs traditional
+///   mode on the whole worktree, as residue did before.
 /// - Matching mode also lists an ignored directory that holds no file or
 ///   symbolic link, which traditional mode hides. The walk finds those, and
-///   `inspect::drop_unlisted` drops them; it asks [`traditional_status`]
-///   about one it cannot settle.
+///   `inspect::drop_unlisted` drops them outside the limited folders; it
+///   asks [`traditional_ignored_in`] about the ones it cannot settle.
 ///
-/// `matching` says which list this is. A top-level entry needs no check:
-/// Git never collapses the worktree root.
+/// `matching` and `limited` say which list each entry is from. A top-level
+/// entry needs no check: Git never collapses the worktree root.
 pub fn status(dir: &Path) -> Result<Status, String> {
     // A matching run that fails (it can print more than traditional mode,
     // one line per file of a collapsed directory) is answered by the
@@ -540,26 +556,157 @@ pub fn status(dir: &Path) -> Result<Status, String> {
     let Ok(mut status) = status_with(dir, "--ignored=matching") else {
         return traditional_status(dir);
     };
-    let folders = parent_folders(&status.ignored);
-    if !folders.is_empty() {
-        let scan = index_scan(dir, &folders);
-        let agrees = matches!(&scan, Ok(scan) if scan.every_folder_tracked);
-        let hidden = Some(scan.map(|scan| scan.hidden));
-        if !agrees {
-            drop(status);
-            let mut traditional = traditional_status(dir)?;
-            traditional.hidden = hidden;
-            return Ok(traditional);
-        }
-        status.hidden = hidden;
-    }
     status.matching = true;
-    Ok(status)
+    let parents = parent_folders(&status.ignored);
+    if parents.is_empty() {
+        return Ok(status);
+    }
+    let asked: HashSet<Vec<u8>> = parents
+        .iter()
+        .flat_map(|parent| folder_and_ancestors(parent))
+        .map(<[u8]>::to_vec)
+        .collect();
+    let scan = index_scan(dir, &asked);
+    let folders = scan
+        .as_ref()
+        .ok()
+        .map(|scan| topmost_untracked(&parents, &scan.tracked));
+    status.hidden = Some(scan.map(|scan| scan.hidden));
+    // A limited run that fails is answered by the full one, as before.
+    let listed = match &folders {
+        Some(folders) if folders.is_empty() => return Ok(status),
+        Some(folders) if within_limit(folders) => limited_status(dir, folders).ok(),
+        _ => None,
+    };
+    if let (Some(folders), Some(listed)) = (folders, listed) {
+        merge_limited(&mut status, folders, listed);
+        return Ok(status);
+    }
+    let hidden = status.hidden.take();
+    drop(status);
+    let mut traditional = traditional_status(dir)?;
+    traditional.hidden = hidden;
+    Ok(traditional)
 }
 
 /// [`status`] from `git status --ignored=traditional`, always.
 pub fn traditional_status(dir: &Path) -> Result<Status, String> {
     status_with(dir, "--ignored=traditional")
+}
+
+/// What `git status --ignored=traditional` lists of `paths`, relative
+/// paths without a trailing slash, none inside another: one run limited to
+/// them ([`limited_status`]), or, when that fails or they pass the cap,
+/// the whole worktree's list.
+pub fn traditional_ignored_in(
+    dir: &Path,
+    paths: &[&Path],
+) -> Result<Vec<(String, PathBuf)>, String> {
+    let paths: Vec<Vec<u8>> = paths
+        .iter()
+        .map(|p| p.as_os_str().as_bytes().to_vec())
+        .collect();
+    let limited = within_limit(&paths)
+        .then(|| limited_status(dir, &paths).ok())
+        .flatten();
+    match limited {
+        Some(listed) => Ok(listed),
+        None => Ok(traditional_status(dir)?.ignored),
+    }
+}
+
+/// The most folders one limited run takes; past it, [`status`] runs
+/// traditional mode on the whole worktree. Git matches every index entry
+/// and every path it reads against each folder, so the run's CPU grows
+/// with their number. On a worktree of 20,000 tracked files and a
+/// 25,000-file `node_modules/`, the whole traditional run took 0.11 to
+/// 0.14 s, and one limited to 64 such folders 0.02 to 0.04 s, to 256 0.05
+/// to 0.06 s and to 1,024 0.21 to 0.23 s (#120). 64 stays well below the
+/// point where limiting costs more.
+const MAX_LIMITED: usize = 64;
+
+/// The most bytes of folder paths one limited run takes. Each folder is one
+/// argument, and 64 KiB keeps the command line well inside the smallest
+/// `ARG_MAX` residue runs on, 256 KiB on NetBSD and DragonFly, environment
+/// included.
+const MAX_LIMITED_BYTES: usize = 64 << 10;
+
+fn within_limit(folders: &[Vec<u8>]) -> bool {
+    folders.len() <= MAX_LIMITED && folders.iter().map(Vec::len).sum::<usize>() <= MAX_LIMITED_BYTES
+}
+
+/// Pathspec settings from the environment, which would change how Git
+/// reads the folders [`limited_status`] names, or make it refuse
+/// `--literal-pathspecs`.
+const PATHSPEC_ENV: &[&str] = &[
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+    "GIT_LITERAL_PATHSPECS",
+];
+
+/// The ignored entries `git status --ignored=traditional` prints in
+/// `folders` (relative paths without a trailing slash), in one run. Each
+/// folder is read as a literal path, so a name with `*`, `?`, `[` or a
+/// leading `:` means only itself.
+fn limited_status(dir: &Path, folders: &[Vec<u8>]) -> Result<Vec<(String, PathBuf)>, String> {
+    let mut args: Vec<&OsStr> = [
+        "--literal-pathspecs",
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=normal",
+        "--ignored=traditional",
+        "--ignore-submodules=none",
+        "--",
+    ]
+    .iter()
+    .map(OsStr::new)
+    .collect();
+    args.extend(folders.iter().map(|folder| OsStr::from_bytes(folder)));
+    let build = |program: &OsStr| {
+        let mut cmd = command(program, dir);
+        for var in PATHSPEC_ENV {
+            cmd.env_remove(var);
+        }
+        cmd
+    };
+    let exit = exec_command(&build, &args, QUERY_TIMEOUT)?;
+    if !exit.success {
+        return Err(format!("{} failed: {}", describe(&args), exit.stderr));
+    }
+    Ok(parse_status(&exit.stdout)?.ignored)
+}
+
+/// The topmost folder above each of `parents` that holds no index entry,
+/// once each and sorted, given the folders that hold one. These are the
+/// folders Git can collapse; none is inside another.
+fn topmost_untracked(parents: &HashSet<Vec<u8>>, tracked: &HashSet<Vec<u8>>) -> Vec<Vec<u8>> {
+    let folders: std::collections::BTreeSet<&[u8]> = parents
+        .iter()
+        .filter_map(|parent| folder_and_ancestors(parent).find(|f| !tracked.contains(*f)))
+        .collect();
+    folders.into_iter().map(<[u8]>::to_vec).collect()
+}
+
+/// Replace the ignored entries of `status` in `folders` with `listed`, the
+/// limited run's, and keep Git's order: by the path as printed, a folder
+/// with its trailing slash.
+fn merge_limited(status: &mut Status, folders: Vec<Vec<u8>>, listed: Vec<(String, PathBuf)>) {
+    let folders: Vec<PathBuf> = folders.iter().map(|f| path_from(f)).collect();
+    let inside = |rel: &Path| folders.iter().any(|folder| rel.starts_with(folder));
+    status.ignored.retain(|(_, rel)| !inside(rel));
+    status
+        .ignored
+        .extend(listed.into_iter().filter(|(_, rel)| inside(rel)));
+    status.ignored.sort_by_cached_key(|(text, rel)| {
+        let mut printed = rel.as_os_str().as_bytes().to_vec();
+        if text.ends_with('/') {
+            printed.push(b'/');
+        }
+        printed
+    });
+    status.limited = folders;
 }
 
 /// The parent folder of each ignored entry below the top level, once.
@@ -602,6 +749,11 @@ fn status_with(dir: &Path, ignored: &str) -> Result<Status, String> {
             "--ignore-submodules=none",
         ],
     )?;
+    parse_status(&out)
+}
+
+/// The records of `git status --porcelain=v1 -z`.
+fn parse_status(out: &[u8]) -> Result<Status, String> {
     let mut status = Status::default();
     let mut fields = out.split(|b| *b == 0);
     while let Some(record) = fields.next() {
@@ -822,13 +974,13 @@ pub fn hidden_from_status(dir: &Path) -> Result<Vec<String>, String> {
 struct IndexScan {
     /// The entries [`hidden_from_status`] returns.
     hidden: Vec<String>,
-    /// Every folder asked about has an index entry below it.
-    every_folder_tracked: bool,
+    /// The folders asked about that have an index entry below them.
+    tracked: HashSet<Vec<u8>>,
 }
 
 /// Read the index once for [`hidden_from_status`] and for [`status`]: the
-/// entries that hide edits, and whether each of `folders` (relative paths
-/// without a trailing slash) has an index entry below it, as Git's
+/// entries that hide edits, and which of `folders` (relative paths without
+/// a trailing slash) have an index entry below them, as Git's
 /// `directory_exists_in_index` asks before it collapses a directory.
 fn index_scan(dir: &Path, folders: &HashSet<Vec<u8>>) -> Result<IndexScan, String> {
     // Only the hidden records and the first record found below each folder
@@ -868,13 +1020,14 @@ fn index_scan(dir: &Path, folders: &HashSet<Vec<u8>>) -> Result<IndexScan, Strin
             hidden.push(String::from_utf8_lossy(&record[2..]).into_owned());
         }
         if let Some(parent) = index_path(record).and_then(parent_of) {
-            tracked.extend(folder_and_ancestors(parent).filter(|f| folders.contains(*f)));
+            tracked.extend(
+                folder_and_ancestors(parent)
+                    .filter(|f| folders.contains(*f))
+                    .map(<[u8]>::to_vec),
+            );
         }
     }
-    Ok(IndexScan {
-        hidden,
-        every_folder_tracked: tracked.len() == folders.len(),
-    })
+    Ok(IndexScan { hidden, tracked })
 }
 
 /// The path of an `ls-files -v` record, after its tag and a space.
@@ -1414,4 +1567,104 @@ pub fn independent(dir: &Path, commits: &[String]) -> Result<Vec<String>, String
         .into_iter()
         .map(|l| String::from_utf8_lossy(l).into_owned())
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    //! How [`status`] joins a limited traditional run to the matching list,
+    //! on synthetic lists only: which folders it limits the run to, the
+    //! merged list's order, which entries count as traditional mode's, and
+    //! the cap. What Git prints in each layout is checked against real Git
+    //! by `scripts/contract-check.sh` (section 13).
+
+    use super::{
+        MAX_LIMITED, MAX_LIMITED_BYTES, Status, merge_limited, topmost_untracked, within_limit,
+    };
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+
+    fn set(items: &[&str]) -> HashSet<Vec<u8>> {
+        items.iter().map(|s| s.as_bytes().to_vec()).collect()
+    }
+
+    fn entry(text: &str) -> (String, PathBuf) {
+        (text.to_string(), PathBuf::from(text.trim_end_matches('/')))
+    }
+
+    fn texts(status: &Status) -> Vec<&str> {
+        status.ignored.iter().map(|(t, _)| t.as_str()).collect()
+    }
+
+    #[test]
+    fn limits_the_run_to_the_topmost_untracked_folders() {
+        // a/ and t/u/ hold index entries; a/b/, x/ and everything under
+        // them hold none. a/b/c and a/b/d share a/b; t/u needs no run.
+        let parents = set(&["a/b/c", "a/b/d", "a/b", "x/y/z", "t/u"]);
+        let tracked = set(&["a", "t", "t/u"]);
+        let folders = topmost_untracked(&parents, &tracked);
+        assert_eq!(folders, vec![b"a/b".to_vec(), b"x".to_vec()]);
+    }
+
+    #[test]
+    fn no_folder_when_every_parent_is_tracked() {
+        let parents = set(&["src", "src/new"]);
+        let tracked = set(&["src", "src/new"]);
+        assert!(topmost_untracked(&parents, &tracked).is_empty());
+    }
+
+    #[test]
+    fn merged_list_replaces_the_folder_and_keeps_git_order() {
+        let mut status = Status {
+            ignored: [
+                "a-b.log",
+                "a.log",
+                "a/x/one.log",
+                "a/y.log",
+                "a0.log",
+                "secrets/",
+            ]
+            .into_iter()
+            .map(entry)
+            .collect(),
+            matching: true,
+            ..Status::default()
+        };
+        // The limited run's list, with one entry outside its folder that
+        // must not be taken twice.
+        let listed = vec![entry("a/"), entry("a.log")];
+        merge_limited(&mut status, vec![b"a".to_vec()], listed);
+        // Git sorts by the path as printed: `-` < `.` < `/` < `0`. Sorting
+        // by the path without its slash would put `a/` first.
+        assert_eq!(
+            texts(&status),
+            ["a-b.log", "a.log", "a/", "a0.log", "secrets/"]
+        );
+        assert_eq!(status.limited, vec![PathBuf::from("a")]);
+    }
+
+    #[test]
+    fn entries_in_a_limited_folder_are_traditional_modes() {
+        let status = Status {
+            matching: true,
+            limited: vec![PathBuf::from("logs"), PathBuf::from("app/[slug]")],
+            ..Status::default()
+        };
+        assert!(status.traditional_listed(Path::new("logs")));
+        assert!(status.traditional_listed(Path::new("logs/old/a.log")));
+        assert!(status.traditional_listed(Path::new("app/[slug]")));
+        assert!(!status.traditional_listed(Path::new("logsx/a.log")));
+        assert!(!status.traditional_listed(Path::new("app/s")));
+        assert!(!status.traditional_listed(Path::new("secrets")));
+        let traditional = Status::default();
+        assert!(traditional.traditional_listed(Path::new("secrets")));
+    }
+
+    #[test]
+    fn past_the_cap_the_whole_run_is_used() {
+        let folders = |n: usize, len: usize| vec![vec![b'f'; len]; n];
+        assert!(within_limit(&folders(MAX_LIMITED, 10)));
+        assert!(!within_limit(&folders(MAX_LIMITED + 1, 10)));
+        assert!(within_limit(&folders(1, MAX_LIMITED_BYTES)));
+        assert!(!within_limit(&folders(2, MAX_LIMITED_BYTES / 2 + 1)));
+    }
 }
