@@ -125,7 +125,31 @@ fn install(args: &[OsString]) -> u8 {
             "The service it replaced only logged what it would remove (--dry-run). This one removes."
         );
     }
+    if let Some(old) = replaced.as_ref().and_then(keep_removed) {
+        if code == 0 && old.seconds != opts.keep_removed.seconds {
+            let old = output::clean(&old.text);
+            println!(
+                "The service it replaced kept removal records {old} (--keep-removed). This one keeps new ones {}; records already written keep their own. Pass --keep-removed {old} to keep the old value.",
+                output::clean(&opts.keep_removed.text)
+            );
+        }
+    }
     code
+}
+
+/// The `--keep-removed` an installed service runs with: the default when
+/// it names none (a service installed before `watch` took it). `None` when
+/// it does not run `watch` or its value does not parse.
+fn keep_removed(installed: &Installed) -> Option<crate::cli::Span> {
+    if installed.program.get(1).map(String::as_str) != Some("watch") {
+        return None;
+    }
+    let value = watch::option_in(installed.program.get(2..)?, "--keep-removed");
+    crate::cli::Span::parse(
+        "--keep-removed",
+        value.as_deref().unwrap_or(crate::cli::DEFAULT_KEEP_REMOVED),
+    )
+    .ok()
 }
 
 /// The ROOTs a user named for the installed service, when `service install`
@@ -165,7 +189,8 @@ pub struct Installed {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Installed {
-    /// The `runs:` and `watches:` lines of `service status`.
+    /// The `runs:`, `watches:` and `removal records:` lines of `service
+    /// status`.
     fn print(&self) {
         let Some((exe, args)) = self.program.split_first() else {
             return;
@@ -184,6 +209,14 @@ impl Installed {
                 } else {
                     ""
                 }
+            );
+            // A service installed before `watch` took --keep-removed runs
+            // its removals with the default.
+            let keep = watch::option_in(&args[1..], "--keep-removed");
+            println!(
+                "removal records: kept {} (--keep-removed{})",
+                output::clean(keep.as_deref().unwrap_or(crate::cli::DEFAULT_KEEP_REMOVED)),
+                if keep.is_some() { "" } else { ", the default" }
             );
         }
     }

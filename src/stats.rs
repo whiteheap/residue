@@ -1479,6 +1479,7 @@ mod tests {
                 reason: "watch_landed".into(),
                 by: Some("watch".into()),
                 removed: removed_at,
+                keep: None,
                 allocated: Some(4096),
                 reclaimable: Some(2048),
                 gone: Vec::new(),

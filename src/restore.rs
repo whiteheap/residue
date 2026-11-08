@@ -648,7 +648,7 @@ fn list_text(found: &Found, started: i64, places: &Places) -> String {
     }
     if !found.trash.is_empty() || !found.removed.is_empty() {
         out.push_str(&style.dim(
-            "\nput one back: residue restore NAME  ·  a remove run purges trash entries older than --keep-trash (default 7d) and forgets removal records older than --keep-removed (default 30d)\n",
+            "\nput one back: residue restore NAME  ·  a remove run purges trash entries older than --keep-trash (default 7d) and forgets a removal record only once it is older than the --keep-removed it was written with (default 30d) and the run's own\n",
         ));
     }
     out
