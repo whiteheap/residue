@@ -51,11 +51,17 @@ cp -R "$src" "$work/$folder"
 git -C "$work" add --all --force -- "$folder"
 tree=$(git -C "$work" write-tree)
 
-# Nothing outside FOLDER changed, and FOLDER holds exactly DIR's files.
+# Nothing outside FOLDER changed, and FOLDER holds exactly DIR's files, byte
+# for byte: a .gitattributes there, such as an LFS or line-ending rule,
+# must not change one.
 git -C "$work" diff --quiet "$old" "$tree" -- ":(exclude)$folder" ||
   fail "the commit would change files outside $folder/: $(git -C "$work" diff --name-only "$old" "$tree" -- ":(exclude)$folder" | tr '\n' ' ')"
-want=$(cd "$src" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)
-have=$(git -C "$work" -c core.quotePath=false ls-tree -r --name-only "$tree" -- "$folder" | sed "s|^$folder/||" | LC_ALL=C sort)
+files=$(cd "$src" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)
+want=$(while IFS= read -r file; do
+  printf '%s %s\n' "$(git -C "$work" hash-object --no-filters -- "$src/$file")" "$file"
+done <<< "$files")
+have=$(git -C "$work" -c core.quotePath=false ls-tree -r --format='%(objectname) %(path)' "$tree" -- "$folder" |
+  sed "s| $folder/| |" | LC_ALL=C sort -k 2)
 [ "$want" = "$have" ] || fail "the commit's $folder/ does not hold exactly the files in $src"
 
 new=$(git -C "$work" commit-tree "$tree" -m "$message")
