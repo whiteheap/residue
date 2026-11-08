@@ -39,6 +39,8 @@
 # 11. The fonts hold every character the site draws: each character in the
 #    pages, hero.js, style.css and the SVGs that docs/assets/render.sh draws
 #    in these fonts, entities decoded, is one site/fonts.sh cut them to.
+# 12. Each text color in style.css reaches 4.5:1 on each background it is
+#    drawn on, as a browser paints it: rounded to 8-bit sRGB.
 set -u
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -711,6 +713,45 @@ else
       ok "the fonts hold every character in $name"
     fi
   done
+fi
+
+# 12. Contrast. A browser paints each oklch() color in 8-bit sRGB, and
+#     Lighthouse 12.8.2, the version PageSpeed Insights runs, measures what
+#     it paints: --faint at oklch(0.56 0 none) was 4.51:1 at full precision
+#     and painted #747474, 4.49:1, which failed (#131). This computes each
+#     pair below the same way, for the grays the site uses: OKLab L cubed is
+#     the linear sRGB value, rounded to 8 bits. A rule that draws text in
+#     another color, or on another background, adds its pair here.
+contrast_pairs='fg:bg muted:bg faint:bg fg:surface muted:surface faint-on-surface:surface fg:tint'
+contrast='
+  def channel: if . <= 0.0031308 then 12.92 * . else 1.055 * pow(.; 1 / 2.4) - 0.055 end;
+  def linear: if . <= 0.04045 then . / 12.92 else pow((. + 0.055) / 1.055; 2.4) end;
+  def painted: pow(.; 3) | channel | . * 255 | round;
+  def hex: "#" + ([(. / 16 | floor), . % 16] | map("0123456789abcdef"[.:. + 1]) | add) * 3;
+  (reduce scan("--([a-z][a-z-]*): oklch\\(([0-9.]+) 0 none\\);") as $m ({}; .[$m[0]] //= ($m[1] | tonumber))) as $gray
+  | $pairs | split(" ")[] | split(":") as [$text, $back]
+  | if $gray[$text] == null or $gray[$back] == null then
+      "fail|--\(if $gray[$text] == null then $text else $back end) is not an oklch() gray this check can read: work out the pair by hand and change rule 12"
+    else
+      ($gray[$text] | painted) as $t | ($gray[$back] | painted) as $b
+      | ([$t, $b] | map(. / 255 | linear + 0.05) | max / min) as $ratio
+      | (if $ratio >= 4.5 then "ok" else "fail" end) + "|--\($text) on --\($back) paints \($t | hex) on \($b | hex), \($ratio * 100 | floor / 100):1"
+        + (if $ratio >= 4.5 then "" else ", under 4.5:1" end)
+    end'
+if ! command -v jq >/dev/null 2>&1; then
+  fail "jq is not installed; this check needs it to compute contrast"
+elif ! pairs=$(jq -Rrs --arg pairs "$contrast_pairs" "$contrast" "$public/style.css"); then
+  fail "site/public/style.css: jq could not compute its contrast"
+else
+  while IFS='|' read -r verdict pair; do
+    if [ "$verdict" = ok ]; then
+      ok "$pair"
+    else
+      fail "$pair"
+    fi
+  done <<EOF
+$pairs
+EOF
 fi
 
 if [ "$failures" -eq 0 ]; then
