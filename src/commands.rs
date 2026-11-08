@@ -41,9 +41,7 @@ const ENVIRONMENT_SOURCES: &str = "git -c, GIT_CONFIG_COUNT, GIT_CONFIG_PARAMETE
 /// learns why it had no effect and what to use instead.
 fn note_ignored_environment(ignored: &Result<Vec<String>, String>) {
     let instead = format!(
-        "residue reads rules only from Git config files, the residue config file and --regenerable. \
-         Pass --regenerable RULE for one run, or run `git config --add {GIT_CONFIG_KEY} RULE` \
-         in the repository to keep the rule"
+        "instead, pass --regenerable RULE, or keep it with `git config --add {GIT_CONFIG_KEY} RULE`"
     );
     match ignored {
         Ok(values) if values.is_empty() => {}
@@ -60,7 +58,7 @@ fn note_ignored_environment(ignored: &Result<Vec<String>, String>) {
                 "residue: note: could not check the environment ({ENVIRONMENT_SOURCES}) for {GIT_CONFIG_KEY}: {}",
                 clean(e)
             );
-            eprintln!("residue: note: any value set there is ignored. {instead}");
+            eprintln!("residue: note: any value set there is ignored; {instead}");
         }
     }
 }
@@ -279,7 +277,7 @@ pub fn scan(options: &Options) -> u8 {
             out.push_str(&format!(
                 "  {}\n",
                 style.dim(&format!(
-                    "trash: {} entr{} · {} · list or restore: residue restore · a remove run purges entries older than --keep-trash",
+                    "trash: {} entr{} · {} · residue restore lists them · purged after --keep-trash",
                     g.trash.len(),
                     if g.trash.len() == 1 { "y" } else { "ies" },
                     output::bytes(bytes)
@@ -291,7 +289,7 @@ pub fn scan(options: &Options) -> u8 {
             out.push_str(&format!(
                 "  {}\n",
                 style.dim(&format!(
-                    "removed: {restorable} restorable · list or restore: residue restore · a remove run forgets a record once it is older than its --keep-removed and the run's"
+                    "removed: {restorable} restorable · residue restore lists them · kept at least --keep-removed"
                 ))
             ));
         }
@@ -523,15 +521,25 @@ pub fn explain_text(r: &Report, repo: &Repo, places: &Places, style: &Style) -> 
         .filter(|c| c.status == inspect::Status::Unknown)
         .count();
     let verdict = match r.verdict {
-        Verdict::Candidate => "every check passed. `residue remove` deletes the directory with `git worktree remove`; the branch and its commits stay.".to_string(),
+        Verdict::Candidate => {
+            "every check passed. Removal keeps the branch and its commits.".to_string()
+        }
         Verdict::Keep => format!(
             "{} block{} removal.",
-            if blockers == 1 { "1 check".to_string() } else { format!("{blockers} checks") },
+            if blockers == 1 {
+                "1 check".to_string()
+            } else {
+                format!("{blockers} checks")
+            },
             if blockers == 1 { "s" } else { "" }
         ),
         Verdict::Unknown => format!(
             "residue could not establish {} and keeps the worktree.",
-            if unknowns == 1 { "1 check".to_string() } else { format!("{unknowns} checks") }
+            if unknowns == 1 {
+                "1 check".to_string()
+            } else {
+                format!("{unknowns} checks")
+            }
         ),
         Verdict::Stale => format!(
             "{}. Only Git metadata remains; `git worktree prune` clears it.",
@@ -566,7 +574,7 @@ pub fn explain_text(r: &Report, repo: &Repo, places: &Places, style: &Style) -> 
         "local-only commits",
         match &r.local_commits {
             Ok(Some(n)) => {
-                format!("{n} (compared with local remote-tracking refs, as of the last fetch)")
+                format!("{n} (as of the last fetch)")
             }
             Ok(None) => "unknown: the repository has no remote-tracking refs".into(),
             Err(e) => format!("unknown: {}", clean(e)),
@@ -603,7 +611,7 @@ pub fn explain_text(r: &Report, repo: &Repo, places: &Places, style: &Style) -> 
             &mut out,
             "restored",
             format!(
-                "{}from {}; residue watch never removes it again because its work landed",
+                "{}from {}; never removed again because its branch landed",
                 m.at.map(|t| format!("{} ({}), ", output::date(t), output::age(output::now() - t)))
                     .unwrap_or_default(),
                 clean(&m.from)
@@ -621,7 +629,7 @@ pub fn explain_text(r: &Report, repo: &Repo, places: &Places, style: &Style) -> 
         fact(
             &mut out,
             "",
-            style.dim("reclaimable excludes files hard-linked from outside; copy-on-write clones are not detected"),
+            style.dim("reclaimable leaves out hard links from outside; clones are not detected"),
         );
     }
     if !r.ignored.is_empty() {

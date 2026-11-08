@@ -10,19 +10,18 @@ pub const HELP: &str = "\
 residue service: run `residue watch` in the background, from login.
 
 Usage:
-  residue service install [WATCH OPTIONS] [ROOT...]
-  residue service status
-  residue service uninstall
+  residue service install [OPTIONS] [ROOT...]  Install or replace it; start it
+  residue service status                       Show what it runs, and its log
+  residue service uninstall                    Stop it and remove it
 
-install writes a launchd agent (macOS) or a systemd user service (Linux)
-that runs `residue watch` with these options and roots, starts it now, and
-starts it at every login. Without a ROOT it uses the usual code folders
-that exist in your home folder (`residue watch --help` lists them) and
-writes them into the service, so it watches the same folders on every
-start; install again to pick up a new one. Running install again replaces
-it. Try it first with --dry-run: the service then logs what it would
-remove. status shows what it runs and the last lines of its log.
-See `residue watch --help` for the options.
+Examples:
+  residue service install --dry-run   log what it would remove; remove nothing
+  residue service install ~/src       watch ~/src
+
+Runs as:   a launchd agent (macOS) or a systemd user service (Linux)
+Folders:   without a ROOT, the usual code folders that exist now; install
+           again to add a new one
+Options:   residue watch --help
 ";
 
 /// The launchd label on macOS.
@@ -80,7 +79,7 @@ fn install(args: &[OsString]) -> u8 {
     }
     if let Some(file) = homebrew_service() {
         eprintln!(
-            "residue service install: Homebrew already runs residue watch as a service ({}), and only one watch runs per user. Keep that one, or stop it first: brew services stop residue",
+            "residue service install: Homebrew already runs residue watch ({}), and only one can run. Keep it, or stop it first: brew services stop residue",
             output::clean(&file.to_string_lossy())
         );
         return 1;
@@ -129,9 +128,10 @@ fn install(args: &[OsString]) -> u8 {
         if code == 0 && old.seconds != opts.keep_removed.seconds {
             let old = output::clean(&old.text);
             println!(
-                "The service it replaced kept removal records {old} (--keep-removed). This one keeps new ones {}; records already written keep their own. Pass --keep-removed {old} to keep the old value.",
+                "removal records: new ones kept {} (was {old}); written ones keep their own",
                 output::clean(&opts.keep_removed.text)
             );
+            println!("to keep {old}: residue service install --keep-removed {old}");
         }
     }
     code
@@ -205,7 +205,7 @@ impl Installed {
                 "watches: {}{}",
                 output::clean(&roots.join(", ")),
                 if self.default_roots {
-                    " (the code folders in your home folder at install; install again to pick up a new one)"
+                    " (the code folders at install; install again to add new ones)"
                 } else {
                     ""
                 }

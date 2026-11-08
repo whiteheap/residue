@@ -993,7 +993,7 @@ if [ -z "$partial_probe" ]; then
     (cd "$HOME" && "$bin" restore --json) >"$work/$name.list" 2>"$work/$name.list-err"
     in_dir "$HOME" run restore --json w
     if ! jq -e --arg src "$home/src/app/" '(.removed | length) == 1 and (.removed[0].original_path | startswith($src))' "$work/$name.list" >/dev/null; then fail "the list from the home folder: $(head -c 2000 "$work/$name.list")"
-    elif ! grep -qF "residue: note: listed the repositories in the usual code folders in your home folder (src); residue does not search the rest of your home folder" "$work/$name.list-err"; then fail "the list does not say where it looked: $(cat "$work/$name.list-err")"
+    elif ! grep -qF "residue: note: listed only the usual code folders in your home folder (src); for another repository, run residue restore inside it" "$work/$name.list-err"; then fail "the list does not say where it looked: $(cat "$work/$name.list-err")"
     elif [ "$status" != 0 ]; then fail "restore w from the home folder: exit $status, want 0"
     elif ! restore_ok removed checked_out_branch; then fail "stdout is not one restore document with checkout checked_out_branch"
     elif [ "$(jq -r .restored "$out")" != "$home/src/app/.worktrees/w" ]; then fail "restored $(jq -r .restored "$out"), want $home/src/app/.worktrees/w"
@@ -1003,7 +1003,7 @@ if [ -z "$partial_probe" ]; then
         repo=$docs w_sha=$docs_sha
         if [ "$status" != 1 ]; then fail "restore w from the home folder, with only ~/Documents holding one: exit $status, want 1"
         elif [ -s "$out" ]; then fail "stdout is not empty"
-        elif ! grep -qF "residue: nothing named w in the trash or the removal records of the repositories in the usual code folders in your home folder (src), and residue does not search the rest of your home folder; run residue restore inside its repository, or pass the entry's path it lists there" "$err"; then fail "the message does not name where it looked"
+        elif ! grep -qF "residue: nothing named w in the usual code folders in your home folder (src); run residue restore inside its repository, or pass the entry's path" "$err"; then fail "the message does not name where it looked"
         elif [ "$(records)" != "1 records, 1 refs" ]; then fail "$docs has $(records), want 1 records, 1 refs"
         else
             in_dir "$docs" run restore --json w
@@ -1091,7 +1091,7 @@ elif [ -s "$err" ]; then fail "stderr is not empty"
 else
     run stats
     if [ "$status" != 0 ]; then fail "text: exit $status, want 0"
-    elif ! grep -q "^residue has not counted any freed space on this machine yet\. It counts what it frees from version 0\.0\.8 on\.$" "$out"; then fail "text: no 'has not counted any freed space' line"
+    elif ! grep -q "^residue has not counted any freed space yet\. It counts from version 0\.0\.8 on\.$" "$out"; then fail "text: no 'has not counted any freed space' line"
     elif [ -e "$ledger" ]; then fail "reading the stats created the ledger"
     else ok; fi
 fi
@@ -1188,7 +1188,7 @@ if [ -z "$partial_probe" ]; then
     run scan "$repo"
     if [ "$first" != 0 ] || [ "$status" != 0 ]; then fail "scan: exit $first and $status, want 0"
     elif [ -s "$err" ]; then fail "stderr is not empty"
-    elif ! grep -q "^residue has freed about .* on this machine since [0-9-]*, from 1 worktree; about .* in the last 7 days · residue stats\$" <<<"$scan_tail"; then fail "scan does not end with the totals: $scan_tail"
+    elif ! grep -q "^freed about .* from 1 worktree since [0-9-]*; .* in the last 7 days · residue stats\$" <<<"$scan_tail"; then fail "scan does not end with the totals: $scan_tail"
     elif ! ledger_lines | jq -e -s 'length == 1 and (.[0] | .event == "freed" and .seeded == true and .by == "remove" and .reason == "remove" and .bytes > 0)' >/dev/null; then fail "the ledger: $(cat "$ledger" 2>/dev/null)"
     elif ! stats_has '.freed.all_time.worktrees == 1'; then fail "residue stats: $(stats_show)"
     else
@@ -1270,7 +1270,7 @@ if [ -z "$partial_probe" ]; then
     run remove --yes "$wt"
     if [ "$status" != 0 ]; then fail "exit $status, want 0"
     elif grep -q "freed" "$work/$name.preview"; then fail "a run that removed nothing printed a freed line"
-    elif ! tail -n 1 "$out" | grep -q -E '^freed about [0-9.]+ [KMG]?B \(residue has freed about [0-9.]+ [KMG]?B on this machine since [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\)$'; then fail "the last line is not the freed line: $(tail -n 1 "$out")"
+    elif ! tail -n 1 "$out" | grep -q -E '^freed about [0-9.]+ [KMG]?B \(about [0-9.]+ [KMG]?B on this machine since [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\)$'; then fail "the last line is not the freed line: $(tail -n 1 "$out")"
     elif [ "$(ledger_lines | wc -l | tr -d ' ')" != 1 ]; then fail "the ledger has $(ledger_lines | wc -l | tr -d ' ') lines, want 1"
     else
         run stats

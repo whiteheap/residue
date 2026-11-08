@@ -119,9 +119,9 @@ fetch_case() {
 
   # --no-fetch: the local refs still have origin/landed, so nothing landed.
   HOME="$H" "$residue" watch --once --no-fetch --grace 1m 2> "$S/log" || fail "7: the --no-fetch run failed"
-  grep -q "residue watch: watching ~/src (.*the usual code folders in your home folder" "$S/log" \
+  grep -q "residue watch: watching ~/src (.*the usual code folders; name ROOTs to change" "$S/log" \
     || fail "7: watch without a ROOT did not log ~/src as the usual code folders"
-  grep -q "Does not fetch (--no-fetch)" "$S/log" || fail "7: --no-fetch was not logged"
+  grep -q "fetch: off (--no-fetch)" "$S/log" || fail "7: --no-fetch was not logged"
   ! grep -q -E "fetched |removed " "$S/log" || fail "7: --no-fetch fetched or removed"
   git -C "$H/src/app7" rev-parse -q --verify refs/remotes/origin/landed > /dev/null || fail "7: --no-fetch changed the refs"
 
@@ -129,7 +129,7 @@ fetch_case() {
   # fails: logged, its refs as they were, nothing removed for it.
   HOME="$H" "$residue" watch --once --grace 1m 2> "$S/log" || fail "7: the fetching run failed"
   grep -q "fetched ~/src/app7: origin/landed is gone from the remote" "$S/log" || fail "7: no line for the pruned origin/landed"
-  grep -q "fetch of origin in ~/src/far failed, so its remote-tracking refs stay as they were" "$S/log" \
+  grep -q "fetch of origin in ~/src/far failed; its refs stay as they were" "$S/log" \
     || fail "7: the failed fetch was not logged"
   ! git -C "$H/src/app7" rev-parse -q --verify refs/remotes/origin/landed > /dev/null || fail "7: origin/landed was not pruned"
   git -C "$H/src/app7" rev-parse -q --verify refs/remotes/origin/stays > /dev/null || fail "7: origin/stays is gone"
@@ -143,7 +143,7 @@ fetch_case() {
     ! grep -q "removed " "$S/log" || fail "7: removed a worktree with a partial probe"
     [ -d "$H/src/app7/.worktrees/landed" ] || fail "7: landed is gone with a partial probe"
   else
-    grep -q "removed ~/src/app7/.worktrees/landed (.*): its upstream branch origin/landed was deleted" "$S/log" \
+    grep -q "removed ~/src/app7/.worktrees/landed (.*): origin/landed was deleted" "$S/log" \
       || fail "7: landed was not removed after watch's fetch"
     [ ! -e "$H/src/app7/.worktrees/landed" ] || fail "7: landed still exists"
   fi
@@ -182,7 +182,7 @@ if [ -n "$partial_probe" ]; then
   "$residue" watch --once --grace 1m "$S" 2> "$S/log" || fail "--once failed"
   ! grep -q "removed " "$S/log" || fail "--once removed a worktree"
   "$residue" watch --once --min-free 99.9 --idle 1m "$S" 2> "$S/log" || fail "pressure run failed"
-  grep -q "no worktree on it is a candidate unchanged for 1m" "$S/log" || fail "the pressure run did not say no worktree is a candidate"
+  grep -q "and no candidate unchanged for 1m" "$S/log" || fail "the pressure run did not say no worktree is a candidate"
   ! grep -q "removed " "$S/log" || fail "the pressure run removed a worktree"
   for name in fix wip local; do
     [ -d ".worktrees/$name" ] || fail "$name is gone"
@@ -210,7 +210,7 @@ grep -q "removed .*worktrees/fix" "$S/log" || fail "fix was not removed"
 [ ! -e .worktrees/fix ] || fail "fix still exists"
 [ -d .worktrees/wip ] && [ -d .worktrees/local ] || fail "removed more than fix"
 [ ! -e .git/residue-trash ] || fail "watch moved fix to the trash instead of deleting it"
-grep -q "residue watch: freed about .* (residue has freed about .* on this machine since " "$S/log" \
+grep -q "residue watch: freed about .* (about .* on this machine since " "$S/log" \
   || fail "the log does not say what removing fix freed"
 "$residue" stats --json | grep -q '"watch":[{]"bytes":[0-9]*,"worktrees":1[}]' \
   || fail "residue stats does not count fix under watch"
@@ -412,7 +412,7 @@ stage 1 "--only-if-upstream-gone: its upstream origin/race exists in the local r
 # The next pass, without the wrapper: the upstream exists, so race did not
 # land, and disk pressure takes it on its own terms.
 "$residue" watch --once --no-fetch --grace 1m --min-free 99.9 --idle 1m "$S/w6" 2> "$S/log" || fail "the pressure pass failed"
-grep -q "removed .*worktrees/race (.*): free space on its filesystem" "$S/log" || fail "pressure did not remove race on the next pass"
+grep -q "removed .*worktrees/race (.*): [0-9.]*% free, below" "$S/log" || fail "pressure did not remove race on the next pass"
 git rev-parse --verify -q race > /dev/null || fail "branch race is gone"
 
 # 8. Each removal writes a removal record, and its log line names the
@@ -438,7 +438,7 @@ age8() {
 }
 age8
 "$residue" watch --once --no-fetch --grace 1m "$S/r8" 2> "$S/log" || fail "8: the landed run failed"
-grep -q "removed .*worktrees/back (.*): its upstream branch origin/back was deleted.*; restore: residue restore .*/residue-removed/back-" "$S/log" \
+grep -q "removed .*worktrees/back (.*): origin/back was deleted.*; restore: residue restore .*/residue-removed/back-" "$S/log" \
   || fail "8: the removal line has no 'restore: residue restore RECORD'"
 record=$(sed -n 's/^.*; restore: residue restore //p' "$S/log" | head -n 1)
 [ -f "$record/info" ] || fail "8: the record $record has no info file"
@@ -454,12 +454,12 @@ git worktree list --porcelain | grep -q "^worktree .*/\.worktrees/back\$" || fai
 git push -q origin --delete control
 age8
 "$residue" watch --once --grace 1m "$S/r8" 2> "$S/log" || fail "8: the second landed run failed"
-grep -q "removed .*worktrees/control (.*): its upstream branch origin/control was deleted" "$S/log" || fail "8: control was not removed"
+grep -q "removed .*worktrees/control (.*): origin/control was deleted" "$S/log" || fail "8: control was not removed"
 ! grep -q "removed .*worktrees/back" "$S/log" || fail "8: watch removed the restored back again because its work landed"
 [ -d .worktrees/back ] || fail "8: back is gone"
 # Disk pressure removes it, and writes a new record.
 "$residue" watch --once --no-fetch --min-free 99.9 --idle 1m "$S/r8" 2> "$S/log" || fail "8: the pressure run failed"
-grep -q "removed .*worktrees/back (.*): free space on its filesystem.*; restore: residue restore .*/residue-removed/back-" "$S/log" \
+grep -q "removed .*worktrees/back (.*): [0-9.]*% free, below.*; restore: residue restore .*/residue-removed/back-" "$S/log" \
   || fail "8: disk pressure did not remove the restored back"
 for b in back control; do
   git rev-parse --verify -q "$b" > /dev/null || fail "8: branch $b is gone"

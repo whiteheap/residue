@@ -47,7 +47,7 @@ pub fn command(options: &Options) -> u8 {
         let found = gather(&search.roots);
         if search.code_folders {
             eprintln!(
-                "residue: note: listed the repositories in {}; residue does not search the rest of your home folder: run residue restore inside a repository to list its own",
+                "residue: note: listed only {}; for another repository, run residue restore inside it",
                 search.place(&places)
             );
         }
@@ -97,7 +97,7 @@ pub fn command(options: &Options) -> u8 {
                 }
                 if let Some(root) = missed {
                     return fail(&format!(
-                        "nothing named {} in the trash or the removal records of the repositories at or under {}, and residue does not search your home folder or the folders above it for it; run residue restore inside its repository, or pass the entry's path it lists there",
+                        "nothing named {} under {}; run residue restore inside its repository, or pass the entry's path",
                         wanted.display(),
                         root.display()
                     ));
@@ -182,12 +182,12 @@ fn repository_of(wanted: &Path) -> Result<Option<PathBuf>, String> {
     if at_or_above_home(&dir) {
         return Err(if exists {
             format!(
-                "{} is your home folder or a folder above it, which residue does not search; run residue restore inside a repository, or pass an entry's path",
+                "residue does not search {}, your home folder or above; run residue restore inside a repository, or pass an entry's path",
                 wanted.display()
             )
         } else {
             format!(
-                "{} is gone, and residue does not search your home folder or the folders above it for it; run residue restore inside its repository, or pass the entry name it lists there",
+                "{} is gone, and residue does not search your home folder for it; run residue restore inside its repository, or pass the entry name",
                 wanted.display()
             )
         });
@@ -230,7 +230,7 @@ impl Search {
                 roots,
                 code_folders: true,
             }),
-            _ => Err("this is your home folder or a folder above it, which residue does not search, and none of the usual code folders is in your home folder (`residue watch --help` lists them); run residue restore inside a repository, or pass an entry's path".into()),
+            _ => Err("residue does not search your home folder, and none of the usual code folders exists in it; run residue restore inside a repository, or pass an entry's path".into()),
         }
     }
 
@@ -347,12 +347,12 @@ impl Miss {
     fn text(self, wanted: &Path, search: &Search, places: &Places) -> String {
         match self {
             Miss::Nothing if search.code_folders => format!(
-                "nothing named {} in the trash or the removal records of the repositories in {}, and residue does not search the rest of your home folder; run residue restore inside its repository, or pass the entry's path it lists there",
+                "nothing named {} in {}; run residue restore inside its repository, or pass the entry's path",
                 wanted.display(),
                 search.place(places)
             ),
             Miss::Nothing => format!(
-                "nothing named {} in the trash or the removal records of the repositories at or under the current directory; `residue restore` lists them",
+                "nothing named {} in the trash or removal records under this directory; `residue restore` lists them",
                 wanted.display()
             ),
             Miss::Many(e) => e,
@@ -648,7 +648,7 @@ fn list_text(found: &Found, started: i64, places: &Places) -> String {
     }
     if !found.trash.is_empty() || !found.removed.is_empty() {
         out.push_str(&style.dim(
-            "\nput one back: residue restore NAME  ·  a remove run purges trash entries older than --keep-trash (default 7d) and forgets a removal record only once it is older than the --keep-removed it was written with (default 30d) and the run's own\n",
+            "\nput one back: residue restore NAME  ·  trash purged after --keep-trash (7d), records kept at least --keep-removed (30d)\n",
         ));
     }
     out

@@ -690,7 +690,7 @@ scan_unusable_ok() { # WHY
     entry=$(cd "$repo/.git/residue-removed" && ls)
     text=$(cd "$repo" && "$bin" scan 2>&1)
     left=$(interrupted)
-    if ! grep -qF "Git can no longer use it ($1), so it cannot move it back; restore says what to clear, then recreates it: residue restore $main/.git/residue-removed/$entry" <<<"$text"; then fail "scan does not give the restore of its record: $text"
+    if ! grep -qF "Git can no longer use it ($1); restore says what to clear, then recreates it: residue restore $main/.git/residue-removed/$entry" <<<"$text"; then fail "scan does not give the restore of its record: $text"
     elif grep -qE "put it back|worktree move|or: residue restore" <<<"$text"; then fail "scan still gives a move back Git refuses: $text"
     elif [ "$(jq -r '.[0].recovery' <<<"$left")" != "residue restore $main/.git/residue-removed/$entry" ]; then fail "scan's recovery: $(jq -r '.[0].recovery' <<<"$left")"
     elif ! jq -e --arg why "$1" --arg rec "$main/.git/residue-removed/$entry" '.[0].unusable == $why and .[0].removal_record == $rec' <<<"$left" >/dev/null; then fail "scan's interrupted removal: $left"

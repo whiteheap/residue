@@ -63,7 +63,11 @@ const LATEST: i64 = 253_402_300_799;
 const WEEKS: i64 = 12;
 /// The repositories `residue stats` lists in text; JSON lists every one.
 const TOP: usize = 10;
+/// `residue stats --json` `estimate_note`, unchanged for the JSON contract.
 pub const ESTIMATE: &str = "Sizes are estimates, measured like \"reclaimable\" before each removal: APFS snapshots, clones and hard links can keep some of the space.";
+/// The same caveat in `residue stats` text, in one short line.
+const ESTIMATE_LINE: &str =
+    "Sizes are estimates: APFS snapshots, clones and hard links can keep some space.";
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Event {
@@ -616,7 +620,7 @@ impl Run {
         }
         if self.trashed.worktrees > 0 {
             parts.push(format!(
-                "moved about {} to the trash, freed once a remove run purges it after {keep}",
+                "moved about {} to the trash, freed when a remove run purges it after {keep}",
                 output::bytes(self.trashed.bytes)
             ));
         }
@@ -625,14 +629,14 @@ impl Run {
         }
         let total = match &self.total {
             Some((sum, _)) if sum.worktrees == 0 => {
-                "residue has not counted any freed space on this machine yet".to_string()
+                "nothing counted on this machine yet".to_string()
             }
             Some((sum, since)) => format!(
-                "residue has freed about {} on this machine since {}",
+                "about {} on this machine since {}",
                 output::bytes(sum.bytes),
                 output::day(*since)
             ),
-            None => "residue could not update its stats ledger; see the warning".to_string(),
+            None => "stats ledger not updated; see the warning".to_string(),
         };
         Some(format!("{} ({total})", parts.join(" and ")))
     }
@@ -857,11 +861,11 @@ pub fn scan_line(ledger: &Ledger, now: i64) -> Option<String> {
         return None;
     }
     Some(format!(
-        "residue has freed about {} on this machine since {}, from {} worktree{}; about {} in the last 7 days · residue stats",
+        "freed about {} from {} worktree{} since {}; {} in the last 7 days · residue stats",
         output::bytes(all.bytes),
-        output::day(stats.since.unwrap_or(now)),
         all.worktrees,
         if all.worktrees == 1 { "" } else { "s" },
+        output::day(stats.since.unwrap_or(now)),
         output::bytes(stats.last_7_days.all.bytes)
     ))
 }
@@ -889,13 +893,13 @@ pub fn service_line(installed: bool) -> Option<String> {
     let when = |at: i64| format!("{} ({})", output::date(at), output::age(now - at));
     Some(match last {
         None if !installed => return None,
-        None => "freed: nothing counted yet; residue counts what automatic cleanup frees from version 0.0.8 on".to_string(),
+        None => "freed: nothing counted yet (residue counts from version 0.0.8 on)".to_string(),
         Some(at) if week.worktrees == 0 => format!(
-            "freed: nothing in the last 7 days; automatic cleanup last removed a worktree {}",
+            "freed: nothing in the last 7 days; last removal {}",
             when(at)
         ),
         Some(at) => format!(
-            "freed: about {} from {} worktree{} in the last 7 days; automatic cleanup last removed one {}",
+            "freed: about {} from {} worktree{} in the last 7 days; last removal {}",
             output::bytes(week.bytes),
             week.worktrees,
             if week.worktrees == 1 { "" } else { "s" },
@@ -1146,7 +1150,7 @@ fn text(
             }
         }
         _ => out.push_str(
-            "\nresidue has not counted any freed space on this machine yet. It counts what it frees from version 0.0.8 on.\n",
+            "\nresidue has not counted any freed space yet. It counts from version 0.0.8 on.\n",
         ),
     }
     let mut trash_rows = Vec::new();
@@ -1170,9 +1174,9 @@ fn text(
     }
     section(&mut out, &style, "trash", &trash_rows);
     if !trash_rows.is_empty() {
-        out.push_str(&style.dim(
-            "  a move into the trash frees nothing until a remove run purges it, after --keep-trash\n",
-        ));
+        out.push_str(
+            &style.dim("  frees nothing until a remove run purges it, after --keep-trash\n"),
+        );
     }
     if stats.restored > 0 {
         out.push_str(&format!(
@@ -1189,7 +1193,7 @@ fn text(
         }
     }
     out.push('\n');
-    out.push_str(&style.dim(&format!("{ESTIMATE}\n")));
+    out.push_str(&style.dim(&format!("{ESTIMATE_LINE}\n")));
     let mut where_ = format!("ledger: {}", places.show(&ledger.path));
     if !ledger.path.exists() {
         where_.push_str(" (not written yet)");
@@ -1675,9 +1679,7 @@ mod tests {
         };
         let text = run.text("7d").unwrap();
         assert!(
-            text.starts_with(
-                "freed about 2.1 GB (residue has freed about 48.3 GB on this machine since "
-            ),
+            text.starts_with("freed about 2.1 GB (about 48.3 GB on this machine since "),
             "{text}"
         );
         let none = Run {

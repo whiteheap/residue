@@ -7,109 +7,52 @@ use std::path::PathBuf;
 use crate::removed::Reason;
 
 pub const HELP: &str = "\
-residue: find what coding agents left behind on disk, and remove a Git
-worktree only when nothing in it would be lost.
+residue: remove a Git worktree only when nothing in it would be lost.
 
 Usage:
-  residue [scan] [PATH...]   Report the linked worktrees of each repository at
-                             or under PATH (default: the current directory)
-  residue explain PATH       Show every check for one linked worktree
-  residue remove PATH...     Confirm, re-check, move aside, check again, write a
-                             removal record, then `git worktree remove` each
-                             (or keep it in the trash)
-  residue remove --all PATH...
-                             The same for every candidate a scan of PATH finds
-  residue restore [ENTRY]    List what residue can put back in the repositories
-                             at or under the current directory (from the home
-                             folder, in its usual code folders): trash entries
-                             and removal records. Or put one ENTRY back (its
-                             name from the list, the worktree's name or branch,
-                             or a path)
-  residue stats              Show how much disk residue has freed on this
-                             machine: all time, the last 7 and 30 days, by
-                             command and by repository (estimates)
-  residue watch [ROOT...]    Stay running; remove a worktree when its branch
-                             lands or the disk runs low. Without a ROOT, the
-                             usual code folders (`residue watch --help`)
-  residue service install [ROOT...]
-                             Run `residue watch` from login (launchd, systemd)
+  residue [scan] [PATH...]      List the linked worktrees under PATH (default .)
+  residue explain PATH          Show every check for one worktree
+  residue remove PATH...        Remove candidates, after you type yes
+  residue remove --all PATH...  Remove every candidate under PATH
+  residue restore [ENTRY]       List what residue can put back, or put back one
+  residue stats                 Show how much disk residue has freed
+  residue watch [ROOT...]       Clean up when a branch lands or disk is low
+  residue service install       Run `residue watch` from login
 
 Options:
-  --json                Print one JSON document (scan, explain, remove, restore,
-                        stats)
-  --idle DURATION       Keep any worktree changed within DURATION (30m, 12h,
-                        2d, 1w): its files, its index and other files in its
-                        Git directory, or its HEAD reflog. For scheduled runs,
-                        where a paused session leaves no process inside.
-                        With remove, it also turns on --trash
-  --all                 remove: treat each PATH as a scan root and remove
-                        every candidate under it. With --yes it needs --idle
-  --yes                 remove: skip the prompt. Only for the session that owns
-                        the worktree and knows its task is finished, or for a
-                        scheduled `remove --all --idle`; every check still runs
-  --trash               remove: move each worktree into its repository's trash
-                        (GIT_COMMON_DIR/residue-trash) instead of deleting it,
-                        so `residue restore` can put it back
-  --no-trash            remove: delete, even with --idle
-  --keep-trash DURATION remove: purge trash entries older than DURATION
-                        (default 7d). Every remove run purges, after the same
-                        confirmation; the purge is what frees the disk
-  --keep-removed DURATION
-                        remove: keep the removal records it writes for at
-                        least DURATION (default 30d), and forget older ones,
-                        after the same confirmation. A record is never
-                        forgotten before the DURATION it was written with.
-                        Only the record and its refs go; branches stay.
-                        `residue watch` takes it too
-  --removal-reason watch-landed|watch-low-disk
-                        remove: the reason its removal records name.
-                        `residue watch` passes it
-  --to PATH             restore: put the worktree at PATH, not where it was
-  --only-if-upstream-gone
-                        remove: keep any worktree whose branch's upstream is
-                        not gone, as the local refs show it at the plan,
-                        right before the move and right before the deletion
-                        (remove never fetches). `residue watch` passes it
-                        for a branch that landed
-  --regenerable RULE    Also treat ignored entries matching RULE as regenerable
-                        output that removal may delete. A NAME or *.ext matches
-                        at any depth; a PATH with a slash is anchored at the
-                        worktree root and may use * within a segment
-                        (web/.tscache, .local-dev/*.lock)
-  -h, --help            Show this help
-  -V, --version         Show the version
+  --json                   Print one JSON document
+  --idle DURATION          Keep worktrees changed within it; remove: --trash too
+  --all                    remove: every candidate under each PATH
+  --yes                    remove: skip the prompt; only once the task is done
+  --trash                  remove: into the trash; frees nothing until purged
+  --no-trash               remove: delete, even with --idle
+  --keep-trash DURATION    remove: purge trash entries older than this (7d)
+  --keep-removed DURATION  remove: keep removal records at least this long (30d)
+  --removal-reason REASON  remove: watch-landed or watch-low-disk (set by watch)
+  --only-if-upstream-gone  remove: only worktrees local refs show upstream gone
+  --to PATH                restore: put the worktree at PATH
+  --regenerable RULE       Treat ignored entries matching RULE as regenerable
+  -h, --help               Show this help
+  -V, --version            Show the version
 
-residue never removes the main checkout, a locked worktree, one a visible
-process is using, or one with staged, modified or untracked files or with
-ignored files outside the regenerable list. It never deletes branches, never
-kills processes and never passes --force to Git. Right before it deletes, it
-moves the worktree aside and checks again; anything that changed since you
-confirmed keeps it.
+DURATION is a number and m, h, d or w: 30m, 12h, 2d, 1w.
 
-Every deletion first writes a removal record (GIT_COMMON_DIR/residue-removed)
-and refs that keep its HEAD commit (refs/residue/removed/NAME) and the
-commits only its reflog held (refs/residue/reflog/NAME/); if they cannot be
-written, nothing is deleted. `residue restore` recreates the
-worktree from it at its path, on its branch and HEAD, for at least 30
-days (--keep-removed). Ignored files it deleted, such as node_modules, are not
-kept: the project's install or build makes them again. A restored worktree
-is never removed again because its branch landed; `residue remove` and low
-disk still can.
+Examples:
+  residue scan ~/src
+  residue explain ~/src/app/.worktrees/fix-login
+  residue remove ~/src/app/.worktrees/fix-login
+  residue remove --all --yes --idle 2d ~/src    scheduled sweep, into the trash
+  git worktree lock --reason \"resume later\" PATH  keep a worktree
+  git config --add residue.regenerable .cache     a rule for one repository
 
-Keep a worktree:  git worktree lock --reason \"resume later\" PATH
-Per repository:   git config --add residue.regenerable RULE
-Config file:      ~/.config/residue/regenerable (one RULE per line, every repo)
-Scheduled sweep:  residue remove --all --yes --idle 2d ~/src   (into the trash)
-Exit status:      0 ok, 1 error, 2 usage, 3 remove refused or skipped a path
-
-Rules apply only to ignored entries: an untracked file that is not ignored
-always blocks. They come from the built-in list, the config file,
---regenerable, and residue.regenerable in Git config files: the
-repository's, the global and the system file, including files chosen by
-GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM. residue ignores residue.regenerable
-set through the environment (git -c, GIT_CONFIG_COUNT, GIT_CONFIG_PARAMETERS,
-GIT_CONFIG) and prints a note when it finds one, because an inherited
-environment must not widen what residue deletes.
+Never removed: the main checkout; a locked or in-use worktree; one with
+               staged, modified, untracked or non-regenerable ignored files
+Kept:          branches and commits
+Restore:       each deletion writes a removal record first; `residue restore`
+               brings the worktree back for 30d, without its ignored files
+Rules:         ~/.config/residue/regenerable, one RULE per line
+Exit status:   0 ok, 1 error, 2 usage, 3 remove refused or skipped a path
+Details:       https://github.com/whiteheap/residue#readme
 ";
 
 /// A length of time given on the command line, such as `--idle 2d` or
@@ -125,11 +68,8 @@ impl Span {
     /// A positive whole number and one unit: `30m`, `12h`, `2d`, `1w`.
     /// `flag` names the option in error messages.
     pub fn parse(flag: &str, text: &str) -> Result<Span, String> {
-        let invalid = || {
-            format!(
-                "{flag} {text:?}: use a whole number and one unit, m (minutes), h (hours), d (days) or w (weeks), such as 30m, 12h, 2d or 1w"
-            )
-        };
+        let invalid =
+            || format!("{flag} {text:?}: use a number and a unit, such as 30m, 12h, 2d or 1w");
         let unit = text.chars().last().ok_or_else(invalid)?;
         let scale: i64 = match unit {
             'm' => 60,
@@ -377,9 +317,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
         return Err("--only-if-upstream-gone applies only to `residue remove`".into());
     }
     if options.only_if_upstream_gone && options.all {
-        return Err(
-            "--only-if-upstream-gone takes worktree PATHs, not --all: name each worktree, such as the paths `residue scan --json` reports with upstream_gone true".into(),
-        );
+        return Err("--only-if-upstream-gone takes worktree PATHs, not --all".into());
     }
     if kind != "remove" {
         if let Some(value) = options.trash {
@@ -434,7 +372,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
             Err("`residue remove` needs at least one worktree PATH".into())
         }
         "remove" if options.all && options.yes && options.idle.is_none() => Err(
-            "`residue remove --all --yes` needs --idle DURATION, such as --idle 2d: a session that is paused, not finished, has no process in its worktree, so an unattended sweep keeps only what changed recently".into(),
+            "`residue remove --all --yes` needs --idle DURATION, such as --idle 2d: a paused session looks finished".into(),
         ),
         "remove" => Ok(Command::Remove(options)),
         _ => Ok(Command::Scan(options)),
