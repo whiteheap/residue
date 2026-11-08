@@ -6,10 +6,11 @@
  *
  * The canvas holds one pixel per cell and CSS scales it up with
  * `image-rendering: pixelated`. A frame is a function of the time t alone, so
- * nothing accumulates between frames. It draws at most 30 frames a second
- * while something moves and 10 while the stack rests, stops while off screen
- * or in a hidden tab, and draws one still frame when the reader prefers
- * reduced motion. Without this script the hero is plain black and reads the
+ * nothing accumulates between frames. It draws 30 frames a second while
+ * something moves and 10 while the stack rests, and sleeps on a timer between
+ * two frames, so it does not wake on the display frames it skips. It stops
+ * while off screen or in a hidden tab, and draws one still frame when the
+ * reader prefers reduced motion. Without this script the hero is plain black and reads the
  * same. It also shows the copy button beside the install command. It loads
  * nothing and stores nothing.
  */
@@ -334,6 +335,7 @@
   let pixels = null;
   let visible = true;
   let raf = 0;
+  let timer = 0;
   let last = 0;
   let t = START;
 
@@ -381,19 +383,26 @@
   const tick = (now) => {
     raf = 0;
     if (!moving()) return;
+    // A long gap (a stalled tab) moves the stack at most 0.1 s.
+    t += last ? Math.min(0.1, (now - last) / 1000) : 0;
+    last = now;
+    render();
     const tau = t % CYCLE;
     const resting = tau < REST || tau > ARRIVE_AT + ARRIVE;
-    if (!last || now - last >= (resting ? 98 : 31)) {
-      // A long gap (a stalled tab) moves the stack at most 0.1 s.
-      t += last ? Math.min(0.1, (now - last) / 1000) : 0;
-      last = now;
-      render();
-    }
-    raf = requestAnimationFrame(tick);
+    // Sleep until 6 ms before the next frame is due, then wait for the
+    // display, so frames stay on its beat (at 60, 90, 120 or 144 Hz the next
+    // display frame after that is the due one) and skipped ones cost nothing.
+    timer = setTimeout(
+      () => {
+        timer = 0;
+        if (moving()) raf = requestAnimationFrame(tick);
+      },
+      (resting ? 100 : 1000 / 30) - 6,
+    );
   };
 
   const run = () => {
-    if (raf || !moving()) return;
+    if (raf || timer || !moving()) return;
     last = 0;
     raf = requestAnimationFrame(tick);
   };
