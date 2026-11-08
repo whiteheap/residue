@@ -1,6 +1,6 @@
 #!/bin/sh
 # Place the residue CLI where Tauri's externalBin expects it:
-# src-tauri/binaries/residue-<target>, for aarch64-apple-darwin,
+# src-tauri/binaries/residue-cli-<target>, for aarch64-apple-darwin,
 # x86_64-apple-darwin and universal-apple-darwin (the two joined with lipo).
 # Nothing here is committed: src-tauri/binaries/ is ignored.
 #
@@ -36,16 +36,16 @@ arch_is() {
 
 check() {
   for t in aarch64-apple-darwin x86_64-apple-darwin universal-apple-darwin; do
-    if [ ! -x "$out/residue-$t" ]; then
-      echo "sidecar: src-tauri/binaries/residue-$t is missing; run sh scripts/sidecar.sh" >&2
+    if [ ! -x "$out/residue-cli-$t" ]; then
+      echo "sidecar: src-tauri/binaries/residue-cli-$t is missing; run sh scripts/sidecar.sh" >&2
       exit 1
     fi
   done
-  arch_is "$out/residue-aarch64-apple-darwin" arm64
-  arch_is "$out/residue-x86_64-apple-darwin" x86_64
-  arch_is "$out/residue-universal-apple-darwin" "x86_64 arm64"
+  arch_is "$out/residue-cli-aarch64-apple-darwin" arm64
+  arch_is "$out/residue-cli-x86_64-apple-darwin" x86_64
+  arch_is "$out/residue-cli-universal-apple-darwin" "x86_64 arm64"
   # The universal binary runs its native slice on either kind of Mac.
-  reported=$("$out/residue-universal-apple-darwin" --version)
+  reported=$("$out/residue-cli-universal-apple-darwin" --version)
   if [ "$reported" != "residue $version" ]; then
     echo "sidecar: the bundled binary reports '$reported', and Cargo.toml says $version; run sh scripts/sidecar.sh" >&2
     exit 1
@@ -56,11 +56,11 @@ place() {
   arch_is "$1" arm64
   arch_is "$2" x86_64
   mkdir -p "$out"
-  install -m 0755 "$1" "$out/residue-aarch64-apple-darwin"
-  install -m 0755 "$2" "$out/residue-x86_64-apple-darwin"
-  rm -f "$out/residue-universal-apple-darwin"
-  lipo -create -output "$out/residue-universal-apple-darwin" "$1" "$2"
-  chmod 0755 "$out/residue-universal-apple-darwin"
+  install -m 0755 "$1" "$out/residue-cli-aarch64-apple-darwin"
+  install -m 0755 "$2" "$out/residue-cli-x86_64-apple-darwin"
+  rm -f "$out/residue-cli-universal-apple-darwin"
+  lipo -create -output "$out/residue-cli-universal-apple-darwin" "$1" "$2"
+  chmod 0755 "$out/residue-cli-universal-apple-darwin"
 }
 
 case "${1:-}" in

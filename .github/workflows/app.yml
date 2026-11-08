@@ -88,10 +88,14 @@ jobs:
           test "$(plutil -extract CFBundleIdentifier raw -o - "$plist")" = com.whiteheap.residue
           test "$(plutil -extract CFBundleName raw -o - "$plist")" = residue
           test "$(plutil -extract CFBundleShortVersionString raw -o - "$plist")" = "$version"
+          # The app's executable is residue, the name macOS shows; the CLI
+          # inside it is residue-cli.
+          ls -la "$app/Contents/MacOS"
           main=$(plutil -extract CFBundleExecutable raw -o - "$plist")
+          test "$main" = residue
           test "$(lipo -archs "$app/Contents/MacOS/$main")" = "x86_64 arm64"
-          test "$(lipo -archs "$app/Contents/MacOS/residue")" = "x86_64 arm64"
-          test "$("$app/Contents/MacOS/residue" --version)" = "residue $version"
+          test "$(lipo -archs "$app/Contents/MacOS/residue-cli")" = "x86_64 arm64"
+          test "$("$app/Contents/MacOS/residue-cli" --version)" = "residue $version"
           codesign --verify --deep --strict --verbose=2 "$app"
           set -- "$bundle"/dmg/*.dmg
           if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then

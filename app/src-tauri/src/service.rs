@@ -893,8 +893,14 @@ struct Installer {
 fn find_installer(ctx: &Context) -> Result<Installer, CliError> {
     let bundled = parse_version(&format!("residue {}", ctx.bundled_version));
     let managed = managed_binary(ctx.data_dir);
-    let skip: Vec<PathBuf> = [ctx.sidecar, managed.as_path()]
-        .iter()
+    // The app's own executable is named residue too: a PATH that holds a
+    // development build's folder must never make the app run itself. The
+    // sidecar's path came from current_exe, so it does not fail here; if it
+    // did, the sidecar is still skipped.
+    let own = std::env::current_exe().ok();
+    let skip: Vec<PathBuf> = [Some(ctx.sidecar), Some(managed.as_path()), own.as_deref()]
+        .into_iter()
+        .flatten()
         .filter_map(|p| p.canonicalize().ok())
         .collect();
     let mut dirs: Vec<PathBuf> = std::env::split_paths(ctx.path_env).collect();
