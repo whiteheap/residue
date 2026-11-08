@@ -1439,6 +1439,17 @@ layout_refused ignored-dotgit-upper-case-sensitive ignored,nested_repo "node_mod
     'private/\n' 'git config core.ignorecase false && mkdir -p private/.GIT && echo notes >private/.GIT/notes.txt'
 layout_refused ignored-dotgit-plain-folder nested_repo "node_modules/" \
     'private/\n' 'mkdir -p private/.git && echo notes >private/.git/notes.txt'
+# The same at the worktree's root, beside its `.git` link: neither list
+# names `.GIT/`, so only nested_repo keeps its files. A case-insensitive
+# file system cannot hold `.GIT` there, so the case runs only on a
+# case-sensitive one (Linux; a case-sensitive APFS volume as TMPDIR).
+setup touch "$work/case-probe"
+if [ -e "$work/CASE-PROBE" ]; then
+    echo "skip ignored-dotgit-upper-root: this file system is case-insensitive, so .GIT would be the worktree's .git link"
+else
+    layout_refused ignored-dotgit-upper-root nested_repo "node_modules/" \
+        '' 'git config core.ignorecase true && mkdir .GIT && echo notes >.GIT/notes.txt'
+fi
 # An untracked folder of ignored entries is one entry, `orphan/`, which the
 # rules for what is inside it do not match. Matching mode would list
 # `orphan/a.log` and `orphan/node_modules/`, which they do.
