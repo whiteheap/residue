@@ -471,17 +471,6 @@ impl Item {
         self.registered.is_some()
     }
 
-    /// An interrupted removal whose HEAD Git can no longer read: a `git
-    /// worktree remove` that failed part way deleted it. Git can neither
-    /// move nor remove that worktree, so restore cannot move it back.
-    pub fn head_gone(&self) -> bool {
-        self.registered.as_ref().is_some_and(|e| {
-            e.head
-                .as_deref()
-                .is_none_or(|h| h.bytes().all(|b| b == b'0'))
-        })
-    }
-
     pub fn age(&self, now: i64) -> Option<i64> {
         self.record.as_ref().ok().map(|r| now - r.removed)
     }
@@ -1137,6 +1126,22 @@ fn holds(
     }
 }
 
+/// How to clear what is left of a worktree Git can no longer use, so that
+/// restore can recreate it: lift residue's lock when it holds one, delete
+/// the directory, and let Git drop its record.
+fn clear_steps(main: &Path, aside: &Path, ours: bool) -> String {
+    let git = format!("git -C {} worktree", output::shell(main));
+    let unlock = if ours {
+        format!("run `{git} unlock {}`, ", output::shell(aside))
+    } else {
+        String::new()
+    };
+    format!(
+        "{unlock}delete {}, run `{git} prune`, then run this restore again",
+        aside.display()
+    )
+}
+
 /// A worktree an interrupted run left where the deletion started: move it
 /// back with `git worktree move`, the same command `residue scan` prints
 /// for an interrupted removal.
@@ -1165,7 +1170,18 @@ fn move_back(
             aside.display()
         ));
     };
+    let ours = registered.locked.as_deref() == Some(crate::remove::REMOVING);
     if left.running {
+        // Git refuses to move a worktree it can no longer use, so there is
+        // no command to run while that process may be removing it. PIDs are
+        // reused, so the process may be another one that never exits.
+        if let Some(why) = &left.unusable {
+            return Err(format!(
+                "process {pid} still runs, so residue may still be removing it, and Git can no longer use it ({why}); once that process has exited, run this restore again: it says what to clear; if it is not residue (`ps -p {pid}` shows what it is): {}",
+                clear_steps(main, aside, ours),
+                pid = left.pid
+            ));
+        }
         return Err(format!(
             "process {} still runs, so residue may still be removing it; if it is not residue, put it back with: {}",
             left.pid, left.recovery
@@ -1177,7 +1193,6 @@ fn move_back(
             left.recovery
         ));
     }
-    let ours = registered.locked.as_deref() == Some(crate::remove::REMOVING);
     if registered.locked.is_some() && !ours {
         return Err(format!(
             "it is locked by someone else ({}); residue leaves that lock alone",
@@ -1213,16 +1228,12 @@ fn move_back(
         // Git then can neither move nor remove it. The record still keeps
         // its HEAD and reflog, so once Git's leftovers are cleared, this
         // restore recreates it.
-        if let Err(why) = git::identity(aside) {
-            let git = format!("git -C {} worktree", output::shell(main));
-            let unlock = if ours {
-                format!("run `{git} unlock {}`, ", output::shell(aside))
-            } else {
-                String::new()
-            };
+        // A `.git` file it lost leaves `git rev-parse` to find the repository
+        // above it, so that answer alone does not show it.
+        if let Some(why) = git::identity(aside).err().or_else(|| left.unusable.clone()) {
             return Err(format!(
-                "{e}; Git can no longer use it ({why}), so it can neither move it back nor remove it; the record keeps its HEAD and reflog: {unlock}delete {}, run `{git} prune`, then run this restore again",
-                aside.display()
+                "{e}; Git can no longer use it ({why}), so it can neither move it back nor remove it; the record keeps its HEAD and reflog: {}",
+                clear_steps(main, aside, ours)
             ));
         }
         return Err(e);

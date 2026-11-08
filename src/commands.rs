@@ -115,6 +115,14 @@ pub fn scan(options: &Options) -> u8 {
             .interrupted
             .iter()
             .filter_map(|e| Leftover::of(e, &repo.command_dir()))
+            .map(|l| {
+                // A run that stopped after writing its removal record.
+                let record = records
+                    .iter()
+                    .find(|i| i.record.as_ref().is_ok_and(|r| r.aside == l.path))
+                    .map(|i| i.dir.clone());
+                l.with_record(record)
+            })
             .collect();
         grouped.push(Group {
             repo,
@@ -295,18 +303,6 @@ pub fn scan(options: &Options) -> u8 {
         out.push_str(&format!("\n{}\n", remove::LEFTOVER_TITLE));
         for l in &leftovers {
             out.push_str(&l.text(&places, &style));
-            // A run that stopped after writing its removal record: restore
-            // moves it back, with the same checks.
-            let record = grouped
-                .iter()
-                .flat_map(|g| g.records.iter())
-                .find(|i| i.record.as_ref().is_ok_and(|r| r.aside == l.path));
-            if let Some(item) = record {
-                out.push_str(&format!(
-                    "    or: residue restore {}\n",
-                    output::shell(&item.dir)
-                ));
-            }
         }
     }
     if !found.orphans.is_empty() {
