@@ -6,17 +6,27 @@
   <img src="docs/assets/logo.png" width="112" alt="Residue mark: three flat sheets stacked like linked worktrees, and a small square set apart underneath.">
 </picture>
 
-**Coding agents leave Git worktrees on disk; residue removes one only when every check passes.**
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/hero.png">
+  <img src="docs/assets/hero.png" width="830" alt="Reclaim your storage from Git worktrees, automatically and safely.">
+</picture>
 
-Website: [residue.whiteheap.com](https://residue.whiteheap.com)
+**residue removes a worktree only when nothing in it would be lost, whichever coding agent left it.**
+
+```sh
+curl -fsSL https://residue.whiteheap.com/install.sh | sh
+```
+
+It installs residue and, on macOS and Linux, turns on [automatic cleanup](#automate-cleanup). Homebrew alone installs residue without it: `brew install whiteheap/tap/residue`. Website: [residue.whiteheap.com](https://residue.whiteheap.com)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/how-it-works-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="docs/assets/how-it-works.png">
-  <img src="docs/assets/how-it-works.png" width="500" alt="Chart. A repository leads to its linked worktrees, then checks, then a report. Read only ends at scan and explain, which read and stop. A separate arrow, you or watch, enters remove, then fresh checks. The left arrow from fresh checks ends at stays when a check blocks, is unknown, or the worktree changed. A different pair of arrows, only when every check passes, goes to git remove without --force or to the trash for restore. The block path does not continue to deletion.">
+  <img src="docs/assets/how-it-works.png" width="480" alt="Chart, top to bottom. Linked worktrees: any coding agent, or you, adds them with git worktree add; Git lists each one. Who starts residue: scan and explain (you; they never delete), remove (you, after you type yes), the Mac app (you, in its window), and watch, the service, on its own when work landed (its upstream branch is gone and it is unchanged for --grace, 1 hour) or the disk is low (free space under --min-free, 10 percent: worktrees unchanged for --idle, 2 days, go largest first). Then 15 checks in four families. Git's records: identity, locked, operation, private_refs, head and layout, from git worktree list, refs and the Git directory. The files: tracked_changes, untracked, ignored and index_flags, from git status --ignored and ls-files. The directory: nested_repo, mount_point and contents, from one walk that follows no symlinks. Use and time: activity, from processes' open files and working directories, and idle, only with --idle, from the newest change. The verdict is candidate when all passed, keep when one blocked, unknown when one could not finish, or stale when the directory is gone. Keep, unknown and stale stay where they are, each with the check that kept it; scan and explain stop there, with the report. A candidate, for remove or watch, is removed one at a time. Step 1: check again and compare with the plan. Delete, by default and for watch: 2, move it aside under a hidden name and lock it; 3, write its removal record and refs; 4, check again; 5, git worktree remove, never --force. Trash, with --trash, --idle or the Mac app: 2, move it into the trash and lock it; 3, check again; it is kept whole and locked, and frees no disk until it is purged. A failed check, or any change, moves it back to its path, where it stays. A removal record lasts 30 days (--keep-removed): residue restore recreates the worktree at its path, on its branch and HEAD, without its ignored files. A trash entry lasts 7 days (--keep-trash): residue restore puts it back whole, every file in it; after that it is purged into a removal record. residue never deletes a branch, commit or stash. residue stats: a local ledger.jsonl notes every deletion, trash move and restore; it never decides a removal and never leaves the machine.">
 </picture>
 
-A repository's linked worktrees are checked, then reported. `scan` and `explain` only read that report and stop. `remove` is separate: you run it, or `watch` chooses paths for it. From fresh checks, a block, an unknown, or a change keeps the worktree. Only when every check passes does `git worktree remove` delete it, without `--force`, after residue writes the record `restore` recreates it from; or the trash holds it for `restore`. A pass is not a guarantee, and age alone does not mean inactive.
+`scan`, `explain`, `remove`, the Mac app and `watch` all run the same checks, and only a `candidate`, where every check passed, is ever removed. `scan` and `explain` stop at the report. To delete a candidate, residue checks it again, moves it aside under a hidden name, writes its removal record, checks once more, and only then runs `git worktree remove`, never with `--force`. With `--trash`, `--idle` or the Mac app, it moves the candidate into the trash whole instead. A failed check or any change puts the worktree back. `residue restore` recreates a deleted worktree for 30 days, without its ignored files, and puts a trashed one back whole for 7 days; branches, commits and the stash always stay. A pass is not a guarantee, and age alone does not mean inactive.
 
 [Install](#install) · [Inspect](#inspect-a-worktree) · [Remove](#remove-a-worktree) · [Automate](#automate-cleanup) · [Mac app](#mac-app) · [Reference](#reference)
 

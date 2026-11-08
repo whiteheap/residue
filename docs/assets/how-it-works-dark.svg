@@ -1,63 +1,112 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Concept chart. Transparent background, no outer frame, no gradients.
-  The block path leaves the left of "fresh checks" and ends at "stays".
-  The all-pass path is two arrows from the bottom of that node to
-  git remove and trash. Those arrows do not meet the block path.
-  README PNGs are rasterized with JetBrains Mono.
+  The README's how-it-works chart (dark palette). Source of how-it-works-dark.png: run
+  sh docs/assets/render.sh. how-it-works.svg is the same drawing in the light
+  palette, and site/public/how-it-works-dark.svg is a copy of the dark one
+  (site/check.sh compares them): change all three together, and the alt
+  text in README.md and site/public/index.html with them.
+
+  Every fact here comes from the code: the triggers and their defaults from
+  src/watch.rs and src/cli.rs, the checks from src/inspect.rs, the removal
+  order from execute() in src/remove.rs, what comes back from src/removed.rs
+  and src/trash.rs, and the ledger from src/stats.rs.
+
+  Drawn 480 px wide with no text under 14 px, so a phone that shows it about
+  320 px wide still shows every word at about 10 px.
 -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 600" role="img" aria-labelledby="howTitle howDesc">
-  <title id="howTitle">How residue works</title>
-  <desc id="howDesc">A repository's linked worktrees are checked and reported. scan and explain only read that report and stop. remove is a separate command, which you run or which watch chooses paths for. From fresh checks, the left arrow ends at stays when a check blocks, is unknown, or the worktree changed. A different pair of arrows, taken only when every check passes, goes to git worktree remove without --force or to the trash for restore. The block path does not continue to deletion.</desc>
-  <defs>
-    <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto">
-      <path d="M0 0 L8 4 L0 8 Z" fill="#f4f4f4"/>
-    </marker>
-  </defs>
-  <style>
-    text { font-family: "JetBrains Mono", "Cascadia Mono", "Liberation Mono", monospace; }
-  </style>
-  <g fill="none" stroke="#f4f4f4" stroke-width="1.25">
-    <rect x="148" y="16" width="204" height="42"/>
-    <line x1="250" y1="58" x2="250" y2="84" marker-end="url(#arrow)"/>
-    <rect x="96" y="86" width="308" height="42"/>
-    <line x1="250" y1="128" x2="250" y2="158" marker-end="url(#arrow)"/>
-    <rect x="170" y="160" width="160" height="42"/>
-    <polyline points="250,202 250,228 118,228 118,252" marker-end="url(#arrow)"/>
-    <polyline points="250,228 382,228 382,252" marker-end="url(#arrow)"/>
-    <rect x="20" y="254" width="196" height="58"/>
-    <rect x="284" y="262" width="196" height="42"/>
-    <line x1="382" y1="304" x2="382" y2="340" marker-end="url(#arrow)"/>
-    <rect x="250" y="342" width="230" height="44"/>
-    <!-- block path ends at stays; it does not reach git remove or trash -->
-    <polyline points="250,386 250,424 102,424 102,468" marker-end="url(#arrow)"/>
-    <line x1="310" y1="386" x2="310" y2="468" marker-end="url(#arrow)"/>
-    <line x1="430" y1="386" x2="430" y2="468" marker-end="url(#arrow)"/>
-    <rect x="16" y="470" width="172" height="100"/>
-    <rect x="240" y="470" width="140" height="72"/>
-    <rect x="404" y="470" width="80" height="72"/>
-  </g>
-  <g fill="#f4f4f4" font-size="16">
-    <text x="250" y="43" text-anchor="middle">repository</text>
-    <text x="250" y="113" text-anchor="middle">linked worktrees</text>
-    <text x="250" y="187" text-anchor="middle">report</text>
-    <text x="118" y="278" text-anchor="middle">scan / explain</text>
-    <text x="382" y="289" text-anchor="middle">remove</text>
-    <text x="365" y="370" text-anchor="middle">fresh checks</text>
-    <text x="102" y="508" text-anchor="middle">stays</text>
-    <text x="310" y="500" text-anchor="middle">git remove</text>
-    <text x="444" y="500" text-anchor="middle">trash</text>
-  </g>
-  <g fill="#e6e6e6" font-size="14">
-    <text x="258" y="150">checks</text>
-    <text x="24" y="222">read only</text>
-    <text x="292" y="222">you or watch</text>
-    <text x="118" y="300" text-anchor="middle">reads. stops.</text>
-    <text x="102" y="532" text-anchor="middle">block, unknown,</text>
-    <text x="102" y="552" text-anchor="middle">or changed</text>
-    <text x="370" y="418" text-anchor="middle">all pass</text>
-    <text x="370" y="440" text-anchor="middle">or</text>
-    <text x="310" y="522" text-anchor="middle">no --force</text>
-    <text x="444" y="522" text-anchor="middle">restore</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 1675" width="480" height="1675" role="img" aria-labelledby="how-it-works-title how-it-works-desc" xml:space="preserve">
+  <title id="how-it-works-title">How residue removes a worktree, and brings it back</title>
+  <desc id="how-it-works-desc">Chart, top to bottom. Linked worktrees: any coding agent, or you, adds them with git worktree add; Git lists each one. Who starts residue: scan and explain (you; they never delete), remove (you, after you type yes), the Mac app (you, in its window), and watch, the service, on its own when work landed (its upstream branch is gone and it is unchanged for --grace, 1 hour) or the disk is low (free space under --min-free, 10 percent: worktrees unchanged for --idle, 2 days, go largest first). Then 15 checks in four families. Git's records: identity, locked, operation, private_refs, head and layout, from git worktree list, refs and the Git directory. The files: tracked_changes, untracked, ignored and index_flags, from git status --ignored and ls-files. The directory: nested_repo, mount_point and contents, from one walk that follows no symlinks. Use and time: activity, from processes' open files and working directories, and idle, only with --idle, from the newest change. The verdict is candidate when all passed, keep when one blocked, unknown when one could not finish, or stale when the directory is gone. Keep, unknown and stale stay where they are, each with the check that kept it; scan and explain stop there, with the report. A candidate, for remove or watch, is removed one at a time. Step 1: check again and compare with the plan. Delete, by default and for watch: 2, move it aside under a hidden name and lock it; 3, write its removal record and refs; 4, check again; 5, git worktree remove, never --force. Trash, with --trash, --idle or the Mac app: 2, move it into the trash and lock it; 3, check again; it is kept whole and locked, and frees no disk until it is purged. A failed check, or any change, moves it back to its path, where it stays. A removal record lasts 30 days (--keep-removed): residue restore recreates the worktree at its path, on its branch and HEAD, without its ignored files. A trash entry lasts 7 days (--keep-trash): residue restore puts it back whole, every file in it; after that it is purged into a removal record. residue never deletes a branch, commit or stash. residue stats: a local ledger.jsonl notes every deletion, trash move and restore; it never decides a removal and never leaves the machine.</desc>
+  <rect x="0.5" y="0.5" width="479" height="1674" rx="11.5" fill="#000000" stroke="#262626"/>
+  <g font-family="'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace">
+    <!-- 1. Where linked worktrees come from -->
+    <rect x="20.5" y="20.5" width="439" height="93" rx="8" fill="#0a0a0a" stroke="#2e2e2e"/>
+    <text x="36" y="50.6" font-size="17" font-weight="500" fill="#f5f5f5">Linked worktrees</text>
+    <text x="36" y="74.5" font-size="15" fill="#a4a4a4">Any coding agent, or you, adds them with</text>
+    <text x="36" y="95.5" font-size="15" fill="#a4a4a4"><tspan fill="#f5f5f5">git worktree add</tspan>. Git lists each one.</text>
+    <path d="M240 114V137" stroke="#6e6e6e" stroke-width="1.5" fill="none"/><path d="M235 136L240 144L245 136Z" fill="#6e6e6e"/>
+    <!-- 2. What starts residue: you, the Mac app, or the service -->
+    <rect x="20.5" y="144.5" width="439" height="255" rx="8" fill="#0a0a0a" stroke="#2e2e2e"/>
+    <text x="36" y="174.6" font-size="17" font-weight="500" fill="#f5f5f5">Who starts it</text>
+    <text x="36" y="198.4" font-size="15" font-weight="500" fill="#f5f5f5">scan, explain</text>
+    <text x="168" y="198.4" font-size="15" fill="#a4a4a4">you; they never delete</text>
+    <text x="36" y="219.4" font-size="15" font-weight="500" fill="#f5f5f5">remove</text>
+    <text x="168" y="219.4" font-size="15" fill="#a4a4a4">you, after you type yes</text>
+    <text x="36" y="240.4" font-size="15" font-weight="500" fill="#f5f5f5">Mac app</text>
+    <text x="168" y="240.4" font-size="15" fill="#a4a4a4">you, in its window</text>
+    <text x="36" y="261.4" font-size="15" font-weight="500" fill="#f5f5f5">watch</text>
+    <text x="168" y="261.4" font-size="15" fill="#a4a4a4">the service, on its own:</text>
+    <rect x="168.5" y="275.5" width="6" height="6" fill="none" stroke="#a4a4a4"/><text x="182" y="283.1" font-size="14" fill="#a4a4a4">work landed: its upstream</text><text x="182" y="302.1" font-size="14" fill="#a4a4a4">branch is gone, unchanged</text><text x="182" y="321.1" font-size="14" fill="#a4a4a4">for <tspan fill="#f5f5f5">--grace</tspan> (1h)</text>
+    <rect x="168.5" y="336.5" width="6" height="6" fill="none" stroke="#a4a4a4"/><text x="182" y="344.1" font-size="14" fill="#a4a4a4">disk low: free space under</text><text x="182" y="363.1" font-size="14" fill="#a4a4a4"><tspan fill="#f5f5f5">--min-free</tspan> (10%); unchanged</text><text x="182" y="382.1" font-size="14" fill="#a4a4a4">for <tspan fill="#f5f5f5">--idle</tspan> (2d), largest first</text>
+    <path d="M240 400V423" stroke="#6e6e6e" stroke-width="1.5" fill="none"/><path d="M235 422L240 430L245 422Z" fill="#6e6e6e"/>
+    <!-- 3. Every check, then one verdict -->
+    <rect x="20.5" y="430.5" width="439" height="439" rx="8" fill="#0a0a0a" stroke="#2e2e2e"/>
+    <text x="36" y="460.6" font-size="17" font-weight="500" fill="#f5f5f5">15 checks, then a verdict</text>
+    <text x="36" y="484.4" font-size="15" font-weight="500" fill="#f5f5f5">Git's records</text>
+    <text x="168" y="483.1" font-size="14" fill="#a4a4a4"><tspan fill="#f5f5f5">identity</tspan>, <tspan fill="#f5f5f5">locked</tspan>, <tspan fill="#f5f5f5">operation</tspan>,</text>
+    <text x="36" y="504.1" font-size="14" fill="#a4a4a4"></text>
+    <text x="168" y="504.1" font-size="14" fill="#a4a4a4"><tspan fill="#f5f5f5">private_refs</tspan>, <tspan fill="#f5f5f5">head</tspan>, <tspan fill="#f5f5f5">layout</tspan></text>
+    <text x="36" y="523.1" font-size="14" fill="#a4a4a4"></text>
+    <text x="168" y="523.1" font-size="14" fill="#a4a4a4">git worktree list, refs, Git dir</text>
+    <text x="36" y="550.5" font-size="15" font-weight="500" fill="#f5f5f5">The files</text>
+    <text x="168" y="549.1" font-size="14" fill="#a4a4a4"><tspan fill="#f5f5f5">tracked_changes</tspan>, <tspan fill="#f5f5f5">untracked</tspan>,</text>
+    <text x="36" y="570.1" font-size="14" fill="#a4a4a4"></text>
+    <text x="168" y="570.1" font-size="14" fill="#a4a4a4"><tspan fill="#f5f5f5">ignored</tspan>, <tspan fill="#f5f5f5">index_flags</tspan></text>
+    <text x="36" y="589.1" font-size="14" fill="#a4a4a4"></text>
+    <text x="168" y="589.1" font-size="14" fill="#a4a4a4">git status --ignored, ls-files</text>
+    <text x="36" y="616.5" font-size="15" font-weight="500" fill="#f5f5f5">The directory</text>
+    <text x="168" y="615.1" font-size="14" fill="#a4a4a4"><tspan fill="#f5f5f5">nested_repo</tspan>, <tspan fill="#f5f5f5">mount_point</tspan>,</text>
+    <text x="36" y="636.1" font-size="14" fill="#a4a4a4"></text>
+    <text x="168" y="636.1" font-size="14" fill="#a4a4a4"><tspan fill="#f5f5f5">contents</tspan>: one walk, no symlinks</text>
+    <text x="36" y="663.5" font-size="15" font-weight="500" fill="#f5f5f5">Use and time</text>
+    <text x="168" y="662.1" font-size="14" fill="#a4a4a4"><tspan fill="#f5f5f5">activity</tspan>: processes' open</text>
+    <text x="36" y="683.1" font-size="14" fill="#a4a4a4"></text>
+    <text x="168" y="683.1" font-size="14" fill="#a4a4a4">files and working directories</text>
+    <text x="36" y="702.1" font-size="14" fill="#a4a4a4"></text>
+    <text x="168" y="702.1" font-size="14" fill="#a4a4a4"><tspan fill="#f5f5f5">idle</tspan>, only with <tspan fill="#f5f5f5">--idle</tspan>:</text>
+    <text x="36" y="721.1" font-size="14" fill="#a4a4a4"></text>
+    <text x="168" y="721.1" font-size="14" fill="#a4a4a4">the newest change</text>
+    <rect x="36.5" y="736.5" width="95" height="51" rx="6" fill="#f5f5f5" stroke="#f5f5f5"/><text x="84" y="756.5" font-size="15" font-weight="500" text-anchor="middle" fill="#000000">candidate</text><text x="84" y="776.1" font-size="14" text-anchor="middle" fill="#000000">all passed</text><rect x="140.5" y="736.5" width="95" height="51" rx="6" fill="#131313" stroke="#303030"/><text x="188" y="756.5" font-size="15" font-weight="500" text-anchor="middle" fill="#f5f5f5">keep</text><text x="188" y="776.1" font-size="14" text-anchor="middle" fill="#a4a4a4">blocked</text><rect x="244.5" y="736.5" width="95" height="51" rx="6" fill="#131313" stroke="#303030"/><text x="292" y="756.5" font-size="15" font-weight="500" text-anchor="middle" fill="#f5f5f5">unknown</text><text x="292" y="776.1" font-size="14" text-anchor="middle" fill="#a4a4a4">unfinished</text><rect x="348.5" y="736.5" width="95" height="51" rx="6" fill="#131313" stroke="#303030"/><text x="396" y="756.5" font-size="15" font-weight="500" text-anchor="middle" fill="#f5f5f5">stale</text><text x="396" y="776.1" font-size="14" text-anchor="middle" fill="#a4a4a4">gone</text>
+    <text x="36" y="814.1" font-size="14" fill="#a4a4a4">keep, unknown and stale stay where they are,</text>
+    <text x="36" y="833.1" font-size="14" fill="#a4a4a4">each with the check that kept it. scan and</text>
+    <text x="36" y="852.1" font-size="14" fill="#a4a4a4">explain stop here, with the report.</text>
+    <path d="M84 870V903" stroke="#6e6e6e" stroke-width="1.5" fill="none"/><path d="M79 902L84 910L89 902Z" fill="#6e6e6e"/>
+    <text x="98" y="892.1" font-size="14" fill="#8a8a8a">a candidate, for remove or watch</text>
+    <!-- 4. A removal, in order -->
+    <rect x="20.5" y="910.5" width="439" height="354" rx="8" fill="#0a0a0a" stroke="#2e2e2e"/>
+    <text x="36" y="940.6" font-size="17" font-weight="500" fill="#f5f5f5">Removal, one candidate at a time</text>
+    <text x="36" y="964.5" font-size="15" fill="#8a8a8a">1</text><text x="54" y="964.5" font-size="15" fill="#a4a4a4">check again; compare with the plan</text>
+    <rect x="36.5" y="980.5" width="197" height="223" rx="6" fill="#131313" stroke="#303030"/><rect x="246.5" y="980.5" width="197" height="223" rx="6" fill="#131313" stroke="#303030"/><text x="46" y="1007.5" font-size="15" font-weight="500" fill="#f5f5f5">Delete</text><text x="256" y="1007.5" font-size="15" font-weight="500" fill="#f5f5f5">Trash</text><text x="46" y="1027.1" font-size="14" fill="#a4a4a4">by default, and</text><text x="256" y="1027.1" font-size="14" fill="#a4a4a4"><tspan fill="#f5f5f5">--trash</tspan>, <tspan fill="#f5f5f5">--idle</tspan>,</text><text x="46" y="1046.1" font-size="14" fill="#a4a4a4">for watch</text><text x="256" y="1046.1" font-size="14" fill="#a4a4a4">the Mac app</text><text x="46" y="1073.1" font-size="14" fill="#8a8a8a">2</text><text x="62" y="1073.1" font-size="14" fill="#a4a4a4">move aside under a</text><text x="62" y="1092.1" font-size="14" fill="#a4a4a4">hidden name; lock</text><text x="256" y="1073.1" font-size="14" fill="#8a8a8a">2</text><text x="272" y="1073.1" font-size="14" fill="#a4a4a4">move into the</text><text x="272" y="1092.1" font-size="14" fill="#a4a4a4">trash; lock</text><text x="46" y="1111.1" font-size="14" fill="#8a8a8a">3</text><text x="62" y="1111.1" font-size="14" fill="#a4a4a4">write its removal</text><text x="62" y="1130.1" font-size="14" fill="#a4a4a4">record and refs</text><text x="256" y="1111.1" font-size="14" fill="#8a8a8a">3</text><text x="272" y="1111.1" font-size="14" fill="#a4a4a4">check again</text><text x="272" y="1130.1" font-size="14" fill="#f5f5f5">kept whole, locked;</text><text x="272" y="1149.1" font-size="14" fill="#a4a4a4">frees no disk until</text><text x="272" y="1168.1" font-size="14" fill="#a4a4a4">it is purged</text><text x="46" y="1149.1" font-size="14" fill="#8a8a8a">4</text><text x="62" y="1149.1" font-size="14" fill="#a4a4a4">check again</text><text x="46" y="1168.1" font-size="14" fill="#8a8a8a">5</text><text x="62" y="1168.1" font-size="14" fill="#a4a4a4"><tspan fill="#f5f5f5">git worktree remove</tspan></text><text x="62" y="1187.1" font-size="14" fill="#a4a4a4">never <tspan fill="#f5f5f5">--force</tspan></text>
+    <text x="36" y="1228.1" font-size="14" fill="#a4a4a4">A failed check, or any change: it moves</text>
+    <text x="36" y="1247.1" font-size="14" fill="#a4a4a4">back to its path and stays.</text>
+    <!-- 5. What comes back, and for how long -->
+    <path d="M135 1265V1288" stroke="#6e6e6e" stroke-width="1.5" fill="none"/><path d="M130 1287L135 1295L140 1287Z" fill="#6e6e6e"/>
+    <path d="M345 1265V1288" stroke="#6e6e6e" stroke-width="1.5" fill="none"/><path d="M340 1287L345 1295L350 1287Z" fill="#6e6e6e"/>
+    <rect x="20.5" y="1295.5" width="205" height="191" rx="8" fill="#0a0a0a" stroke="#2e2e2e"/>
+    <text x="34" y="1323.5" font-size="15" font-weight="500" fill="#f5f5f5">Removal record</text>
+    <text x="34" y="1346.5" font-size="15" font-weight="500" fill="#f5f5f5">for 30 days</text>
+    <text x="34" y="1366.1" font-size="14" fill="#a4a4a4"><tspan fill="#f5f5f5">--keep-removed</tspan></text>
+    <text x="34" y="1393.1" font-size="14" fill="#a4a4a4"><tspan fill="#f5f5f5">residue restore</tspan></text>
+    <text x="34" y="1412.1" font-size="14" fill="#a4a4a4">recreates it at its</text>
+    <text x="34" y="1431.1" font-size="14" fill="#a4a4a4">path, on its branch</text>
+    <text x="34" y="1450.1" font-size="14" fill="#a4a4a4">and HEAD, without</text>
+    <text x="34" y="1469.1" font-size="14" fill="#a4a4a4">its ignored files</text>
+    <rect x="254.5" y="1295.5" width="205" height="191" rx="8" fill="#0a0a0a" stroke="#2e2e2e"/>
+    <text x="268" y="1323.5" font-size="15" font-weight="500" fill="#f5f5f5">Trash entry</text>
+    <text x="268" y="1346.5" font-size="15" font-weight="500" fill="#f5f5f5">for 7 days</text>
+    <text x="268" y="1366.1" font-size="14" fill="#a4a4a4"><tspan fill="#f5f5f5">--keep-trash</tspan></text>
+    <text x="268" y="1393.1" font-size="14" fill="#a4a4a4"><tspan fill="#f5f5f5">residue restore</tspan></text>
+    <text x="268" y="1412.1" font-size="14" fill="#a4a4a4">puts it back whole,</text>
+    <text x="268" y="1431.1" font-size="14" fill="#a4a4a4">every file in it.</text>
+    <text x="268" y="1450.1" font-size="14" fill="#a4a4a4">Then it is purged</text>
+    <text x="268" y="1469.1" font-size="14" fill="#a4a4a4">into a removal record</text>
+    <path d="M254 1464.5H233" stroke="#6e6e6e" stroke-width="1.5" fill="none"/><path d="M234 1459.5L226 1464.5L234 1469.5Z" fill="#6e6e6e"/>
+    <text x="20" y="1513.1" font-size="14" fill="#a4a4a4">residue never deletes a branch, commit or stash.</text>
+    <!-- 6. What residue measures -->
+    <rect x="20.5" y="1540.5" width="439" height="114" rx="8" fill="#0a0a0a" stroke="#2e2e2e"/>
+    <text x="36" y="1570.6" font-size="17" font-weight="500" fill="#f5f5f5">residue stats</text>
+    <text x="36" y="1594.5" font-size="15" fill="#a4a4a4">A local ledger.jsonl notes every deletion,</text>
+    <text x="36" y="1615.5" font-size="15" fill="#a4a4a4">trash move and restore. It never decides</text>
+    <text x="36" y="1636.5" font-size="15" fill="#a4a4a4">a removal, and never leaves the machine.</text>
   </g>
 </svg>
