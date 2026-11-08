@@ -1464,5 +1464,39 @@ layout_refused ignored-deep-glob ignored "deep/ node_modules/" \
 layout_removed ignored-coverage-contents 'coverage/*\n' \
     'mkdir -p coverage/html && echo x >coverage/lcov.info && echo y >coverage/html/i.html' --regenerable coverage
 
+# 12. An ignored folder whose name the disk stores decomposed (NFD), `café/`
+# as `cafe` and U+0301. On macOS Git prints it precomposed (NFC), elsewhere
+# as stored; either way the walk finds it, so its entry has a size (#103).
+# The folder named precomposed is the control.
+nfd=$(printf 'cafe\314\201')
+nfc=$(printf 'caf\303\251')
+ignored_sized() { # NAME FOLDER
+    name=$1
+    local before
+    make_layout 'caf*/\n' "mkdir -p '$2/sub' && echo notes >'$2/sub/notes.txt'"
+    before=$(sums "$wt")
+    run remove --yes --json "$wt"
+    if [ "$status" != 3 ]; then fail "exit $status, want 3"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(failing_checks 0)" != "$(want_failing ignored)" ]; then fail "failing checks: $(failing_checks 0), want $(want_failing ignored)"
+    elif ! jq -e '[.results[0].worktree.ignored[] | select(.path != "node_modules/")] | length == 1 and .[0].files == 1 and .[0].bytes == 6' "$out" >/dev/null; then
+        fail "ignored entries: $(jq -c '.results[0].worktree.ignored' "$out"), want the folder with 1 file and 6 bytes"
+    elif untouched "$before"; then ok; fi
+}
+ignored_sized ignored-nfd-folder-size "$nfd"
+ignored_sized ignored-nfc-folder-size "$nfc"
+# A path rule inside it, written precomposed as a person types it, matches
+# on macOS, where Git spells the path that way too. Elsewhere Git keeps the
+# disk's spelling, so only a rule in that spelling matches there.
+if [ "$(uname -s)" = Darwin ]; then
+    layout_removed ignored-nfd-folder-path-rule 'caf*/\n' \
+        "mkdir -p '$nfd/sub' && echo notes >'$nfd/sub/notes.txt'" --regenerable "$nfc/sub/*.txt"
+else
+    layout_removed ignored-nfd-folder-path-rule 'caf*/\n' \
+        "mkdir -p '$nfd/sub' && echo notes >'$nfd/sub/notes.txt'" --regenerable "$nfd/sub/*.txt"
+fi
+layout_removed ignored-nfc-folder-path-rule 'caf*/\n' \
+    "mkdir -p '$nfc/sub' && echo notes >'$nfc/sub/notes.txt'" --regenerable "$nfc/sub/*.txt"
+
 echo "contract-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]

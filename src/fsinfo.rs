@@ -273,7 +273,11 @@ pub fn measure(
             }
             let mut here = place;
             if here.bucket.is_none() {
-                if let Some(&i) = lookup.get(&path) {
+                // Git's path, which can spell the name another way (#103).
+                let found = lookup.get(&path).or_else(|| {
+                    git_spelling(&path, root).and_then(|rel| lookup.get(&root.join(rel)))
+                });
+                if let Some(&i) = found {
                     here.bucket = Some(i);
                     usage.buckets[i].seen = true;
                     if buckets[i].expand {
@@ -291,7 +295,10 @@ pub fn measure(
                         }
                         here.covered = true;
                     } else if matches!(state, Expansion::Matched) {
-                        if relative(&path, root).is_some_and(|rel| matches(&rel)) {
+                        // A rule matches Git's spelling, and also the disk's.
+                        if relative(&path, root).is_some_and(|rel| matches(&rel))
+                            || git_spelling(&path, root).is_some_and(|rel| matches(&rel))
+                        {
                             here.covered = true;
                         } else if !meta.is_dir() || meta.dev() != device {
                             // A file no rule matches, or a mount point whose
@@ -689,6 +696,89 @@ fn relative(path: &Path, root: &Path) -> Option<String> {
         .ok()
         .and_then(|rel| rel.to_str())
         .map(str::to_string)
+}
+
+/// The path relative to the worktree root as Git prints it, when that is
+/// not how the disk spells it. On macOS, where `git init` sets
+/// `core.precomposeunicode`, Git precomposes (NFC) each name it reads that
+/// holds a non-ASCII byte, with `iconv` from UTF-8-MAC to UTF-8
+/// (`precompose_utf8_readdir` in Git's `compat/precompose_utf8.c`). A name
+/// stored decomposed (NFD) then never equals Git's path byte for byte
+/// (#103). None for an ASCII path, one the conversion leaves alone or
+/// refuses (Git then prints the name as stored), and on other systems,
+/// where Git prints every name as stored. The walk tries the disk's
+/// spelling first, which is Git's when the setting is off.
+fn git_spelling(path: &Path, root: &Path) -> Option<String> {
+    let rel = path.strip_prefix(root).ok()?.as_os_str().as_bytes();
+    if rel.is_ascii() {
+        return None;
+    }
+    precompose(rel)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn precompose(_: &[u8]) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+use nfc::precompose;
+
+#[cfg(target_os = "macos")]
+mod nfc {
+    use std::ffi::{c_char, c_int, c_void};
+
+    // <iconv.h>, in the libiconv every macOS has, which Git uses for this and
+    // residue already links through the libc crate. That crate's bindings
+    // are deprecated, as it means to stop linking the library, so the three
+    // calls are declared here.
+    #[link(name = "iconv")]
+    unsafe extern "C" {
+        fn iconv_open(tocode: *const c_char, fromcode: *const c_char) -> *mut c_void;
+        fn iconv(
+            cd: *mut c_void,
+            inbuf: *mut *mut c_char,
+            inbytesleft: *mut usize,
+            outbuf: *mut *mut c_char,
+            outbytesleft: *mut usize,
+        ) -> usize;
+        fn iconv_close(cd: *mut c_void) -> c_int;
+    }
+
+    /// Git's own conversion, called as Git calls it: the name with its NUL,
+    /// through a fresh descriptor (about 0.6 us on Apple silicon). A slash
+    /// never composes, so a whole path converts as its names do one by one.
+    pub fn precompose(name: &[u8]) -> Option<String> {
+        // SAFETY: both arguments are NUL-terminated literals.
+        let cd = unsafe { iconv_open(c"UTF-8".as_ptr(), c"UTF-8-MAC".as_ptr()) };
+        if cd.addr() == usize::MAX {
+            return None;
+        }
+        let mut input = Vec::with_capacity(name.len() + 1);
+        input.extend_from_slice(name);
+        input.push(0);
+        // Composing never lengthens a name; a conversion that would is
+        // refused, and the name keeps the disk's spelling.
+        let mut out = vec![0u8; input.len()];
+        let mut in_ptr = input.as_mut_ptr().cast::<c_char>();
+        let mut in_left = input.len();
+        let mut out_ptr = out.as_mut_ptr().cast::<c_char>();
+        let mut out_left = out.len();
+        // SAFETY: iconv reads at most `in_left` bytes from `input` and writes
+        // at most `out_left` into `out`, both ours, advancing the two
+        // pointers within them; `cd` is open until the close below.
+        let done = unsafe { iconv(cd, &mut in_ptr, &mut in_left, &mut out_ptr, &mut out_left) };
+        // SAFETY: `cd` came from iconv_open and is closed once.
+        unsafe { iconv_close(cd) };
+        if done == usize::MAX || in_left != 0 {
+            return None;
+        }
+        out.truncate(out.len() - out_left);
+        if out.pop() != Some(0) || out == name {
+            return None;
+        }
+        String::from_utf8(out).ok()
+    }
 }
 
 fn display(path: &Path, root: &Path) -> String {
