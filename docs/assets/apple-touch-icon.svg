@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The site's home-screen icon: logo-dark.svg on black, with room for the
+  rounded corners iOS cuts. Source of apple-touch-icon.png, 180 by 180: run
+  sh docs/assets/render.sh apple-touch-icon.svg, then copy the PNG to
+  site/public (site/check.sh compares them). Drawn at half size.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 90 90" width="90" height="90">
+  <rect width="90" height="90" fill="#000000"/>
+  <image href="logo-dark.svg" x="13" y="12.7" width="64" height="64.6"/>
+</svg>

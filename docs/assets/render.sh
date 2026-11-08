@@ -1,14 +1,19 @@
 #!/bin/sh
-# Renders the README artwork: each PNG in docs/assets that README.md shows,
-# from the SVG of the same name beside it, at twice its drawn size, on a
-# transparent background.
-# GitHub shows the PNGs, because it strips the styles and fonts an SVG would
-# need. Text is set in IBM Plex Mono from the site's own copy of the font
-# (site/public, pinned by site/check.sh), so a render looks the same on any
-# machine that has Chrome.
+# Renders the artwork: each PNG in docs/assets that README.md shows, or each
+# SVG you name, from the SVG of the same name beside it, at twice its drawn
+# size, on a transparent background. GitHub shows the README's PNGs, because
+# it strips the styles and fonts an SVG would need. og.png,
+# apple-touch-icon.png and icon-192.png are the site's social image and
+# icons; name them to render them. Text is set in IBM Plex Mono from the
+# site's own copy of the font (site/public, pinned by site/check.sh), so a
+# render looks the same on any machine that has Chrome. An SVG may draw
+# another file beside it, such as <image href="logo-dark.svg">, so the logo
+# has one owner.
 #
 #   sh docs/assets/render.sh                  every PNG the README shows
 #   sh docs/assets/render.sh hero.svg ...     only these
+#   sh docs/assets/render.sh og.svg apple-touch-icon.svg icon-192.svg
+#                                             the site's social image and icons
 #
 # Needs Google Chrome or Chromium. Set CHROME to its binary when it is not in
 # the usual place. Reads the SVGs and the fonts, and writes only the PNGs.
@@ -17,7 +22,8 @@
 # numbers: that is the drawn size, and the PNG is twice it.
 #
 # This script does not copy anything to the site. After a change to logo.svg,
-# logo-dark.svg or how-it-works-dark.svg, copy them to site/public as
+# logo-dark.svg or how-it-works-dark.svg, or a new og.png,
+# apple-touch-icon.png or icon-192.png, copy them to site/public as
 # site/README.md says.
 set -eu
 
@@ -74,8 +80,11 @@ for svg in "$@"; do
   fi
   width=${size% *}
   height=${size#* }
+  # The page sits in a scratch directory, so a relative href in the SVG
+  # resolves against the SVG's own directory instead.
+  base=$(cd "$(dirname "$svg")" && pwd | sed 's/%/%25/g; s/ /%20/g; s/#/%23/g; s/?/%3F/g')
   {
-    printf '<!doctype html><meta charset="utf-8"><style>\n%s\n' "$faces"
+    printf '<!doctype html><meta charset="utf-8"><base href="file://%s/"><style>\n%s\n' "$base" "$faces"
     printf 'html,body{margin:0;background:transparent}body>svg{display:block;width:%spx;height:%spx}</style>\n' "$width" "$height"
     sed '/^<?xml /d' "$svg"
   } > "$tmp/page.html"

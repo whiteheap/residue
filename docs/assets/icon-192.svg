@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The site's PNG icon, for browsers and search engines that do not use the
+  SVG favicon: logo.svg, which reads on a light or a dark tab bar, filling a
+  transparent square. Source of icon-192.png, 192 by 192 (Google Search asks
+  for a square that is a multiple of 48 px): run
+  sh docs/assets/render.sh icon-192.svg, then copy the PNG to site/public
+  (site/check.sh compares them). Drawn at half size.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96">
+  <image href="logo.svg" x="-5.96" y="-6.49" width="107.9" height="108.98"/>
+</svg>

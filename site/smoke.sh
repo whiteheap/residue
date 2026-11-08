@@ -7,11 +7,17 @@
 #
 # /           200, the bytes of index.html, and the Content-Security-Policy
 #             header of public/_headers, exactly
-# /NAME       200, the bytes of site/public/NAME, for every other served file;
-#             with nosniff, a script or a font must also carry its own type,
-#             and install.sh is text/plain
+# /NAME       200, the bytes of site/public/NAME, for every other served file,
+#             and /.well-known/NAME for each file in public/.well-known; with
+#             nosniff, a script or a font must also carry its own type;
+#             install.sh is text/plain, each .txt file text/plain with
+#             charset=utf-8 (security.txt and llms.txt require it), the
+#             sitemap XML, and each .png image/png
 # a missing   404, the bytes of 404.html
 #   path
+# crawlers    200 for /, robots.txt, sitemap.xml and llms.txt as each of
+#             Googlebot, Bingbot, OAI-SearchBot, Claude-SearchBot and
+#             PerplexityBot, by user agent, so no bot rule turns them away
 set -u
 
 url=${1:-https://residue.whiteheap.com}
@@ -31,8 +37,16 @@ header() {
 # One pass over every file. Writes a line per mismatch to $scratch/failures.
 pass() {
   : >"$scratch/failures"
-  for file in "$public"/*; do
-    name=$(basename "$file")
+  for agent in Googlebot/2.1 Bingbot/2.0 OAI-SearchBot/1.0 Claude-SearchBot/1.0 PerplexityBot/1.0; do
+    for target in / /robots.txt /sitemap.xml /llms.txt; do
+      status=$(curl -sS -A "$agent" -o /dev/null -w '%{http_code}' "$url$target") || status=error
+      [ "$status" = 200 ] ||
+        printf 'FAIL %s as %s: HTTP %s, expected 200\n' "$target" "$agent" "$status" >>"$scratch/failures"
+    done
+  done
+  for file in "$public"/* "$public"/.well-known/*; do
+    [ -f "$file" ] || continue
+    name=${file#"$public"/}
     want=200
     case $name in
       _headers) continue ;;
@@ -53,6 +67,9 @@ pass() {
         *.woff2) check=content-type expect='font/woff2*' ;;
         # Text, so a browser shows the script instead of downloading it.
         install.sh) check=content-type expect='text/plain*' ;;
+        *.txt) check=content-type expect='text/plain*charset=utf-8*' ;;
+        sitemap.xml) check=content-type expect='*/xml*' ;;
+        *.png) check=content-type expect='image/png*' ;;
         *) check= ;;
       esac
       if [ -n "$check" ]; then
@@ -78,4 +95,4 @@ while ! pass; do
   attempt=$((attempt + 1))
   sleep 5
 done
-printf 'ok   %s serves site/public byte for byte (attempt %s)\n' "$url" "$attempt"
+printf 'ok   %s serves site/public byte for byte, to every crawler too (attempt %s)\n' "$url" "$attempt"

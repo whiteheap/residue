@@ -1,0 +1,5 @@
+Contact: https://github.com/whiteheap/residue/security/advisories/new
+Expires: 2027-10-08T00:00:00.000Z
+Preferred-Languages: en
+Canonical: https://residue.whiteheap.com/.well-known/security.txt
+Policy: https://github.com/whiteheap/residue/blob/main/SECURITY.md

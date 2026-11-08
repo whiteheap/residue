@@ -2,12 +2,16 @@
 # deploy time and does not serve it. site/README.md says how to check them.
 # script-src and font-src name the site itself only: hero.js and the two
 # IBM Plex Mono files. site/check.sh holds this policy to the exact value.
+# Strict-Transport-Security asks for HTTPS only, for two years. While the
+# whiteheap.com zone's own HSTS setting is on, Cloudflare serves the zone's
+# header instead of this one: site/README.md, "HTTPS".
 /*
   Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
   X-Content-Type-Options: nosniff
   X-Frame-Options: DENY
   Referrer-Policy: strict-origin-when-cross-origin
   Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=()
+  Strict-Transport-Security: max-age=63072000
 
 # The install script reads as text in a browser, so people can check it
 # before they pipe it to sh. Without this it is application/x-sh, a download.
