@@ -725,8 +725,9 @@ name=remove-fails-part-way-dotgit
 part_remove_unusable part-remove-dotgit "its .git file is gone" "its files are gone"
 
 # 5d: restore while the run that left w, which Git can no longer use, still
-# runs. There is no command to give yet: restore says to wait for that
-# process and run it again, and never prints an empty command.
+# runs. No command can move it back: restore says to wait for that process
+# and run it again, or, if the PID is another process (PIDs are reused),
+# what to clear; it never prints an empty command.
 name=remove-fails-part-way-running
 make_repo
 echo "part-remove-head hold-after" >"$work/mode"
@@ -742,7 +743,7 @@ else
     : >"$work/go-after"
     finish "$pid"
     if [ "$restored" != 1 ]; then fail "restore while the removal runs exited $restored, want 1"
-    elif ! grep -qF "process $pid still runs, so residue may still be removing it, and Git can no longer use it (Git reads no HEAD in its Git directory); once that process has exited, run this restore again: it says what to clear" "$work/$name.err-restore"; then fail "restore: $(cat "$work/$name.err-restore")"
+    elif ! grep -qF "process $pid still runs, so residue may still be removing it, and Git can no longer use it (Git reads no HEAD in its Git directory); once that process has exited, run this restore again: it says what to clear; if it is not residue (\`ps -p $pid\` shows what it is): delete $aside, run \`git -C $(cd "$repo" && pwd -P) worktree prune\`, then run this restore again" "$work/$name.err-restore"; then fail "restore: $(cat "$work/$name.err-restore")"
     elif grep -qE "put it back with: *$" "$work/$name.err-restore"; then fail "restore prints an empty command: $(cat "$work/$name.err-restore")"
     elif [ "$status" != 3 ]; then fail "the removal exited $status, want 3"
     elif [ -z "$aside" ] || [ "$(record "$aside")" != registered ]; then fail "want it at the moved-aside path, which Git lists: ${aside:-none}"
