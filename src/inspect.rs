@@ -1255,9 +1255,11 @@ fn listing(text: &str, measured: &BucketUsage) -> Listing {
 }
 
 /// Drop the entries of a `--ignored=matching` list that
-/// `--ignored=traditional` would not print, with their buckets. An entry the
-/// walk cannot settle is looked up in traditional mode's list, which costs
-/// one more `git status`.
+/// `--ignored=traditional` would not print, with their buckets. Entries in
+/// the folders a limited traditional run listed (`git::Status::limited`)
+/// are that run's, so they stay. The entries the walk cannot settle are
+/// looked up in traditional mode's list of them, which costs one more `git
+/// status`, limited to those entries.
 fn drop_unlisted(
     dir: &Path,
     status: &mut git::Status,
@@ -1267,20 +1269,35 @@ fn drop_unlisted(
     if status.ignored.len() != buckets.len() || buckets.len() != usage.buckets.len() {
         return Err("the walk did not measure every ignored entry".to_string());
     }
+    // An entry in a limited folder is traditional mode's own, so it stays,
+    // even one the walk could not settle (#120).
     let kinds: Vec<Listing> = status
         .ignored
         .iter()
         .zip(&usage.buckets)
-        .map(|((text, _), measured)| listing(text, measured))
+        .map(|((text, rel), measured)| {
+            if status.traditional_listed(rel) {
+                Listing::Both
+            } else {
+                listing(text, measured)
+            }
+        })
         .collect();
     if kinds.iter().all(|kind| *kind == Listing::Both) {
         return Ok(());
     }
-    let traditional: HashSet<String> = if kinds.contains(&Listing::Unsure) {
-        let listed = git::traditional_status(dir)?.ignored;
-        listed.into_iter().map(|(text, _)| text).collect()
-    } else {
+    let unsure: Vec<&Path> = status
+        .ignored
+        .iter()
+        .zip(&kinds)
+        .filter(|(_, kind)| **kind == Listing::Unsure)
+        .map(|((_, rel), _)| rel.as_path())
+        .collect();
+    let traditional: HashSet<String> = if unsure.is_empty() {
         HashSet::new()
+    } else {
+        let listed = git::traditional_ignored_in(dir, &unsure)?;
+        listed.into_iter().map(|(text, _)| text).collect()
     };
     let entries = std::mem::take(&mut status.ignored);
     let walked = std::mem::take(buckets);

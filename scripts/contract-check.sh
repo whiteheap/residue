@@ -1498,5 +1498,57 @@ fi
 layout_removed ignored-nfc-folder-path-rule 'caf*/\n' \
     "mkdir -p '$nfc/sub' && echo notes >'$nfc/sub/notes.txt'" --regenerable "$nfc/sub/*.txt"
 
+# 13. Untracked folders that hold only ignored entries: residue lists them
+# again with one `git status --ignored=traditional` limited to them, not
+# the whole worktree (#120). The oracle is Git's own full traditional list,
+# which residue's ignored entries must equal; a Git trace counts the
+# `git status` calls and the limited ones among them.
+git_traditional() { # the ignored paths of a full traditional run in $wt, sorted, |-separated
+    git -C "$wt" -c core.quotePath=false status --porcelain=v1 -z --untracked-files=normal \
+        --ignored=traditional --ignore-submodules=none | tr '\0' '\n' | sed -n 's/^!! //p' |
+        LC_ALL=C sort | paste -s -d '|' -
+}
+
+layout_limited() { # NAME STATUS-CALLS LIMITED-CALLS PATTERNS SETUP
+    name=$1
+    local calls=$2 limited want got before starts
+    make_layout "$4" "$5"
+    want=$(git_traditional)
+    before=$(sums "$wt")
+    export GIT_TRACE2_EVENT=$work/$name.trace
+    run explain --json "$wt"
+    unset GIT_TRACE2_EVENT
+    got=$(jq -r '.worktree.ignored[].path' "$out" 2>/dev/null | LC_ALL=C sort | paste -s -d '|' -)
+    starts=$(grep '"event":"start"' "$work/$name.trace" | grep '"status"')
+    limited=$(printf '%s\n' "$starts" | grep -c 'literal-pathspecs')
+    if [ "$status" != 0 ]; then fail "explain exit $status, want 0"
+    elif ! jq -e '.schema == "residue.explain/v1"' "$out" >/dev/null 2>&1; then fail "stdout is not one explain document"
+    elif [ "$got" != "$want" ]; then fail "ignored entries: $got, want Git's traditional list: $want"
+    elif [ "$(printf '%s\n' "$starts" | grep -c .)" != "$calls" ] || [ "$limited" != "$3" ]; then
+        fail "git status ran $(printf '%s\n' "$starts" | grep -c .) times, $limited of them limited; want $calls and $3"
+    elif untouched "$before"; then ok; fi
+}
+
+# Several such folders, at the top and below a tracked one, take one
+# limited run.
+layout_limited limited-several 2 1 '*.log\nbuild/\n' \
+    'mkdir -p logs tmp/cache sub/gen/deep && echo a >logs/a.log && echo c >tmp/cache/c.log && echo g >sub/gen/deep/g.log'
+# Each name means only itself: read as a glob, `sub/[slug]` would be
+# `sub/s`, and `:x` would be pathspec magic.
+layout_limited limited-literal-names 2 1 '*.log\n' \
+    'mkdir -p -- "sub/[slug]" sub/s "a*b" "q?" :x ":(exclude)y" -d && for d in "sub/[slug]" sub/s "a*b" "q?" :x ":(exclude)y" -d; do echo l >"$d/x.log"; done'
+# An empty ignored folder outside the limited folder is still dropped;
+# inside one, traditional mode's answer stands.
+layout_limited limited-empty-outside 2 1 'secrets/\n*.log\nbuild/\n' \
+    'mkdir -p secrets sub/build logs/build && echo a >logs/a.log'
+# A nested repository in a limited folder, and one in an ignored folder
+# outside it that holds nothing else: that one is looked up with a second
+# limited run, never the whole worktree.
+layout_limited limited-nested-repos 3 2 '*.log\nbuild/\n' \
+    'mkdir -p u sub/build && git init -q u/dep && echo a >u/a.log && git init -q sub/build/dep'
+# Past 64 folders, the whole worktree runs in traditional mode.
+layout_limited limited-past-cap 2 0 '*.log\n' \
+    'i=0; while [ $i -lt 65 ]; do mkdir u$i && echo l >u$i/x.log; i=$((i + 1)); done'
+
 echo "contract-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]

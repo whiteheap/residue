@@ -66,6 +66,9 @@
 #                  after deleting the checkout and the `gitdir` file in the
 #                  worktree's Git directory, or all of that directory: what
 #                  Git's own remove leaves when it stops part way (4f)
+#   fail-limited   fail every `git status` limited to some folders (a
+#                  `--literal-pathspecs status`), and log each status
+#                  call's kind to $work/statuses (7)
 #
 # A held command waits at most 50 s, and never runs once its residue has
 # exited or the test aborted it. The two removers of scenario 4 start one
@@ -274,6 +277,15 @@ case " \$* " in
     esac
     ;;
 *" status "*)
+    case "\$* \$mode" in
+    *" --literal-pathspecs status "*fail-limited*)
+        echo limited >>"\$work/statuses"
+        echo "fatal: recovery-check: the limited status is failed on purpose" >&2
+        exit 128
+        ;;
+    *--ignored=traditional*fail-limited*) echo full >>"\$work/statuses" ;;
+    *--ignored=matching*fail-limited*) echo matching >>"\$work/statuses" ;;
+    esac
     case "\$dir \$mode" in
     *residue-removing-*touch-aside*)
         if [ ! -e "\$work/touched" ]; then
@@ -381,7 +393,7 @@ ok() {
 # With ref_format set, Git stores its refs that way (`--ref-format`).
 make_repo() {
     repo=$work/$name
-    rm -f "$work"/at-* "$work"/go-* "$work"/abort-* "$work/touched" "$work/held" "$work/part-done" "$work/inner"
+    rm -f "$work"/at-* "$work"/go-* "$work"/abort-* "$work/touched" "$work/held" "$work/part-done" "$work/inner" "$work/statuses"
     setup git init -q ${ref_format:+--ref-format="$ref_format"} "$repo"
     printf 'node_modules/\n' >"$repo/.gitignore"
     echo hello >"$repo/README.md"
@@ -1360,6 +1372,31 @@ else
         elif common_ok; then ok "restore says the sweep forgot the record and names $lone"; fi
     fi
 fi
+
+# --- 7. A `git status` limited to some folders fails ----------------------
+# logs/ holds only ignored files and no tracked one, so residue lists it
+# with a traditional run limited to it (#120). When that run fails, residue
+# runs traditional mode on the whole worktree, as before: logs/ is one
+# entry, and it keeps the worktree.
+name=limited-status-fails
+make_repo
+printf '*.log\n' >>"$repo/.git/info/exclude"
+mkdir "$wt/logs"
+echo a >"$wt/logs/a.log"
+before=$(sums "$wt")
+echo fail-limited >"$work/mode"
+start "" remove --yes --json "$wt"
+finish "$pid"
+: >"$work/mode"
+out=$work/$name.out
+calls=$(paste -s -d ' ' - <"$work/statuses" 2>/dev/null)
+if [ "$status" != 3 ]; then fail "exit $status, want 3"
+elif [ "$(jq -r '.results[0].result' "$out")" != refused ]; then fail "result $(jq -r '.results[0].result' "$out"), want refused"
+elif [ "$(jq -r '[.results[0].worktree.ignored[].path] | sort | join(" ")' "$out")" != "logs/ node_modules/" ]; then
+    fail "ignored entries: $(jq -c '[.results[0].worktree.ignored[].path]' "$out"), want logs/ and node_modules/"
+elif [ "$calls" != "matching limited full" ]; then fail "git status ran: $calls; want matching limited full"
+elif [ "$(record "$wt")" != registered ] || [ "$(sums "$wt")" != "$before" ]; then fail "w changed: $(record "$wt")"
+elif common_ok; then ok "the whole traditional run answered, and logs/ keeps w"; fi
 
 echo "recovery-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]
