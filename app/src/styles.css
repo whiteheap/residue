@@ -3,10 +3,11 @@
    utilities of every Kumo component, about 80 KB the window parses and
    matches on each style change for components it never draws. So the scan
    takes this app's src/ and the chunks of the Kumo components it renders:
-   the ones it imports (Button, Checkbox, Dialog, Empty, Loader, Tabs) and the
-   Kumo components those draw (Label, LayerCard, Text, Tooltip). Importing
-   another Kumo component, or a Kumo upgrade that changes what these draw,
-   adds its name here; a component missing from the list renders unstyled. */
+   the ones it imports (Button, Checkbox, Dialog, Empty, Tabs) and the Kumo
+   components those draw (Label, LayerCard, Loader in Button's loading state,
+   Text, Tooltip). Importing another Kumo component, or a Kumo upgrade that
+   changes what these draw, adds its name here; a component missing from the
+   list renders unstyled. */
 @source "./";
 @source "../node_modules/@cloudflare/kumo/dist/chunks/{button,checkbox,dialog,empty,label,layer-card,loader,tabs,text,tooltip}-*.js";
 @source not "../node_modules/@cloudflare/kumo/dist/chunks/button-group-*.js";
@@ -179,6 +180,12 @@
 
 /* ---------------------------------------------------------------- shell */
 
+/* The document never scrolls: the shell is one viewport tall
+   (`block-size: 100dvh`), clips what overflows (`overflow: clip`), and each
+   page scrolls inside .page-body. WebKit redraws the document's buffers at
+   every window activation. One that does not scroll is two window-sized
+   buffers, 30.2 MB of WebContent memory at the default size; one that
+   scrolls is drawn in tiles, 98.5 MB. */
 .app {
   display: grid;
   grid-template-columns: 15rem minmax(0, 1fr);
@@ -753,6 +760,26 @@ dd {
   align-items: center;
   gap: 1rem;
   padding-block: 2rem;
+}
+
+.loading-arc {
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+
+.loading-ring {
+  stroke: var(--line);
+}
+
+/* A turn of `transform`, never `steps()`: WebKit hands it to Core Animation,
+   so it repaints nothing. */
+@keyframes loading-turn {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .loading-text,
@@ -1816,6 +1843,10 @@ li:not([data-result="trashed"]) > .plan-result {
     transform-box: view-box;
     transform-origin: 0 0;
     animation: viz-zoom 240ms var(--ease-out);
+  }
+
+  .loading-arc {
+    animation: loading-turn 2s linear infinite;
   }
 }
 
