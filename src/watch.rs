@@ -402,6 +402,13 @@ impl Options {
     }
 }
 
+/// How often `wait` reads free space for `--min-free`: one `statvfs` per
+/// filesystem, under 0.01 s of CPU in five minutes at rest. No event serves
+/// instead on Linux or macOS. Linux has none. macOS defines
+/// `VQ_FREE_SPACE_CHANGE` for an `EVFILT_FS` kqueue, but on macOS 26.3.1
+/// APFS sent none while 10.25 GB was written and deleted, only
+/// `VQ_PURGEABLE_SPACE_CHANGE` (2026-11-08). A longer interval only delays
+/// the low-disk rule, and that write took 9 s.
 const FREE_CHECK: Duration = Duration::from_secs(5 * 60);
 const REDISCOVER: Duration = Duration::from_secs(6 * 60 * 60);
 const QUIET: Duration = Duration::from_secs(20);
