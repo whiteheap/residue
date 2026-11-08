@@ -29,13 +29,13 @@ Options:
   --keep-trash DURATION    remove: purge trash entries older than this (7d)
   --keep-removed DURATION  remove: keep removal records at least this long (30d)
   --removal-reason REASON  remove: watch-landed or watch-low-disk (set by watch)
-  --only-if-upstream-gone  remove: only worktrees local refs show upstream gone
+  --only-if-upstream-gone  remove: only if local refs show the upstream gone
   --to PATH                restore: put the worktree at PATH
   --regenerable RULE       Treat ignored entries matching RULE as regenerable
   -h, --help               Show this help
   -V, --version            Show the version
 
-DURATION is a number and m, h, d or w: 30m, 12h, 2d, 1w.
+DURATION is a whole number and m, h, d or w: 30m, 12h, 2d, 1w.
 
 Examples:
   residue scan ~/src
@@ -68,8 +68,9 @@ impl Span {
     /// A positive whole number and one unit: `30m`, `12h`, `2d`, `1w`.
     /// `flag` names the option in error messages.
     pub fn parse(flag: &str, text: &str) -> Result<Span, String> {
-        let invalid =
-            || format!("{flag} {text:?}: use a number and a unit, such as 30m, 12h, 2d or 1w");
+        let invalid = || {
+            format!("{flag} {text:?}: use a whole number and a unit, such as 30m, 12h, 2d or 1w")
+        };
         let unit = text.chars().last().ok_or_else(invalid)?;
         let scale: i64 = match unit {
             'm' => 60,

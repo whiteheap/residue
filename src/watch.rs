@@ -87,7 +87,7 @@ Options:
   --once                   Fetch, decide and act once, then exit
   -h, --help               Show this help
 
-DURATION is a number and m, h, d or w: 30m, 1h, 2d, 1w.
+DURATION is a whole number and m, h, d or w: 30m, 1h, 2d, 1w.
 
 Examples:
   residue watch --once --dry-run   preview one pass (it still fetches)
@@ -224,7 +224,7 @@ pub struct Span {
 impl Span {
     pub fn parse(flag: &str, text: &str) -> Result<Span, String> {
         let invalid =
-            || format!("{flag} {text:?}: use a number and a unit, such as 30m, 1h, 2d or 1w");
+            || format!("{flag} {text:?}: use a whole number and a unit, such as 30m, 1h, 2d or 1w");
         let unit = text.chars().last().ok_or_else(invalid)?;
         let seconds = match unit {
             'm' => 60,
@@ -439,7 +439,7 @@ pub fn main(args: &[OsString]) -> u8 {
     };
     // One line of labels and values; `residue watch --help` explains each.
     log(&format!(
-        "watching {} ({}{}) · landed: unchanged {} · below {}% free: unchanged {} · removal records: {} · fetch: {}{}",
+        "watching {} ({}{}) · removes: landed and unchanged {}, or below {}% free and unchanged {} · removal records: {} · fetch: {}{}",
         opts.shown_roots(),
         events::BACKEND,
         if opts.default_roots {

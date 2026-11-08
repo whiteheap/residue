@@ -807,7 +807,7 @@ const NO_TERMINAL: &str = "stdin is not a terminal, so residue cannot ask for co
 
 /// The same, as the two lines a text run ends with: what happened, then
 /// what to do.
-const NO_TERMINAL_TEXT: &str = "nothing removed: stdin is not a terminal, so residue cannot ask\nnext: run it in a terminal, or pass --yes from the session that finished their task";
+const NO_TERMINAL_TEXT: &str = "nothing removed: stdin is not a terminal, so residue cannot ask\nnext: run it in a terminal, or pass --yes from the session that owns them, once its task is done";
 
 fn confirm(worktrees: usize, purges: usize, forgets: usize, trash: bool) -> Result<bool, String> {
     let stdin = io::stdin();
