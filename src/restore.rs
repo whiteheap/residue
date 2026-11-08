@@ -735,6 +735,14 @@ fn removed_row(item: &removed::Item, now: i64, places: &Places, style: &Style) -
                         places.show(&r.aside)
                     ))
                 ));
+            } else if item.back {
+                out.push_str(&format!(
+                    "    {}\n",
+                    style.dim(&format!(
+                        "back: Git lists it at {} again, at the recorded HEAD or ahead of it; nothing to restore",
+                        places.show(&r.original)
+                    ))
+                ));
             } else if !r.gone.is_empty() {
                 let list: Vec<String> = r.gone.iter().map(removed::Gone::sized).collect();
                 out.push_str(&format!(

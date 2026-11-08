@@ -21,7 +21,9 @@
 //! ends with the `residue restore` command that brings the worktree back.
 //! A worktree `residue restore` put back is never removed again because its
 //! work landed (the scan's `restored`, and the child's own check): someone
-//! wanted it after it landed. Disk pressure still removes it.
+//! wanted it after it landed. One a removal record names as back at its
+//! path (`state` `back`) is kept the same way, which covers a restore stopped
+//! before it wrote its marker. Disk pressure still removes it.
 //!
 //! To see a branch deleted on the remote, it fetches (`Fetcher`): about
 //! every `--fetch-every`, `git fetch --prune --no-tags` of each remote that
@@ -562,7 +564,8 @@ struct Worktree {
     /// has been unchanged long enough.
     waits_for_idle: bool,
     /// `residue restore` put it back (or residue could not read whether
-    /// it did): the landed-work rule never removes it again.
+    /// it did), or a removal record names it as back at its path: the
+    /// landed-work rule never removes it again.
     restored: bool,
     /// The filesystem it is on.
     dev: Option<u64>,
@@ -621,6 +624,8 @@ fn scan(exe: &Path, opts: &Options) -> Result<Snapshot, ScanError> {
     };
     for repo in doc.get("repositories").map(Value::items).unwrap_or(&[]) {
         let worktrees = repo.get("worktrees").map(Value::items).unwrap_or(&[]);
+        let back = back_paths(repo);
+        let put_back = |w: &Value| restored(w) || is_back(w, &back);
         if let Some(common_dir) = repo.get("common_dir").and_then(Value::str) {
             let common_dir = PathBuf::from(common_dir);
             let dir = repo
@@ -631,7 +636,7 @@ fn scan(exe: &Path, opts: &Options) -> Result<Snapshot, ScanError> {
                 .unwrap_or_else(|| common_dir.clone());
             let mut branches = BTreeSet::new();
             let mut upstreams = HashSet::new();
-            for w in worktrees.iter().filter(|w| !restored(w)) {
+            for w in worktrees.iter().filter(|w| !put_back(w)) {
                 let branch = w.get("branch").and_then(Value::str);
                 let upstream = w.get("upstream_ref").and_then(Value::str);
                 if let (Some(branch), Some(upstream)) = (branch, upstream) {
@@ -683,7 +688,7 @@ fn scan(exe: &Path, opts: &Options) -> Result<Snapshot, ScanError> {
                     .unwrap_or(0)
                     .max(0) as u64,
                 waits_for_idle: !failing.is_empty() && failing.iter().all(|id| *id == "idle"),
-                restored: restored(w),
+                restored: put_back(w),
                 dev: std::fs::metadata(path).ok().map(|m| m.dev()),
             });
         }
@@ -1043,6 +1048,34 @@ fn restored(worktree: &Value) -> bool {
     ["restored", "restored_error"]
         .iter()
         .any(|k| worktree.get(k).is_some_and(|v| !matches!(v, Value::Null)))
+}
+
+/// The original paths of the repository's removal records whose worktree
+/// is back there (`state` `back`): a restore stopped before it wrote its
+/// marker, or one that kept its record, or a move back whose record could
+/// not be dropped. The landed rule keeps those worktrees as it keeps a
+/// marked one, while the record lives.
+fn back_paths(repo: &Value) -> Vec<PathBuf> {
+    repo.get("removed")
+        .map(Value::items)
+        .unwrap_or(&[])
+        .iter()
+        .filter(|r| r.get("state").and_then(Value::str) == Some("back"))
+        .filter_map(|r| r.get("original_path").and_then(Value::str))
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// A worktree at one of `back`, by its path as the scan gives it or as
+/// the filesystem resolves it.
+fn is_back(worktree: &Value, back: &[PathBuf]) -> bool {
+    if back.is_empty() {
+        return false;
+    }
+    let Some(path) = worktree.get("path").and_then(Value::str).map(Path::new) else {
+        return false;
+    };
+    back.iter().any(|b| b == path) || std::fs::canonicalize(path).is_ok_and(|p| back.contains(&p))
 }
 
 /// Watch what a fetch or prune changes in each repository: the directories

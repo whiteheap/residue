@@ -385,13 +385,16 @@ fn holds_only_info(entry: &Path) -> bool {
 /// Remove a directory if it is empty; one that still has entries stays and
 /// is not an error. POSIX lets rmdir(2) report a non-empty directory as
 /// ENOTEMPTY or EEXIST, and illumos uses EEXIST, which Rust calls
-/// `AlreadyExists`. rmdir never reports EEXIST for anything else.
+/// `AlreadyExists`. rmdir never reports EEXIST for anything else. One
+/// another run removed first is gone, as this one wanted.
 pub fn remove_dir_if_empty(dir: &Path) -> io::Result<()> {
     match fs::remove_dir(dir) {
         Err(e)
             if matches!(
                 e.kind(),
-                io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::AlreadyExists
+                io::ErrorKind::DirectoryNotEmpty
+                    | io::ErrorKind::AlreadyExists
+                    | io::ErrorKind::NotFound
             ) =>
         {
             Ok(())

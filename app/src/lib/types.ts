@@ -118,8 +118,14 @@ export interface RemovalRecord {
   entry: string;
   entry_path: string;
   ref: string;
-  /** `interrupted`: the removal did not finish, and Git still lists the worktree. */
-  state: "removed" | "interrupted";
+  /**
+   * `removed`: the worktree is gone, and restore recreates it. `interrupted`:
+   * the removal did not finish, and Git still lists the worktree. `back`: Git
+   * lists the worktree at `original_path` again, so there is nothing to
+   * restore. `incomplete` and `unreadable`: residue cannot use the record
+   * (`incomplete`, `error`).
+   */
+  state: "removed" | "interrupted" | "back" | "incomplete" | "unreadable";
   original_path: string | null;
   aside_path: string | null;
   branch: string | null;

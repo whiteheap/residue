@@ -138,7 +138,7 @@ residue stores no state field. Its store is Git and the filesystem, and each lif
 | Lifecycle | Its states are read in | Its moves are made by |
 | --- | --- | --- |
 | A worktree being removed: linked, moved aside (`.NAME.residue-removing-PID`, locked `residue: removing`), in the trash (locked `residue: in trash`), deleted | `discover::Repo::new` | `remove::execute`, `Moved::put_back`, `remove::purge`, `trash::restore`, `removed::restore` |
-| A removal record: incomplete, interrupted, removed | `removed::list`, `removed::Item` | `removed::create`, `Written::undo`, `removed::forget`, `removed::restore` |
+| A removal record (`removed::State`): incomplete, unreadable, interrupted, back (Git lists its worktree at its original path again, on its branch at or ahead of the recorded HEAD), removed | `removed::list`, `removed::Item::state` (`removed::is_back`) | `removed::create`, `Written::undo`, `removed::forget`, `removed::restore` |
 | A trash entry: being made (no `info` yet), holds its worktree, holds only its record (a purge clears it an hour after it was made) | `trash::list`, `trash::Item` | `trash::create`, `trash::restore`, `trash::purge`, `trash::discard` |
 | The restored marker | `removed::marked` | `removed::mark` |
 

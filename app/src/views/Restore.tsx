@@ -65,6 +65,9 @@ function recordNote(item: Extract<Restorable, { kind: "removed" }>, home: string
       item.asidePath ? ` at ${tilde(item.asidePath, home)}` : ""
     }. Restore moves it back.`;
   }
+  if (item.state === "back") {
+    return `It is back${item.originalPath ? ` at ${tilde(item.originalPath, home)}` : ""}, so there is nothing to restore.`;
+  }
   if (item.notKept.length === 0) return null;
   return `Comes back without its ignored files: ${item.notKept
     .map(sized)
@@ -259,8 +262,10 @@ export function Restore({
                 // A record residue cannot read has no branch to show, detached or not.
                 const branch = item.error ? name : (shortBranch(item.branch) ?? "detached");
                 const note = item.kind === "removed" && !item.error ? recordNote(item, home) : null;
-                // residue cannot restore from a record it cannot read.
-                const restorable = item.kind === "trash" || (!item.error && !item.incomplete);
+                // residue cannot restore from a record it cannot read, and a
+                // worktree that is back at its path has nothing to restore.
+                const restorable =
+                  item.kind === "trash" || (!item.error && !item.incomplete && item.state !== "back");
                 const kept = item.kind === "trash" && !item.error ? trashAge(item.at, now, keepSeconds) : null;
                 const held = item.kind === "removed" ? recordKeep(item, now) : null;
                 return (

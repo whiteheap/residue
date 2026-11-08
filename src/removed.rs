@@ -505,6 +505,38 @@ pub struct Item {
     /// that failed part way can have deleted part of its files and of its
     /// Git directory, which the record keeps.
     pub registered: Option<Entry>,
+    /// Git lists a worktree at the record's original path again, on its
+    /// branch (or detached, as it was) at the recorded HEAD or ahead of
+    /// it: a restore or a move back put it there (`is_back`).
+    pub back: bool,
+}
+
+/// Where a removal record stands, read from its files and from Git's list
+/// of worktrees when it is listed. `item_json` gives it as `state`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum State {
+    /// The entry has no `info`: its run stopped before it deleted anything.
+    Incomplete,
+    /// Its `info` cannot be read, so residue never uses or forgets it.
+    Unreadable,
+    /// Git still lists the worktree where the deletion started.
+    Interrupted,
+    /// Git lists the worktree at its original path again.
+    Back,
+    /// The worktree is gone; `residue restore` recreates it.
+    Removed,
+}
+
+impl State {
+    pub fn code(self) -> &'static str {
+        match self {
+            State::Incomplete => "incomplete",
+            State::Unreadable => "unreadable",
+            State::Interrupted => "interrupted",
+            State::Back => "back",
+            State::Removed => "removed",
+        }
+    }
 }
 
 impl Item {
@@ -528,11 +560,13 @@ impl Item {
         })
     }
 
-    pub fn state(&self) -> &'static str {
-        if self.interrupted() {
-            "interrupted"
-        } else {
-            "removed"
+    pub fn state(&self) -> State {
+        match (&self.record, self.incomplete) {
+            (Err(_), true) => State::Incomplete,
+            (Err(_), false) => State::Unreadable,
+            (Ok(_), _) if self.interrupted() => State::Interrupted,
+            (Ok(_), _) if self.back => State::Back,
+            (Ok(_), _) => State::Removed,
         }
     }
 
@@ -555,15 +589,23 @@ fn refs_of(name: &str, head: &str, kept: &[String]) -> Vec<(String, String)> {
 
 /// The records of the repository at `common_dir`, oldest first. `listed`
 /// is every worktree Git lists for it, so a record whose worktree Git still
-/// lists where the deletion started is marked interrupted. A record that
-/// cannot be read is listed with its error, and never forgotten or used.
+/// lists where the deletion started is marked interrupted, and one whose
+/// worktree Git lists at its original path again is marked back. A record
+/// that cannot be read is listed with its error, and never forgotten or
+/// used.
 pub fn of_repo(repo: &crate::discover::Repo) -> Result<Vec<Item>, String> {
     let listed: Vec<&Entry> = repo.trash.iter().chain(&repo.interrupted).collect();
-    list(&repo.common_dir, &repo.command_dir(), &listed)
+    list(&repo.common_dir, &repo.command_dir(), &listed, &repo.linked)
 }
 
-/// [`of_repo`] for a repository given by its directories.
-pub fn list(common_dir: &Path, command_dir: &Path, listed: &[&Entry]) -> Result<Vec<Item>, String> {
+/// [`of_repo`] for a repository given by its directories. `live` is the
+/// linked worktrees Git lists outside the trash and the hidden names.
+fn list(
+    common_dir: &Path,
+    command_dir: &Path,
+    listed: &[&Entry],
+    live: &[Entry],
+) -> Result<Vec<Item>, String> {
     let root = root(common_dir);
     let listing = match fs::read_dir(&root) {
         Ok(l) => l,
@@ -604,6 +646,8 @@ pub fn list(common_dir: &Path, command_dir: &Path, listed: &[&Entry]) -> Result<
                 })
                 .map(|e| (*e).clone())
         });
+        let back =
+            registered.is_none() && record.as_ref().is_ok_and(|r| is_back(r, live, command_dir));
         items.push(Item {
             name,
             common_dir: common_dir.to_path_buf(),
@@ -614,6 +658,7 @@ pub fn list(common_dir: &Path, command_dir: &Path, listed: &[&Entry]) -> Result<
             head_reflog: dir.join(REFLOG).is_file(),
             modified: Some(meta.mtime()),
             registered,
+            back,
             dir,
         });
     }
@@ -624,6 +669,38 @@ pub fn list(common_dir: &Path, command_dir: &Path, listed: &[&Entry]) -> Result<
         )
     });
     Ok(items)
+}
+
+/// Git lists a worktree at the record's original path whose checkout is
+/// there, on the recorded branch (detached when the record is), and whose
+/// HEAD is the recorded HEAD or contains it. A restore that kept its record,
+/// one stopped before it wrote its marker, a move back whose record could
+/// not be dropped, and a trash restore that lands during a purge all leave
+/// that. A new worktree on another branch at the same path is not one, and
+/// neither is one whose HEAD Git cannot compare with the recorded one.
+fn is_back(record: &Record, live: &[Entry], command_dir: &Path) -> bool {
+    let Some(entry) = live.iter().find(|e| {
+        e.prunable.is_none()
+            && (e.path == record.original
+                || git::canonical(&e.path).ok().as_deref() == Some(record.original.as_path()))
+    }) else {
+        return false;
+    };
+    let Some(head) = entry.head.as_deref() else {
+        return false;
+    };
+    if entry.branch != record.branch {
+        return false;
+    }
+    head == record.head || git::is_ancestor(command_dir, &record.head, head).unwrap_or(false)
+}
+
+/// Why `residue restore` does not restore a record whose worktree is back.
+fn back_text(record: &Record) -> String {
+    format!(
+        "Git lists its worktree at {} again, at the recorded HEAD or ahead of it, so there is nothing to restore; a remove run forgets this record after --keep-removed",
+        record.original.display()
+    )
 }
 
 /// A record residue has written and not yet given up.
@@ -920,7 +997,8 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<(), String> {
 
 /// Remove an entry's files and its now empty directory, and the records
 /// directory once it is empty. Never recursive: anything else left in the
-/// entry stays, and the error says so.
+/// entry stays, and the error says so. An entry another run discarded
+/// first is gone, as this one wanted.
 fn discard(dir: &Path) -> Result<(), String> {
     for file in [INFO, INFO_NEW, CONFIG, REFLOG] {
         match fs::remove_file(dir.join(file)) {
@@ -929,7 +1007,11 @@ fn discard(dir: &Path) -> Result<(), String> {
             Err(e) => return Err(format!("cannot remove {}: {e}", dir.join(file).display())),
         }
     }
-    fs::remove_dir(dir).map_err(|e| format!("cannot remove {}: {e}", dir.display()))?;
+    match fs::remove_dir(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("cannot remove {}: {e}", dir.display())),
+    }
     if let Some(root) = dir.parent() {
         crate::trash::remove_dir_if_empty(root)
             .map_err(|e| format!("cannot remove {}: {e}", root.display()))?;
@@ -1068,6 +1150,9 @@ fn whereabouts(entry: &Entry, main: &Entry, trash_root: &Path) -> String {
 /// one first.
 pub fn restore(item: &Item, to: Option<&Path>, listed: &[Entry]) -> Result<Restored, String> {
     let record = item.record.as_ref().map_err(|e| e.clone())?;
+    if item.back && to.is_none() {
+        return Err(back_text(record));
+    }
     let dest = to.unwrap_or(&record.original);
     match fs::symlink_metadata(dest) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -1688,7 +1773,7 @@ pub fn item_json(item: &Item) -> Json {
         ("entry", Json::str(item.name.clone())),
         ("entry_path", Json::path(&item.dir)),
         ("ref", Json::str(item.ref_name())),
-        ("state", Json::str(item.state())),
+        ("state", Json::str(item.state().code())),
         (
             "original_path",
             Json::opt(r.map(|r| r.original.as_path()), Json::path),
@@ -1846,6 +1931,7 @@ mod tests {
             head_reflog: false,
             modified: None,
             registered: None,
+            back: false,
         };
         let day = 86_400;
         let removed = sample().removed;

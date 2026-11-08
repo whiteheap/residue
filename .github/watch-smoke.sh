@@ -35,11 +35,14 @@
 #      that restore brings the worktree back on its branch and HEAD. The
 #      restored worktree is never removed again because its work landed,
 #      with watch fetching, past --grace; disk pressure still removes it.
+#   9. A worktree back at its path while its removal record lives, with no
+#      restored marker (a restore stopped after its `git worktree add`), is
+#      listed as back and never removed again because its work landed.
 # Every branch stays, and nothing goes to the trash: watch deletes.
 # On NetBSD, OpenBSD and DragonFly (scripts/partial-probe.sh) no worktree
 # is a candidate: there it checks that every worktree is `unknown` for the
 # probe's reason and that dry, landed and disk-pressure runs remove none,
-# skips 1-6 and 8 by name, and runs 7 expecting no removal.
+# skips 1-6, 8 and 9 by name, and runs 7 expecting no removal.
 set -eu
 
 residue=$1
@@ -192,7 +195,8 @@ if [ -n "$partial_probe" ]; then
   for case in "1. a dry run names the landed fix" "2. --once removes the landed fix" \
     "3. a running watch removes wip" "4. disk pressure removes local" \
     "5. the removal child's --only-if-upstream-gone" "6. the child's three upstream reads" \
-    "8. a restored worktree is not removed again because its work landed"; do
+    "8. a restored worktree is not removed again because its work landed" \
+    "9. a worktree back at its path without its marker is not removed again because its work landed"; do
     skip_partial "$case"
   done
   fetch_case
@@ -465,6 +469,42 @@ for b in back control; do
   git rev-parse --verify -q "$b" > /dev/null || fail "8: branch $b is gone"
 done
 echo "watch-smoke: 8. removal records restored back; the landed rule kept it, disk pressure did not"
+
+# 9. A worktree back at its path while its removal record lives, with no
+# restored marker: what a restore stopped right after its `git worktree
+# add` leaves (scripts/recovery-check.sh restore-stopped-before-mark). The
+# record reads as back, and the landed rule never removes the worktree
+# again, past --grace; a landed control beside it goes.
+git init -q --bare -b main "$S/r9.git"
+git clone -q "$S/r9.git" "$S/r9" 2> /dev/null
+cd "$S/r9"
+git config user.email smoke@example.com
+git config user.name smoke
+echo hello > README.md
+git add . && git commit -qm init && git push -q origin main
+for name in again control; do
+  git worktree add -q "$S/r9/.worktrees/$name" -b "$name"
+  (cd ".worktrees/$name" && echo "$name" >> README.md && git commit -qam "$name" && git push -q -u origin "$name")
+done
+git push -q origin --delete again
+git fetch -q --prune
+age9() {
+  find "$S/r9/.worktrees" "$S/r9/.git/worktrees" -exec touch -t 202601010000 {} +
+}
+age9
+"$residue" watch --once --no-fetch --grace 1m "$S/r9" 2> "$S/log" || fail "9: the landed run failed"
+grep -q "removed .*worktrees/again (.*): origin/again was deleted" "$S/log" || fail "9: again was not removed"
+git worktree add -q "$S/r9/.worktrees/again" again
+git push -q origin --delete control
+git fetch -q --prune
+age9
+"$residue" watch --once --no-fetch --grace 1m "$S/r9" 2> "$S/log" || fail "9: the second landed run failed"
+grep -q "removed .*worktrees/control (.*): origin/control was deleted" "$S/log" || fail "9: control was not removed"
+! grep -q "removed .*worktrees/again" "$S/log" || fail "9: watch removed again, which its removal record lists as back"
+[ -d .worktrees/again ] || fail "9: again is gone"
+"$residue" restore > "$S/restore9.out" 2>&1 || fail "9: the restore list failed: $(cat "$S/restore9.out")"
+grep -q "back: Git lists it at .*worktrees/again again" "$S/restore9.out" || fail "9: the record does not read as back: $(cat "$S/restore9.out")"
+echo "watch-smoke: 9. a worktree back at its path without its marker; the landed rule kept it"
 
 fetch_case
 echo "watch-smoke: ok"
