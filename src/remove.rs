@@ -678,7 +678,10 @@ fn expired_records(
 }
 
 /// The trash entries of these repositories that are at least `keep` old,
-/// and records that hold no worktree, which any purge clears.
+/// and entries that hold only their record an hour after they were made
+/// (`trash::Item::clearable`), which any purge clears. A younger one may
+/// be another run's, between writing `info` and moving the worktree in,
+/// so it is left alone, as is one with no `info` yet.
 fn expired(repos: &[Repo], keep: &Span, now: i64, errors: &mut Vec<String>) -> Vec<Purge> {
     let mut out = Vec::new();
     for repo in repos {
@@ -686,12 +689,14 @@ fn expired(repos: &[Repo], keep: &Span, now: i64, errors: &mut Vec<String>) -> V
             Ok(list) => {
                 for item in list {
                     match &item.record {
-                        Err(e) => errors.push(format!("trash entry {}: {e}", item.dir.display())),
-                        Ok(_) if item.is_empty_record() => out.push(Purge {
+                        _ if item.clearable(now) => out.push(Purge {
                             item,
                             report: None,
                             outcome: None,
                         }),
+                        Err(_) if item.incomplete && item.bare => {}
+                        Err(e) => errors.push(format!("trash entry {}: {e}", item.dir.display())),
+                        Ok(_) if item.is_empty_record() => {}
                         Ok(_) if item.age(now).is_some_and(|a| a >= keep.seconds) => {
                             let outcome = if item.registered.is_none() {
                                 Some(Outcome::Failed(
@@ -1469,7 +1474,7 @@ fn verify_moved(
 /// Re-check one expired trash entry, then delete it with `git worktree
 /// remove`.
 fn purge(p: &Purge, policy: &Policy, mode: &Mode) -> Outcome {
-    if p.item.is_empty_record() {
+    if p.item.holds_only_record() {
         return match trash::purge(&p.item) {
             Ok(()) => Outcome::Removed(None),
             Err(e) => Outcome::Failed(e),
@@ -1687,7 +1692,11 @@ fn refusal(r: &Report) -> String {
 fn purge_summary(p: &Purge, places: &Places, style: &Style) -> String {
     let now = output::now();
     let Ok(r) = &p.item.record else {
-        return String::new();
+        return format!(
+            "  {}\n    {}\n",
+            style.bold(&places.show(&p.item.dir)),
+            style.dim("holds no worktree, and its record is missing or damaged")
+        );
     };
     let branch = r
         .branch
@@ -1764,7 +1773,7 @@ fn purge_line(p: &Purge, outcome: &Outcome, places: &Places) -> String {
         .map(|r| format!(" (was {})", places.show(&r.original)))
         .unwrap_or_default();
     match outcome {
-        Outcome::Removed(_) if p.item.is_empty_record() => {
+        Outcome::Removed(_) if p.item.holds_only_record() => {
             format!("cleared the empty trash record {name}{was}")
         }
         Outcome::Removed(record) => format!(

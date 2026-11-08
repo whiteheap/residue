@@ -1023,6 +1023,45 @@ else
     done
 fi
 
+# 8b. Trash entries that hold only their record, on every platform: a sweep
+# that removes nothing still runs the purge. One an hour old or more is
+# cleared: an empty record by its trashed time, one with no info or a
+# damaged one by its directory's time. A younger one may be another run's,
+# about to move a worktree in, so it stays, and one with no info yet is
+# no error. An hour-old entry with no info that holds anything else stays,
+# and is an error, exit 3: residue cannot tell what it holds.
+name=trash-record-only
+make_repo
+tr=$repo/.git/residue-trash
+mkdir -p "$tr/old-20260101T000000Z" "$tr/fresh-20260101T000000Z" "$tr/half-20260101T000000Z" \
+    "$tr/fresh-half-20260101T000000Z" "$tr/damaged-20260101T000000Z" || exit 2
+printf 'path %s\ntrashed 1767225600 2026-01-01T00:00:00Z\n' "$repo/.worktrees/old" >"$tr/old-20260101T000000Z/info" || exit 2
+printf 'path %s\ntrashed %s now\n' "$repo/.worktrees/fresh" "$(date +%s)" >"$tr/fresh-20260101T000000Z/info" || exit 2
+echo partial >"$tr/half-20260101T000000Z/info.new" || exit 2
+echo partial >"$tr/fresh-half-20260101T000000Z/info.new" || exit 2
+printf 'path /x\n' >"$tr/damaged-20260101T000000Z/info" || exit 2
+touch -t 202601010000 "$tr/old-20260101T000000Z" "$tr/half-20260101T000000Z" "$tr/damaged-20260101T000000Z" || exit 2
+before=$(sums "$wt")
+run remove --all --yes --json --idle 30d "$repo"
+left=$(find "$tr" -mindepth 1 -maxdepth 1 -exec basename {} \; 2>/dev/null | LC_ALL=C sort | paste -s -d , -)
+if [ "$status" != 0 ]; then fail "exit $status, want 0"
+elif [ "$(jq -c .errors "$out")" != "[]" ]; then fail "errors: $(jq -c .errors "$out"), want []"
+elif [ "$(jq -r '[.purged[] | .result + " " + .entry.entry] | sort | join(",")' "$out")" != "purged damaged-20260101T000000Z,purged half-20260101T000000Z,purged old-20260101T000000Z" ]; then fail "purged: $(jq -c '[.purged[] | {result, reason, entry: .entry.entry}]' "$out")"
+elif [ "$left" != "fresh-20260101T000000Z,fresh-half-20260101T000000Z" ]; then fail "left in the trash: $left"
+elif ! registered "$wt" || [ "$(sums "$wt")" != "$before" ]; then fail "w changed"
+elif ! registered "$repo/.worktrees/u" || [ "$(sums "$repo/.worktrees/u")" != "$u_sum" ]; then fail "the unrelated worktree u changed"
+else
+    mkdir -p "$tr/held-20260101T000000Z/w" || exit 2
+    echo keep >"$tr/held-20260101T000000Z/w/file.txt" || exit 2
+    touch -t 202601010000 "$tr/held-20260101T000000Z" || exit 2
+    run remove --all --yes --json --idle 30d "$repo"
+    if [ "$status" != 3 ]; then fail "with an entry holding more than its record: exit $status, want 3"
+    elif ! jq -e '.errors | length == 1 and (.[0] | contains("held-20260101T000000Z") and contains("it has no info"))' "$out" >/dev/null; then fail "errors: $(jq -c .errors "$out")"
+    elif [ "$(jq -c .purged "$out")" != "[]" ]; then fail "purged: $(jq -c '[.purged[] | {result, entry: .entry.entry}]' "$out")"
+    elif [ "$(cat "$tr/held-20260101T000000Z/w/file.txt" 2>/dev/null)" != keep ]; then fail "the entry holding more than its record changed"
+    else ok; fi
+fi
+
 # 9. Stats: each removal, move into the trash, purge and restore adds a
 # line to the stats ledger, `remove --json` reports what it freed in
 # `stats`, and `residue stats --json` (residue.stats/v1) adds them up. A

@@ -387,7 +387,7 @@ if [ -n "$partial_probe" ]; then
     elif [ "$(records)" != "0 records, 0 refs" ]; then fail "removal records: $(records), want 0 records, 0 refs"
     elif common_ok; then ok "refused before any move: $(jq -r '.results[0].worktree.activity.detail' "$out")"; fi
     for scenario in stopped-after-move stopped-after-move-restore stopped-after-move-control refused-after-move \
-        refused-after-move-control move-back-fails original-taken two-removers two-removers-trash \
+        refused-after-move-control move-back-fails original-taken two-removers two-removers-trash trash-move-in-flight \
         remove-fails-part-way-reflog remove-fails-part-way-head remove-fails-part-way-dotgit remove-fails-part-way-running; do
         skip_partial "$scenario"
     done
@@ -614,6 +614,56 @@ else
     elif [ -e "$wt" ] || [ -n "$(asides)" ]; then fail "something of w is left outside the trash"
     elif [ "$(records)" != "0 records, 0 refs" ]; then fail "removal records: $(records), want 0 records, 0 refs"
     elif common_ok; then ok "one trash entry; second: $rb"; fi
+fi
+
+# --- 4c. A move into the trash in flight while another run purges -----------
+# The first remover made its trash entry, wrote its info and is held at
+# its `git worktree move`, so the entry holds only its record. A second
+# remove run in the same repository lists the trash then: it must leave
+# that entry alone (an entry that holds only its record is cleared an hour
+# after it was made), and once released the first must trash w whole, with
+# its info, so `residue restore` brings it back. Outside the wrapper: a
+# move landing between the purge's two syscalls, `info` removed and the
+# directory removed; the hour keeps a purge from getting that far.
+name=trash-move-in-flight
+make_repo
+echo hold-move >"$work/mode"
+start ".a" remove --yes --json --trash "$wt"
+pid_a=$pid
+if ! await "$work/at-move-$pid_a"; then
+    finish "$pid_a"
+    fail "the first remover never reached its move (exit $status)"
+else
+    : >"$work/mode"
+    entry=$(find "$repo/.git/residue-trash" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+    setup git -C "$repo" worktree add -q "$repo/.worktrees/x" -b x
+    start ".b" remove --yes --json "$repo/.worktrees/x"
+    finish "$pid"
+    status_b=$status
+    purged_b=$(jq -r '[.purged[] | .result + " " + .entry.entry] | join(",")' "$work/$name.out.b")
+    info_kept=no
+    [ -f "$entry/info" ] && info_kept=yes
+    touch "$work/go-move-$pid_a"
+    finish "$pid_a"
+    status_a=$status
+    ra=$(jq -r '.results[0].result' "$work/$name.out.a")
+    moved=$entry/w
+    if [ -z "$entry" ] || [ "$(printf '%s\n' "$entry" | wc -l | tr -d ' ')" != 1 ]; then fail "want one trash entry while the first remover is held, got: ${entry:-none}"
+    elif [ "$status_b" != 0 ]; then fail "the second run: exit $status_b, want 0"
+    elif [ -n "$purged_b" ]; then fail "the second run purged the entry being made: $purged_b"
+    elif [ "$info_kept" != yes ]; then fail "the second run removed the entry's info"
+    elif [ "$status_a,$ra" != "0,trashed" ]; then fail "the first remover: exit $status_a, $ra; want 0, trashed"
+    elif [ ! -f "$entry/info" ]; then fail "the entry has no info after the move"
+    elif [ "$(record "$moved")" != "registered, locked residue: in trash" ]; then fail "in the trash Git has: $(record "$moved")"
+    elif [ "$(sums "$moved")" != "$w_sum" ]; then fail "the trashed worktree's files changed"
+    else
+        (cd "$repo" && "$bin" restore --json w >"$work/$name.out-restore" 2>"$work/$name.err-restore")
+        restored=$?
+        if [ "$restored" != 0 ]; then fail "restore exited $restored: $(cat "$work/$name.err-restore")"
+        elif [ "$(record "$wt")" != registered ] || [ "$(sums "$wt")" != "$w_sum" ]; then fail "w is not back whole: $(record "$wt")"
+        elif [ -n "$(ls -A "$repo/.git/residue-trash" 2>/dev/null)" ]; then fail "the trash entry is left after the restore"
+        elif common_ok; then ok "the second run left the entry alone; w trashed whole and restored"; fi
+    fi
 fi
 
 # --- 5. git worktree remove fails part way ----------------------------------

@@ -896,7 +896,7 @@ fn reflog_ids(bytes: &[u8]) -> Vec<String> {
     ids
 }
 
-fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::File::create_new(path).and_then(|mut f| f.write_all(bytes).and_then(|()| f.sync_all()))
 }
 
@@ -904,7 +904,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// loss. A filesystem that cannot sync a directory (some network and FUSE
 /// ones answer EINVAL, ENOTSUP or EBADF) is not an error: POSIX leaves a
 /// directory's sync to the filesystem, and the files themselves are synced.
-fn sync_dir(dir: &Path) -> Result<(), String> {
+pub(crate) fn sync_dir(dir: &Path) -> Result<(), String> {
     match fs::File::open(dir).and_then(|f| f.sync_all()) {
         Ok(()) => Ok(()),
         Err(e)
