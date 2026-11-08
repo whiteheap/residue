@@ -15,6 +15,7 @@
 - The Mac app uses less CPU and memory. Moving the pointer over the Worktrees map redraws only its tooltip, a long list of worktrees is drawn only where you can see it, its stylesheet is half the size, and it keeps residue's reports as text instead of parsing them twice (#75).
 - On macOS, `explain` run from inside a worktree no longer names lsof as a process using it: lsof now runs in `/`. residue counts the running processes with `proc_listallpids` in place of starting `ps`, so a snapshot starts one program, not two, and a process whose working directory or files lsof could not read no longer counts as inspected (#85).
 - On Linux, the activity check now sees a process that uses a worktree only through a mapped file, such as a native module loaded from its `node_modules` by a process started elsewhere. It reads each process's `/proc/PID/maps` beside its working directory, executable and open files. Before, such a worktree could be a removal candidate while the process ran (#84).
+- The Mac app uses less CPU while the pointer moves along the bar of files by size in a worktree's detail: only its tooltip moves, and the bar is drawn again only when the pointer reaches another block or leaves it. Over 20 s of pointer movement, WebKit's WebContent process used 0.97 to 1.22 s of user CPU, down from 1.27 to 1.79 s. The app also reads its bundled residue's version once per launch, not each time Automatic cleanup or Restore opens (#95).
 
 ## 0.0.9 (2026-11-08)
 
