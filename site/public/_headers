@@ -1,11 +1,13 @@
 # Response headers for every static asset. Cloudflare reads this file at
 # deploy time and does not serve it. site/README.md says how to check them.
 # script-src and font-src name the site itself only: hero.js and the two
-# IBM Plex Mono files. site/check.sh holds this policy to the exact value.
+# IBM Plex Mono files. connect-src 'self' lets Lighthouse's robots.txt and
+# llms.txt audits fetch those files from the page (lighthouse#17292).
+# site/check.sh holds this policy to the exact value.
 # No Strict-Transport-Security here: the whiteheap.com zone's HSTS setting
 # sends it and replaces any a Worker sends (site/README.md, "HTTPS").
 /*
-  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+  Content-Security-Policy: default-src 'none'; connect-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
   X-Content-Type-Options: nosniff
   X-Frame-Options: DENY
   Referrer-Policy: strict-origin-when-cross-origin

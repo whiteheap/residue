@@ -186,7 +186,7 @@ done
 slugs=$(sed -n 's/^#\{1,6\} \(.*\)$/\1/p' "$readme" |
   tr '[:upper:]' '[:lower:]' |
   sed 's/[^a-z0-9 _-]//g; s/ /-/g')
-for anchor in $(grep -oh 'https://github.com/whiteheap/residue#[^")]*' "$public"/*.html "$public/llms.txt" | sed 's/.*#//' | sort -u); do
+for anchor in $(grep -ohE 'https://(github\.com/whiteheap/residue|raw\.githubusercontent\.com/whiteheap/residue/main/README\.md)#[^")]*' "$public"/*.html "$public/llms.txt" | sed 's/.*#//' | sort -u); do
   if [ "$anchor" = readme ] || printf '%s\n' "$slugs" | grep -qx -- "$anchor"; then
     ok "README anchor #$anchor exists"
   else
@@ -254,7 +254,7 @@ fi
 # 7. Fonts and the Content Security Policy. The policy allows the site's own
 #    script, styles, images and fonts, and nothing else. Change it here and in
 #    public/_headers together.
-csp="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+csp="default-src 'none'; connect-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 if [ "$(sed -n 's/^  Content-Security-Policy: //p' "$public/_headers")" = "$csp" ]; then
   ok "_headers has the Content Security Policy, exactly"
 else
@@ -411,7 +411,7 @@ for page in "$public"/*.html; do
     fi
   done <<TAGS
 og:type website
-og:site_name Whiteheap
+og:site_name residue
 og:url $canonical
 og:title $title
 og:description $description
