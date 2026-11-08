@@ -98,7 +98,7 @@
             </div>
             <a class="install-source" href="/install.sh">read the script</a>
           </div>
-          <p class="install-note">Installs residue, and on macOS and Linux turns on automatic cleanup · or Homebrew: <code>brew install whiteheap/tap/residue</code> · <a href="https://github.com/whiteheap/residue#install">other ways to install</a></p>
+          <p class="install-note">Installs residue, and on macOS and Linux turns on automatic cleanup · or Homebrew: <code>brew install whiteheap/tap/residue</code> · <a href="#mac-app">the Mac&nbsp;app</a> · <a href="https://github.com/whiteheap/residue#install">other ways to install</a></p>
         </div>
       </section>
 
@@ -144,6 +144,22 @@
           <p>Replace the example path <code>~/src/app</code> with your repository's path. <code>scan</code> only reads: it lists each linked worktree with its size, its verdict and the reason, and every directory is still there afterwards.</p>
           <pre tabindex="0"><code>residue explain PATH</code></pre>
           <p>Replace <code>PATH</code> with a linked worktree's path to see every check, and why it passed or failed.</p>
+        </div>
+      </section>
+
+      <section id="mac-app" class="section split wrap" aria-labelledby="mac-app-title">
+        <h2 id="mac-app-title" class="label">mac app</h2>
+        <div class="flow">
+          <p class="lead">residue in a window.</p>
+          <p>The Mac app lists the linked worktrees under your code folders with their size and verdict, shows why each one is kept, moves the ones that can go to the trash, restores them, and turns automatic cleanup on or off. Every check and removal comes from the residue inside the app, the same version as its release, and nothing moves until you confirm the plan it shows. Automatic cleanup deletes instead of using the trash, and the app says so before you turn it on. macOS 13 or later, on Apple silicon and Intel.</p>
+          <p><a class="button button-secondary" href="/download/macos"><svg aria-hidden="true" viewBox="0 0 256 256" fill="currentColor"><path d="M224,144v64a8,8,0,0,1-8,8H40a8,8,0,0,1-8-8V144a8,8,0,0,1,16,0v56H208V144a8,8,0,0,1,16,0Zm-101.66,5.66a8,8,0,0,0,11.32,0l40-40a8,8,0,0,0-11.32-11.32L136,124.69V32a8,8,0,0,0-16,0v92.69L93.66,98.34a8,8,0,0,0-11.32,11.32Z"/></svg>Download for macOS</a></p>
+          <p>The app is not notarized yet, so macOS blocks it the first time you open it:</p>
+          <ol class="points">
+            <li>Open residue from Applications. macOS says it could not verify the app: click Done.</li>
+            <li>In System Settings, open Privacy &amp; Security and click Open Anyway next to the message about residue. The button is there for about an hour.</li>
+            <li>macOS asks again: click Open, and enter your login password if it asks.</li>
+          </ol>
+          <p><a href="https://github.com/whiteheap/residue#mac-app">Mac app</a> · <a href="https://github.com/whiteheap/residue#first-launch">First launch</a> · <a href="https://github.com/whiteheap/residue/releases/latest">Release notes and checksums</a></p>
         </div>
       </section>
 

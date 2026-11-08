@@ -16,6 +16,7 @@
 #             install.sh is text/plain, each .txt file text/plain with
 #             charset=utf-8 (security.txt and llms.txt require it), the
 #             sitemap XML, and each .png image/png
+# /SOURCE     each line of public/_redirects: its code and Location, exactly
 # a missing   404, the bytes of 404.html
 #   path
 # crawlers    200 for /, robots.txt, sitemap.xml and llms.txt as each of
@@ -62,7 +63,7 @@ pass() {
     name=${file#"$public"/}
     want=200
     case $name in
-      _headers) continue ;;
+      _headers | _redirects) continue ;;
       index.html) target=/ ;;
       404.html) target=/residue-smoke-missing-page want=404 ;;
       *) target=/$name ;;
@@ -113,6 +114,13 @@ pass() {
         fi
       fi
     fi
+  done
+  # Each redirect answers with its own code and destination, not followed.
+  grep -v '^#' "$public/_redirects" | while read -r source destination code; do
+    [ -n "$source" ] || continue
+    got=$(curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' "$url$source") || got=error
+    [ "$got" = "${code:-302} $destination" ] ||
+      printf 'FAIL %s: "%s", expected "%s %s"\n' "$source" "$got" "${code:-302}" "$destination" >>"$scratch/failures"
   done
   [ ! -s "$scratch/failures" ]
 }
