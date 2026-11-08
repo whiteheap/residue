@@ -7,8 +7,9 @@
 //! removed so it cannot bend `git status` or widen the regenerable rules.
 //! Arguments are passed as argv, never through a shell.
 
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -288,11 +289,17 @@ fn exit_of(result: Result<run::Captured, RunError>, args: &[&OsStr]) -> Result<E
     }
 }
 
-/// [`git`], keeping only the output records that `filter` accepts.
-fn git_filtered(dir: &Path, args: &[&str], filter: run::Filter) -> Result<Vec<u8>, String> {
+/// [`git`], keeping only the output records that `filter` accepts. Each
+/// attempt [`spawn`] makes reads with its own copy of `filter`, so a retry
+/// after a moved binary starts from the state the caller gave.
+fn git_filtered<K: FnMut(&[u8]) -> bool + Clone + Send + 'static>(
+    dir: &Path,
+    args: &[&str],
+    filter: run::Filter<K>,
+) -> Result<Vec<u8>, String> {
     let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
     let result = spawn(&|program| command(program, dir), &args, |cmd| {
-        run::run_filtered(cmd, QUERY_TIMEOUT, MAX_OUTPUT, filter)
+        run::run_filtered(cmd, QUERY_TIMEOUT, MAX_OUTPUT, filter.clone())
     });
     let exit = exit_of(result, &args)?;
     if exit.success {
@@ -492,11 +499,98 @@ pub struct Status {
     /// Each ignored entry as text (for display and rule matching), and as
     /// the exact relative path without a trailing slash (for the size walk).
     pub ignored: Vec<(String, PathBuf)>,
+    /// True when `ignored` comes from `--ignored=matching`, which [`status`]
+    /// takes only when it lists what `--ignored=traditional` lists, plus
+    /// the empty ignored directories traditional mode hides.
+    pub matching: bool,
+    /// What [`hidden_from_status`] returns, when `status` read `git
+    /// ls-files -v` for its own check, so the caller need not read it again.
+    pub hidden: Option<Result<Vec<String>, String>>,
 }
 
-/// Staged, modified, untracked and ignored entries. Ignored and untracked
-/// directories are reported once, as `dir/`, the way Git collapses them.
+/// Staged, modified, untracked and ignored entries, as `git status
+/// --ignored=traditional` lists them: an ignored or untracked directory
+/// once, as `dir/`, the way Git collapses it.
+///
+/// Traditional mode reads every path inside each ignored directory, such as
+/// `node_modules/`, only to print the directory once. `--ignored=matching`
+/// does not go inside a directory an ignore pattern matches (#83). Its list
+/// differs in two ways (`treat_directory` in Git's dir.c, the same from 2.36
+/// to 2.56):
+///
+/// - Git collapses an untracked directory that holds only ignored entries.
+///   Traditional mode lists the directory, matching mode what is in it. Git
+///   collapses only a directory with no index entry below it, so when the
+///   parent folder of every ignored entry below the top level has one, no
+///   entry is inside a collapsed directory. [`index_scan`] answers that from
+///   the `git ls-files -v` the `index_flags` check reads anyway. When a
+///   folder has none, or the read fails, this runs traditional mode, as
+///   residue always did.
+/// - Matching mode also lists an ignored directory that holds no file or
+///   symbolic link, which traditional mode hides. The walk finds those, and
+///   `inspect::drop_unlisted` drops them; it asks [`traditional_status`]
+///   about one it cannot settle.
+///
+/// `matching` says which list this is. A top-level entry needs no check:
+/// Git never collapses the worktree root.
 pub fn status(dir: &Path) -> Result<Status, String> {
+    // A matching run that fails (it can print more than traditional mode,
+    // one line per file of a collapsed directory) is answered by the
+    // traditional run, whose own failure is the error.
+    let Ok(mut status) = status_with(dir, "--ignored=matching") else {
+        return traditional_status(dir);
+    };
+    let folders = parent_folders(&status.ignored);
+    if !folders.is_empty() {
+        let scan = index_scan(dir, &folders);
+        let agrees = matches!(&scan, Ok(scan) if scan.every_folder_tracked);
+        let hidden = Some(scan.map(|scan| scan.hidden));
+        if !agrees {
+            drop(status);
+            let mut traditional = traditional_status(dir)?;
+            traditional.hidden = hidden;
+            return Ok(traditional);
+        }
+        status.hidden = hidden;
+    }
+    status.matching = true;
+    Ok(status)
+}
+
+/// [`status`] from `git status --ignored=traditional`, always.
+pub fn traditional_status(dir: &Path) -> Result<Status, String> {
+    status_with(dir, "--ignored=traditional")
+}
+
+/// The parent folder of each ignored entry below the top level, once.
+fn parent_folders(ignored: &[(String, PathBuf)]) -> HashSet<Vec<u8>> {
+    ignored
+        .iter()
+        .filter_map(|(_, rel)| parent_of(rel.as_os_str().as_bytes()))
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+/// `a/b` for `a/b/c`; `None` at the top level.
+fn parent_of(path: &[u8]) -> Option<&[u8]> {
+    path.iter()
+        .rposition(|b| *b == b'/')
+        .map(|end| &path[..end])
+}
+
+/// `a`, `a/b` and `a/b/c` for the folder `a/b/c`.
+fn folder_and_ancestors(folder: &[u8]) -> impl Iterator<Item = &[u8]> {
+    folder
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| **b == b'/')
+        .map(move |(end, _)| &folder[..end])
+        .chain(std::iter::once(folder))
+}
+
+/// One `git status --porcelain=v1 -z` run with `ignored` as its
+/// `--ignored` mode.
+fn status_with(dir: &Path, ignored: &str) -> Result<Status, String> {
     let out = git(
         dir,
         &[
@@ -504,7 +598,7 @@ pub fn status(dir: &Path) -> Result<Status, String> {
             "--porcelain=v1",
             "-z",
             "--untracked-files=normal",
-            "--ignored=traditional",
+            ignored,
             "--ignore-submodules=none",
         ],
     )?;
@@ -721,18 +815,71 @@ pub fn remove_worktree(main: &Path, worktree: &Path) -> Result<(), String> {
 /// marked assume-unchanged (a lowercase tag) or skip-worktree (`S`).
 /// `git worktree remove` would delete such edits without noticing them.
 pub fn hidden_from_status(dir: &Path) -> Result<Vec<String>, String> {
-    // Only these records are held, as Git writes them: the whole list was
-    // 3.4 MB for a worktree of 59,888 tracked files (#78).
-    let filter = run::Filter {
-        separator: 0,
-        keep: hides_edits,
+    index_scan(dir, &HashSet::new()).map(|scan| scan.hidden)
+}
+
+/// What one `git ls-files -v -z` says about the index.
+struct IndexScan {
+    /// The entries [`hidden_from_status`] returns.
+    hidden: Vec<String>,
+    /// Every folder asked about has an index entry below it.
+    every_folder_tracked: bool,
+}
+
+/// Read the index once for [`hidden_from_status`] and for [`status`]: the
+/// entries that hide edits, and whether each of `folders` (relative paths
+/// without a trailing slash) has an index entry below it, as Git's
+/// `directory_exists_in_index` asks before it collapses a directory.
+fn index_scan(dir: &Path, folders: &HashSet<Vec<u8>>) -> Result<IndexScan, String> {
+    // Only the hidden records and the first record found below each folder
+    // are held, as Git writes them: the whole list was 3.4 MB for a worktree
+    // of 59,888 tracked files (#78).
+    let mut unseen = folders.clone();
+    let mut last = Vec::new();
+    let keep = move |record: &[u8]| {
+        if hides_edits(record) {
+            return true;
+        }
+        if unseen.is_empty() {
+            return false;
+        }
+        let Some(parent) = index_path(record).and_then(parent_of) else {
+            return false;
+        };
+        // A record in the same folder as the one before it can mark no
+        // folder that one did not.
+        if parent == last.as_slice() {
+            return false;
+        }
+        last.clear();
+        last.extend_from_slice(parent);
+        let mut marked = false;
+        for folder in folder_and_ancestors(parent) {
+            marked |= unseen.remove(folder);
+        }
+        marked
     };
+    let filter = run::Filter { separator: 0, keep };
     let out = git_filtered(dir, &["ls-files", "-v", "-z"], filter)?;
-    Ok(out
-        .split(|b| *b == 0)
-        .filter(|record| hides_edits(record))
-        .map(|record| String::from_utf8_lossy(&record[2..]).into_owned())
-        .collect())
+    let mut hidden = Vec::new();
+    let mut tracked = HashSet::new();
+    for record in out.split(|b| *b == 0) {
+        if hides_edits(record) {
+            hidden.push(String::from_utf8_lossy(&record[2..]).into_owned());
+        }
+        if let Some(parent) = index_path(record).and_then(parent_of) {
+            tracked.extend(folder_and_ancestors(parent).filter(|f| folders.contains(*f)));
+        }
+    }
+    Ok(IndexScan {
+        hidden,
+        every_folder_tracked: tracked.len() == folders.len(),
+    })
+}
+
+/// The path of an `ls-files -v` record, after its tag and a space.
+fn index_path(record: &[u8]) -> Option<&[u8]> {
+    (record.len() >= 3 && record[1] == b' ').then(|| &record[2..])
 }
 
 /// An `ls-files -v` record whose tag hides edits from `git status`: a

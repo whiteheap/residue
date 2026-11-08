@@ -1334,5 +1334,75 @@ if [ "$(uname -s)" = Linux ]; then
     fi
 fi
 
+# 11. Ignored folders that `git status --ignored=matching` lists
+# differently from `--ignored=traditional`: residue judges the list
+# traditional mode prints, so each result is the one it always was (#83).
+# The patterns go in .git/info/exclude, which no commit carries; `sub/`
+# holds a tracked file, so what is below it takes matching mode's list.
+make_layout() { # PATTERNS SETUP
+    make_repo
+    printf '%b' "$1" >>"$repo/.git/info/exclude"
+    (cd "$wt" && sh -c "$2") >/dev/null 2>&1 || { echo "contract-check: setup failed in $name: $2" >&2; exit 2; }
+}
+
+ignored_paths() { # INDEX: the reported ignored entries, sorted, space-separated
+    jq -r "[.results[$1].worktree.ignored[]?.path] | sort | join(\" \")" "$out"
+}
+
+layout_refused() { # NAME CHECK-IDS(comma-separated) ENTRIES PATTERNS SETUP [REMOVE-ARGS...]
+    name=$1
+    local check entries before ids
+    IFS=, read -r -a ids <<<"$2"
+    check=$(want_failing "${ids[@]}")
+    entries=$3
+    make_layout "$4" "$5"
+    shift 5
+    before=$(sums "$wt")
+    run remove --yes --json "$@" "$wt"
+    if [ "$status" != 3 ]; then fail "exit $status, want 3"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), want refused"
+    elif [ "$(failing_checks 0)" != "$check" ]; then fail "failing checks: $(failing_checks 0), want $check"
+    elif [ "$(ignored_paths 0)" != "$entries" ]; then fail "ignored entries: $(ignored_paths 0), want $entries"
+    elif untouched "$before"; then ok; fi
+}
+
+layout_removed() { # NAME PATTERNS SETUP [REMOVE-ARGS...]
+    name=$1
+    if [ -n "$partial_probe" ]; then
+        skip_partial "$name"
+        return
+    fi
+    make_layout "$2" "$3"
+    shift 3
+    run remove --yes --json "$@" "$wt"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0 (failing checks: $(failing_checks 0))"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
+    elif [ -e "$wt" ] || registered "$wt"; then fail "the worktree is still there"
+    elif common_ok; then ok; fi
+}
+
+# Empty ignored folders: matching mode lists them, traditional mode hides
+# them, so none is an entry that blocks.
+layout_removed ignored-empty-folders 'secrets/\n' 'mkdir -p secrets sub/secrets/a'
+# A folder holding only a nested repository is listed, and the repository
+# blocks.
+layout_refused ignored-nested-repo-only ignored,nested_repo "node_modules/ sub/secrets/" \
+    'secrets/\n' 'mkdir -p sub/secrets && git init -q sub/secrets/dep'
+# An untracked folder of ignored entries is one entry, `orphan/`, which the
+# rules for what is inside it do not match. Matching mode would list
+# `orphan/a.log` and `orphan/node_modules/`, which they do.
+layout_refused ignored-only-ignored-files ignored "node_modules/ orphan/" \
+    '*.log\n' 'mkdir orphan && echo a >orphan/a.log' --regenerable '*.log'
+layout_refused ignored-orphan-node-modules ignored "node_modules/ orphan/" \
+    '' 'mkdir -p orphan/node_modules/p && echo x >orphan/node_modules/p/i.js'
+layout_refused ignored-deep-glob ignored "deep/ node_modules/" \
+    'deep/**/gen/\n' 'mkdir -p deep/a/gen && echo g >deep/a/gen/out.js' --regenerable gen
+# The other way: `coverage/` matches its rule, and the entries matching
+# mode lists inside it would not.
+layout_removed ignored-coverage-contents 'coverage/*\n' \
+    'mkdir -p coverage/html && echo x >coverage/lcov.info && echo y >coverage/html/i.html' --regenerable coverage
+
 echo "contract-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]

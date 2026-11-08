@@ -46,23 +46,25 @@ struct Stream {
 
 /// Keeps only the records of standard output that `keep` accepts, each
 /// record ending with `separator`, so a caller that needs a few records of
-/// a long output holds those and not the whole output (#78).
+/// a long output holds those and not the whole output (#78). `keep` sees
+/// every record once, in order, so it can also remember what it has seen
+/// (`git::status` notes which folders hold a tracked file, #83).
 #[derive(Clone, Copy)]
-pub struct Filter {
+pub struct Filter<K = fn(&[u8]) -> bool> {
     pub separator: u8,
-    pub keep: fn(&[u8]) -> bool,
+    pub keep: K,
 }
 
 /// A [`Filter`] over output read in pieces: the record the last piece left
 /// unfinished, and the records kept so far, each with its separator.
-struct Records {
-    filter: Filter,
+struct Records<K> {
+    filter: Filter<K>,
     pending: Vec<u8>,
     kept: Vec<u8>,
 }
 
-impl Records {
-    fn new(filter: Filter) -> Self {
+impl<K: FnMut(&[u8]) -> bool> Records<K> {
+    fn new(filter: Filter<K>) -> Self {
         Records {
             filter,
             pending: Vec::new(),
@@ -112,11 +114,11 @@ pub fn run(cmd: &mut Command, timeout: Duration, max_output: usize) -> Result<Ca
 /// [`run`], keeping only the records of standard output that `filter`
 /// accepts. `max_output` still counts every byte the child writes, so a
 /// filtered run fails with [`RunError::TooLarge`] exactly when [`run`] would.
-pub fn run_filtered(
+pub fn run_filtered<K: FnMut(&[u8]) -> bool + Send + 'static>(
     cmd: &mut Command,
     timeout: Duration,
     max_output: usize,
-    filter: Filter,
+    filter: Filter<K>,
 ) -> Result<Captured, RunError> {
     run_inner(cmd, None, timeout, max_output, Some(filter))
 }
@@ -129,15 +131,15 @@ pub fn run_with_input(
     timeout: Duration,
     max_output: usize,
 ) -> Result<Captured, RunError> {
-    run_inner(cmd, input, timeout, max_output, None)
+    run_inner::<fn(&[u8]) -> bool>(cmd, input, timeout, max_output, None)
 }
 
-fn run_inner(
+fn run_inner<K: FnMut(&[u8]) -> bool + Send + 'static>(
     cmd: &mut Command,
     input: Option<Vec<u8>>,
     timeout: Duration,
     max_output: usize,
-    filter: Option<Filter>,
+    filter: Option<Filter<K>>,
 ) -> Result<Captured, RunError> {
     cmd.stdin(if input.is_some() {
         Stdio::piped()
@@ -161,7 +163,7 @@ fn run_inner(
         thread::spawn(move || drop(stdin.write_all(&input)));
     }
     let stdout = drain(child.stdout.take(), max_output, filter);
-    let stderr = drain(child.stderr.take(), max_output, None);
+    let stderr = drain::<_, fn(&[u8]) -> bool>(child.stderr.take(), max_output, None);
     let deadline = Instant::now() + timeout;
     // Each drain thread ends when its pipe closes, which happens when the
     // child exits, so this wakes at the exit and not on a timer (#82).
@@ -254,10 +256,10 @@ fn stop(child: &mut Child) {
 /// the child never blocks on a full pipe; the overflow is reported instead.
 /// With a filter, only the records it keeps are held, and `max` still counts
 /// every byte read.
-fn drain<R: Read + Send + 'static>(
+fn drain<R: Read + Send + 'static, K: FnMut(&[u8]) -> bool + Send + 'static>(
     pipe: Option<R>,
     max: usize,
-    filter: Option<Filter>,
+    filter: Option<Filter<K>>,
 ) -> Receiver<Stream> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
