@@ -561,7 +561,9 @@ fn repos_of(items: &[Item]) -> Vec<Repo> {
     repos
 }
 
-/// The removal records of these repositories at least `keep` old, and the
+/// The removal records of these repositories at least `keep` old and at
+/// least as old as the `--keep-removed` each was written with
+/// (`removed::Item::expired`), and the
 /// entries with no `info` old enough to clear. A record of an interrupted
 /// removal is never forgotten: its worktree is still there, and `residue
 /// restore` is how it goes back. An unreadable record is never forgotten
@@ -586,7 +588,7 @@ fn expired_records(
                         Err(_) if item.incomplete => {}
                         Err(e) => warnings.push(format!("removal record: {e}")),
                         Ok(_) if item.interrupted() => {}
-                        Ok(_) if item.age(now).is_some_and(|a| a >= keep.seconds) => {
+                        Ok(_) if item.expired(now, keep.seconds) => {
                             out.push(Forget {
                                 item,
                                 outcome: None,
@@ -1079,7 +1081,15 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
     // syncing them does not widen the time between that check and the
     // deletion; if the check fails, they are undone. Without them residue
     // deletes nothing.
-    let record = removal_record(original, &dest, &listed, before, mode.reason, mode.by);
+    let record = removal_record(
+        original,
+        &dest,
+        &listed,
+        before,
+        mode.reason,
+        mode.by,
+        &mode.keep_removed,
+    );
     let git_dir = before
         .fingerprint
         .as_ref()
@@ -1123,7 +1133,8 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
 
 /// What the removal record keeps of a worktree about to be deleted at
 /// `aside`: `listed` is Git's entry for it, `before` the plan's report,
-/// `by` the command this run is.
+/// `by` the command this run is, `keep` its `--keep-removed`, which the
+/// record keeps so that no later run forgets it sooner.
 fn removal_record(
     original: &Path,
     aside: &Path,
@@ -1131,6 +1142,7 @@ fn removal_record(
     before: &Report,
     reason: Reason,
     by: By,
+    keep: &Span,
 ) -> removed::Record {
     removed::Record {
         original: original.to_path_buf(),
@@ -1146,6 +1158,10 @@ fn removal_record(
         reason: reason.code().to_string(),
         by: Some(by.code().to_string()),
         removed: output::now(),
+        keep: Some(removed::Keep {
+            seconds: keep.seconds,
+            text: keep.text.clone(),
+        }),
         allocated: before.usage.as_ref().map(|u| u.allocated),
         reclaimable: before.usage.as_ref().map(|u| u.reclaimable),
         gone: before
@@ -1406,6 +1422,7 @@ fn purge(p: &Purge, policy: &Policy, mode: &Mode) -> Outcome {
         before,
         Reason::TrashPurge,
         mode.by,
+        &mode.keep_removed,
     );
     let git_dir = before
         .fingerprint

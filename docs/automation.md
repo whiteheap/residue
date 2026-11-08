@@ -53,15 +53,15 @@ A fetch changes only remote-tracking refs. It is never a reason to remove: it on
 
 ### Removal records
 
-`residue restore` can recreate a worktree `watch` removed for as long as its [removal record](../README.md#restore-a-removed-worktree) lasts: 30 days unless you pass `--keep-removed DURATION`, with the same syntax and limits as `residue remove --keep-removed` (`12h`, `30d`, `12w`, at most 100 years). `watch` passes it to each removal it starts, which forgets the records older than that in the repositories it removes in. To keep records twelve weeks:
+`residue restore` can recreate a worktree `watch` removed for as long as its [removal record](../README.md#restore-a-removed-worktree) lasts: at least 30 days, or the `--keep-removed DURATION` you pass, with the same syntax and limits as `residue remove --keep-removed` (`12h`, `30d`, `12w`, at most 100 years). `watch` passes it to each removal it starts. Each record that removal writes keeps the value in its `info` (`keep 7257600 12w`), and `residue restore --json` shows it as `keep` and `keep_seconds`. To keep records twelve weeks:
 
 ```sh
 residue service install --keep-removed 12w
 ```
 
-`residue service status` then shows `removal records: kept 12w (--keep-removed)`, and the `watching` line at the top of the log ends with `Keeps each removal record 12w (--keep-removed).` A service installed before `watch` took the option shows `removal records: kept 30d (--keep-removed, the default)`.
+`residue service status` then shows `removal records: kept 12w (--keep-removed)`, and the `watching` line at the top of the log ends with `Keeps each removal record 12w (--keep-removed).` A service installed before `watch` took the option shows `removal records: kept 30d (--keep-removed, the default)`. Running `residue service install` again without the option goes back to `30d`, and says so: `The service it replaced kept removal records 12w (--keep-removed). This one keeps new ones 30d; records already written keep their own.`
 
-A record past the setting is forgotten by the next removal in its repository, not on the day it expires, so in a repository where nothing more is removed it stays. A `residue remove` you run yourself forgets by its own `--keep-removed`, `30d` unless you give one: give it the same value in those repositories, or it forgets what the service still keeps. Forgetting a record can lose commits only its refs held: [What `--keep-removed` can lose](../README.md#restore-a-removed-worktree).
+No run forgets a record before the `--keep-removed` it was written with. A run forgets the records in its repositories that are older than both that and its own `--keep-removed`, so a `residue remove` you run yourself, with its default `30d`, leaves a record written with `12w` until it is twelve weeks old. A record older than both is forgotten by the next removal in its repository, not on the day it expires, so in a repository where nothing more is removed it stays. A record residue 0.0.7 or earlier wrote has no `keep`, and the run's value alone decides. Forgetting a record can lose commits only its refs held: [What `--keep-removed` can lose](../README.md#restore-a-removed-worktree).
 
 ### Try it first
 

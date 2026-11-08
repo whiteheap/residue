@@ -54,10 +54,12 @@ Options:
                         (default 7d). Every remove run purges, after the same
                         confirmation; the purge is what frees the disk
   --keep-removed DURATION
-                        remove: forget removal records older than DURATION
-                        (default 30d), after the same confirmation. Only the
-                        record and its ref go; branches stay. `residue watch`
-                        takes it too
+                        remove: keep the removal records it writes for at
+                        least DURATION (default 30d), and forget older ones,
+                        after the same confirmation. A record is never
+                        forgotten before the DURATION it was written with.
+                        Only the record and its refs go; branches stay.
+                        `residue watch` takes it too
   --removal-reason watch-landed|watch-low-disk
                         remove: the reason its removal records name.
                         `residue watch` passes it
@@ -87,8 +89,8 @@ Every deletion first writes a removal record (GIT_COMMON_DIR/residue-removed)
 and refs that keep its HEAD commit (refs/residue/removed/NAME) and the
 commits only its reflog held (refs/residue/reflog/NAME/); if they cannot be
 written, nothing is deleted. `residue restore` recreates the
-worktree from it at its path, on its branch and HEAD, for 30 days
-(--keep-removed). Ignored files it deleted, such as node_modules, are not
+worktree from it at its path, on its branch and HEAD, for at least 30
+days (--keep-removed). Ignored files it deleted, such as node_modules, are not
 kept: the project's install or build makes them again. A restored worktree
 is never removed again because its branch landed; `residue remove` and low
 disk still can.

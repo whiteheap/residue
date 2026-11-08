@@ -95,9 +95,9 @@ trash, and purges that repository's trash entries older than 7 days.
 Branches and commits are always kept.
 Each removal first writes a removal record, and its log line ends with
 `restore: residue restore RECORD`, which recreates the worktree on its
-branch and HEAD for --keep-removed (30 days by default). A restored
-worktree is never removed again because its branch landed; disk pressure
-still removes it.
+branch and HEAD for at least --keep-removed (30 days by default). A
+restored worktree is never removed again because its branch landed; disk
+pressure still removes it.
 
 Options:
   --grace DURATION        Once its branch landed, keep a worktree that
@@ -105,10 +105,10 @@ Options:
   --idle DURATION         When the disk is low, keep a worktree that changed
                           within DURATION (default 2d)
   --min-free PERCENT      The disk is low below PERCENT free (default 10)
-  --keep-removed DURATION Keep each removal record, and with it `residue
-                          restore`, for DURATION (default 30d). The next
-                          removal in a repository forgets its older records;
-                          branches stay
+  --keep-removed DURATION Keep each removal record it writes, and with it
+                          `residue restore`, for at least DURATION (default
+                          30d). No run forgets a record before the DURATION
+                          it was written with; branches stay
   --fetch-every DURATION  Fetch each repository about this often (default
                           30m), each on its own clock
   --no-fetch              Never fetch: a deleted branch is seen after your

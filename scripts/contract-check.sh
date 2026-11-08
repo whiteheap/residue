@@ -555,17 +555,64 @@ if [ -z "$partial_probe" ]; then
     elif [ "$(git -C "$repo" for-each-ref --format='%(objectname)' refs/residue/removed/)" != "$(git -C "$repo" rev-parse x)" ]; then fail "the ref left is not x's"
     elif common_ok; then ok; fi
 
-    # `watch --keep-removed` reaches its removal child: a record two days
-    # old, which the default 30d keeps, is forgotten by a `watch` removal
-    # in its repository with --keep-removed 1d. The removal is disk
-    # pressure (--min-free 99.9999) of x, which last changed on 2026-01-01;
-    # u changed just now, so --idle 1m keeps it.
+    # Make the removal record DIR say it was written DAYS days ago.
+    age_record() { # DIR DAYS
+        local then
+        then=$(($(date +%s) - $2 * 86400))
+        sed "s/^removed [0-9]* /removed $then /" "$1/info" >"$work/$name.info" && cat "$work/$name.info" >"$1/info" || exit 2
+    }
+
+    # Remove w with --keep-removed KEEP, for a record to age.
+    remove_w_keeping() { # KEEP
+        run remove --yes --json --keep-removed "$1" "$wt"
+        if [ "$status" != 0 ] || [ "$(result 0 result)" != removed ] || [ "$(records)" != "1 records, 1 refs" ]; then
+            echo "contract-check: setup failed in $name: remove exit $status, $(result 0 result), $(records)" >&2
+            exit 2
+        fi
+    }
+
+    # A record keeps the --keep-removed it was written with: written with
+    # 12w and 31 days old, a plain remove (30d) of another worktree in its
+    # repository leaves it, and restore --json shows each record's keep;
+    # 85 days old, the next plain remove forgets it.
+    name=record-keep-own
+    make_repo
+    remove_w_keeping 12w
+    old=$(find "$repo/.git/residue-removed" -mindepth 1 -maxdepth 1 -type d)
+    age_record "$old" 31
+    setup git -C "$repo" worktree add -q "$repo/.worktrees/x" -b x
+    run remove --yes --json "$repo/.worktrees/x"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif [ "$(jq -c '[.forgotten[] | .result + " " + .entry.entry]' "$out")" != "[]" ]; then fail "a plain remove forgot a 31-day-old record written with --keep-removed 12w: $(jq -c '[.forgotten[] | .result + " " + .entry.entry]' "$out")"
+    elif [ ! -e "$old" ]; then fail "the 12w record is gone after 31 days"
+    elif [ "$(records)" != "2 records, 2 refs" ]; then fail "$(records), want 2 records, 2 refs (w's and x's)"
+    elif ! (cd "$repo" && "$bin" restore --json) >"$work/$name.list" 2>"$err"; then fail "restore --json (the list) failed"
+    elif ! jq -e --arg old "$(basename "$old")" '
+            ([.removed[] | select(.entry == $old)][0] | .keep == "12w" and .keep_seconds == 7257600)
+            and ([.removed[] | select(.entry != $old)][0] | .keep == "30d" and .keep_seconds == 2592000)
+        ' "$work/$name.list" >/dev/null; then fail "restore --json keep: $(jq -c '[.removed[] | {entry, keep, keep_seconds}]' "$work/$name.list")"
+    else
+        age_record "$old" 85
+        setup git -C "$repo" worktree add -q "$repo/.worktrees/y" -b y
+        run remove --yes --json "$repo/.worktrees/y"
+        if [ "$status" != 0 ]; then fail "past 12w: exit $status, want 0"
+        elif [ "$(jq -r '[.forgotten[] | .result + " " + .entry.entry] | join(",")' "$out")" != "forgotten $(basename "$old")" ]; then fail "past 12w, forgotten: $(jq -c .forgotten "$out")"
+        elif [ -e "$old" ]; then fail "the 12w record is still on disk after 85 days"
+        elif [ "$(records)" != "2 records, 2 refs" ]; then fail "$(records) past 12w, want 2 records, 2 refs (x's and y's)"
+        elif common_ok; then ok; fi
+    fi
+
+    # `watch --keep-removed` reaches its removal child: a record written
+    # with --keep-removed 1d and two days old, which the child's default
+    # 30d would keep, is forgotten by a `watch` removal in its repository
+    # with --keep-removed 1d, and the record that removal writes keeps 1d.
+    # The removal is disk pressure (--min-free 99.9999) of x, which last
+    # changed on 2026-01-01; u changed just now, so --idle 1m keeps it.
     name=watch-keep-removed
     make_repo
-    remove_w
+    remove_w_keeping 1d
     old=$(find "$repo/.git/residue-removed" -mindepth 1 -maxdepth 1 -type d)
-    two_days_ago=$(($(date +%s) - 2 * 86400))
-    sed "s/^removed [0-9]* /removed $two_days_ago /" "$old/info" >"$work/$name.info" && cat "$work/$name.info" >"$old/info" || exit 2
+    age_record "$old" 2
     GIT_COMMITTER_DATE=2026-01-01T00:00:00Z GIT_AUTHOR_DATE=2026-01-01T00:00:00Z \
         setup git -C "$repo" worktree add -q "$repo/.worktrees/x" -b x
     setup find "$repo/.worktrees/x" "$repo/.git/worktrees/x" -exec touch -t 202601010000 {} +
@@ -577,6 +624,7 @@ if [ -z "$partial_probe" ]; then
     elif registered "$repo/.worktrees/x"; then fail "x is still registered"
     elif [ "$(records)" != "1 records, 1 refs" ]; then fail "$(records), want 1 records, 1 refs (x's)"
     elif ! grep -qx "by watch" "$repo"/.git/residue-removed/*/info; then fail "the record left does not say by watch"
+    elif ! grep -qx "keep 86400 1d" "$repo"/.git/residue-removed/*/info; then fail "the record left does not keep 1d: $(grep '^keep' "$repo"/.git/residue-removed/*/info)"
     elif common_ok; then ok; fi
 
     # A commit only the worktree's own HEAD reflog holds: the removal pins
@@ -759,7 +807,7 @@ if [ -z "$partial_probe" ]; then
     elif [ "$(git -C "$wt" rev-parse HEAD)" != "$w_sha" ]; then fail "the restored worktree is not at the recorded HEAD"
     elif common_ok; then ok; fi
 else
-    for c in record-json record-text record-fail-closed-dir record-fail-closed-ref record-retention watch-keep-removed \
+    for c in record-json record-text record-fail-closed-dir record-fail-closed-ref record-retention record-keep-own watch-keep-removed \
         record-reflog-pin record-reflog-branch record-reflog-reftable record-unreadable \
         restore-branch-ahead restore-branch-rewritten restore-branch-gone restore-branch-elsewhere \
         restore-path-occupied restore-detached; do

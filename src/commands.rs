@@ -283,7 +283,7 @@ pub fn scan(options: &Options) -> u8 {
             out.push_str(&format!(
                 "  {}\n",
                 style.dim(&format!(
-                    "removed: {restorable} restorable · list or restore: residue restore · a remove run forgets records older than --keep-removed"
+                    "removed: {restorable} restorable · list or restore: residue restore · a remove run forgets a record once it is older than its --keep-removed and the run's"
                 ))
             ));
         }

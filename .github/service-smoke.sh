@@ -9,7 +9,7 @@
 #      running, logging, and status shows the root and the 12w, which the
 #      running watch logs too.
 #   2. install again without a ROOT keeps that root, and --keep-removed
-#      goes back to its default, 30d.
+#      goes back to its default, 30d, with a note that says so.
 #   3. after uninstall, install without a ROOT uses the usual code folders
 #      in the home folder and marks them as such (a GitHub runner has
 #      ~/work), and installing again finds them again. With none of the
@@ -61,6 +61,8 @@ printf '%s\n' "$status" | grep -q "residue watch: watching .* Keeps each removal
 out=$("$residue" service install --dry-run)
 printf '%s\n' "$out"
 printf '%s\n' "$out" | grep -q "watches: $root (kept from the service it replaces" || fail "install without a ROOT did not keep the root" "$out"
+printf '%s\n' "$out" | grep -qx "The service it replaced kept removal records 12w (--keep-removed). This one keeps new ones 30d; records already written keep their own. Pass --keep-removed 12w to keep the old value." \
+  || fail "install did not say --keep-removed went back to its default" "$out"
 status=$("$residue" service status)
 printf '%s\n' "$status" | grep -qx "watches: $root" || fail "status lost the kept root" "$status"
 printf '%s\n' "$status" | grep -qx "removal records: kept 30d (--keep-removed)" \
