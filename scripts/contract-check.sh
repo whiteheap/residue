@@ -730,7 +730,7 @@ if [ -z "$partial_probe" ]; then
         fi
     }
     if ! git init -q --ref-format=reftable "$work/reftable.probe" >/dev/null 2>&1; then
-        for c in record-reflog-reftable record-reflog-reftable-expired record-reflog-reftable-deleted; do
+        for c in record-reflog-reftable record-reflog-reftable-expired record-reflog-reftable-deleted record-reflog-reftable-stray; do
             echo "skip $c: this Git cannot make a reftable repository (Git 2.45 and later)"
         done
         echo "skip record-reflog-migrated: this Git has no git refs migrate (Git 2.46 and later)"
@@ -798,6 +798,27 @@ if [ -z "$partial_probe" ]; then
                 run restore --json "$wt"
                 reftable_restore_ok recreated_branch
             fi
+        fi
+
+        # A logs/HEAD file in a reftable repository's worktree, which Git
+        # does not read: the restore of residue 0.0.7 wrote one there after
+        # a `git refs migrate`. The file names only w's own commit; Git's
+        # reflog names the lone commit of record-reflog-pin. The removal
+        # neither copies the file nor reads it, so it pins the lone commit.
+        name=record-reflog-reftable-stray
+        ref_format=reftable make_repo
+        setup git -C "$wt" checkout -q --detach
+        setup git -C "$wt" commit -q --allow-empty -m lone
+        lone=$(git -C "$wt" rev-parse HEAD) || exit 2
+        setup git -C "$wt" checkout -q --detach "$w_sha"
+        w_git=$(git -C "$wt" rev-parse --absolute-git-dir) || exit 2
+        setup mkdir -p "$w_git/logs"
+        printf '%s %s C O Mitter <committer@example.com> 1700000000 +0000\tcheckout: a file Git does not read\n' \
+            0000000000000000000000000000000000000000 "$w_sha" >"$w_git/logs/HEAD" || exit 2
+        run remove --yes --json "$wt"
+        if reftable_pin_ok "$lone"; then
+            run restore --json "$wt"
+            reftable_restore_ok detached
         fi
 
         # `git refs migrate` (Git 2.46 and later) between the removal and
@@ -995,7 +1016,7 @@ if [ -z "$partial_probe" ]; then
 else
     for c in record-json record-text record-fail-closed-dir record-fail-closed-ref record-retention record-keep-own watch-keep-removed \
         record-reflog-pin record-reflog-branch record-reflog-reftable record-reflog-reftable-expired \
-        record-reflog-reftable-deleted record-reflog-migrated record-unreadable \
+        record-reflog-reftable-deleted record-reflog-reftable-stray record-reflog-migrated record-unreadable \
         restore-branch-ahead restore-branch-rewritten restore-branch-gone restore-branch-elsewhere \
         restore-path-occupied restore-detached restore-name-from-home; do
         skip_partial "$c"

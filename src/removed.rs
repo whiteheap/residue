@@ -21,9 +21,10 @@
 //! `git branch -D` deletes a branch's reflog with the branch, and reflogs
 //! expire. Worktree-private refs and an operation in progress already keep
 //! a worktree from removal (`inspect`), so the reflog is all the Git
-//! directory adds. A reftable repository has no `logs/HEAD` file: Git
-//! reads the commits that reflog names for residue (`git_head_reflog`
-//! says which, and which it cannot), and there is no copy.
+//! directory adds. In a repository that keeps its refs in reftable, Git
+//! reads no `logs/HEAD` file, even one that is there, so residue asks Git
+//! which commits that reflog names (`git_head_reflog` says which, and
+//! which it cannot), and there is no copy.
 //!
 //! A removal writes the record and its refs after it moves the worktree
 //! aside and before its check at the new path, which drops them again
@@ -87,7 +88,8 @@ const INFO_NEW: &str = "info.new";
 /// A copy of the worktree's own `config.worktree`, when it had one.
 const CONFIG: &str = "config.worktree";
 /// A copy of the worktree's HEAD reflog, `logs/HEAD` in its Git directory,
-/// when it had one (Git's files ref backend keeps it there).
+/// when it had one and the repository kept its refs in files, the only
+/// backend whose reflog Git reads from that file.
 const REFLOG: &str = "HEAD.reflog";
 /// What a restore that recreates a worktree says in a repository that
 /// keeps its refs in reftable, where Git reads no `logs/HEAD` file to put
@@ -713,8 +715,19 @@ pub fn create(
     }
     let config = read_if_present(git_dir.map(|d| d.join(CONFIG)))
         .map_err(|e| format!("cannot read its config.worktree: {e}"))?;
-    let reflog = read_if_present(git_dir.map(|d| d.join("logs").join("HEAD")))
-        .map_err(|e| format!("cannot read its HEAD reflog: {e}"))?;
+    // Git reads a `logs/HEAD` file only while the repository keeps its
+    // refs in files. In reftable one is not the worktree's reflog (the
+    // restore of residue 0.0.7 and earlier wrote one there after a `git
+    // refs migrate`), so it is not copied, and `reflog_only` asks Git.
+    let reftable = git::is_reftable(command_dir).map_err(|e| {
+        format!("cannot tell whether the repository keeps its refs in reftable: {e}")
+    })?;
+    let reflog = if reftable {
+        None
+    } else {
+        read_if_present(git_dir.map(|d| d.join("logs").join("HEAD")))
+            .map_err(|e| format!("cannot read its HEAD reflog: {e}"))?
+    };
     let mut record = record.clone();
     record.kept = reflog_only(reflog.as_deref(), &record.aside, command_dir)
         .map_err(|e| format!("cannot tell which commits only its reflog holds: {e}"))?;
