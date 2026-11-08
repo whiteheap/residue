@@ -520,18 +520,23 @@ fn restore_removed(found: &Found, i: usize, to: Option<&Path>) -> Result<Done, S
     let listed = git::worktrees(&item.command_dir)?;
     let restored = removed::restore(item, to, &listed)?;
     let record = item.record.as_ref().ok();
-    let moved_back = matches!(restored.how, How::MovedBack(_));
+    let gone = record.map_or_else(Vec::new, |r| r.gone.clone());
+    let not_kept = match restored.how {
+        // A worktree moved back kept whatever its removal did not delete.
+        How::MovedBack(_) => Vec::new(),
+        // One already back may have them again: only those it lacks.
+        How::AlreadyBack { .. } => gone
+            .into_iter()
+            .filter(|g| std::fs::symlink_metadata(restored.path.join(&g.path)).is_err())
+            .collect(),
+        _ => gone,
+    };
     Ok(Done {
         path: restored.path,
         how: restored.how,
         branch: restored.branch,
         head: record.map(|r| r.head.clone()),
-        // A worktree moved back kept whatever its removal did not delete.
-        not_kept: if moved_back {
-            Vec::new()
-        } else {
-            record.map_or_else(Vec::new, |r| r.gone.clone())
-        },
+        not_kept,
         notes: restored.notes,
     })
 }
@@ -565,6 +570,13 @@ fn how_text(done: &Done) -> String {
             short(tip)
         ),
         How::Detached => format!("detached at {head}, as it was"),
+        How::AlreadyBack { tip } if done.branch.is_some() => format!(
+            "on branch {branch} at {}, where Git already listed it",
+            short(tip)
+        ),
+        How::AlreadyBack { tip } => {
+            format!("detached at {}, where Git already listed it", short(tip))
+        }
     }
 }
 
@@ -706,8 +718,11 @@ fn removed_row(item: &removed::Item, now: i64, places: &Places, style: &Style) -
     );
     match &item.record {
         Ok(r) => {
+            // A worktree back at its path, or maybe back, took again what
+            // its removal freed.
             let size = r
                 .allocated
+                .filter(|_| item.back == removed::Back::No)
                 .map(|b| format!(" · {} freed", output::bytes(b)))
                 .unwrap_or_default();
             out.push_str(&format!(
@@ -734,6 +749,19 @@ fn removed_row(item: &removed::Item, now: i64, places: &Places, style: &Style) -
                         "interrupted: its removal did not finish, and Git still lists it at {}; {how}",
                         places.show(&r.aside)
                     ))
+                ));
+            } else if item.back == removed::Back::Yes {
+                out.push_str(&format!(
+                    "    {}\n",
+                    style.dim(&format!(
+                        "back: Git lists it at {} again, at the recorded HEAD or ahead of it; restore puts back what it lacks",
+                        places.show(&r.original)
+                    ))
+                ));
+            } else if let removed::Back::Unknown(why) = &item.back {
+                out.push_str(&format!(
+                    "    {}\n",
+                    style.dim(&format!("unknown: {}", clean(why)))
                 ));
             } else if !r.gone.is_empty() {
                 let list: Vec<String> = r.gone.iter().map(removed::Gone::sized).collect();
@@ -794,7 +822,9 @@ fn list_json(found: &Found, started: i64, done: Option<(Pick, &Done)>) -> Json {
             (
                 "branch_tip",
                 match &d.how {
-                    How::Branch { tip } | How::NewBranch { tip, .. } => Json::str(tip.clone()),
+                    How::Branch { tip } | How::NewBranch { tip, .. } | How::AlreadyBack { tip } => {
+                        Json::str(tip.clone())
+                    }
                     _ => Json::Null,
                 },
             ),

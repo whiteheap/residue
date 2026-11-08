@@ -1190,11 +1190,11 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
     };
     if let Err(why) = check() {
         let outcome = moved.put_back(true, &why);
-        return settle(&written, &main, &[original, &dest], outcome);
+        return settle(&written, &main, &[original, &dest], None, outcome);
     }
     if let Err(e) = git::unlock_worktree(&main, &dest) {
         let outcome = moved.put_back(true, &format!("could not unlock it: {e}"));
-        return settle(&written, &main, &[original, &dest], outcome);
+        return settle(&written, &main, &[original, &dest], None, outcome);
     }
     match git::remove_worktree(&main, &dest) {
         Ok(()) => Outcome::Removed(Some(written.dir)),
@@ -1203,14 +1203,14 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
         // move it, and the record is how it comes back: `residue restore`
         // moves it back and puts back what its Git directory lost.
         Err(e) if matches!(standing(&written, &main, &[&dest]), Standing::Lacking(..)) => {
-            settle(&written, &main, &[&dest], Outcome::Failed(e))
+            settle(&written, &main, &[&dest], None, Outcome::Failed(e))
         }
         Err(e) => {
             let outcome = match moved.put_back(false, &e) {
                 Outcome::Skipped(why) => Outcome::Failed(why),
                 other => other,
             };
-            settle(&written, &main, &[original, &dest], outcome)
+            settle(&written, &main, &[original, &dest], None, outcome)
         }
     }
 }
@@ -1275,7 +1275,7 @@ fn checkout_present(path: &Path) -> bool {
 enum Standing<'a> {
     /// Git lists it at this path, with its checkout and everything the
     /// record keeps: nothing of it is gone.
-    Whole,
+    Whole(&'a Path),
     /// Git lists it at this path, but this part of it is gone.
     Lacking(&'a Path, String),
     /// Git no longer lists it at any of the paths.
@@ -1291,41 +1291,85 @@ enum Standing<'a> {
 /// Git deletes the checkout, then its own directory for the worktree, each
 /// in the order the filesystem lists the files and stopping at the first
 /// it cannot delete, so it can list a worktree part of which is gone.
+/// Another writer can add a worktree at one of the paths meanwhile (a
+/// `git worktree add` at the path a purge's trash entry came from): a
+/// listed path counts as this worktree only when its Git directory is the
+/// one the record was written for (`Written::is_its_git_dir`), so another
+/// worktree's HEAD never stands in for this one's. A listed path whose
+/// Git directory residue cannot read may be this worktree, part of which
+/// is gone: it is the answer unless another path is this worktree.
 fn standing<'a>(written: &removed::Written, main: &Path, paths: &[&'a Path]) -> Standing<'a> {
     let list = match git::worktrees(main) {
         Ok(list) => list,
         Err(e) => return Standing::Unknown(e),
     };
-    let listed = paths.iter().copied().find_map(|p| {
-        list.iter()
-            .find(|e| e.path == p || git::canonical(&e.path).ok().as_deref() == Some(p))
-            .map(|e| (p, e.head.clone()))
-    });
-    let Some((at, head)) = listed else {
-        return Standing::Unlisted;
-    };
-    if !checkout_present(at) {
-        return Standing::Lacking(at, "its files are gone".to_string());
+    let mut unsure = None;
+    for &at in paths {
+        let Some(entry) = list
+            .iter()
+            .find(|e| e.path == at || git::canonical(&e.path).ok().as_deref() == Some(at))
+        else {
+            continue;
+        };
+        if !checkout_present(at) {
+            unsure.get_or_insert(Standing::Lacking(at, "its files are gone".to_string()));
+            continue;
+        }
+        // Git lists a worktree whose `commondir` is gone with its HEAD, but
+        // cannot use it.
+        let id = match git::identity(at) {
+            Ok(id) => id,
+            Err(e) => {
+                unsure.get_or_insert(Standing::Lacking(
+                    at,
+                    format!("Git can no longer use it ({e})"),
+                ));
+                continue;
+            }
+        };
+        if !written.is_its_git_dir(&id.git_dir) {
+            continue;
+        }
+        return match written.lacks(entry.head.as_deref()) {
+            None => Standing::Whole(at),
+            Some(why) => Standing::Lacking(at, why),
+        };
     }
-    // Git lists a worktree whose `commondir` is gone with its HEAD, but
-    // cannot use it.
-    if let Err(e) = git::identity(at) {
-        return Standing::Lacking(at, format!("Git can no longer use it ({e})"));
-    }
-    match written.lacks(head.as_deref()) {
-        None => Standing::Whole,
-        Some(why) => Standing::Lacking(at, why),
-    }
+    unsure.unwrap_or(Standing::Unlisted)
 }
 
 /// After a deletion that did not complete: when nothing of the worktree
 /// is gone (`standing`), its removal record is dropped. Otherwise the
 /// record stays, and the outcome says so: it is how the worktree comes
-/// back.
-fn settle(written: &removed::Written, main: &Path, paths: &[&Path], outcome: Outcome) -> Outcome {
+/// back. `back` is where another run may have put it back meanwhile (a
+/// trash restore during a purge); Git listing it whole there makes the
+/// outcome a skip that says so.
+fn settle(
+    written: &removed::Written,
+    main: &Path,
+    paths: &[&Path],
+    back: Option<&Path>,
+    outcome: Outcome,
+) -> Outcome {
     let restore = output::shell(&written.dir);
-    let note = match standing(written, main, paths) {
-        Standing::Whole => match written.undo() {
+    let mut search = paths.to_vec();
+    search.extend(back);
+    let note = match standing(written, main, &search) {
+        Standing::Whole(at) if Some(at) == back => {
+            let why = match &outcome {
+                Outcome::Skipped(why) | Outcome::Failed(why) => why.as_str(),
+                _ => "",
+            };
+            let kept = match written.undo() {
+                Ok(()) => String::new(),
+                Err(e) => format!("; its removal record stays ({e})"),
+            };
+            return Outcome::Skipped(format!(
+                "another run put it back at {} while this one ran, and nothing of it is gone ({why}){kept}",
+                at.display()
+            ));
+        }
+        Standing::Whole(_) => match written.undo() {
             Ok(()) => return outcome,
             Err(e) => format!("its removal record stays ({e})"),
         },
@@ -1522,7 +1566,13 @@ fn purge(p: &Purge, policy: &Policy, mode: &Mode) -> Outcome {
     };
     match trash::purge(&p.item) {
         Ok(()) => Outcome::Removed(Some(written.dir)),
-        Err(e) => settle(&written, &p.item.command_dir, &[&path], Outcome::Failed(e)),
+        Err(e) => settle(
+            &written,
+            &p.item.command_dir,
+            &[&path],
+            Some(&trashed.original),
+            Outcome::Failed(e),
+        ),
     }
 }
 

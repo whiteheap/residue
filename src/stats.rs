@@ -384,14 +384,22 @@ fn name_of(path: &Path) -> Option<String> {
 }
 
 /// The `freed` line a removal record stands for. None for a record that
-/// cannot be read, an interrupted removal (Git still lists the worktree, so
-/// nothing is freed), and the record of a run still going: its deletion can
-/// yet fail and take the record back, and that run writes its own line.
+/// cannot be read or has no `info`, an interrupted removal (Git still lists
+/// the worktree, so nothing is freed), a worktree that is back at its path
+/// (whatever its removal freed is taken again), one residue cannot tell is
+/// back or gone (`unknown`), and the record of a run
+/// still going: its deletion can yet fail and take the record back, and
+/// that run writes its own line.
 fn record_line(item: &removed::Item, now: i64) -> Option<Line> {
-    let r = item.record.as_ref().ok()?;
-    if item.interrupted() {
-        return None;
+    match item.state() {
+        removed::State::Removed => {}
+        removed::State::Incomplete
+        | removed::State::Unreadable
+        | removed::State::Interrupted
+        | removed::State::Back
+        | removed::State::Unknown => return None,
     }
+    let r = item.record.as_ref().ok()?;
     let running =
         r.pid.is_some_and(crate::remove::running) && now - r.removed < removed::INCOMPLETE_AFTER;
     if running {
@@ -1498,6 +1506,7 @@ mod tests {
             head_reflog: false,
             modified: Some(removed_at),
             registered: None,
+            back: removed::Back::No,
         }
     }
 
@@ -1557,6 +1566,13 @@ mod tests {
             now - 2 * removed::INCOMPLETE_AFTER,
             Some(std::process::id()),
         );
+        // Git lists its worktree at its path again: nothing is freed.
+        let mut back = record("fix-7", 700, None);
+        back.back = removed::Back::Yes;
+        // Git lists a worktree there that residue could not compare: it
+        // cannot tell, so nothing is seeded.
+        let mut unsure = record("fix-8", 800, None);
+        unsure.back = removed::Back::Unknown("no such commit".into());
         let records = [
             record("fix-1", 100, None),
             record("fix-2", 200, None),
@@ -1564,6 +1580,8 @@ mod tests {
             unreadable,
             going,
             old_pid,
+            back,
+            unsure,
         ];
         let found: Vec<Line> = records
             .iter()
