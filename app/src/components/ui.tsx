@@ -1,4 +1,4 @@
-import { Button, Loader } from "@cloudflare/kumo";
+import { Button } from "@cloudflare/kumo";
 import { Check, Copy, WarningCircle } from "@phosphor-icons/react";
 import { Fragment, useEffect, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import type { CliError, Verdict } from "../lib/types";
@@ -157,10 +157,20 @@ export function ErrorPanel({
   );
 }
 
+/**
+ * A loading state: a fixed arc that CSS turns, beside a title. Kumo's `Loader`
+ * animates with SVG SMIL, which WebKit repaints every frame: while it showed,
+ * the GPU and WebContent processes held about 250 MB more, and where macOS
+ * does not auto-play animated images it stood still. A CSS `transform` turn
+ * repaints nothing, and with reduced motion the arc stands still.
+ */
 export function Loading({ title, detail }: { title: string; detail?: ReactNode }) {
   return (
     <output className="loading" aria-live="polite">
-      <Loader size="base" />
+      <svg className="loading-arc" width="24" height="24" viewBox="0 0 24 24" aria-hidden focusable="false">
+        <circle className="loading-ring" cx="12" cy="12" r="9.5" />
+        <circle cx="12" cy="12" r="9.5" strokeDasharray="42 150" />
+      </svg>
       <span className="loading-text">
         <span className="loading-title">{title}</span>
         {detail ? <span className="loading-detail">{detail}</span> : null}
