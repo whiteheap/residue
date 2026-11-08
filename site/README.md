@@ -44,6 +44,8 @@ One same-origin script and two same-origin fonts; no analytics, no cookies, no f
 
 A returning reader's browser keeps `style.css`, `hero.js` and the two fonts for a year and never asks for them again (`immutable` in `_headers`). So each reference to one ends in a version, `?v=` and the first 12 hex digits of the file's SHA-256, and a change to the file makes a new URL. Cloudflare ignores the query, so no file is renamed and no build step writes the version. The pages keep Cloudflare's default, `max-age=0, must-revalidate`: a reader always gets the newest page and, through it, the newest URLs.
 
+One gap remains. A reader who loads the page while a deploy is still reaching every Cloudflare server can get the new page and, under the new URL, the old file, and keeps that file until it changes again. File names that carry the hash would avoid that, at the cost of a rename and a new `_headers` rule for every change.
+
 After you change one of those files, run `sh site/check.sh`. Rule 10 names each reference whose version is stale and the value to write, for example `/style.css?v=7d19fb71801f`. A font's version sits in `style.css`, so a font change changes `style.css`'s version too: run the check again after the first fix. A new file kept a year needs its own rule in `_headers`, naming that one file: Cloudflare applies a rule to the 404 page it serves for a missing path the rule matches, so a pattern such as `/*.woff2` would keep that 404 for a year too.
 
 ### Fonts
