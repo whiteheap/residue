@@ -163,6 +163,7 @@ pre code::before {
 }
 
 .site-header {
+  container: site-header / inline-size;
   display: flex;
   align-items: center;
   gap: 1rem;
@@ -171,7 +172,39 @@ pre code::before {
 
 .site-header nav {
   display: flex;
+  gap: 0.5rem;
   margin-inline-start: auto;
+}
+
+/* The header holds the brand (234px), 16px, then the Mac app link (98px), 8px
+   and GitHub (88px, or 36px as its icon alone). Each piece shows only where it
+   fits, so nothing overlaps: the Mac app link from 446px, which leaves it to
+   the page's Mac app section on a phone, GitHub's label from 338px, and the
+   byline from 286px. */
+.site-header .nav-app {
+  display: none;
+}
+
+@container site-header (inline-size >= 27.875rem) {
+  .site-header .nav-app {
+    display: inline-flex;
+  }
+}
+
+@container site-header (inline-size < 21.125rem) {
+  .site-header .nav-github {
+    padding-inline: 0.6875rem;
+  }
+
+  .site-header .nav-label {
+    display: none;
+  }
+}
+
+@container site-header (inline-size < 17.875rem) {
+  .site-header .byline {
+    display: none;
+  }
 }
 
 /* The residue wordmark, then "by whiteheap" with its mark. */
