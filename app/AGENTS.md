@@ -27,7 +27,8 @@ The root [AGENTS.md](../AGENTS.md#text-and-cost) rule holds on every screen and 
 
 The root [AGENTS.md](../AGENTS.md#text-and-cost) rule holds. Measure memory as `footprint -p PID` of the app, its WebContent and its GPU process, and CPU as `ps -o time= -p PID` before and after a fixed task (#90).
 
-- Tailwind scans only `src/` and the chunks of the Kumo components the app draws, listed in `src/styles.css`. Importing another Kumo component adds its chunk there, or it renders unstyled.
+- Tailwind scans only `src/` and the chunks of the Kumo components the app draws, listed in `src/styles.css`. Importing another Kumo component adds its chunk there, or it renders unstyled. `pnpm build` fails until the list names every Kumo component chunk in the bundle, and none it no longer holds (`bundle.ts`, `kumoSources`, #124).
+- The build keeps only Phosphor's regular, bold and fill weights (`bundle.ts`, `phosphorWeights`, #123). It fails when the app's source or the Kumo code it bundles uses another weight, a weight it cannot read, or an `IconContext` value it cannot read, since that icon would render blank. To draw another weight, add it to `KEPT`.
 - What follows the pointer is written to its element, not to state: a render of the Worktrees map draws every tile.
 - residue's JSON reaches the window as the text residue printed (`cli::Document`). The app reads only its `schema`.
 

@@ -10,7 +10,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
-    "lint": "oxlint --deny-warnings src",
+    "lint": "oxlint --deny-warnings src bundle.ts vite.config.ts",
     "sidecar": "sh scripts/sidecar.sh",
     "tauri": "sh scripts/tauri.sh"
   },

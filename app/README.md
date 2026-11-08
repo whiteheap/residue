@@ -50,6 +50,8 @@ pnpm tauri build --ci --target universal-apple-darwin -- --locked
 
 Then it checks the bundle: the identifier `com.whiteheap.residue`, the name `residue`, the version, both architectures in the app and in the bundled residue, residue's `--version`, and the signature.
 
+`pnpm build` also fails when the app uses a Phosphor icon weight the build drops, or bundles a Kumo component `src/styles.css` does not scan (`bundle.ts`).
+
 ## Development builds
 
 These environment variables change what a debug build (`pnpm tauri dev`) does. Release builds ignore them.
