@@ -10,6 +10,7 @@
 - The Mac app's text is brief: short headings, a sentence or two under each, buttons that name what they do, and every caveat kept beside its action. Restore and Automatic cleanup move the rules on forgetting removal records into a disclosure. Restore shows about 25% fewer words, Automatic cleanup about 30% fewer (#77).
 - The Mac app uses less CPU and memory. Moving the pointer over the Worktrees map redraws only its tooltip, a long list of worktrees is drawn only where you can see it, its stylesheet is half the size, and it keeps residue's reports as text instead of parsing them twice (#75).
 - On macOS, `explain` run from inside a worktree no longer names lsof as a process using it: lsof now runs in `/`. residue counts the running processes with `proc_listallpids` in place of starting `ps`, so a snapshot starts one program, not two, and a process whose working directory or files lsof could not read no longer counts as inspected (#85).
+- On Linux, the activity check now sees a process that uses a worktree only through a mapped file, such as a native module loaded from its `node_modules` by a process started elsewhere. It reads each process's `/proc/PID/maps` beside its working directory, executable and open files. Before, such a worktree could be a removal candidate while the process ran (#84).
 
 ## 0.0.9 (2026-11-08)
 
