@@ -27,9 +27,7 @@ const CONFIG: &[&str] = &[
     // Preload runs the index refresh's lstat calls on up to 20 threads. On a
     // warm 98,466-entry worktree, `git status` without it took 0.04 to 0.23 s
     // longer and used a third to a half of the system CPU; residue spends
-    // the time to save the CPU (#75). Where that system CPU goes is not
-    // known. It is not the kernel's name-cache lock: path lookups on the
-    // Mac measured skip it (`vfs.ncstats.nc_smr_enabled` is 1).
+    // the time to save the CPU (#75).
     "core.preloadIndex=false",
     "core.hooksPath=/dev/null",
     "core.quotePath=false",
