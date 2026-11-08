@@ -1,12 +1,14 @@
 //! Run a child process with a deadline and a cap on captured output.
 //!
 //! Every external program residue starts (git, lsof, ps) goes through
-//! [`run`], so a hung or chatty child can never hang residue itself.
+//! [`run`], so a hung or chatty child can never hang residue itself, and
+//! every child is started by [`spawn`].
 
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -134,6 +136,29 @@ pub fn run_with_input(
     run_inner::<fn(&[u8]) -> bool>(cmd, input, timeout, max_output, None)
 }
 
+/// Start `cmd`, one child at a time. On macOS, which has no `pipe2`, the
+/// standard library makes a child's pipes with `pipe()` and marks them
+/// close-on-exec in a second step. A child another thread starts between
+/// the two steps inherits them, and then the first child's output ends only
+/// when that other child, and anything it left running, exits (#114). Under
+/// this lock no child starts while another start is making its pipes.
+///
+/// The lock covers only the children started here, so this is the one call
+/// of `Command::spawn` in residue, and `clippy.toml` refuses `spawn`,
+/// `output` and `status` anywhere else. A start holds the lock for the
+/// `posix_spawn` or `fork` and `exec` alone, never while the child runs.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the one place a child starts, under the lock"
+)]
+pub fn spawn(cmd: &mut Command) -> io::Result<Child> {
+    static STARTING: Mutex<()> = Mutex::new(());
+    // The lock guards no data, so a start that panicked holding it left
+    // nothing half done.
+    let _starting = STARTING.lock().unwrap_or_else(PoisonError::into_inner);
+    cmd.spawn()
+}
+
 fn run_inner<K: FnMut(&[u8]) -> bool + Send + 'static>(
     cmd: &mut Command,
     input: Option<Vec<u8>>,
@@ -148,7 +173,7 @@ fn run_inner<K: FnMut(&[u8]) -> bool + Send + 'static>(
     })
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| {
+    let mut child = spawn(cmd).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
             RunError::NotFound
         } else {

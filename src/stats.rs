@@ -1633,7 +1633,8 @@ mod tests {
         assert_eq!(ledger.skipped, 1);
         // A FIFO: refused at once, never an open or a read that waits.
         let fifo = dir.join("fifo");
-        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        let made = crate::run::spawn(std::process::Command::new("mkfifo").arg(&fifo))
+            .and_then(|mut child| child.wait());
         assert!(made.unwrap().success());
         assert!(read_at(fifo.clone()).is_err());
         assert!(append(&fifo, std::slice::from_ref(&a)).is_err());

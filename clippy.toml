@@ -1,0 +1,7 @@
+# A child starts only through run::spawn, which holds the lock that keeps a
+# child from inheriting another child's pipes on macOS (#114).
+disallowed-methods = [
+    { path = "std::process::Command::spawn", reason = "start a child with run::spawn (#114)" },
+    { path = "std::process::Command::output", reason = "start a child with run::run or run::spawn (#114)" },
+    { path = "std::process::Command::status", reason = "start a child with run::run or run::spawn (#114)" },
+]

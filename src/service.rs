@@ -328,9 +328,15 @@ fn home() -> Option<PathBuf> {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run(program: &str, args: &[&str]) -> Result<String, String> {
-    let out = std::process::Command::new(program)
-        .args(args)
-        .output()
+    use std::process::{Command, Stdio};
+    // What `Command::output` does, with the child started by run::spawn.
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = crate::run::spawn(&mut cmd)
+        .and_then(|child| child.wait_with_output())
         .map_err(|e| format!("{program}: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     if out.status.success() {
