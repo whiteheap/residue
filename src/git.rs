@@ -27,7 +27,9 @@ const CONFIG: &[&str] = &[
     // Preload runs the index refresh's lstat calls on up to 20 threads. On a
     // warm 98,466-entry worktree, `git status` without it took 0.04 to 0.23 s
     // longer and used a third to a half of the system CPU; residue spends
-    // the time to save the CPU (#75).
+    // the time to save the CPU (#75). Where that system CPU goes is not
+    // known. It is not the kernel's name-cache lock: path lookups on the
+    // Mac measured skip it (`vfs.ncstats.nc_smr_enabled` is 1).
     "core.preloadIndex=false",
     "core.hooksPath=/dev/null",
     "core.quotePath=false",
@@ -58,8 +60,122 @@ const REDIRECT_ENV: &[&str] = &[
 /// own Git.
 const CONFIG_ENV: &[&str] = &["GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"];
 
-fn command(dir: &Path) -> Command {
-    let mut cmd = command_keeping_config_env(dir);
+/// The program a PATH search finds, which every command runs unless
+/// [`program`] finds the binary behind a launcher.
+const GIT: &str = "git";
+
+/// The Git program every command runs, resolved once per process.
+///
+/// On macOS, `git` on PATH is usually `/usr/bin/git`, Apple's launcher,
+/// which finds and runs the real binary of the selected developer tools on
+/// every call: 8 to 25 ms of wall time and 6.5 to 9 ms of CPU each (#81).
+/// When the first `git` on PATH is that launcher, residue asks it once for
+/// `--exec-path` and runs the file `<exec-path>/git` is, the binary the
+/// launcher runs, by its path. Anything else first on PATH, such as
+/// Homebrew's Git or a wrapper the user put there, still runs as `git`. So
+/// does the launcher while `GIT_EXEC_PATH` is set: `--exec-path` then
+/// prints that directory, not the launcher's own Git.
+fn program() -> &'static OsStr {
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::OnceLock;
+        use std::sync::atomic::Ordering;
+        static RESOLVED: OnceLock<OsString> = OnceLock::new();
+        if !launcher::MOVED.load(Ordering::Relaxed) {
+            return RESOLVED.get_or_init(launcher::resolve);
+        }
+    }
+    OsStr::new(GIT)
+}
+
+/// The resolved binary is gone, as when the developer tools are reinstalled
+/// under a long `watch`: from now on this process runs `git` from PATH.
+fn program_moved() {
+    #[cfg(target_os = "macos")]
+    launcher::MOVED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(target_os = "macos")]
+mod launcher {
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicBool;
+
+    use super::{GIT, QUERY_TIMEOUT, command};
+    use crate::run;
+
+    /// Set once the resolved binary is gone ([`super::program_moved`]).
+    pub static MOVED: AtomicBool = AtomicBool::new(false);
+
+    const LAUNCHER: &str = "/usr/bin/git";
+
+    /// The most `git --exec-path` may print.
+    const MAX_OUTPUT: usize = 64 << 10;
+
+    /// `<exec-path>/git`, or `git` when the launcher is not first on PATH,
+    /// `GIT_EXEC_PATH` is set, or any step fails, so a Mac without
+    /// developer tools fails the same way it always did.
+    pub fn resolve() -> OsString {
+        real().map_or_else(|| OsString::from(GIT), PathBuf::into_os_string)
+    }
+
+    fn real() -> Option<PathBuf> {
+        // Git ignores an empty GIT_EXEC_PATH, and so does this.
+        if std::env::var_os("GIT_EXEC_PATH").is_some_and(|v| !v.is_empty()) {
+            return None;
+        }
+        if std::fs::canonicalize(first_on_path()?).ok()? != Path::new(LAUNCHER) {
+            return None;
+        }
+        // The file itself, at the path the launcher runs it by: here
+        // `git-core/git` links to `../../bin/git`.
+        let git = std::fs::canonicalize(exec_path()?.join(GIT)).ok()?;
+        executable(&git).then_some(git)
+    }
+
+    /// The file a PATH search for `git` finds first. As in `execvp`, an
+    /// empty entry is the current directory.
+    fn first_on_path() -> Option<PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|dir| {
+                if dir.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    dir
+                }
+            })
+            .map(|dir| dir.join(GIT))
+            .find(|candidate| executable(candidate))
+    }
+
+    /// The launcher's `--exec-path`, asked with the same environment and
+    /// config as every other Git call, in `/` so no repository is read.
+    fn exec_path() -> Option<PathBuf> {
+        let mut cmd = command(OsStr::new(GIT), Path::new("/"));
+        cmd.arg("--exec-path");
+        let out = run::run(&mut cmd, QUERY_TIMEOUT, MAX_OUTPUT).ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let mut bytes = out.stdout;
+        while bytes.last() == Some(&b'\n') {
+            bytes.pop();
+        }
+        let dir = PathBuf::from(OsString::from_vec(bytes));
+        dir.is_absolute().then_some(dir)
+    }
+
+    /// A regular file, after symbolic links, that someone may execute.
+    fn executable(path: &Path) -> bool {
+        std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+}
+
+fn command(program: &OsStr, dir: &Path) -> Command {
+    let mut cmd = command_keeping_config_env(program, dir);
     for var in CONFIG_ENV {
         cmd.env_remove(var);
     }
@@ -68,8 +184,8 @@ fn command(dir: &Path) -> Command {
 
 /// `command` without removing `CONFIG_ENV`. Only for reporting what the
 /// environment sets; never for a query whose answer residue acts on.
-fn command_keeping_config_env(dir: &Path) -> Command {
-    let mut cmd = Command::new("git");
+fn command_keeping_config_env(program: &OsStr, dir: &Path) -> Command {
+    let mut cmd = Command::new(program);
     cmd.arg("-C").arg(dir);
     for setting in CONFIG {
         cmd.arg("-c").arg(setting);
@@ -113,26 +229,52 @@ pub struct Exit {
     pub stderr: String,
 }
 
+/// Builds one Git command for a given program: [`command`], or a caller's
+/// variant of it with more environment.
+type Build<'a> = &'a dyn Fn(&OsStr) -> Command;
+
 fn exec(dir: &Path, args: &[&OsStr], timeout: Duration) -> Result<Exit, String> {
-    exec_command(command(dir), args, timeout)
+    exec_command(&|program| command(program, dir), args, timeout)
 }
 
-fn exec_command(cmd: Command, args: &[&OsStr], timeout: Duration) -> Result<Exit, String> {
-    exec_input(cmd, args, None, timeout)
+fn exec_command(build: Build, args: &[&OsStr], timeout: Duration) -> Result<Exit, String> {
+    exec_input(build, args, None, timeout)
 }
 
 /// [`exec_command`] with `input` on git's standard input.
 fn exec_input(
-    mut cmd: Command,
+    build: Build,
     args: &[&OsStr],
-    input: Option<Vec<u8>>,
+    input: Option<&[u8]>,
     timeout: Duration,
 ) -> Result<Exit, String> {
-    cmd.args(args);
-    exit_of(
-        run::run_with_input(&mut cmd, input, timeout, MAX_OUTPUT),
-        args,
-    )
+    let result = spawn(build, args, |cmd| {
+        run::run_with_input(cmd, input.map(<[u8]>::to_vec), timeout, MAX_OUTPUT)
+    });
+    exit_of(result, args)
+}
+
+/// Run the command `build` makes for [`program`], with `args`, through
+/// `run`. When that program is a resolved path that no longer exists, run
+/// `git` from PATH instead, now and for the rest of the process.
+fn spawn(
+    build: Build,
+    args: &[&OsStr],
+    run: impl Fn(&mut Command) -> Result<run::Captured, RunError>,
+) -> Result<run::Captured, RunError> {
+    let attempt = |program: &OsStr| {
+        let mut cmd = build(program);
+        cmd.args(args);
+        run(&mut cmd)
+    };
+    let program = program();
+    match attempt(program) {
+        Err(RunError::NotFound) if program != GIT => {
+            program_moved();
+            attempt(OsStr::new(GIT))
+        }
+        result => result,
+    }
 }
 
 fn exit_of(result: Result<run::Captured, RunError>, args: &[&OsStr]) -> Result<Exit, String> {
@@ -151,12 +293,10 @@ fn exit_of(result: Result<run::Captured, RunError>, args: &[&OsStr]) -> Result<E
 /// [`git`], keeping only the output records that `filter` accepts.
 fn git_filtered(dir: &Path, args: &[&str], filter: run::Filter) -> Result<Vec<u8>, String> {
     let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
-    let mut cmd = command(dir);
-    cmd.args(&args);
-    let exit = exit_of(
-        run::run_filtered(&mut cmd, QUERY_TIMEOUT, MAX_OUTPUT, filter),
-        &args,
-    )?;
+    let result = spawn(&|program| command(program, dir), &args, |cmd| {
+        run::run_filtered(cmd, QUERY_TIMEOUT, MAX_OUTPUT, filter)
+    });
+    let exit = exit_of(result, &args)?;
     if exit.success {
         Ok(exit.stdout)
     } else {
@@ -511,7 +651,7 @@ pub fn environment_regenerable() -> Result<Vec<String>, String> {
         // `/` so no repository's own config is read or can fail the query.
         let args = ["config", "--show-scope", "--null", "--get-all"].map(OsStr::new);
         let exit = exec_command(
-            command_keeping_config_env(Path::new("/")),
+            &|program| command_keeping_config_env(program, Path::new("/")),
             &[&args[..], &[key]].concat(),
             QUERY_TIMEOUT,
         )?;
@@ -751,17 +891,20 @@ pub fn remote_refs(dir: &Path) -> Result<std::collections::BTreeMap<String, Stri
 /// that needs a person fails instead, and so does one that runs past
 /// `FETCH_TIMEOUT`. The error is the first line Git or SSH printed.
 pub fn fetch(dir: &Path, remote: &str) -> Result<(), String> {
-    let mut cmd = command(dir);
     let user_ssh = std::env::var_os("GIT_SSH_COMMAND").is_some_and(|v| !v.is_empty())
         || std::env::var_os("GIT_SSH").is_some_and(|v| !v.is_empty())
         || ssh_command_configured(dir);
-    if !user_ssh {
-        cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
-    }
-    cmd.env("SSH_ASKPASS_REQUIRE", "never")
-        .env_remove("SSH_ASKPASS")
-        .env("GCM_INTERACTIVE", "never");
-    new_session(&mut cmd);
+    let build = |program: &OsStr| {
+        let mut cmd = command(program, dir);
+        if !user_ssh {
+            cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+        }
+        cmd.env("SSH_ASKPASS_REQUIRE", "never")
+            .env_remove("SSH_ASKPASS")
+            .env("GCM_INTERACTIVE", "never");
+        new_session(&mut cmd);
+        cmd
+    };
     let args: Vec<&OsStr> = [
         "fetch",
         "--prune",
@@ -776,7 +919,7 @@ pub fn fetch(dir: &Path, remote: &str) -> Result<(), String> {
     .into_iter()
     .map(OsStr::new)
     .collect();
-    let exit = exec_command(cmd, &args, FETCH_TIMEOUT)?;
+    let exit = exec_command(&build, &args, FETCH_TIMEOUT)?;
     if exit.success {
         Ok(())
     } else {
@@ -943,7 +1086,12 @@ pub fn change_refs(dir: &Path, changes: &[RefChange]) -> Result<(), String> {
         "--stdin",
     ];
     let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
-    let exit = exec_input(command(dir), &args, Some(input.into_bytes()), QUERY_TIMEOUT)?;
+    let exit = exec_input(
+        &|program| command(program, dir),
+        &args,
+        Some(input.as_bytes()),
+        QUERY_TIMEOUT,
+    )?;
     if exit.success {
         Ok(())
     } else {
@@ -1091,7 +1239,12 @@ pub fn unreferenced(dir: &Path, commits: &[&str]) -> Result<Vec<String>, String>
     let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
     let mut input = commits.join("\n");
     input.push('\n');
-    let exit = exec_input(command(dir), &args, Some(input.into_bytes()), QUERY_TIMEOUT)?;
+    let exit = exec_input(
+        &|program| command(program, dir),
+        &args,
+        Some(input.as_bytes()),
+        QUERY_TIMEOUT,
+    )?;
     if !exit.success {
         return Err(format!("git rev-list --not --all failed: {}", exit.stderr));
     }
