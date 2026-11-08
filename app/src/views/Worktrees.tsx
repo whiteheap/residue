@@ -1,6 +1,6 @@
 import { Button, Checkbox, Empty, Tabs } from "@cloudflare/kumo";
 import { ArrowClockwise, ArrowsClockwise, CaretRight, FolderPlus, Trash } from "@phosphor-icons/react";
-import { useId, useMemo } from "react";
+import { useId, useMemo, type CSSProperties } from "react";
 import { Treemap, type ZoomLevel } from "../components/viz/Treemap";
 import {
   ErrorPanel,
@@ -400,7 +400,8 @@ function RepoGroup({
           {plural(worktrees.length, "worktree")} · {bytes(total)}
         </span>
       </header>
-      <ul className="rows">
+      {/* --rows sizes the list until it is first drawn (styles.css, .rows). */}
+      <ul className="rows" style={{ "--rows": worktrees.length } as CSSProperties}>
         {worktrees.map((w) => (
           <Row
             key={w.path}

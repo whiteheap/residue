@@ -13,9 +13,8 @@ mod env;
 mod service;
 mod settings;
 
-use cli::{CliError, ErrorKind, Run};
+use cli::{CliError, Document, ErrorKind, Run};
 use serde::Serialize;
-use serde_json::Value;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -159,7 +158,7 @@ async fn set_roots(
 
 /// `residue scan --json ROOT...`
 #[tauri::command]
-async fn scan(state: AppState<'_>, roots: Vec<String>) -> Result<Value, CliError> {
+async fn scan(state: AppState<'_>, roots: Vec<String>) -> Result<Document, CliError> {
     blocking(&state, move |s| {
         let roots = settings::folders(&roots)?;
         if roots.is_empty() {
@@ -175,7 +174,7 @@ async fn scan(state: AppState<'_>, roots: Vec<String>) -> Result<Value, CliError
 
 /// `residue explain --json PATH`
 #[tauri::command]
-async fn explain(state: AppState<'_>, path: String) -> Result<Value, CliError> {
+async fn explain(state: AppState<'_>, path: String) -> Result<Document, CliError> {
     blocking(&state, move |s| {
         let path = absolute(&path)?;
         s.run(
@@ -190,7 +189,7 @@ async fn explain(state: AppState<'_>, path: String) -> Result<Value, CliError> {
 
 #[derive(Serialize)]
 struct Removal {
-    document: Value,
+    document: Document,
     exit_code: Option<i32>,
 }
 
@@ -240,7 +239,7 @@ async fn remove_to_trash(state: AppState<'_>, paths: Vec<String>) -> Result<Remo
 struct Listing {
     /// The folder the listing ran in.
     root: String,
-    document: Option<Value>,
+    document: Option<Document>,
     error: Option<CliError>,
 }
 
@@ -284,7 +283,11 @@ async fn list_restorable(
 
 /// `residue restore --json ENTRY_PATH`, run in the folder that listed it.
 #[tauri::command]
-async fn restore(state: AppState<'_>, entry_path: String, root: String) -> Result<Value, CliError> {
+async fn restore(
+    state: AppState<'_>,
+    entry_path: String,
+    root: String,
+) -> Result<Document, CliError> {
     blocking(&state, move |s| {
         let entry = absolute(&entry_path)?;
         let root = settings::folders(&[root])?
@@ -307,7 +310,7 @@ async fn restore(state: AppState<'_>, entry_path: String, root: String) -> Resul
 /// ledger. It reads the ledger and the trash entries of the repositories the
 /// ledger names, never a worktree, so it is quick.
 #[tauri::command]
-async fn stats(state: AppState<'_>) -> Result<Value, CliError> {
+async fn stats(state: AppState<'_>) -> Result<Document, CliError> {
     blocking(&state, |s| {
         s.run(
             vec!["stats".into(), "--json".into()],

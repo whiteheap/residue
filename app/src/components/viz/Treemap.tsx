@@ -1,4 +1,4 @@
-import { Fragment, useMemo, useState, type CSSProperties, type FocusEvent, type KeyboardEvent, type PointerEvent } from "react";
+import { Fragment, useMemo, useRef, useState, type CSSProperties, type FocusEvent, type KeyboardEvent, type PointerEvent } from "react";
 import { baseName, bytes, grouped, plural, someOf } from "../../lib/format";
 import type { ScanDocument, Worktree } from "../../lib/types";
 import {
@@ -19,7 +19,7 @@ import {
 import { branchLabel, displayPath, summary, verdictLabel } from "../../lib/worktree";
 import { Figure, Hatch, Legend, Mark, useSvgId } from "./Figure";
 import { fitLabel, labelWidth, useWidth } from "./measure";
-import { TipLines, Tooltip } from "./Tooltip";
+import { TipLines, tipTranslate, Tooltip } from "./Tooltip";
 import { useTreeKeys, type TreeItem } from "./useTreeKeys";
 
 type ChartNode =
@@ -104,7 +104,11 @@ export function Treemap({
   const height = Math.round(Math.min(360, Math.max(220, width * 0.36)));
   const layout = useMemo(() => (width > 0 ? layoutTreemap(shown, width, height) : null), [shown, width, height]);
   const hatch = useSvgId("tree-hatch");
+  // The node under the pointer, and where the pointer came onto it. A move
+  // within the node moves its tooltip through `tip`, not by drawing the chart
+  // again: a render draws every tile.
   const [hover, setHover] = useState<{ id: string; x: number; y: number } | null>(null);
+  const tip = useRef<HTMLDivElement>(null);
   const [focused, setFocused] = useState<string | null>(null);
 
   // The tree in reading order: each repository, then its tiles, largest first;
@@ -183,7 +187,15 @@ export function Treemap({
   const onPointerMove = (e: PointerEvent<SVGSVGElement>) => {
     const id = nodeOf(e.target);
     const box = e.currentTarget.getBoundingClientRect();
-    setHover(id ? { id, x: e.clientX - box.left, y: e.clientY - box.top } : null);
+    const x = e.clientX - box.left;
+    const y = e.clientY - box.top;
+    if (id !== null && id === hover?.id) {
+      // React sets the style again only when a render changes `hover`, which
+      // starts from where the pointer is then.
+      if (tip.current) tip.current.style.translate = tipTranslate(x, y, width, height);
+      return;
+    }
+    setHover(id ? { id, x, y } : null);
   };
   const onFocus = (e: FocusEvent<SVGSVGElement>) => {
     // Only keyboard focus shows a tooltip: a pointer has its own.
@@ -306,7 +318,7 @@ export function Treemap({
           <div style={{ blockSize: height }} />
         )}
         {tipNode && tipAt ? (
-          <Tooltip x={tipAt.x} y={tipAt.y} width={width} height={height}>
+          <Tooltip ref={tip} x={tipAt.x} y={tipAt.y} width={width} height={height}>
             <Tip node={tipNode} now={now} zooms={!single} />
           </Tooltip>
         ) : null}
