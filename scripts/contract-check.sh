@@ -697,34 +697,106 @@ if [ -z "$partial_probe" ]; then
         elif common_ok; then ok; fi
     fi
 
-    # The lone commit of record-reflog-pin in a reftable repository (Git
-    # 2.45 and later), which has no logs/HEAD file to copy: Git reads the
-    # worktree's reflog for residue, and the pin keeps the commit through
-    # `git gc`. Restore cannot write that reflog back, so the record and
-    # its refs stay after it.
-    name=record-reflog-reftable
-    if ! git init -q --ref-format=reftable "$work/$name.probe" >/dev/null 2>&1; then
-        echo "skip $name: this Git cannot make a reftable repository (Git 2.45 and later)"
+    # Reftable repositories (Git 2.45 and later) have no logs/HEAD file to
+    # copy: Git reads the worktree's reflog for residue. Restore cannot
+    # write that reflog back, so after it the record and its two refs stay,
+    # and the restore says so in its notes, on stderr and in the JSON.
+    reftable_restore_ok() { # CHECKOUT
+        if [ "$status" != 0 ]; then fail "restore: exit $status, want 0"
+        elif ! restore_ok removed "$1"; then fail "stdout is not one restore document with checkout $1"
+        elif [ "$(records)" != "1 records, 2 refs" ]; then fail "$(records) after the restore, want 1 records, 2 refs"
+        elif ! jq -e '.restore.notes | any(startswith("its HEAD reflog was not put back: in a reftable repository"))' "$out" >/dev/null; then fail "the notes do not say the HEAD reflog was not put back: $(jq -c .restore.notes "$out")"
+        elif ! grep -q '^residue: note: its HEAD reflog was not put back' "$err"; then fail "stderr does not say the HEAD reflog was not put back"
+        elif common_ok; then ok; fi
+    }
+    # The removal pinned COMMIT, alone, and `git gc --prune=now` keeps it.
+    reftable_pin_ok() { # COMMIT
+        entry=$(basename "$(result 0 removal_record)")
+        if [ "$status" != 0 ]; then fail "exit $status, want 0"
+        elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
+        elif [ -e "$repo/.git/residue-removed/$entry/HEAD.reflog" ]; then fail "a HEAD.reflog was saved from a reftable repository"
+        elif [ "$(git -C "$repo" for-each-ref --format='%(refname) %(objectname)' refs/residue/reflog/)" != "refs/residue/reflog/$entry/1 $1" ]; then fail "the reflog pin, want refs/residue/reflog/$entry/1 $1: $(git -C "$repo" for-each-ref refs/residue/reflog/)"
+        elif ! git -C "$repo" gc -q --prune=now >/dev/null 2>&1; then fail "git gc failed"
+        elif [ "$(git -C "$repo" cat-file -t "$1" 2>/dev/null)" != commit ]; then fail "gc lost the commit only the reflog held"
+        else return 0; fi
+        return 1
+    }
+    # A fixture whose Git does not leave the gap the case needs stops the
+    # run: COMMIT must be no entry's new value in w's HEAD reflog.
+    reftable_gap() { # COMMIT
+        if git -C "$wt" rev-list --walk-reflogs HEAD | grep -qx "$1"; then
+            echo "contract-check: setup failed in $name: an entry of the HEAD reflog still names $1 as its new value" >&2
+            exit 2
+        fi
+    }
+    if ! git init -q --ref-format=reftable "$work/reftable.probe" >/dev/null 2>&1; then
+        for c in record-reflog-reftable record-reflog-reftable-expired record-reflog-reftable-deleted; do
+            echo "skip $c: this Git cannot make a reftable repository (Git 2.45 and later)"
+        done
     else
+        # The lone commit of record-reflog-pin.
+        name=record-reflog-reftable
         ref_format=reftable make_repo
         setup git -C "$wt" checkout -q --detach
         setup git -C "$wt" commit -q --allow-empty -m lone
         lone=$(git -C "$wt" rev-parse HEAD) || exit 2
         setup git -C "$wt" checkout -q --detach "$w_sha"
         run remove --yes --json "$wt"
-        entry=$(basename "$(result 0 removal_record)")
-        if [ "$status" != 0 ]; then fail "exit $status, want 0"
-        elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
-        elif [ -e "$repo/.git/residue-removed/$entry/HEAD.reflog" ]; then fail "a HEAD.reflog was saved from a reftable repository"
-        elif [ "$(git -C "$repo" for-each-ref --format='%(refname) %(objectname)' refs/residue/reflog/)" != "refs/residue/reflog/$entry/1 $lone" ]; then fail "the reflog pin: $(git -C "$repo" for-each-ref refs/residue/reflog/)"
-        elif ! git -C "$repo" gc -q --prune=now >/dev/null 2>&1; then fail "git gc failed"
-        elif [ "$(git -C "$repo" cat-file -t "$lone" 2>/dev/null)" != commit ]; then fail "gc lost the commit only the reflog held"
-        else
+        if reftable_pin_ok "$lone"; then
             run restore --json "$wt"
-            if [ "$status" != 0 ]; then fail "restore: exit $status, want 0"
-            elif ! restore_ok removed detached; then fail "stdout is not one restore document with checkout detached"
-            elif [ "$(records)" != "1 records, 2 refs" ]; then fail "$(records) after the restore, want 1 records, 2 refs"
-            elif common_ok; then ok; fi
+            reftable_restore_ok detached
+        fi
+
+        # The gap `git gc` leaves when it expires reflog entries. The entry
+        # that made the lone commit is 60 days old, older than either
+        # expiry period, and the one that left it 10 days, newer than
+        # either; so on Git's documented defaults (90 days, 30 for a
+        # commit no ref reaches) and on the swapped ones of Git 2.50 to
+        # 2.56 alike, only the old value of the newer entry names the
+        # commit. The removal pins it from the commits the worktree's
+        # reflogs name that the main worktree's do not.
+        name=record-reflog-reftable-expired
+        ref_format=reftable make_repo
+        now=$(git -C "$repo" log -1 --format=%ct) || exit 2
+        setup git -C "$wt" checkout -q --detach
+        setup env GIT_COMMITTER_DATE="$((now - 60 * 86400)) +0000" git -C "$wt" commit -q --allow-empty -m lone
+        lone=$(git -C "$wt" rev-parse HEAD) || exit 2
+        setup env GIT_COMMITTER_DATE="$((now - 10 * 86400)) +0000" git -C "$wt" checkout -q --detach "$w_sha"
+        setup git -C "$repo" gc -q
+        reftable_gap "$lone"
+        run remove --yes --json "$wt"
+        if reftable_pin_ok "$lone"; then
+            run restore --json "$wt"
+            reftable_restore_ok detached
+        fi
+
+        # `git reflog delete` of every entry before an amend leaves the
+        # commit before it as the oldest entry's old value, which Git
+        # reads as HEAD@{N}: the state `git gc` leaves on Git 2.50 to 2.56,
+        # which expire every entry older than 30 days. Branch w's reflog
+        # names that commit too, so it is not the worktree's alone, but
+        # `git branch -D w` deletes that reflog, and the pin keeps it.
+        name=record-reflog-reftable-deleted
+        ref_format=reftable make_repo
+        echo b >>"$wt/README.md"
+        setup git -C "$wt" commit -qam b
+        before_amend=$(git -C "$wt" rev-parse HEAD) || exit 2
+        setup git -C "$wt" commit -q --amend -m b2
+        w_sha=$(git -C "$repo" rev-parse w) || exit 2
+        n=$(git -C "$wt" rev-list --walk-reflogs HEAD | wc -l) || exit 2
+        for ((i = n - 1; i >= 1; i--)); do
+            setup git -C "$wt" reflog delete "HEAD@{$i}"
+        done
+        reftable_gap "$before_amend"
+        run remove --yes --json "$wt"
+        if reftable_pin_ok "$before_amend"; then
+            if ! git -C "$repo" branch -q -D w >/dev/null 2>&1; then fail "git branch -D w failed"
+            elif ! git -C "$repo" gc -q --prune=now >/dev/null 2>&1; then fail "git gc failed"
+            elif [ "$(git -C "$repo" cat-file -t "$before_amend" 2>/dev/null)" != commit ]; then fail "gc lost the commit before the amend once branch w was deleted"
+            else
+                run restore --json "$wt"
+                reftable_restore_ok recreated_branch
+            fi
         fi
     fi
 
@@ -856,7 +928,8 @@ if [ -z "$partial_probe" ]; then
     rm -rf -- "$work/home/Documents" "$work/home/src"
 else
     for c in record-json record-text record-fail-closed-dir record-fail-closed-ref record-retention record-keep-own watch-keep-removed \
-        record-reflog-pin record-reflog-branch record-reflog-reftable record-unreadable \
+        record-reflog-pin record-reflog-branch record-reflog-reftable record-reflog-reftable-expired \
+        record-reflog-reftable-deleted record-unreadable \
         restore-branch-ahead restore-branch-rewritten restore-branch-gone restore-branch-elsewhere \
         restore-path-occupied restore-detached restore-name-from-home; do
         skip_partial "$c"
