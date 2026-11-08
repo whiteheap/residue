@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- On macOS, residue measures a worktree's size two to five times faster, with the same result to the byte. It reads each folder with one `getattrlistbulk` call, as `du` does, in place of one `stat` call per file. Folders, symbolic links and other entries that are not regular files still get `stat`, and a folder the call refuses is read as before. `explain` of a 98,000-file worktree takes about 1.0 s, down from 1.4 s; `git status` is most of what is left (#72).
 - When nothing freed is counted yet, `service status`, `residue stats`, the line after a removal and the Mac app say so, and say that residue counts what it frees from version 0.0.8 on. They said residue had never freed any space, which was false after a version before 0.0.8 removed a worktree (#70).
 
 ## 0.0.8 (2026-11-08)

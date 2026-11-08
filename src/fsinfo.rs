@@ -99,7 +99,7 @@ pub fn measure(
     buckets: &[Bucket],
     matches: &dyn Fn(&str) -> bool,
 ) -> io::Result<Usage> {
-    let top = fs::symlink_metadata(root)?;
+    let top = Stat::from(&fs::symlink_metadata(root)?);
     let device = top.dev();
     let mut usage = Usage {
         buckets: vec![BucketUsage::default(); buckets.len()],
@@ -120,8 +120,9 @@ pub fn measure(
             covered: false,
         },
     )];
+    let mut buf = Vec::new();
     while let Some((dir, place)) = stack.pop() {
-        let listing = match fs::read_dir(&dir) {
+        let listing = match list(&dir, &mut buf) {
             Ok(listing) => listing,
             Err(e) => {
                 usage.unreadable_entry(&dir, &e);
@@ -138,9 +139,9 @@ pub fn measure(
                     continue;
                 }
             };
-            let path = item.path();
-            // DirEntry::metadata does not follow symbolic links on Unix.
-            let meta = match item.metadata() {
+            let path = item.path;
+            // Neither listing follows symbolic links.
+            let meta = match item.stat {
                 Ok(meta) => meta,
                 Err(e) => {
                     usage.unreadable_entry(&path, &e);
@@ -148,7 +149,7 @@ pub fn measure(
                     continue;
                 }
             };
-            if item.file_name() == ".git" && dir != root {
+            if item.git && dir != root {
                 usage.nested_repos.push(dir.clone());
             }
             let mut here = place;
@@ -249,7 +250,7 @@ fn display(path: &Path, root: &Path) -> String {
 fn account(
     usage: &mut Usage,
     shared: &mut HashMap<(u64, u64), Shared>,
-    meta: &Metadata,
+    meta: &Stat,
     path: &Path,
 ) -> bool {
     usage.entries += 1;
@@ -278,6 +279,357 @@ fn account(
     usage.reclaimable += blocks;
     true
 }
+
+/// The fields of `lstat` the walk reads for one entry.
+#[derive(Clone, Copy)]
+struct Stat {
+    dir: bool,
+    dev: u64,
+    ino: u64,
+    nlink: u64,
+    /// 512-byte blocks allocated, as `st_blocks`.
+    blocks: u64,
+    len: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+impl Stat {
+    fn is_dir(&self) -> bool {
+        self.dir
+    }
+    fn dev(&self) -> u64 {
+        self.dev
+    }
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+    fn nlink(&self) -> u64 {
+        self.nlink
+    }
+    fn blocks(&self) -> u64 {
+        self.blocks
+    }
+    fn len(&self) -> u64 {
+        self.len
+    }
+    fn mtime(&self) -> i64 {
+        self.mtime
+    }
+    fn mtime_nsec(&self) -> i64 {
+        self.mtime_nsec
+    }
+}
+
+impl From<&Metadata> for Stat {
+    fn from(meta: &Metadata) -> Stat {
+        Stat {
+            dir: meta.is_dir(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+            nlink: meta.nlink(),
+            blocks: meta.blocks(),
+            len: meta.len(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+        }
+    }
+}
+
+/// One entry of a directory listing.
+struct Listed {
+    path: PathBuf,
+    /// The entry is named `.git`.
+    git: bool,
+    stat: io::Result<Stat>,
+}
+
+/// The entries of one directory, in the order the file system lists them.
+/// An `Err` item is a listing error, after which the listing ends, as
+/// `fs::read_dir` does; an entry whose `stat` failed carries that error.
+type Listing = Vec<io::Result<Listed>>;
+
+/// The listing through the standard library: `readdir`, then one `lstat`
+/// per entry (relative to the directory where the platform allows).
+fn list_std(dir: &Path) -> io::Result<Listing> {
+    let mut out = Vec::new();
+    for item in fs::read_dir(dir)? {
+        out.push(item.map(|item| Listed {
+            git: item.file_name() == ".git",
+            path: item.path(),
+            stat: item.metadata().map(|meta| Stat::from(&meta)),
+        }));
+    }
+    Ok(out)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn list(dir: &Path, _buf: &mut Vec<u8>) -> io::Result<Listing> {
+    list_std(dir)
+}
+
+/// On macOS, one `getattrlistbulk` call returns a batch of entries with
+/// their attributes, where `readdir` plus `fstatat` costs one system call
+/// per entry: `du` lists this way through fts. A regular file's fields come
+/// from the batch. Any other entry, or one the call reports an error for,
+/// is read with `fstatat`, exactly as the standard library reads it. A
+/// directory the call refuses gets the standard listing.
+#[cfg(target_os = "macos")]
+fn list(dir: &Path, buf: &mut Vec<u8>) -> io::Result<Listing> {
+    bulk::list(dir, buf)
+}
+
+#[cfg(target_os = "macos")]
+mod bulk {
+    use super::{Listed, Listing, Stat, list_std};
+    use std::ffi::{CStr, CString, OsStr};
+    use std::io;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    // <sys/attr.h> and <sys/vnode.h>; the libc crate does not have these.
+    const ATTR_CMN_ERROR: libc::attrgroup_t = 0x2000_0000;
+    const VREG: u32 = 1;
+    /// Bytes per call: room for several hundred entries.
+    const BUF_LEN: usize = 128 * 1024;
+
+    const COMMON: libc::attrgroup_t = libc::ATTR_CMN_RETURNED_ATTRS
+        | ATTR_CMN_ERROR
+        | libc::ATTR_CMN_NAME
+        | libc::ATTR_CMN_DEVID
+        | libc::ATTR_CMN_OBJTYPE
+        | libc::ATTR_CMN_MODTIME
+        | libc::ATTR_CMN_FILEID;
+    const FILE: libc::attrgroup_t =
+        libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_ALLOCSIZE | libc::ATTR_FILE_DATALENGTH;
+
+    /// Closes the directory's descriptor when the listing is done.
+    struct Fd(libc::c_int);
+
+    impl Drop for Fd {
+        fn drop(&mut self) {
+            // SAFETY: the descriptor is ours, open, and closed only here.
+            unsafe { libc::close(self.0) };
+        }
+    }
+
+    pub fn list(dir: &Path, buf: &mut Vec<u8>) -> io::Result<Listing> {
+        let c_dir = CString::new(dir.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+        // The flags opendir(3) uses.
+        // SAFETY: open reads the NUL-terminated path, which outlives the call.
+        let fd = unsafe {
+            libc::open(
+                c_dir.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = Fd(fd);
+        let mut attrs = libc::attrlist {
+            bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+            reserved: 0,
+            commonattr: COMMON,
+            volattr: 0,
+            dirattr: 0,
+            fileattr: FILE,
+            forkattr: 0,
+        };
+        buf.resize(BUF_LEN, 0);
+        let mut out = Vec::new();
+        let mut first = true;
+        loop {
+            // SAFETY: the call reads `attrs` and writes at most `buf.len()`
+            // bytes into `buf`; both are ours and outlive it.
+            let count = unsafe {
+                libc::getattrlistbulk(
+                    fd.0,
+                    (&raw mut attrs).cast(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    0,
+                )
+            };
+            if count < 0 {
+                // A file system without the call, or a directory it refuses
+                // (one without search permission, say), gets the standard
+                // listing, so each entry reports what `read_dir` reports.
+                if first {
+                    return list_std(dir);
+                }
+                out.push(Err(io::Error::last_os_error()));
+                break;
+            }
+            if count == 0 {
+                break;
+            }
+            first = false;
+            let mut at = 0;
+            for _ in 0..count {
+                let Some((entry, len)) = buf.get(at..).and_then(parse) else {
+                    out.push(Err(io::Error::other(
+                        "getattrlistbulk returned an entry residue cannot read",
+                    )));
+                    return Ok(out);
+                };
+                at += len;
+                // std's read_dir skips these two, and the walk must never descend them.
+                if entry.name == b"." || entry.name == b".." {
+                    continue;
+                }
+                let path = dir.join(OsStr::from_bytes(entry.name));
+                let stat = match entry.stat() {
+                    Some(stat) => Ok(stat),
+                    None => fstatat(fd.0, entry.name),
+                };
+                out.push(Ok(Listed {
+                    git: entry.name == b".git",
+                    path,
+                    stat,
+                }));
+            }
+        }
+        Ok(out)
+    }
+
+    /// One entry of a batch: the attributes it returned.
+    struct Entry<'a> {
+        name: &'a [u8],
+        error: u32,
+        objtype: Option<u32>,
+        dev: Option<i32>,
+        mtime: Option<(i64, i64)>,
+        ino: Option<u64>,
+        nlink: Option<u32>,
+        alloc: Option<i64>,
+        len: Option<i64>,
+    }
+
+    impl Entry<'_> {
+        /// The fields of a regular file, when the batch returned all of
+        /// them without an error.
+        fn stat(&self) -> Option<Stat> {
+            if self.error != 0 || self.objtype? != VREG {
+                return None;
+            }
+            let (mtime, mtime_nsec) = self.mtime?;
+            Some(Stat {
+                dir: false,
+                // As std's MetadataExt::dev widens st_dev.
+                dev: self.dev? as u64,
+                ino: self.ino?,
+                nlink: u64::from(self.nlink?),
+                // Allocation is in whole file system blocks, so this is
+                // exact; st_blocks counts the same allocation.
+                blocks: u64::try_from(self.alloc?).ok()?.div_ceil(512),
+                len: u64::try_from(self.len?).ok()?,
+                mtime,
+                mtime_nsec,
+            })
+        }
+    }
+
+    fn take<const N: usize>(rec: &[u8], at: &mut usize) -> Option<[u8; N]> {
+        let bytes = rec.get(*at..at.checked_add(N)?)?;
+        *at += N;
+        bytes.try_into().ok()
+    }
+
+    /// Reads the entry at the start of `buf`, and returns it with its
+    /// length. The layout is getattrlist(2)'s: the length, the returned
+    /// attribute set, the error code, then each returned attribute in bit
+    /// order, every one a multiple of 4 bytes and 4-byte aligned.
+    fn parse(buf: &[u8]) -> Option<(Entry<'_>, usize)> {
+        let len = u32::from_ne_bytes(buf.get(..4)?.try_into().ok()?) as usize;
+        let rec = buf.get(..len)?;
+        let mut at = 4;
+        let common = u32::from_ne_bytes(take(rec, &mut at)?);
+        let _vol = take::<4>(rec, &mut at)?;
+        let _dir = take::<4>(rec, &mut at)?;
+        let file = u32::from_ne_bytes(take(rec, &mut at)?);
+        let _fork = take::<4>(rec, &mut at)?;
+        let mut entry = Entry {
+            name: &[],
+            error: 0,
+            objtype: None,
+            dev: None,
+            mtime: None,
+            ino: None,
+            nlink: None,
+            alloc: None,
+            len: None,
+        };
+        if common & ATTR_CMN_ERROR != 0 {
+            entry.error = u32::from_ne_bytes(take(rec, &mut at)?);
+        }
+        if common & libc::ATTR_CMN_NAME == 0 {
+            return None;
+        }
+        // An attrreference_t: the name's offset from this field, and its
+        // length with the terminating NUL.
+        let field = at;
+        let offset = i32::from_ne_bytes(take(rec, &mut at)?);
+        let name_len = u32::from_ne_bytes(take(rec, &mut at)?) as usize;
+        let start = field.checked_add_signed(isize::try_from(offset).ok()?)?;
+        let name = rec.get(start..start.checked_add(name_len)?)?;
+        entry.name = CStr::from_bytes_until_nul(name).ok()?.to_bytes();
+        if entry.name.is_empty() {
+            return None;
+        }
+        if common & libc::ATTR_CMN_DEVID != 0 {
+            entry.dev = Some(i32::from_ne_bytes(take(rec, &mut at)?));
+        }
+        if common & libc::ATTR_CMN_OBJTYPE != 0 {
+            entry.objtype = Some(u32::from_ne_bytes(take(rec, &mut at)?));
+        }
+        if common & libc::ATTR_CMN_MODTIME != 0 {
+            let sec = i64::from_ne_bytes(take(rec, &mut at)?);
+            let nsec = i64::from_ne_bytes(take(rec, &mut at)?);
+            entry.mtime = Some((sec, nsec));
+        }
+        if common & libc::ATTR_CMN_FILEID != 0 {
+            entry.ino = Some(u64::from_ne_bytes(take(rec, &mut at)?));
+        }
+        if file & libc::ATTR_FILE_LINKCOUNT != 0 {
+            entry.nlink = Some(u32::from_ne_bytes(take(rec, &mut at)?));
+        }
+        if file & libc::ATTR_FILE_ALLOCSIZE != 0 {
+            entry.alloc = Some(i64::from_ne_bytes(take(rec, &mut at)?));
+        }
+        if file & libc::ATTR_FILE_DATALENGTH != 0 {
+            entry.len = Some(i64::from_ne_bytes(take(rec, &mut at)?));
+        }
+        Some((entry, len))
+    }
+
+    /// `lstat` of one entry, relative to its directory, as std's
+    /// `DirEntry::metadata` does on macOS.
+    fn fstatat(dirfd: libc::c_int, name: &[u8]) -> io::Result<Stat> {
+        let c_name = CString::new(name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains a NUL byte"))?;
+        // SAFETY: fstatat reads the NUL-terminated name, which outlives the
+        // call, and writes into the zeroed struct we own.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatat(dirfd, c_name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Stat {
+            dir: st.st_mode & libc::S_IFMT == libc::S_IFDIR,
+            // As std's MetadataExt widens each field.
+            dev: st.st_dev as u64,
+            ino: st.st_ino,
+            nlink: u64::from(st.st_nlink),
+            blocks: st.st_blocks as u64,
+            len: st.st_size as u64,
+            mtime: st.st_mtime,
+            mtime_nsec: st.st_mtime_nsec,
+        })
+    }
+}
+
 impl Usage {
     fn unreadable_entry(&mut self, path: &Path, error: &io::Error) {
         self.unreadable += 1;
