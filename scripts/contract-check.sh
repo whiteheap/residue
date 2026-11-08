@@ -730,9 +730,10 @@ if [ -z "$partial_probe" ]; then
         fi
     }
     if ! git init -q --ref-format=reftable "$work/reftable.probe" >/dev/null 2>&1; then
-        for c in record-reflog-reftable record-reflog-reftable-expired record-reflog-reftable-deleted; do
+        for c in record-reflog-reftable record-reflog-reftable-expired record-reflog-reftable-deleted record-reflog-reftable-stray; do
             echo "skip $c: this Git cannot make a reftable repository (Git 2.45 and later)"
         done
+        echo "skip record-reflog-migrated: this Git has no git refs migrate (Git 2.46 and later)"
     else
         # The lone commit of record-reflog-pin.
         name=record-reflog-reftable
@@ -796,6 +797,92 @@ if [ -z "$partial_probe" ]; then
             else
                 run restore --json "$wt"
                 reftable_restore_ok recreated_branch
+            fi
+        fi
+
+        # A logs/HEAD file in a reftable repository's worktree, which Git
+        # does not read: the restore of residue 0.0.7 wrote one there after
+        # a `git refs migrate`. The file names only w's own commit; Git's
+        # reflog names the lone commit of record-reflog-pin. The removal
+        # neither copies the file nor reads it, so it pins the lone commit.
+        name=record-reflog-reftable-stray
+        ref_format=reftable make_repo
+        setup git -C "$wt" checkout -q --detach
+        setup git -C "$wt" commit -q --allow-empty -m lone
+        lone=$(git -C "$wt" rev-parse HEAD) || exit 2
+        setup git -C "$wt" checkout -q --detach "$w_sha"
+        w_git=$(git -C "$wt" rev-parse --absolute-git-dir) || exit 2
+        setup mkdir -p "$w_git/logs"
+        printf '%s %s C O Mitter <committer@example.com> 1700000000 +0000\tcheckout: a file Git does not read\n' \
+            0000000000000000000000000000000000000000 "$w_sha" >"$w_git/logs/HEAD" || exit 2
+        run remove --yes --json "$wt"
+        if reftable_pin_ok "$lone"; then
+            run restore --json "$wt"
+            reftable_restore_ok detached
+        fi
+
+        # `git refs migrate` (Git 2.46 and later) between the removal and
+        # the restore. Removed while the repository kept its refs in
+        # files, w leaves a copy of its logs/HEAD and a pin on the lone
+        # commit of record-reflog-pin. Once the refs are in reftable, Git
+        # reads no logs/HEAD file, so the restore writes none, says the
+        # reflog was not put back and keeps the record and both refs, and
+        # `git gc --prune=now` keeps the lone commit. The other way,
+        # removed in reftable and restored once the refs are in files
+        # again, the recreated worktree's reflog does not name the lone
+        # commit either, so that record stays too. `git refs migrate`
+        # refuses a repository with linked worktrees, so u goes out for
+        # the migration and comes back.
+        name=record-reflog-migrated
+        migrate() { # FORMAT
+            setup git -C "$repo" worktree remove "$repo/.worktrees/u"
+            setup git -C "$repo" refs migrate --ref-format="$1"
+            setup git -C "$repo" worktree add -q "$repo/.worktrees/u" u
+        }
+        # Remove w after the lone commit; stops the run when the removal
+        # does not pin it.
+        remove_lone() {
+            setup git -C "$wt" checkout -q --detach
+            setup git -C "$wt" commit -q --allow-empty -m lone
+            lone=$(git -C "$wt" rev-parse HEAD) || exit 2
+            setup git -C "$wt" checkout -q --detach "$w_sha"
+            run remove --yes --json "$wt"
+            entry=$(basename "$(result 0 removal_record)")
+            if [ "$status" != 0 ] || [ "$(result 0 result)" != removed ] \
+                || [ "$(git -C "$repo" for-each-ref --format='%(objectname)' "refs/residue/reflog/$entry/")" != "$lone" ]; then
+                echo "contract-check: setup failed in $name: remove exit $status, $(result 0 result), $(records), no pin on $lone" >&2
+                exit 2
+            fi
+        }
+        probe=$work/migrate.probe
+        if ! { git init -q "$probe" && git -C "$probe" commit -q --allow-empty -m probe \
+            && git -C "$probe" refs migrate --ref-format=reftable; } >/dev/null 2>&1; then
+            echo "skip $name: this Git has no git refs migrate (Git 2.46 and later)"
+        else
+            make_repo
+            remove_lone
+            migrate reftable
+            run restore --json "$wt"
+            if [ "$status" != 0 ]; then fail "restore after the migration to reftable: exit $status, want 0"
+            elif ! restore_ok removed detached; then fail "stdout is not one restore document with checkout detached"
+            elif ! git -C "$repo" gc -q --prune=now >/dev/null 2>&1; then fail "git gc failed"
+            elif [ "$(git -C "$repo" cat-file -t "$lone" 2>/dev/null)" != commit ]; then fail "gc lost the commit only the reflog held, restored after the migration to reftable ($(records) left)"
+            elif [ "$(records)" != "1 records, 2 refs" ]; then fail "$(records) after the restore in reftable, want 1 records, 2 refs"
+            elif ! jq -e '.restore.notes | any(startswith("its HEAD reflog was not put back: in a reftable repository"))' "$out" >/dev/null; then fail "the notes do not say the HEAD reflog was not put back: $(jq -c .restore.notes "$out")"
+            elif ! grep -q '^residue: note: its HEAD reflog was not put back' "$err"; then fail "stderr does not say the HEAD reflog was not put back"
+            elif [ -e "$repo/.git/worktrees/w/logs/HEAD" ]; then fail "the restore wrote a logs/HEAD file, which Git does not read in a reftable repository"
+            elif common_ok; then
+                ref_format=reftable make_repo "$work/$name-files"
+                remove_lone
+                migrate files
+                run restore --json "$wt"
+                if [ "$status" != 0 ]; then fail "restore after the migration back to files: exit $status, want 0"
+                elif ! restore_ok removed detached; then fail "stdout is not one restore document with checkout detached, back in files"
+                elif ! git -C "$repo" gc -q --prune=now >/dev/null 2>&1; then fail "git gc failed, back in files"
+                elif [ "$(git -C "$repo" cat-file -t "$lone" 2>/dev/null)" != commit ]; then fail "gc lost the commit only the reflog held, restored after the migration back to files ($(records) left)"
+                elif [ "$(records)" != "1 records, 2 refs" ]; then fail "$(records) after the restore in files, want 1 records, 2 refs"
+                elif ! jq -e '.restore.notes | any(startswith("its reflog does not name 1 of the 1 commits only the old reflog held"))' "$out" >/dev/null; then fail "the notes do not say the reflog lacks the lone commit: $(jq -c .restore.notes "$out")"
+                elif common_ok; then ok; fi
             fi
         fi
     fi
@@ -929,7 +1016,7 @@ if [ -z "$partial_probe" ]; then
 else
     for c in record-json record-text record-fail-closed-dir record-fail-closed-ref record-retention record-keep-own watch-keep-removed \
         record-reflog-pin record-reflog-branch record-reflog-reftable record-reflog-reftable-expired \
-        record-reflog-reftable-deleted record-unreadable \
+        record-reflog-reftable-deleted record-reflog-reftable-stray record-reflog-migrated record-unreadable \
         restore-branch-ahead restore-branch-rewritten restore-branch-gone restore-branch-elsewhere \
         restore-path-occupied restore-detached restore-name-from-home; do
         skip_partial "$c"

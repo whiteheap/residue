@@ -21,9 +21,10 @@
 //! `git branch -D` deletes a branch's reflog with the branch, and reflogs
 //! expire. Worktree-private refs and an operation in progress already keep
 //! a worktree from removal (`inspect`), so the reflog is all the Git
-//! directory adds. A reftable repository has no `logs/HEAD` file: Git
-//! reads the commits that reflog names for residue (`reflog_only` says
-//! which, and which it cannot), and there is no copy.
+//! directory adds. In a repository that keeps its refs in reftable, Git
+//! reads no `logs/HEAD` file, even one that is there, so residue asks Git
+//! which commits that reflog names (`git_head_reflog` says which, and
+//! which it cannot), and there is no copy.
 //!
 //! A removal writes the record and its refs after it moves the worktree
 //! aside and before its check at the new path, which drops them again
@@ -39,11 +40,14 @@
 //! the branch at the recorded HEAD or ahead of it is checked out, a branch
 //! that is gone is recreated there, and a branch that no longer contains
 //! the recorded HEAD keeps its commits while a new branch is made at the
-//! recorded HEAD. The recorded reflog goes back in front of the new one;
-//! in a reftable repository, which has none, restore says so.
-//! Ignored entries, such as `node_modules/`, are not restored; the
-//! project's own install makes them again. The record and its refs are
-//! dropped only once the restored worktree holds everything they held.
+//! recorded HEAD. The recorded reflog goes back in front of the new one
+//! while the repository keeps its refs in files. In one that keeps them in
+//! reftable when restore runs, Git reads no `logs/HEAD` file, so restore
+//! writes none and says so, and a record holding a copy (written before a
+//! `git refs migrate`) stays. Ignored entries, such as `node_modules/`,
+//! are not restored; the project's own install makes them again. The
+//! record and its refs are dropped only once the restored worktree holds
+//! everything they held, as Git reads it.
 //!
 //! A record and its refs expire after `--keep-removed` (default 30 days),
 //! which the record keeps (`keep`): every remove run forgets them too,
@@ -84,10 +88,12 @@ const INFO_NEW: &str = "info.new";
 /// A copy of the worktree's own `config.worktree`, when it had one.
 const CONFIG: &str = "config.worktree";
 /// A copy of the worktree's HEAD reflog, `logs/HEAD` in its Git directory,
-/// when it had one (Git's files ref backend keeps it there).
+/// when it had one and the repository kept its refs in files, the only
+/// backend whose reflog Git reads from that file.
 const REFLOG: &str = "HEAD.reflog";
-/// What a restore in a reftable repository says, which has no `logs/HEAD`
-/// to copy or put back.
+/// What a restore that recreates a worktree says in a repository that
+/// keeps its refs in reftable, where Git reads no `logs/HEAD` file to put
+/// the old entries in.
 const REFTABLE_REFLOG_NOTE: &str = "its HEAD reflog was not put back: in a reftable repository Git adds a reflog entry only as the newest one, so the old entries cannot go back in front of the new one, and `git reflog` there starts at this restore";
 /// An entry with no `info` (the run that made it stopped first) and no ref
 /// is cleared once its directory is this old, in seconds: a run writing
@@ -709,8 +715,19 @@ pub fn create(
     }
     let config = read_if_present(git_dir.map(|d| d.join(CONFIG)))
         .map_err(|e| format!("cannot read its config.worktree: {e}"))?;
-    let reflog = read_if_present(git_dir.map(|d| d.join("logs").join("HEAD")))
-        .map_err(|e| format!("cannot read its HEAD reflog: {e}"))?;
+    // Git reads a `logs/HEAD` file only while the repository keeps its
+    // refs in files. In reftable one is not the worktree's reflog (the
+    // restore of residue 0.0.7 and earlier wrote one there after a `git
+    // refs migrate`), so it is not copied, and `reflog_only` asks Git.
+    let reftable = git::is_reftable(command_dir).map_err(|e| {
+        format!("cannot tell whether the repository keeps its refs in reftable: {e}")
+    })?;
+    let reflog = if reftable {
+        None
+    } else {
+        read_if_present(git_dir.map(|d| d.join("logs").join("HEAD")))
+            .map_err(|e| format!("cannot read its HEAD reflog: {e}"))?
+    };
     let mut record = record.clone();
     record.kept = reflog_only(reflog.as_deref(), &record.aside, command_dir)
         .map_err(|e| format!("cannot tell which commits only its reflog holds: {e}"))?;
@@ -814,44 +831,46 @@ fn write_entry(dir: &Path, files: &[(&str, &[u8])], info: &[u8]) -> Result<(), S
     sync_dir(dir)
 }
 
-/// The commits the worktree's HEAD reflog (`reflog`, the bytes of its
-/// `logs/HEAD`) holds that no ref outside `refs/residue/` and no
-/// worktree's HEAD reaches (the record's own ref keeps its HEAD). Another
-/// reflog naming one does not count: a branch's reflog goes with `git
-/// branch -D`, and any reflog expires. Of those, the fewest that reach
-/// them all, so one ref each keeps every one. `main` is where Git commands
-/// for the repository run.
-///
-/// With no `logs/HEAD` file, as in a reftable repository, where `git
-/// worktree remove` deletes the worktree's reflog all the same, Git reads
-/// that reflog from the worktree at `worktree` instead: each entry's new
-/// value and the oldest entry's old value. Git reads no other old value
-/// on its own, and one after a gap in the middle (an entry expired, or
-/// deleted with `git reflog delete`) names a commit no entry names as
-/// new. So every commit the reflogs Git reads at `worktree` name that the
-/// ones it reads at `main` do not counts too: only the worktree's own
-/// reflog names it. Left out is such an old value that another reflog
-/// also names, a branch's say: that reflog keeps it after the removal,
-/// and a later `git branch -D` can lose it.
+/// The commits the worktree's HEAD reflog holds that no ref outside
+/// `refs/residue/` and no worktree's HEAD reaches (the record's own ref
+/// keeps its HEAD). Another reflog naming one does not count: a branch's
+/// reflog goes with `git branch -D`, and any reflog expires. Of those, the
+/// fewest that reach them all, so one ref each keeps every one. `reflog`
+/// is the bytes of its `logs/HEAD`, where Git keeps it in a files
+/// repository; without them Git says which commits it names
+/// (`git_head_reflog`). `main` is where Git commands for the repository
+/// run.
 fn reflog_only(reflog: Option<&[u8]>, worktree: &Path, main: &Path) -> Result<Vec<String>, String> {
     let named = match reflog {
         Some(bytes) => reflog_ids(bytes),
-        None => {
-            let shared: HashSet<String> = git::reflogs_commits(main)?.into_iter().collect();
-            let own = git::reflogs_commits(worktree)?
-                .into_iter()
-                .filter(|id| !shared.contains(id));
-            let mut seen = HashSet::new();
-            git::head_reflog_commits(worktree)?
-                .into_iter()
-                .chain(own)
-                .filter(|id| seen.insert(id.clone()))
-                .collect()
-        }
+        None => git_head_reflog(worktree, main)?,
     };
     let named: Vec<&str> = named.iter().map(String::as_str).collect();
     let lost = git::unreferenced(main, &named)?;
     git::independent(main, &lost)
+}
+
+/// The commits Git reads the HEAD reflog of the worktree at `worktree` as
+/// naming, once each: each entry's new value and the oldest entry's old
+/// value. Git reads no other old value on its own, and one after a gap in
+/// the middle (an entry expired, or deleted with `git reflog delete`)
+/// names a commit no entry names as new. So every commit the reflogs Git
+/// reads at `worktree` name that the ones it reads at `main` do not counts
+/// too: only the worktree's own reflog names it. Left out is such an old
+/// value that another reflog also names, a branch's say. At a removal,
+/// that reflog keeps it after the removal, and a later `git branch -D` can
+/// lose it; at a restore, the record that pins it stays.
+fn git_head_reflog(worktree: &Path, main: &Path) -> Result<Vec<String>, String> {
+    let shared: HashSet<String> = git::reflogs_commits(main)?.into_iter().collect();
+    let own = git::reflogs_commits(worktree)?
+        .into_iter()
+        .filter(|id| !shared.contains(id));
+    let mut seen = HashSet::new();
+    Ok(git::head_reflog_commits(worktree)?
+        .into_iter()
+        .chain(own)
+        .filter(|id| seen.insert(id.clone()))
+        .collect())
 }
 
 /// Every commit a reflog's bytes name, the old and the new value of each
@@ -1071,17 +1090,24 @@ pub fn restore(item: &Item, to: Option<&Path>, listed: &[Entry]) -> Result<Resto
     // commits the refs keep, the record stays.
     let recreated = item.registered.is_none();
     let mut keep_record = false;
-    let git_dir = match git::identity(&restored.path) {
+    match git::identity(&restored.path) {
         Ok(id) => {
             if let Err(e) = mark(&id.git_dir, &format!("removal record {}", item.name)) {
                 restored.notes.push(format!(
                     "could not mark it as restored ({e}); `residue watch` may remove it again once its upstream is gone: lock it with `git worktree lock` to keep it"
                 ));
             }
-            let reflog = if recreated {
-                restore_reflog(&item.dir, &id.git_dir)
-            } else {
-                reflog_if_lost(&item.dir, &id.git_dir)
+            // Git reads a `logs/HEAD` file only while the repository keeps
+            // its refs in files. How it keeps them now decides, not how it
+            // kept them when the record was written: `git refs migrate`
+            // can change it in between.
+            let reflog = match git::is_reftable(&restored.path) {
+                Ok(false) if recreated => restore_reflog(&item.dir, &id.git_dir),
+                Ok(false) => reflog_if_lost(&item.dir, &id.git_dir),
+                Ok(true) => reftable_reflog(item, recreated),
+                Err(e) => Err(format!(
+                    "its HEAD reflog was not put back: residue could not tell whether the repository keeps its refs in reftable, where Git does not read the file it would write ({e})"
+                )),
             };
             for step in [restore_config(&item.dir, &id.git_dir), reflog] {
                 match step {
@@ -1093,34 +1119,16 @@ pub fn restore(item: &Item, to: Option<&Path>, listed: &[Entry]) -> Result<Resto
                     }
                 }
             }
-            // A reftable repository has no `logs/HEAD` file, so the record
-            // has no copy to put back, and Git offers no way to.
-            if recreated && !item.head_reflog {
-                match git::is_reftable(&restored.path) {
-                    Ok(true) => restored.notes.push(REFTABLE_REFLOG_NOTE.into()),
-                    Ok(false) => {}
-                    Err(e) => restored.notes.push(format!(
-                        "could not tell whether the repository keeps its refs in reftable ({e}), where its HEAD reflog cannot be put back"
-                    )),
-                }
-            }
-            Some(id.git_dir)
         }
         Err(e) => {
             restored.notes.push(format!(
                 "could not find its Git directory to mark it as restored ({e}); `residue watch` may remove it again once its upstream is gone: lock it with `git worktree lock` to keep it"
             ));
             keep_record = item.worktree_config || item.head_reflog;
-            None
         }
-    };
+    }
     if !keep_record {
-        if let Err(note) = holds(
-            record,
-            &restored.path,
-            git_dir.as_deref(),
-            &mut restored.how,
-        ) {
+        if let Err(note) = holds(record, &restored.path, &item.command_dir, &mut restored.how) {
             restored.notes.push(note);
             keep_record = true;
         }
@@ -1138,19 +1146,31 @@ pub fn restore(item: &Item, to: Option<&Path>, listed: &[Entry]) -> Result<Resto
     Ok(restored)
 }
 
+/// What a restore does with the recorded HEAD reflog in a repository that
+/// keeps its refs in reftable now, where Git reads no `logs/HEAD` file and
+/// adds an entry only as the newest one. A recreated worktree's reflog
+/// starts at this restore, so the restore says so, and a record holding a
+/// copy, written while the repository kept its refs in files, stays with
+/// it. A worktree moved back kept its reflog in its own Git directory;
+/// `holds` asks Git whether it still names every kept commit.
+fn reftable_reflog(item: &Item, recreated: bool) -> Result<Option<String>, String> {
+    match (recreated, item.head_reflog) {
+        (false, _) => Ok(None),
+        (true, false) => Ok(Some(REFTABLE_REFLOG_NOTE.into())),
+        (true, true) => Err(REFTABLE_REFLOG_NOTE.into()),
+    }
+}
+
 /// The restored worktree at `path` holds what the record's refs keep: its
 /// HEAD contains the recorded HEAD (a branch moved between the check and
-/// `git worktree add` would not), and its own HEAD reflog, in its Git
-/// directory `git_dir`, names every kept commit: that reflog, not a
-/// branch's, is what kept them before the removal. A branch checkout's tip
-/// in `how` becomes the HEAD it found, so the report says where the
-/// worktree is. `Err` is a note saying what it lacks.
-fn holds(
-    record: &Record,
-    path: &Path,
-    git_dir: Option<&Path>,
-    how: &mut How,
-) -> Result<(), String> {
+/// `git worktree add` would not), and its own HEAD reflog names every kept
+/// commit: that reflog, not a branch's, is what kept them before the
+/// removal. Git says which commits the reflog names (`git_head_reflog`),
+/// never a `logs/HEAD` file, which Git does not read in a reftable
+/// repository. `main` is where Git commands for the repository run. A
+/// branch checkout's tip in `how` becomes the HEAD it found, so the report
+/// says where the worktree is. `Err` is a note saying what it lacks.
+fn holds(record: &Record, path: &Path, main: &Path, how: &mut How) -> Result<(), String> {
     let short = |c: &str| c[..c.len().min(12)].to_string();
     let mut check = || -> Result<Option<String>, String> {
         let now = git::commit_of(path, "HEAD")?.ok_or("it has no HEAD commit")?;
@@ -1168,12 +1188,7 @@ fn holds(
         if record.kept.is_empty() {
             return Ok(None);
         }
-        let git_dir = git_dir.ok_or("residue cannot find its Git directory")?;
-        let log = git_dir.join("logs").join("HEAD");
-        let bytes = read_if_present(Some(log.clone()))
-            .map_err(|e| format!("cannot read {}: {e}", log.display()))?
-            .unwrap_or_default();
-        let named: HashSet<String> = reflog_ids(&bytes).into_iter().collect();
+        let named: HashSet<String> = git_head_reflog(path, main)?.into_iter().collect();
         let missing = record
             .kept
             .iter()
