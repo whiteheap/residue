@@ -128,7 +128,14 @@ fn exec_input(
     timeout: Duration,
 ) -> Result<Exit, String> {
     cmd.args(args);
-    match run::run_with_input(&mut cmd, input, timeout, MAX_OUTPUT) {
+    exit_of(
+        run::run_with_input(&mut cmd, input, timeout, MAX_OUTPUT),
+        args,
+    )
+}
+
+fn exit_of(result: Result<run::Captured, RunError>, args: &[&OsStr]) -> Result<Exit, String> {
+    match result {
         Ok(out) => Ok(Exit {
             success: out.status.success(),
             code: out.status.code(),
@@ -137,6 +144,22 @@ fn exec_input(
         }),
         Err(RunError::NotFound) => Err("git is not installed or not on PATH".into()),
         Err(e) => Err(format!("{}: {e}", describe(args))),
+    }
+}
+
+/// [`git`], keeping only the output records that `filter` accepts.
+fn git_filtered(dir: &Path, args: &[&str], filter: run::Filter) -> Result<Vec<u8>, String> {
+    let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+    let mut cmd = command(dir);
+    cmd.args(&args);
+    let exit = exit_of(
+        run::run_filtered(&mut cmd, QUERY_TIMEOUT, MAX_OUTPUT, filter),
+        &args,
+    )?;
+    if exit.success {
+        Ok(exit.stdout)
+    } else {
+        Err(format!("{} failed: {}", describe(&args), exit.stderr))
     }
 }
 
@@ -559,17 +582,24 @@ pub fn remove_worktree(main: &Path, worktree: &Path) -> Result<(), String> {
 /// marked assume-unchanged (a lowercase tag) or skip-worktree (`S`).
 /// `git worktree remove` would delete such edits without noticing them.
 pub fn hidden_from_status(dir: &Path) -> Result<Vec<String>, String> {
-    let out = git(dir, &["ls-files", "-v", "-z"])?;
-    let mut hidden = Vec::new();
-    for record in out.split(|b| *b == 0) {
-        if record.len() < 3 || record[1] != b' ' {
-            continue;
-        }
-        if record[0].is_ascii_lowercase() || record[0] == b'S' {
-            hidden.push(String::from_utf8_lossy(&record[2..]).into_owned());
-        }
-    }
-    Ok(hidden)
+    // Only these records are held, as Git writes them: the whole list was
+    // 3.4 MB for a worktree of 59,888 tracked files (#78).
+    let filter = run::Filter {
+        separator: 0,
+        keep: hides_edits,
+    };
+    let out = git_filtered(dir, &["ls-files", "-v", "-z"], filter)?;
+    Ok(out
+        .split(|b| *b == 0)
+        .filter(|record| hides_edits(record))
+        .map(|record| String::from_utf8_lossy(&record[2..]).into_owned())
+        .collect())
+}
+
+/// An `ls-files -v` record whose tag hides edits from `git status`: a
+/// lowercase tag (assume-unchanged) or `S` (skip-worktree).
+fn hides_edits(record: &[u8]) -> bool {
+    record.len() >= 3 && record[1] == b' ' && (record[0].is_ascii_lowercase() || record[0] == b'S')
 }
 
 /// Run one `git worktree` subcommand that changes state, from `main` (the
