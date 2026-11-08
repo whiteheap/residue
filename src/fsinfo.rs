@@ -3,12 +3,14 @@
 //! The walk never follows symbolic links and never crosses into another
 //! filesystem. It opens each folder relative to its parent's open
 //! descriptor with `O_NOFOLLOW`, so a folder that becomes a symbolic link,
-//! or another folder, while the walk runs is reported as changed and never
-//! read. It records what would make a removal surprising: nested
-//! repositories, mount points and entries it could not read. The same walk
-//! attributes files and bytes to each ignored entry (a bucket), and judges
-//! the contents of a collapsed ignored directory that a path rule reaches
-//! into, so the worktree is read once.
+//! or another folder, before the walk opens it is reported as changed and
+//! never read. A folder already open is read through its descriptor, as
+//! any walk reads it: renamed away or mounted over after that, it is still
+//! the folder the listing saw. It records what would make a removal
+//! surprising: nested repositories, mount points and entries it could not
+//! read. The same walk attributes files and bytes to each ignored entry (a
+//! bucket), and judges the contents of a collapsed ignored directory that
+//! a path rule reaches into, so the worktree is read once.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr};
@@ -28,15 +30,17 @@ pub const EXPAND_LIMIT: u64 = 100_000;
 /// to level `HELD - 1`. The walk opens each folder from its parent's
 /// descriptor, so it keeps a folder open while subfolders of it wait to be
 /// listed: about one descriptor per level of the path it is on. A folder
-/// deeper than that is closed once listed, and its subfolders are opened
-/// from the deepest folder still open, one name at a time, each checked
-/// against the device and inode its listing showed (`Pending::open`). So a
-/// walk holds at most `HELD + 2` descriptors however deep the tree, and
-/// `scan`'s 8 workers at most 144: launchd starts a login service with a
-/// soft limit of 256, and Git's pipes need some of the rest. The limit is
-/// not raised, because nothing needs more. The deepest folder in five large
-/// local worktrees and checkouts (41,650 to 112,595 entries, 2026-11-08)
-/// was 14 levels down, so in practice no folder is reopened.
+/// deeper than that is closed once listed, unless it is one of the
+/// [`REOPENED`] kept in [`Reopened`], and its subfolders are opened from
+/// the deepest folder still open above them, one name at a time, each
+/// checked against the device and inode its listing showed
+/// (`Pending::open`). So a walk holds at most `HELD + REOPENED + 2`
+/// descriptors however deep the tree, 22, and `scan`'s 8 workers at most
+/// 176: launchd starts a login service with a soft limit of 256, and Git's
+/// pipes need some of the rest. The limit is not raised, because nothing
+/// needs more. The deepest folder in five large local worktrees and
+/// checkouts (41,650 to 112,595 entries, 2026-11-08) was 14 levels down,
+/// so in practice no folder is reopened.
 const HELD: usize = 16;
 
 /// How the walk opens a folder to list it: for reading, as opendir(3)
@@ -166,8 +170,7 @@ pub fn measure(
     buckets: &[Bucket],
     matches: &dyn Fn(&str) -> bool,
 ) -> io::Result<Usage> {
-    let top_fd = Rc::new(open_root(root)?);
-    let top = fstat(top_fd.as_fd())?;
+    let (top, opened) = open_root(root)?;
     let device = top.dev();
     let mut usage = Usage {
         buckets: vec![BucketUsage::default(); buckets.len()],
@@ -181,6 +184,14 @@ pub fn measure(
     let mut walked = vec![0u64; buckets.len()];
     let mut shared: HashMap<(u64, u64), Shared> = HashMap::new();
     account(&mut usage, &mut shared, &top, root);
+    let top_fd = match opened {
+        Ok(fd) => Rc::new(fd),
+        Err(e) => {
+            // As a folder below it that fails to open: one unreadable entry.
+            usage.unreadable_entry(root, &e);
+            return Ok(usage);
+        }
+    };
     let mut next = Some(Folder {
         below: Parent::Open(Rc::clone(&top_fd)),
         fd: top_fd,
@@ -193,6 +204,7 @@ pub fn measure(
         },
     });
     let mut stack: Vec<Pending> = Vec::new();
+    let mut kept = Reopened::default();
     let mut buf = Vec::new();
     loop {
         let folder = match next.take() {
@@ -201,7 +213,7 @@ pub fn measure(
                 let Some(pending) = stack.pop() else {
                     break;
                 };
-                match pending.open() {
+                match pending.open(&mut kept) {
                     Ok(folder) => folder,
                     Err((path, place, e)) => {
                         usage.unreadable_entry(&path, &e);
@@ -219,8 +231,7 @@ pub fn measure(
             below,
         } = folder;
         let listing = list(fd.as_fd(), &dir, &mut buf);
-        // Only `below` keeps it open from here, and only above HELD.
-        drop(fd);
+        let before = stack.len();
         let listing = match listing {
             Ok(listing) => listing,
             Err(e) => {
@@ -324,6 +335,13 @@ pub fn measure(
                 }
             }
         }
+        // A folder deeper than HELD stays open only while subfolders of it
+        // wait, in `kept`; `below` keeps one above HELD open.
+        if let Parent::Below(_, step) = &below {
+            if stack.len() > before {
+                kept.push(Rc::clone(step), fd, Some(stack.len() - before));
+            }
+        }
     }
     for inode in shared.values() {
         if inode.seen >= inode.links {
@@ -360,42 +378,137 @@ struct Pending {
 enum Parent {
     /// Its parent, still open.
     Open(Rc<OwnedFd>),
-    /// Its parent is deeper than [`HELD`] and was closed after its listing:
-    /// the deepest folder still open above it, and the folders from there
-    /// down to its parent, each as its own parent listed it.
-    Below(Rc<OwnedFd>, Rc<[Step]>),
+    /// Its parent is deeper than [`HELD`], so it stays open only while
+    /// [`Reopened`] keeps it: the deepest folder held above it, and its
+    /// parent as the last of the folders from there down, each as its own
+    /// parent listed it.
+    Below(Rc<OwnedFd>, Rc<Step>),
 }
 
-#[derive(Clone)]
+/// A folder deeper than [`HELD`], as its parent's listing showed it.
 struct Step {
     name: CString,
     id: (u64, u64),
+    /// The folder above it, `None` for the first one below the deepest
+    /// folder held.
+    up: Option<Rc<Step>>,
+    /// How far below the deepest folder held it is: 1 for the first.
+    level: usize,
+}
+
+/// The folders deeper than [`HELD`] that the walk keeps open, shallowest
+/// first: at most [`REOPENED`] folders of the path it is on. The walk is
+/// depth-first, so a folder waiting to be opened always has its parent on
+/// that path, and when that parent is kept here the folder opens from it,
+/// rather than reopening every folder from the deepest one held. A folder
+/// with no subfolders left waiting is dropped first, so what stays is the
+/// folders that subfolders still wait in. An entry is matched by the `Rc`
+/// of its step, which it holds, so that address cannot be reused for
+/// another folder while it is kept.
+#[derive(Default)]
+struct Reopened(Vec<Kept>);
+
+struct Kept {
+    step: Rc<Step>,
+    fd: Rc<OwnedFd>,
+    /// How many subfolders of it wait to be opened, when the walk knows:
+    /// it does for a folder it listed, not for one it reopened.
+    waiting: Option<usize>,
+}
+
+/// How many folders [`Reopened`] keeps. Measured 2026-11-08 on a 41-level
+/// chain under `node_modules` ending in a folder of 3,000 leaf folders,
+/// 1,000 folders three deep, 500 six deep, 30 by 30 and 12 by 12 by 12:
+/// with 4, `explain` was as fast as opening each folder by its full path
+/// on all five. With 2 the 12 by 12 by 12 tree was slower. Without it,
+/// every folder past [`HELD`] reopened its whole chain, 5 to 9 times the
+/// system time.
+const REOPENED: usize = 4;
+
+impl Reopened {
+    /// Keeps the folders that `to` is or lies below, drops the rest, and
+    /// returns the deepest one kept. When that is `to`, one subfolder of it
+    /// is being opened, so one fewer waits.
+    fn keep_above(&mut self, to: &Rc<Step>) -> Option<(usize, Rc<OwnedFd>)> {
+        while let Some(kept) = self.0.last_mut() {
+            let mut at = to;
+            while at.level > kept.step.level {
+                match &at.up {
+                    Some(up) => at = up,
+                    None => break,
+                }
+            }
+            if Rc::ptr_eq(at, &kept.step) {
+                if Rc::ptr_eq(to, &kept.step) {
+                    kept.waiting = kept.waiting.map(|n| n.saturating_sub(1));
+                }
+                return Some((kept.step.level, Rc::clone(&kept.fd)));
+            }
+            self.0.pop();
+        }
+        None
+    }
+
+    /// Keeps `fd`, the folder at `step`, as the deepest. It drops the
+    /// folders no subfolder waits in, then the shallowest past
+    /// [`REOPENED`].
+    fn push(&mut self, step: Rc<Step>, fd: Rc<OwnedFd>, waiting: Option<usize>) {
+        self.0.retain(|kept| kept.waiting != Some(0));
+        if self.0.len() == REOPENED {
+            self.0.remove(0);
+        }
+        self.0.push(Kept { step, fd, waiting });
+    }
+}
+
+/// Opens the folder at `to` from the deepest folder kept above it, or from
+/// `base`, the deepest folder held, one name at a time, each checked
+/// against the device and inode its listing showed (`open_listed`), and
+/// keeps each one it opens. A failure gives the level of the folder that
+/// failed.
+fn reopen(
+    base: &Rc<OwnedFd>,
+    to: &Rc<Step>,
+    kept: &mut Reopened,
+) -> Result<Rc<OwnedFd>, (usize, io::Error)> {
+    let (have, mut at) = kept.keep_above(to).unwrap_or_else(|| (0, Rc::clone(base)));
+    let mut missing = Vec::with_capacity(to.level - have);
+    let mut step = to;
+    while step.level > have {
+        missing.push(step);
+        match &step.up {
+            Some(up) => step = up,
+            None => break,
+        }
+    }
+    for step in missing.into_iter().rev() {
+        let fd = open_listed(at.as_fd(), &step.name, step.id).map_err(|e| (step.level, e))?;
+        at = Rc::new(fd);
+        kept.push(Rc::clone(step), Rc::clone(&at), None);
+    }
+    Ok(at)
 }
 
 impl Pending {
     /// Opens it, and returns where its subfolders will be opened from. A
     /// failure names the folder that failed, this one or a folder above it
     /// that had to be reopened, with the place to judge it in.
-    fn open(self) -> Result<Folder, (PathBuf, Place, io::Error)> {
+    fn open(self, kept: &mut Reopened) -> Result<Folder, (PathBuf, Place, io::Error)> {
         let fd = match &self.parent {
-            Parent::Open(at) => open_listed(at.as_fd(), &self.name, self.id),
-            Parent::Below(base, steps) => {
-                let mut held: Option<OwnedFd> = None;
-                for (i, step) in steps.iter().enumerate() {
-                    let at = held.as_ref().map_or(base.as_fd(), AsFd::as_fd);
-                    match open_listed(at, &step.name, step.id) {
-                        Ok(fd) => held = Some(fd),
-                        Err(e) => {
-                            // steps[i] is the folder `steps.len() - i` levels up.
-                            let up = self.path.ancestors().nth(steps.len() - i);
-                            let path = up.unwrap_or(&self.path).to_path_buf();
-                            return Err((path, self.place, e));
-                        }
-                    }
-                }
-                let at = held.as_ref().map_or(base.as_fd(), AsFd::as_fd);
-                open_listed(at, &self.name, self.id)
+            Parent::Open(at) => {
+                // Every folder kept is in a subtree the walk has finished.
+                kept.0.clear();
+                open_listed(at.as_fd(), &self.name, self.id)
             }
+            Parent::Below(base, parent) => match reopen(base, parent, kept) {
+                Ok(at) => open_listed(at.as_fd(), &self.name, self.id),
+                Err((level, e)) => {
+                    // The folder at `level` is `parent.level - level + 1` up.
+                    let up = self.path.ancestors().nth(parent.level - level + 1);
+                    let path = up.unwrap_or(&self.path).to_path_buf();
+                    return Err((path, self.place, e));
+                }
+            },
         };
         let fd = match fd {
             Ok(fd) => Rc::new(fd),
@@ -404,16 +517,18 @@ impl Pending {
         let below = if self.depth < HELD {
             Parent::Open(Rc::clone(&fd))
         } else {
+            let (base, up) = match self.parent {
+                Parent::Open(base) => (base, None),
+                Parent::Below(base, parent) => (base, Some(parent)),
+            };
+            let level = up.as_ref().map_or(1, |up| up.level + 1);
             let step = Step {
                 name: self.name,
                 id: self.id,
+                up,
+                level,
             };
-            match self.parent {
-                Parent::Open(base) => Parent::Below(base, Rc::from([step])),
-                Parent::Below(base, steps) => {
-                    Parent::Below(base, steps.iter().cloned().chain([step]).collect())
-                }
-            }
+            Parent::Below(base, Rc::new(step))
         };
         Ok(Folder {
             fd,
@@ -434,8 +549,12 @@ fn leaf(path: &Path) -> io::Result<CString> {
 
 /// Opens the worktree's folder from `/`, one name at a time, each relative
 /// to the folder before it and never through a symbolic link. `root` is
-/// canonical, so a symbolic link on it means the path changed since.
-fn open_root(root: &Path) -> io::Result<OwnedFd> {
+/// canonical, so a symbolic link on it means the path changed since. An
+/// `Err` is a folder above the worktree that fails to open, or a worktree
+/// that is not a folder. Otherwise the worktree's own lstat comes back
+/// with its open, which can fail on its own: a worktree residue may look
+/// up but not read is still one entry, counted unreadable.
+fn open_root(root: &Path) -> io::Result<(Stat, io::Result<OwnedFd>)> {
     let mut names = Vec::new();
     for part in root.components() {
         match part {
@@ -455,24 +574,44 @@ fn open_root(root: &Path) -> io::Result<OwnedFd> {
             format!("{} is not an absolute path", root.display()),
         ));
     }
-    let flags = if names.is_empty() { DIR } else { ABOVE };
-    // SAFETY: open reads the NUL-terminated literal; the descriptor it
-    // returns is ours.
-    let fd = unsafe { libc::open(c"/".as_ptr(), flags) };
+    let Some((last, above)) = names.split_last() else {
+        // SAFETY: open reads the NUL-terminated literal; the descriptor it
+        // returns is ours.
+        let fd = unsafe { libc::open(c"/".as_ptr(), DIR) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the descriptor is open and nothing else owns it.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        return Ok((fstat(fd.as_fd())?, Ok(fd)));
+    };
+    // SAFETY: as above.
+    let fd = unsafe { libc::open(c"/".as_ptr(), ABOVE) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: the descriptor is open and nothing else owns it.
     let mut at = unsafe { OwnedFd::from_raw_fd(fd) };
     let mut reached = PathBuf::from("/");
-    for (i, name) in names.iter().enumerate() {
+    let at_path = |reached: &Path, e: io::Error| {
+        io::Error::new(e.kind(), format!("{}: {e}", reached.display()))
+    };
+    for name in above {
         reached.push(name);
-        let flags = if i + 1 == names.len() { DIR } else { ABOVE };
         at = leaf(&reached)
-            .and_then(|c| open_dir(at.as_fd(), &c, flags))
-            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", reached.display())))?;
+            .and_then(|c| open_dir(at.as_fd(), &c, ABOVE))
+            .map_err(|e| at_path(&reached, e))?;
     }
-    Ok(at)
+    reached.push(last);
+    let name = leaf(&reached).map_err(|e| at_path(&reached, e))?;
+    let st = lstat_raw(at.as_fd(), &name).map_err(|e| at_path(&reached, e))?;
+    match st.st_mode & libc::S_IFMT {
+        libc::S_IFDIR => {}
+        libc::S_IFLNK => return Err(at_path(&reached, changed("it is a symbolic link now"))),
+        _ => return Err(at_path(&reached, changed("it is not a folder now"))),
+    }
+    let top = Stat::from(&st);
+    Ok((top, open_listed(at.as_fd(), &name, (top.dev(), top.ino()))))
 }
 
 /// Opens a folder the walk listed, relative to the folder it was listed
@@ -585,6 +724,20 @@ fn account(
     true
 }
 
+/// The stat and readdir calls the walk makes. On glibc, `stat`, `fstatat`
+/// and `readdir` are the 32-bit-offset calls on a 32-bit target, unless
+/// the libc crate is built with `gnu_file_offset_bits64`: a file over
+/// 2 GiB or an inode number above 2^32 there fails with `EOVERFLOW`. So on
+/// glibc the walk calls the 64-bit ones at every pointer width, as std
+/// does, and CI's 64-bit Linux runners run that path. musl and the other
+/// systems have only 64-bit offsets.
+mod sys {
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    pub use libc::{fstat, fstatat, readdir, stat};
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    pub use libc::{fstat64 as fstat, fstatat64 as fstatat, readdir64 as readdir, stat64 as stat};
+}
+
 /// The fields of `lstat` the walk reads for one entry.
 #[derive(Clone, Copy)]
 struct Stat {
@@ -631,12 +784,12 @@ impl Stat {
     }
 }
 
-impl From<&libc::stat> for Stat {
+impl From<&sys::stat> for Stat {
     // stat's field types differ by platform (st_dev is i32 on macOS and
     // u64 on Linux, st_nlink u16 to u64), so each is widened with `as`, as
     // std's MetadataExt widens it; on some platforms that is the same type.
     #[allow(clippy::unnecessary_cast)]
-    fn from(st: &libc::stat) -> Stat {
+    fn from(st: &sys::stat) -> Stat {
         #[cfg(target_os = "netbsd")]
         let mtime_nsec = st.st_mtimensec;
         #[cfg(not(target_os = "netbsd"))]
@@ -658,8 +811,8 @@ impl From<&libc::stat> for Stat {
 /// `fstat` of an open folder.
 fn fstat(fd: BorrowedFd) -> io::Result<Stat> {
     // SAFETY: fstat writes into the zeroed struct we own.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+    let mut st: sys::stat = unsafe { std::mem::zeroed() };
+    if unsafe { sys::fstat(fd.as_raw_fd(), &mut st) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(Stat::from(&st))
@@ -670,12 +823,12 @@ fn lstat_at(at: BorrowedFd, name: &CStr) -> io::Result<Stat> {
     lstat_raw(at, name).map(|st| Stat::from(&st))
 }
 
-fn lstat_raw(at: BorrowedFd, name: &CStr) -> io::Result<libc::stat> {
+fn lstat_raw(at: BorrowedFd, name: &CStr) -> io::Result<sys::stat> {
     // SAFETY: fstatat reads the NUL-terminated name, which outlives the
     // call, and writes into the zeroed struct we own.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let mut st: sys::stat = unsafe { std::mem::zeroed() };
     if unsafe {
-        libc::fstatat(
+        sys::fstatat(
             at.as_raw_fd(),
             name.as_ptr(),
             &mut st,
@@ -733,7 +886,7 @@ fn list_readdir(fd: BorrowedFd, dir: &Path) -> io::Result<Listing> {
         clear_errno();
         // SAFETY: the stream is open; the entry stays valid until the next
         // readdir on it.
-        let entry = unsafe { libc::readdir(stream.0) };
+        let entry = unsafe { sys::readdir(stream.0) };
         if entry.is_null() {
             // readdir returns null at the end too, and leaves errno alone.
             let e = io::Error::last_os_error();
@@ -1065,14 +1218,19 @@ pub fn space(path: &Path) -> io::Result<Space> {
 mod tests {
     //! The walk's folder opens, on real folders in a temporary directory:
     //! a folder swapped for a symbolic link or another folder after its
-    //! parent was listed is reported as changed and never read, and a walk
-    //! deeper than [`HELD`] reads every level and keeps the same checks.
+    //! parent was listed is reported as changed and never read, a walk
+    //! deeper than [`HELD`] reads every level and keeps the same checks,
+    //! and a worktree that can be looked up but not read is one unreadable
+    //! entry.
 
-    use super::{HELD, Parent, Pending, Place, Step, lstat_at, measure, open_listed, open_root};
+    use super::{
+        HELD, Parent, Pending, Place, REOPENED, Reopened, Step, lstat_at, measure, open_listed,
+        open_root,
+    };
     use std::ffi::CString;
     use std::fs;
-    use std::os::fd::AsFd;
-    use std::os::unix::fs::symlink;
+    use std::os::fd::{AsFd, OwnedFd};
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
 
@@ -1098,11 +1256,52 @@ mod tests {
         in_git: false,
     };
 
+    /// The folder at `dir`, opened as the walk opens a worktree.
+    fn open(dir: &Path) -> OwnedFd {
+        open_root(dir).unwrap().1.unwrap()
+    }
+
     /// The device and inode of `name` in `dir`, as the listing records it.
     fn id(dir: &Path, name: &str) -> (u64, u64) {
-        let at = open_root(dir).unwrap();
-        let st = lstat_at(at.as_fd(), &c(name)).unwrap();
+        let st = lstat_at(open(dir).as_fd(), &c(name)).unwrap();
         (st.dev(), st.ino())
+    }
+
+    /// The steps from the folder below `base` down to `to`, each as its
+    /// parent lists it.
+    fn steps(base: &Path, to: &Path) -> Rc<Step> {
+        let mut up: Option<Rc<Step>> = None;
+        let mut at = base.to_path_buf();
+        for (i, part) in to.strip_prefix(base).unwrap().iter().enumerate() {
+            let name = part.to_str().unwrap();
+            let step = Step {
+                name: c(name),
+                id: id(&at, name),
+                up: up.take(),
+                level: i + 1,
+            };
+            up = Some(Rc::new(step));
+            at.push(part);
+        }
+        up.unwrap()
+    }
+
+    /// Entries below `dir` and itself, counted with std, never following
+    /// a link, and every folder holding an entry named `.git`.
+    fn count(dir: &Path, repos: &mut Vec<PathBuf>) -> u64 {
+        let mut n = 1;
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name() == ".git" {
+                repos.push(dir.to_path_buf());
+            }
+            if entry.file_type().unwrap().is_dir() {
+                n += count(&entry.path(), repos);
+            } else {
+                n += 1;
+            }
+        }
+        n
     }
 
     #[test]
@@ -1116,7 +1315,7 @@ mod tests {
         fs::write(elsewhere.join("secret"), "y").unwrap();
 
         // The walk has listed `w` and recorded `a` as a folder.
-        let parent = Rc::new(open_root(&w).unwrap());
+        let parent = Rc::new(open(&w));
         let listed = id(&w, "a");
         let pending = |parent: &Rc<_>| Pending {
             path: w.join("a"),
@@ -1126,7 +1325,11 @@ mod tests {
             place: TOP,
             parent: Parent::Open(Rc::clone(parent)),
         };
-        assert!(pending(&parent).open().is_ok(), "the folder as listed");
+        let mut kept = Reopened::default();
+        assert!(
+            pending(&parent).open(&mut kept).is_ok(),
+            "the folder as listed"
+        );
 
         // Now `a` is a symbolic link to a folder outside the worktree.
         fs::rename(w.join("a"), root.join("a-before")).unwrap();
@@ -1136,7 +1339,7 @@ mod tests {
             e.to_string(),
             "changed during the walk: it is a symbolic link now"
         );
-        let Err((path, _, e)) = pending(&parent).open() else {
+        let Err((path, _, e)) = pending(&parent).open(&mut kept) else {
             panic!("the walk opened a symbolic link");
         };
         assert_eq!(path, w.join("a"));
@@ -1145,14 +1348,14 @@ mod tests {
         fs::remove_file(w.join("a")).unwrap();
         symlink(root.join("a-before"), w.join("a")).unwrap();
         assert!(
-            pending(&parent).open().is_err(),
+            pending(&parent).open(&mut kept).is_err(),
             "a link to the same folder"
         );
 
         // Another folder in its place: a new inode.
         fs::remove_file(w.join("a")).unwrap();
         fs::create_dir(w.join("a")).unwrap();
-        let Err((_, _, e)) = pending(&parent).open() else {
+        let Err((_, _, e)) = pending(&parent).open(&mut kept) else {
             panic!("the walk read another folder as the one it listed");
         };
         assert_eq!(
@@ -1163,7 +1366,7 @@ mod tests {
         // A file in its place.
         fs::remove_dir(w.join("a")).unwrap();
         fs::write(w.join("a"), "z").unwrap();
-        let Err((_, _, e)) = pending(&parent).open() else {
+        let Err((_, _, e)) = pending(&parent).open(&mut kept) else {
             panic!("the walk opened a file as a folder");
         };
         assert_eq!(
@@ -1206,26 +1409,40 @@ mod tests {
         for d in &chain {
             fs::write(d.join("f"), "12345").unwrap();
         }
+        // Below HELD, three branches deeper than the folders kept open
+        // there, with a file at every level and a nested repository at the
+        // bottom of the middle one, and many empty siblings beside them.
+        let fork = &chain[HELD + 2];
+        for branch in 0..3 {
+            let mut at = fork.join(format!("b{branch}"));
+            for level in 0..REOPENED + 2 {
+                at.push(format!("x{level}"));
+                fs::create_dir_all(&at).unwrap();
+                fs::write(at.join("g"), "1").unwrap();
+            }
+            if branch == 1 {
+                fs::create_dir(at.join(".git")).unwrap();
+            }
+        }
+        for sibling in 0..20 {
+            fs::create_dir(fork.join(format!("s{sibling}"))).unwrap();
+        }
+        let mut repos = Vec::new();
+        let entries = count(&w, &mut repos);
         let usage = measure(&w, &[], &|_| false).unwrap();
         assert_eq!(usage.unreadable, 0, "{:?}", usage.first_error);
-        // w, each level and its file, left, right and right/.git.
-        assert_eq!(usage.entries, 1 + 2 * levels as u64 + 3);
-        assert_eq!(usage.nested_repos, vec![dir.join("right")]);
+        assert_eq!(usage.entries, entries);
+        let mut found = usage.nested_repos.clone();
+        found.sort();
+        repos.sort();
+        assert_eq!(found, repos);
+        assert_eq!(repos.len(), 2, "right and the middle branch");
 
         // A folder below HELD opens from the deepest folder held, one name
         // at a time, each checked against its listing.
         let base_path = &chain[HELD - 2];
-        let steps: Vec<Step> = chain[HELD - 1..levels - 1]
-            .iter()
-            .map(|d| {
-                let name = d.file_name().unwrap().to_str().unwrap();
-                Step {
-                    name: c(name),
-                    id: id(d.parent().unwrap(), name),
-                }
-            })
-            .collect();
-        let base = Rc::new(open_root(base_path).unwrap());
+        let base = Rc::new(open(base_path));
+        let parent = steps(base_path, &chain[levels - 2]);
         let last = id(&chain[levels - 2], &format!("d{levels}"));
         let pending = || Pending {
             path: dir.clone(),
@@ -1233,17 +1450,40 @@ mod tests {
             id: last,
             depth: levels,
             place: TOP,
-            parent: Parent::Below(Rc::clone(&base), Rc::from(steps.clone())),
+            parent: Parent::Below(Rc::clone(&base), Rc::clone(&parent)),
         };
-        let opened = pending().open();
-        assert!(opened.is_ok(), "the folder as listed");
+        assert!(
+            pending().open(&mut Reopened::default()).is_ok(),
+            "the folder as listed"
+        );
+
+        // With folders of another branch kept, a folder opens from the
+        // deepest folder held, not from one of them.
+        let mut kept = Reopened::default();
+        let b0 = fork.join("b0").join("x0").join("x1");
+        let pending_in = |at: &Path, kept: &mut Reopened| {
+            let up = at.parent().unwrap();
+            let name = at.file_name().unwrap().to_str().unwrap();
+            Pending {
+                path: at.to_path_buf(),
+                name: c(name),
+                id: id(up, name),
+                depth: levels,
+                place: TOP,
+                parent: Parent::Below(Rc::clone(&base), steps(base_path, up)),
+            }
+            .open(kept)
+        };
+        assert!(pending_in(&b0, &mut kept).is_ok());
+        assert!(!kept.0.is_empty(), "the folders it reopened are kept");
+        assert!(pending().open(&mut kept).is_ok(), "another branch");
 
         // A folder on the way down becomes a symbolic link to itself.
         let swapped = &chain[HELD + 2];
         let aside = root.join("aside");
         fs::rename(swapped, &aside).unwrap();
         symlink(&aside, swapped).unwrap();
-        let Err((path, _, e)) = pending().open() else {
+        let Err((path, _, e)) = pending().open(&mut Reopened::default()) else {
             panic!("the reopen followed a symbolic link");
         };
         assert_eq!(&path, swapped, "the folder that changed");
@@ -1253,7 +1493,30 @@ mod tests {
         );
         fs::remove_file(swapped).unwrap();
         fs::rename(&aside, swapped).unwrap();
-        assert!(pending().open().is_ok(), "back as it was");
+        assert!(
+            pending().open(&mut Reopened::default()).is_ok(),
+            "back as it was"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_worktree_that_cannot_be_read_is_one_unreadable_entry() {
+        let root = scratch("root");
+        let w = root.join("w");
+        fs::create_dir_all(w.join("a")).unwrap();
+        fs::set_permissions(&w, fs::Permissions::from_mode(0o311)).unwrap();
+        let usage = measure(&w, &[], &|_| false);
+        fs::set_permissions(&w, fs::Permissions::from_mode(0o755)).unwrap();
+        let usage = usage.unwrap();
+        // SAFETY: geteuid only returns this process's effective user.
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(usage.entries, 1, "the worktree itself");
+            assert_eq!(usage.unreadable, 1);
+            let error = usage.first_error.unwrap();
+            assert!(error.starts_with(&format!("{}: ", w.display())), "{error}");
+            assert!(usage.newest_mtime.is_some());
+        }
         fs::remove_dir_all(&root).unwrap();
     }
 }
