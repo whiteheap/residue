@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- When nothing freed is counted yet, `service status`, `residue stats`, the line after a removal and the Mac app say so, and say that residue counts what it frees from version 0.0.8 on. They said residue had never freed any space, which was false after a version before 0.0.8 removed a worktree (#70).
+
 ## 0.0.8 (2026-11-08)
 
 The Mac app, a record of the space residue frees, and one command to install.

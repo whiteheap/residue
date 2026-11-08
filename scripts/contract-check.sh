@@ -1091,7 +1091,7 @@ elif [ -s "$err" ]; then fail "stderr is not empty"
 else
     run stats
     if [ "$status" != 0 ]; then fail "text: exit $status, want 0"
-    elif ! grep -q "^residue has not freed any space on this machine yet\.$" "$out"; then fail "text: no 'has not freed any space' line"
+    elif ! grep -q "^residue has not counted any freed space on this machine yet\. It counts what it frees from version 0\.0\.8 on\.$" "$out"; then fail "text: no 'has not counted any freed space' line"
     elif [ -e "$ledger" ]; then fail "reading the stats created the ledger"
     else ok; fi
 fi

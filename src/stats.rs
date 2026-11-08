@@ -625,7 +625,7 @@ impl Run {
         }
         let total = match &self.total {
             Some((sum, _)) if sum.worktrees == 0 => {
-                "residue has freed nothing on this machine yet".to_string()
+                "residue has not counted any freed space on this machine yet".to_string()
             }
             Some((sum, since)) => format!(
                 "residue has freed about {} on this machine since {}",
@@ -889,7 +889,7 @@ pub fn service_line(installed: bool) -> Option<String> {
     let when = |at: i64| format!("{} ({})", output::date(at), output::age(now - at));
     Some(match last {
         None if !installed => return None,
-        None => "freed: nothing yet; automatic cleanup has not removed a worktree".to_string(),
+        None => "freed: nothing counted yet; residue counts what automatic cleanup frees from version 0.0.8 on".to_string(),
         Some(at) if week.worktrees == 0 => format!(
             "freed: nothing in the last 7 days; automatic cleanup last removed a worktree {}",
             when(at)
@@ -1145,7 +1145,9 @@ fn text(
                 )));
             }
         }
-        _ => out.push_str("\nresidue has not freed any space on this machine yet.\n"),
+        _ => out.push_str(
+            "\nresidue has not counted any freed space on this machine yet. It counts what it frees from version 0.0.8 on.\n",
+        ),
     }
     let mut trash_rows = Vec::new();
     if stats.trashed.worktrees > 0 {

@@ -53,7 +53,7 @@ export function removalLine(stats: RemoveStats, keep: string): string | null {
     stats.total_freed_worktrees === null || stats.total_freed_bytes === null || stats.since === null
       ? "residue could not update its stats ledger; see the warning"
       : stats.total_freed_worktrees === 0
-        ? "residue has freed nothing on this machine yet"
+        ? "residue has not counted any freed space on this machine yet"
         : `residue has freed about ${bytes(stats.total_freed_bytes)} on this machine since ${localDay(stats.since)}`;
   return `${parts.join(" and ")} (${total})`;
 }

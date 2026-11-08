@@ -77,8 +77,8 @@ export function Freed({
             ) : (
               <Empty
                 icon={<ChartBar size={32} />}
-                title="residue has not freed any space on this machine yet."
-                description="A removal by the app, by residue remove in a terminal, or by automatic cleanup is counted here once it deletes a worktree. A move into the trash frees nothing until a later removal purges it."
+                title="residue has not counted any freed space on this machine yet."
+                description="It counts what it frees from version 0.0.8 on. A removal by the app, by residue remove in a terminal, or by automatic cleanup is counted here once it deletes a worktree. A move into the trash frees nothing until a later removal purges it."
               />
             )}
 
