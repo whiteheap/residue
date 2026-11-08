@@ -62,7 +62,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 pub const HELP: &str = "\
-residue watch: stay running; remove worktrees when a branch lands or disk is low.
+residue watch: stay running; clean up when a branch lands or the disk is low.
 
 Usage:
   residue watch [OPTIONS] [ROOT...]
