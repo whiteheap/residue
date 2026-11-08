@@ -63,6 +63,17 @@ pub struct BucketUsage {
     /// when its file count and size did not.
     pub newest: Option<(i64, i64)>,
     pub expansion: Expansion,
+    /// A regular file or a symbolic link is at or below the entry, outside
+    /// any `.git` entry, every hard link counted: the kinds Git lists, so
+    /// Git lists a directory that holds one (#83).
+    pub holds_file: bool,
+    /// An entry named `.git`, in any case, is at or below the entry. Git
+    /// skips that name, and lists a directory holding nothing else only
+    /// when it makes a nested repository, which only Git decides.
+    pub holds_git: bool,
+    /// Part of the entry was not read: an unreadable entry or a mount point
+    /// is at or below it.
+    pub incomplete: bool,
 }
 
 #[derive(Clone, Default)]
@@ -92,6 +103,8 @@ struct Place {
     /// A rule already matched this entry or one of its ancestors below the
     /// bucket, so nothing under it needs judging.
     covered: bool,
+    /// The entry is, or is inside, an entry named `.git` below the bucket.
+    in_git: bool,
 }
 
 pub fn measure(
@@ -118,6 +131,7 @@ pub fn measure(
         Place {
             bucket: None,
             covered: false,
+            in_git: false,
         },
     )];
     let mut buf = Vec::new();
@@ -183,6 +197,9 @@ pub fn measure(
                 }
             }
             if meta.is_dir() && meta.dev() != device {
+                if let Some(i) = here.bucket {
+                    usage.buckets[i].incomplete = true;
+                }
                 usage.mount_points.push(path);
                 continue;
             }
@@ -192,6 +209,13 @@ pub fn measure(
                 let newest = &mut usage.buckets[i].newest;
                 if newest.is_none_or(|n| stamp > n) {
                     *newest = Some(stamp);
+                }
+                if item.git_name {
+                    usage.buckets[i].holds_git = true;
+                    here.in_git = true;
+                }
+                if meta.is_file() && !here.in_git {
+                    usage.buckets[i].holds_file = true;
                 }
                 if !meta.is_dir() && first {
                     usage.buckets[i].files += 1;
@@ -222,6 +246,7 @@ fn judge_unreadable(
     error: &io::Error,
 ) {
     if let Some(i) = place.bucket {
+        usage.buckets[i].incomplete = true;
         let state = &mut usage.buckets[i].expansion;
         if buckets[i].expand && !place.covered && matches!(state, Expansion::Matched) {
             *state = Expansion::Unreadable(format!("{}: {error}", display(path, root)));
@@ -284,6 +309,8 @@ fn account(
 #[derive(Clone, Copy)]
 struct Stat {
     dir: bool,
+    /// A regular file or a symbolic link.
+    file: bool,
     dev: u64,
     ino: u64,
     nlink: u64,
@@ -297,6 +324,9 @@ struct Stat {
 impl Stat {
     fn is_dir(&self) -> bool {
         self.dir
+    }
+    fn is_file(&self) -> bool {
+        self.file
     }
     fn dev(&self) -> u64 {
         self.dev
@@ -325,6 +355,7 @@ impl From<&Metadata> for Stat {
     fn from(meta: &Metadata) -> Stat {
         Stat {
             dir: meta.is_dir(),
+            file: meta.is_file() || meta.is_symlink(),
             dev: meta.dev(),
             ino: meta.ino(),
             nlink: meta.nlink(),
@@ -341,6 +372,9 @@ struct Listed {
     path: PathBuf,
     /// The entry is named `.git`.
     git: bool,
+    /// The entry is named `.git` in any case, as Git matches the name when
+    /// `core.ignorecase` is set.
+    git_name: bool,
     stat: io::Result<Stat>,
 }
 
@@ -356,6 +390,7 @@ fn list_std(dir: &Path) -> io::Result<Listing> {
     for item in fs::read_dir(dir)? {
         out.push(item.map(|item| Listed {
             git: item.file_name() == ".git",
+            git_name: item.file_name().as_bytes().eq_ignore_ascii_case(b".git"),
             path: item.path(),
             stat: item.metadata().map(|meta| Stat::from(&meta)),
         }));
@@ -486,6 +521,7 @@ mod bulk {
                 };
                 out.push(Ok(Listed {
                     git: entry.name == b".git",
+                    git_name: entry.name.eq_ignore_ascii_case(b".git"),
                     path,
                     stat,
                 }));
@@ -517,6 +553,7 @@ mod bulk {
             let (mtime, mtime_nsec) = self.mtime?;
             Some(Stat {
                 dir: false,
+                file: true,
                 // As std's MetadataExt::dev widens st_dev.
                 dev: self.dev? as u64,
                 ino: self.ino?,
@@ -618,6 +655,7 @@ mod bulk {
         }
         Ok(Stat {
             dir: st.st_mode & libc::S_IFMT == libc::S_IFDIR,
+            file: matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFLNK),
             // As std's MetadataExt widens each field.
             dev: st.st_dev as u64,
             ino: st.st_ino,

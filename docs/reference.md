@@ -38,7 +38,7 @@ A rule is a name or a path.
 - **A name**, or `*.ext`, matches one path component at any depth. `cache` matches `web/cache/` but not `web/cache2/`.
 - **A path** contains a slash and starts at the worktree root. A leading slash is optional, and a trailing slash is ignored. Each segment is literal or uses `*` for any run of characters within that one segment. `**`, `?`, `[`, `\`, and empty, `.` or `..` segments are rejected. A path matches that entry and everything below it: `web/.tscache` matches `web/.tscache/`, and `/build` matches the top-level `build/` but not `web/build/`.
 
-Git reports a fully ignored directory once, as `dir/`. When a path rule reaches inside such a directory, for example `.local-dev/*.lock` and the entry `.local-dev/`, residue reads the directory. It calls the directory regenerable only if a rule matches every file in it, or one of that file's parent directories. Empty directories do not count. `explain` names the first file that no rule matches. A directory with more than 100,000 entries is not judged file by file, so residue keeps it.
+Git reports a fully ignored directory once, as `dir/`, and residue judges it as that one entry, also when it reads Git's faster `--ignored=matching` list. When a path rule reaches inside such a directory, for example `.local-dev/*.lock` and the entry `.local-dev/`, residue reads the directory. It calls the directory regenerable only if a rule matches every file in it, or one of that file's parent directories. Empty directories do not count. `explain` names the first file that no rule matches. A directory with more than 100,000 entries is not judged file by file, so residue keeps it.
 
 ### Where rules come from
 

@@ -6,12 +6,13 @@
 //! branch, a gone upstream, age) are reported separately so a reader sees
 //! each one instead of a single "safe" label.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::activity::{Evidence, Snapshot};
-use crate::fsinfo::{self, Bucket, Expansion, Usage};
+use crate::fsinfo::{self, Bucket, BucketUsage, Expansion, Usage};
 use crate::git::{self, Entry};
 use crate::policy::{GIT_CONFIG_KEY, Policy, RuleSource, Rules};
 
@@ -379,21 +380,18 @@ pub fn worktree(entry: &Entry, common_dir: &Path, snapshot: &Snapshot, policy: &
     // `git status` runs before the walk so the walk can size each ignored
     // entry and judge the collapsed directories a path rule reaches into.
     // The checks are still reported in their usual order.
-    let status = git::status(&canonical);
+    let mut status = git::status(&canonical);
+    let hidden = status.as_mut().ok().and_then(|s| s.hidden.take());
     let repo = RepoRules::read(&canonical);
     let rules = policy.with(&repo.rules);
-    let buckets: Vec<Bucket> = match &status {
-        Ok(s) => buckets_for(s, &rules),
-        Err(_) => Vec::new(),
-    };
-    let usage = fsinfo::measure(&canonical, &buckets, &|rel| rules.matches(rel));
+    let (buckets, usage) = walk(&canonical, &mut status, &rules);
     r.last_change = last_change(&usage, &canonical, &identity.git_dir);
     r.fingerprint = match &status {
         Ok(s) => Fingerprint::of(entry.head.clone(), &identity.git_dir, s, &usage),
         Err(e) => Err(e.clone()),
     };
     check_status(&mut r, status, &repo, &rules, &buckets, &usage);
-    check_index_flags(&mut r, &canonical);
+    check_index_flags(&mut r, &canonical, hidden);
     check_operation(&mut r, &identity.git_dir);
     check_private_refs(&mut r, &canonical);
     check_head(&mut r, entry, &canonical);
@@ -826,8 +824,9 @@ fn judge(
     item
 }
 
-fn check_index_flags(r: &mut Report, dir: &Path) {
-    match git::hidden_from_status(dir) {
+/// `hidden` is the answer `git::status` already read, if it read one.
+fn check_index_flags(r: &mut Report, dir: &Path, hidden: Option<Result<Vec<String>, String>>) {
+    match hidden.unwrap_or_else(|| git::hidden_from_status(dir)) {
         Ok(hidden) if hidden.is_empty() => r.pass(
             "index_flags",
             "no tracked file is marked assume-unchanged or skip-worktree",
@@ -1206,6 +1205,102 @@ pub fn all(jobs: &[(&Entry, &Path)], snapshot: &Snapshot, policy: &Policy) -> Ve
     slots.into_iter().flatten().collect()
 }
 
+/// Walk the worktree once, sizing each ignored entry of `status`. A
+/// `--ignored=matching` list then loses the entries `--ignored=traditional`
+/// does not print, so every check judges the list it always judged (#83).
+/// When Git fails to answer for an entry, `status` becomes that error, as
+/// if `git status` had failed.
+fn walk(
+    dir: &Path,
+    status: &mut Result<git::Status, String>,
+    rules: &Rules,
+) -> (Vec<Bucket>, io::Result<Usage>) {
+    let matcher = |rel: &str| rules.matches(rel);
+    let Ok(listed) = status else {
+        return (Vec::new(), fsinfo::measure(dir, &[], &matcher));
+    };
+    let mut buckets = buckets_for(listed, rules);
+    let mut usage = fsinfo::measure(dir, &buckets, &matcher);
+    let settled = match &mut usage {
+        Ok(usage) if listed.matching => drop_unlisted(dir, listed, &mut buckets, usage),
+        _ => Ok(()),
+    };
+    if let Err(e) = settled {
+        *status = Err(e);
+    }
+    (buckets, usage)
+}
+
+/// Whether `--ignored=traditional` prints an entry of a `--ignored=matching`
+/// list. Both modes list a file. Matching mode also lists an ignored
+/// directory that holds nothing Git lists, which traditional mode hides
+/// (`treat_directory` in Git's dir.c).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Listing {
+    Both,
+    MatchingOnly,
+    /// Only Git can tell: the walk did not reach the directory or read all
+    /// of it, or found a `.git` entry, which may make a nested repository.
+    Unsure,
+}
+
+fn listing(text: &str, measured: &BucketUsage) -> Listing {
+    if !text.ends_with('/') || (measured.seen && measured.holds_file) {
+        Listing::Both
+    } else if !measured.seen || measured.holds_git || measured.incomplete {
+        Listing::Unsure
+    } else {
+        Listing::MatchingOnly
+    }
+}
+
+/// Drop the entries of a `--ignored=matching` list that
+/// `--ignored=traditional` would not print, with their buckets. An entry the
+/// walk cannot settle is looked up in traditional mode's list, which costs
+/// one more `git status`.
+fn drop_unlisted(
+    dir: &Path,
+    status: &mut git::Status,
+    buckets: &mut Vec<Bucket>,
+    usage: &mut Usage,
+) -> Result<(), String> {
+    if status.ignored.len() != buckets.len() || buckets.len() != usage.buckets.len() {
+        return Err("the walk did not measure every ignored entry".to_string());
+    }
+    let kinds: Vec<Listing> = status
+        .ignored
+        .iter()
+        .zip(&usage.buckets)
+        .map(|((text, _), measured)| listing(text, measured))
+        .collect();
+    if kinds.iter().all(|kind| *kind == Listing::Both) {
+        return Ok(());
+    }
+    let traditional: HashSet<String> = if kinds.contains(&Listing::Unsure) {
+        let listed = git::traditional_status(dir)?.ignored;
+        listed.into_iter().map(|(text, _)| text).collect()
+    } else {
+        HashSet::new()
+    };
+    let entries = std::mem::take(&mut status.ignored);
+    let walked = std::mem::take(buckets);
+    let measured = std::mem::take(&mut usage.buckets);
+    let rows = entries.into_iter().zip(walked).zip(measured).zip(kinds);
+    for (((entry, bucket), measured), kind) in rows {
+        let printed = match kind {
+            Listing::Both => true,
+            Listing::MatchingOnly => false,
+            Listing::Unsure => traditional.contains(&entry.0),
+        };
+        if printed {
+            status.ignored.push(entry);
+            buckets.push(bucket);
+            usage.buckets.push(measured);
+        }
+    }
+    Ok(())
+}
+
 /// One walk bucket per ignored entry. A collapsed directory that no rule
 /// matches but a path rule reaches into is judged entry by entry.
 fn buckets_for(status: &git::Status, rules: &Rules) -> Vec<Bucket> {
@@ -1312,15 +1407,14 @@ impl Fingerprint {
         head: Option<String>,
         policy: &Policy,
     ) -> Result<Fingerprint, String> {
-        let status = git::status(dir)?;
+        let mut status = Ok(git::status(dir)?);
         let repo = RepoRules::read(dir);
         if let Some((_, problem)) = &repo.problem {
             return Err(problem.clone());
         }
         let rules = policy.with(&repo.rules);
-        let buckets = buckets_for(&status, &rules);
-        let usage = fsinfo::measure(dir, &buckets, &|rel| rules.matches(rel));
-        Fingerprint::of(head, &self.git_dir, &status, &usage)
+        let (_, usage) = walk(dir, &mut status, &rules);
+        Fingerprint::of(head, &self.git_dir, &status?, &usage)
     }
 
     /// The first difference from `now`, as a sentence that names what
