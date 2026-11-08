@@ -1079,6 +1079,9 @@ pub fn restore(item: &Item, to: Option<&Path>, listed: &[Entry]) -> Result<Resto
         }
         Err(e) => return Err(format!("cannot check {}: {e}", dest.display())),
     }
+    // Read before anything changes: another run may forget this record
+    // meanwhile, and nothing else holds the copies.
+    let (config, reflog) = read_copies(item)?;
     let mut restored = match &item.registered {
         Some(registered) => move_back(item, record, registered, dest)?,
         None => recreate(item, record, dest, listed)?,
@@ -1102,14 +1105,14 @@ pub fn restore(item: &Item, to: Option<&Path>, listed: &[Entry]) -> Result<Resto
             // kept them when the record was written: `git refs migrate`
             // can change it in between.
             let reflog = match git::is_reftable(&restored.path) {
-                Ok(false) if recreated => restore_reflog(&item.dir, &id.git_dir),
-                Ok(false) => reflog_if_lost(&item.dir, &id.git_dir),
+                Ok(false) if recreated => restore_reflog(&reflog, &id.git_dir),
+                Ok(false) => reflog_if_lost(&reflog, &id.git_dir),
                 Ok(true) => reftable_reflog(item, recreated),
                 Err(e) => Err(format!(
                     "its HEAD reflog was not put back: residue could not tell whether the repository keeps its refs in reftable, where Git does not read the file it would write ({e})"
                 )),
             };
-            for step in [restore_config(&item.dir, &id.git_dir), reflog] {
+            for step in [restore_config(&config, &id.git_dir), reflog] {
                 match step {
                     Ok(None) => {}
                     Ok(Some(note)) => restored.notes.push(note),
@@ -1134,16 +1137,119 @@ pub fn restore(item: &Item, to: Option<&Path>, listed: &[Entry]) -> Result<Resto
         }
     }
     if keep_record {
-        restored.notes.push(format!(
-            "the removal record stays at {}, with its refs, so nothing it keeps is lost; a remove run forgets it after --keep-removed",
-            item.dir.display()
-        ));
+        // Said only from Git's refs as they are now: another run may have
+        // forgotten the record while this one restored it.
+        let note = match refs_gone(item) {
+            Ok(false) => format!(
+                "the removal record stays at {}, with its refs, so nothing it keeps is lost; a remove run forgets it after --keep-removed",
+                item.dir.display()
+            ),
+            Ok(true) => taken_note(item, record, &restored.path),
+            Err(e) => format!(
+                "the removal record at {} should stay, with its refs, but residue could not read them to check ({e})",
+                item.dir.display()
+            ),
+        };
+        restored.notes.push(note);
     } else if let Err(e) = forget(item) {
-        restored.notes.push(format!(
-            "could not drop the removal record ({e}); a remove run forgets it after --keep-removed"
-        ));
+        // Gone already: another run forgot it, and the worktree holds
+        // everything it kept.
+        if fs::symlink_metadata(&item.dir).is_ok() {
+            restored.notes.push(format!(
+                "could not drop the removal record ({e}); a remove run forgets it after --keep-removed"
+            ));
+        }
     }
     Ok(restored)
+}
+
+/// A recorded copy, read before a restore changes anything: `None` when
+/// the record has none.
+type Saved = Result<Option<Vec<u8>>, String>;
+
+/// The record's `config.worktree` and HEAD reflog copies, the ones the
+/// listing saw, read before the restore changes anything. `info`, or a
+/// copy the listing saw, that is gone now means another run forgot or
+/// restored the record after this one listed it: the restore stops, having
+/// changed nothing. A copy that cannot be read for another reason is that
+/// step's error, which keeps the record, as before.
+fn read_copies(item: &Item) -> Result<(Saved, Saved), String> {
+    let taken = || {
+        "another residue run forgot or restored this removal record after this restore listed it, so residue changed nothing; `residue restore` lists what is left".to_string()
+    };
+    match fs::symlink_metadata(item.dir.join(INFO)) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(taken()),
+        Err(e) => {
+            return Err(format!(
+                "cannot check {}: {e}",
+                item.dir.join(INFO).display()
+            ));
+        }
+    }
+    let read = |file: &str, listed: bool| -> Result<Saved, String> {
+        if !listed {
+            return Ok(Ok(None));
+        }
+        match fs::read(item.dir.join(file)) {
+            Ok(bytes) => Ok(Ok(Some(bytes))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(taken()),
+            Err(e) => Ok(Err(e.to_string())),
+        }
+    };
+    Ok((
+        read(CONFIG, item.worktree_config)?,
+        read(REFLOG, item.head_reflog)?,
+    ))
+}
+
+/// No ref under the record's names exists: another run forgot it. A
+/// forget deletes them all in one transaction, before the files.
+fn refs_gone(item: &Item) -> Result<bool, String> {
+    let patterns = [
+        format!("{REF_PREFIX}{}", item.name),
+        format!("{REFLOG_PREFIX}{}", item.name),
+    ];
+    let patterns: Vec<&str> = patterns.iter().map(String::as_str).collect();
+    Ok(git::refs_named(&item.command_dir, &patterns)?.is_empty())
+}
+
+/// What a restore says when the record it would keep is gone: another
+/// run forgot it meanwhile, so its refs no longer pin anything, and the
+/// commits only the old reflog held that the restored worktree's reflog
+/// does not name can go with `git gc`.
+fn taken_note(item: &Item, record: &Record, path: &Path) -> String {
+    let head = format!(
+        "another residue run forgot the removal record {} while this restore ran, so its refs are gone",
+        item.name
+    );
+    match unnamed_kept(record, path, &item.command_dir) {
+        Ok(lost) if lost.is_empty() => format!("{head}; the worktree holds every commit they kept"),
+        Ok(lost) => format!(
+            "{head}: {} {} only the old reflog held {} no longer kept, and `git gc` can drop {}: {}; `git branch NAME COMMIT` keeps one",
+            lost.len(),
+            if lost.len() == 1 { "commit" } else { "commits" },
+            if lost.len() == 1 { "is" } else { "are" },
+            if lost.len() == 1 { "it" } else { "them" },
+            lost.join(", ")
+        ),
+        Err(e) => format!("{head}, and residue could not check what the worktree holds ({e})"),
+    }
+}
+
+/// The commits the record keeps that the HEAD reflog of the worktree at
+/// `path` does not name, as Git reads it (`git_head_reflog`).
+fn unnamed_kept(record: &Record, path: &Path, main: &Path) -> Result<Vec<String>, String> {
+    if record.kept.is_empty() {
+        return Ok(Vec::new());
+    }
+    let named: HashSet<String> = git_head_reflog(path, main)?.into_iter().collect();
+    Ok(record
+        .kept
+        .iter()
+        .filter(|k| !named.contains(&k.to_ascii_lowercase()))
+        .cloned()
+        .collect())
 }
 
 /// What a restore does with the recorded HEAD reflog in a repository that
@@ -1185,15 +1291,7 @@ fn holds(record: &Record, path: &Path, main: &Path, how: &mut How) -> Result<(),
                 short(&record.head)
             )));
         }
-        if record.kept.is_empty() {
-            return Ok(None);
-        }
-        let named: HashSet<String> = git_head_reflog(path, main)?.into_iter().collect();
-        let missing = record
-            .kept
-            .iter()
-            .filter(|k| !named.contains(&k.to_ascii_lowercase()))
-            .count();
+        let missing = unnamed_kept(record, path, main)?.len();
         Ok((missing > 0).then(|| {
             format!(
                 "its reflog does not name {missing} of the {} commits only the old reflog held",
@@ -1428,18 +1526,18 @@ fn free_branch(dir: &Path, wanted: &str) -> Result<String, String> {
 /// `Ok` with a note when the recorded one is in the Git directory either
 /// way; `Err` when it is not, so the record, which still holds it, must
 /// stay.
-fn restore_config(entry_dir: &Path, git_dir: &Path) -> Result<Option<String>, String> {
-    let recorded = match fs::read(entry_dir.join(CONFIG)) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+fn restore_config(recorded: &Saved, git_dir: &Path) -> Result<Option<String>, String> {
+    let recorded = match recorded {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(None),
         Err(e) => return Err(format!("could not read its recorded config.worktree: {e}")),
     };
     let target = git_dir.join(CONFIG);
     match fs::read(&target) {
-        Ok(now) if now == recorded => Ok(None),
+        Ok(now) if now == *recorded => Ok(None),
         Ok(_) => {
             let aside = git_dir.join(format!("{CONFIG}.residue-removed"));
-            match write_new(&aside, &recorded) {
+            match write_new(&aside, recorded) {
                 Ok(()) => Ok(Some(format!(
                     "Git gave it a config.worktree that differs from the one it had; the one it had is at {}",
                     aside.display()
@@ -1449,7 +1547,7 @@ fn restore_config(entry_dir: &Path, git_dir: &Path) -> Result<Option<String>, St
                 )),
             }
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => match write_new(&target, &recorded) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => match write_new(&target, recorded) {
             Ok(()) => Ok(None),
             Err(e) => Err(format!("could not put back its config.worktree ({e})")),
         },
@@ -1461,16 +1559,16 @@ fn restore_config(entry_dir: &Path, git_dir: &Path) -> Result<Option<String>, St
 /// the record copied, unless a `git worktree remove` that failed part way
 /// deleted it; then the recorded one goes back in front, as for a
 /// recreated worktree.
-fn reflog_if_lost(entry_dir: &Path, git_dir: &Path) -> Result<Option<String>, String> {
-    let saved = match fs::read(entry_dir.join(REFLOG)) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+fn reflog_if_lost(saved: &Saved, git_dir: &Path) -> Result<Option<String>, String> {
+    let saved_bytes = match saved {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(None),
         Err(e) => return Err(format!("could not read its recorded HEAD reflog: {e}")),
     };
     let log = git_dir.join("logs").join("HEAD");
     match read_if_present(Some(log.clone())) {
-        Ok(Some(now)) if now.starts_with(&saved) => Ok(None),
-        Ok(_) => restore_reflog(entry_dir, git_dir),
+        Ok(Some(now)) if now.starts_with(saved_bytes) => Ok(None),
+        Ok(_) => restore_reflog(saved, git_dir),
         Err(e) => Err(format!("could not read {}: {e}", log.display())),
     }
 }
@@ -1480,10 +1578,10 @@ fn reflog_if_lost(entry_dir: &Path, git_dir: &Path) -> Result<Option<String>, St
 /// and Git keeps the commits only that reflog held. The whole file is
 /// written under another name and renamed into place. `Err` when it is not
 /// back, so the record, which still holds it, must stay.
-fn restore_reflog(entry_dir: &Path, git_dir: &Path) -> Result<Option<String>, String> {
-    let mut bytes = match fs::read(entry_dir.join(REFLOG)) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+fn restore_reflog(saved: &Saved, git_dir: &Path) -> Result<Option<String>, String> {
+    let mut bytes = match saved {
+        Ok(Some(bytes)) => bytes.clone(),
+        Ok(None) => return Ok(None),
         Err(e) => return Err(format!("could not read its recorded HEAD reflog: {e}")),
     };
     let logs = git_dir.join("logs");

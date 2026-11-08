@@ -44,6 +44,13 @@
 #                  cannot delete, or is killed during the delete (5, 5b, 5c)
 #   hold-after     with a part-remove mode, hold the Git command after the
 #                  failed remove, so residue still runs (5d)
+#   hold-add       stop `residue restore` at its `git worktree add`, so a
+#                  sweep can forget the same record meanwhile (6)
+#   hold-update-ref stop a sweep at the `git update-ref` that deletes a
+#                  record's refs, so a restore of it can finish first (6b)
+#   hold-second-list stop a run at its second `git worktree list`: in
+#                  `residue restore`, the one after it listed the records
+#                  and before it reads the one it restores (6c)
 #
 # A held command waits at most 50 s, and never runs once its residue has
 # exited or the test aborted it. The two removers of scenario 4 start one
@@ -222,6 +229,22 @@ case " \$* " in
         ;;
     esac
     ;;
+*" worktree add "*)
+    case \$mode in *hold-add*) [ -e "\$work/at-add" ] || hold add ;; esac
+    ;;
+*" update-ref "*)
+    case \$mode in *hold-update-ref*) [ -e "\$work/at-update-ref" ] || hold update-ref ;; esac
+    ;;
+*" worktree list "*)
+    case \$mode in
+    *hold-second-list*)
+        n=\$(cat "\$work/lists-\$PPID" 2>/dev/null || echo 0)
+        n=\$((n + 1))
+        echo "\$n" >"\$work/lists-\$PPID"
+        [ "\$n" != 2 ] || hold list
+        ;;
+    esac
+    ;;
 esac
 exec "\$real" "\$@"
 EOF
@@ -259,10 +282,11 @@ ok() {
 
 # One repository: .worktrees/w on branch w (its own commit, a regenerable
 # node_modules/), and .worktrees/u on branch u, which nothing names.
+# With ref_format set, Git stores its refs that way (`--ref-format`).
 make_repo() {
     repo=$work/$name
     rm -f "$work"/at-* "$work"/go-* "$work"/abort-* "$work/touched" "$work/held" "$work/part-done"
-    setup git init -q "$repo"
+    setup git init -q ${ref_format:+--ref-format="$ref_format"} "$repo"
     printf 'node_modules/\n' >"$repo/.gitignore"
     echo hello >"$repo/README.md"
     setup git -C "$repo" add .
@@ -388,7 +412,8 @@ if [ -n "$partial_probe" ]; then
     elif common_ok; then ok "refused before any move: $(jq -r '.results[0].worktree.activity.detail' "$out")"; fi
     for scenario in stopped-after-move stopped-after-move-restore stopped-after-move-control refused-after-move \
         refused-after-move-control move-back-fails original-taken two-removers two-removers-trash trash-move-in-flight \
-        remove-fails-part-way-reflog remove-fails-part-way-head remove-fails-part-way-dotgit remove-fails-part-way-running; do
+        remove-fails-part-way-reflog remove-fails-part-way-head remove-fails-part-way-dotgit remove-fails-part-way-running \
+        restore-forget-race forget-restore-race forget-before-restore-reads restore-forget-race-reftable; do
         skip_partial "$scenario"
     done
     echo "recovery-check: $passes passed, $failures failed"
@@ -799,6 +824,154 @@ else
     elif [ -z "$aside" ] || [ "$(record "$aside")" != registered ]; then fail "want it at the moved-aside path, which Git lists: ${aside:-none}"
     elif [ "$(records)" = "0 records, 0 refs" ]; then fail "the removal record is gone"
     else ok "restore says to wait for process $pid, with no empty command"; fi
+fi
+
+# --- 6. A restore and a forget of the same removal record -------------------
+# w holds a commit only its HEAD reflog names, its removal record pins it,
+# and the record is past --keep-removed, so a sweep forgets it. No lock
+# spans the two runs. 6: the restore is held at its `git worktree add`
+# while the sweep forgets the record, refs and files; released, the restore
+# must still put the saved reflog back, so the commit survives `git gc`,
+# and must not say the record stays. 6b: the sweep is held at the `git
+# update-ref` that deletes the refs while the restore runs to the end and
+# drops the record; the sweep's forget then fails, as a warning, and the
+# restored w keeps the commit.
+forget_setup() {
+    make_repo
+    setup git -C "$wt" checkout -q --detach
+    setup git -C "$wt" commit -q --allow-empty -m lone
+    lone=$(git -C "$wt" rev-parse HEAD) || exit 2
+    setup git -C "$wt" checkout -q w
+    : >"$work/mode"
+    setup "$bin" remove --yes --json "$wt"
+    [ "$(records)" = "1 records, 2 refs" ] || setup false records
+    info=$(find "$repo/.git/residue-removed" -name info)
+    sed 's/^removed [0-9]* .*/removed 1767225600 2026-01-01T00:00:00Z/' "$info" >"$work/$name.info" && cat "$work/$name.info" >"$info" || exit 2
+}
+sweep() { # OUT-SUFFIX: a sweep of the repository that removes nothing and forgets the record
+    start "$1" remove --all --yes --json --idle 30d "$repo"
+}
+restored_reflog_ok() { # w is back, its reflog names the lone commit, git gc keeps it
+    git -C "$repo" gc -q --prune=now >/dev/null 2>&1
+    if [ "$(record "$wt")" != registered ]; then fail "at its path Git has: $(record "$wt")"
+    elif ! grep -qx "$lone" <<<"$(git -C "$wt" reflog --format=%H)"; then fail "the restored reflog does not name the commit only its HEAD reflog held"
+    elif ! git -C "$repo" cat-file -e "$lone^{commit}" 2>/dev/null; then fail "git gc lost the commit only its HEAD reflog held"
+    elif [ "$(records)" != "0 records, 0 refs" ]; then fail "after both runs: $(records), want 0 records, 0 refs"
+    else return 0; fi
+    return 1
+}
+
+name=restore-forget-race
+forget_setup
+echo hold-add >"$work/mode"
+start ".r" restore --json "$wt"
+pid_r=$pid
+if ! await "$work/at-add"; then
+    finish "$pid_r"
+    fail "the restore never reached git worktree add (exit $status)"
+else
+    : >"$work/mode"
+    sweep ".f"
+    finish "$pid"
+    status_f=$status
+    forgot=$(jq -r '[.forgotten[].result] | join(",")' "$work/$name.out.f")
+    left_f=$(records)
+    touch "$work/go-add"
+    finish "$pid_r"
+    status_r=$status
+    notes=$(jq -c '.restore.notes' "$work/$name.out.r")
+    if [ "$status_f,$forgot" != "0,forgotten" ]; then fail "the sweep: exit $status_f, forgotten: $forgot; want 0, forgotten"
+    elif [ "$left_f" != "0 records, 0 refs" ]; then fail "after the sweep: $left_f, want 0 records, 0 refs"
+    elif [ "$status_r" != 0 ]; then fail "restore exited $status_r: $(cat "$work/$name.err.r")"
+    elif grep -q 'stays at' <<<"$notes"; then fail "restore says the record stays: $notes"
+    elif restored_reflog_ok && common_ok; then ok "the sweep forgot the record mid-restore; the restored reflog still holds the commit"; fi
+fi
+
+name=forget-restore-race
+forget_setup
+echo hold-update-ref >"$work/mode"
+sweep ".f"
+pid_f=$pid
+if ! await "$work/at-update-ref"; then
+    finish "$pid_f"
+    fail "the sweep never reached git update-ref (exit $status)"
+else
+    : >"$work/mode"
+    start ".r" restore --json "$wt"
+    finish "$pid"
+    status_r=$status
+    touch "$work/go-update-ref"
+    finish "$pid_f"
+    status_f=$status
+    forgot=$(jq -r '[.forgotten[].result] | join(",")' "$work/$name.out.f")
+    if [ "$status_r" != 0 ]; then fail "restore exited $status_r: $(cat "$work/$name.err.r")"
+    elif [ "$status_f,$forgot" != "0,failed" ]; then fail "the sweep: exit $status_f, forgotten: $forgot; want 0, failed"
+    elif ! jq -e '.errors == [] and (.warnings | any(contains("could not forget the removal record")))' "$work/$name.out.f" >/dev/null; then fail "the sweep's errors and warnings: $(jq -c '{errors, warnings}' "$work/$name.out.f")"
+    elif restored_reflog_ok && common_ok; then ok "the restore dropped the record first; the sweep's forget failed, as a warning"; fi
+fi
+
+# 6c: the sweep forgets the record after the restore listed it and before
+# the restore reads it. The restore must change nothing and say that
+# another run took the record, never recreate w from a record that is gone.
+name=forget-before-restore-reads
+forget_setup
+echo hold-second-list >"$work/mode"
+start ".r" restore --json "$wt"
+pid_r=$pid
+if ! await "$work/at-list"; then
+    finish "$pid_r"
+    fail "the restore never reached its second git worktree list (exit $status)"
+else
+    : >"$work/mode"
+    sweep ".f"
+    finish "$pid"
+    status_f=$status
+    forgot=$(jq -r '[.forgotten[].result] | join(",")' "$work/$name.out.f")
+    touch "$work/go-list"
+    finish "$pid_r"
+    status_r=$status
+    if [ "$status_f,$forgot" != "0,forgotten" ]; then fail "the sweep: exit $status_f, forgotten: $forgot; want 0, forgotten"
+    elif [ "$status_r" != 1 ]; then fail "restore exited $status_r, want 1"
+    elif [ -s "$work/$name.out.r" ]; then fail "restore printed a document: $(head -c 300 "$work/$name.out.r")"
+    elif ! grep -q "another residue run forgot or restored this removal record after this restore listed it, so residue changed nothing" "$work/$name.err.r"; then fail "restore: $(cat "$work/$name.err.r")"
+    elif [ -e "$wt" ]; then fail "something is at w's path: $(record "$wt")"
+    elif [ "$(records)" != "0 records, 0 refs" ]; then fail "$(records), want 0 records, 0 refs"
+    elif common_ok; then ok "restore changed nothing: $(sed 's/^residue: //' "$work/$name.err.r" | cut -c1-110)"; fi
+fi
+
+# 6d: 6 in a reftable repository, where Git reads no logs/HEAD file, so
+# the restore cannot put the reflog back and keeps the record. The sweep
+# forgot it meanwhile, so the restore must say so and name the commit no
+# ref keeps now, never that the record stays.
+if ! git init -q --ref-format=reftable "$work/reftable.probe" >/dev/null 2>&1; then
+    echo "skip restore-forget-race-reftable: this Git cannot make a reftable repository (Git 2.45 and later)"
+else
+    name=restore-forget-race-reftable
+    ref_format=reftable forget_setup
+    echo hold-add >"$work/mode"
+    start ".r" restore --json "$wt"
+    pid_r=$pid
+    if ! await "$work/at-add"; then
+        finish "$pid_r"
+        fail "the restore never reached git worktree add (exit $status)"
+    else
+        : >"$work/mode"
+        sweep ".f"
+        finish "$pid"
+        status_f=$status
+        forgot=$(jq -r '[.forgotten[].result] | join(",")' "$work/$name.out.f")
+        touch "$work/go-add"
+        finish "$pid_r"
+        status_r=$status
+        notes=$(jq -c '.restore.notes' "$work/$name.out.r")
+        if [ "$status_f,$forgot" != "0,forgotten" ]; then fail "the sweep: exit $status_f, forgotten: $forgot; want 0, forgotten"
+        elif [ "$status_r" != 0 ]; then fail "restore exited $status_r: $(cat "$work/$name.err.r")"
+        elif grep -q 'stays at' <<<"$notes"; then fail "restore says the record stays: $notes"
+        elif ! jq -e --arg lone "$lone" '.restore.notes | any(startswith("another residue run forgot the removal record") and contains("1 commit only the old reflog held is no longer kept") and contains($lone))' "$work/$name.out.r" >/dev/null; then fail "the notes do not name the commit no ref keeps: $notes"
+        elif [ "$(record "$wt")" != registered ]; then fail "at its path Git has: $(record "$wt")"
+        elif [ "$(records)" != "0 records, 0 refs" ]; then fail "$(records), want 0 records, 0 refs"
+        elif common_ok; then ok "restore says the sweep forgot the record and names $lone"; fi
+    fi
 fi
 
 echo "recovery-check: $passes passed, $failures failed"
