@@ -151,13 +151,104 @@ A change that adds a state or a move:
 - writes a record ahead of a deletion only as intent: what Git and the filesystem show decides the state, and a record whose deletion did not happen is undone or reads as interrupted;
 - adds the state to this table and to the owner's `Item`, and to the JSON `state` and `app/src/lib/types.ts` when the app reads it, and adds a `scripts/recovery-check.sh` or `scripts/race-check.sh` case for the move and for another writer that gets there first.
 
+## Performance
+
+residue runs beside your editor, your builds and your coding agents, and its service runs all day, so the CPU and memory it spends are the user's. A pull request that touches a hot path, or adds a dependency, a thread, a child process or a timer, gives in its description: the commands below with every run of both builds, the machine, warm or cold cache, how you checked that the output is the same, and what you did not measure. A change that makes a number worse says why it is worth it.
+
+### Measure a change
+
+This fixture holds four candidate worktrees of 27,000 entries each: 2,000 tracked files and 25,000 in `node_modules/`. It takes about 12 seconds and 440 MB of disk. It gives residue a `HOME` of its own, so its `git config --global` lines write only there, your Git config does not move the numbers, and `scan` writes nothing to your stats ledger. Save it as `~/perf.sh` and run `sh ~/perf.sh`:
+
+```sh
+set -eu
+P=$(mktemp -d)
+mkdir "$P/home"
+export HOME="$P/home" XDG_STATE_HOME="$P/state"
+git config --global user.name perf
+git config --global user.email perf@example.com
+git init -q -b main "$P/app" && cd "$P/app"
+echo node_modules/ > .gitignore
+mkdir src && for i in $(seq 2000); do echo "$i" > "src/$i.txt"; done
+git add . && git commit -qm init
+
+# four candidates, each 2,000 tracked files and 25,000 in node_modules/
+for w in 1 2 3 4; do
+  git worktree add -q ".worktrees/w$w" -b "w$w"
+  for d in $(seq 250); do
+    mkdir -p ".worktrees/w$w/node_modules/$d"
+    for f in $(seq 100); do echo x > ".worktrees/w$w/node_modules/$d/$f.js"; done
+  done
+done
+echo "P=$P"
+```
+
+Paste the `P=...` line it prints. Then build main in a second worktree and run the two builds in turn, three rounds, from your checkout:
+
+```sh
+git worktree add -q --detach ../residue-main origin/main
+cargo build --locked --release --manifest-path ../residue-main/Cargo.toml
+cargo build --locked --release
+BASE=$(cd ../residue-main && pwd)/target/release/residue NEW=$PWD/target/release/residue
+(
+  export HOME="$P/home" XDG_STATE_HOME="$P/state"
+  t() { /usr/bin/time -l "$@" 2>&1 >/dev/null | grep -E ' real |resident|peak'; }
+  for i in 1 2 3; do
+    for R in "$BASE" "$NEW"; do
+      echo "$R  load: $(sysctl -n vm.loadavg)"
+      t "$R" --version
+      t "$R" stats --json
+      t "$R" explain "$P/app/.worktrees/w1"
+      t "$R" scan "$P/app"
+    done
+  done
+  for R in "$BASE" "$NEW"; do
+    rm -f "$P/trace"; GIT_TRACE2_EVENT="$P/trace" "$R" scan "$P/app" >/dev/null
+    echo "$R  git processes: $(grep -c '"event":"version"' "$P/trace")"
+  done
+)
+```
+
+`user` and `sys` include the git processes residue waited for, and `maximum resident set size` is the largest of residue and those processes; `peak memory footprint` is residue's own. On Linux, use `/usr/bin/time -v` with `grep -E 'Elapsed|seconds|Maximum resident'`, and `cat /proc/loadavg`. `scan` and `explain` also read the open files of every process residue can see, so their CPU grows with what else runs; compare builds on one machine, never with another machine's numbers.
+
+### Main's numbers
+
+Main at c61d629 on 2026-11-08: Apple M4 Max, 14 cores, 36 GB, macOS 26.3.1, Apple Git 2.50.1, warm cache after one unrecorded round, 1-minute load average 7.3 at every run, 670 running processes. Cold cache and Linux were not measured. Output checked: `scan` lists the four worktrees as candidates with 442 MB reclaimable, and `explain` passes every check.
+
+| Command | Wall time, 3 runs | User CPU | System CPU | residue's peak footprint | Largest resident set | Git processes |
+| --- | --- | --- | --- | --- | --- | --- |
+| `--version` | 0.00, 0.00, 0.00 s | 0.00 s | 0.00 s | 1.1 MB | 1.6 MB | 0 |
+| `stats --json`, empty ledger | 0.00, 0.00, 0.00 s | 0.00 s | 0.00 s | 1.1 to 1.2 MB | 2.0 MB | 0 |
+| `explain` of `w1` | 0.24, 0.24, 0.26 s | 0.07 s each | 0.16, 0.15, 0.17 s | 6.5 to 6.7 MB | 8.5 to 8.6 MB | 13 |
+| `scan` of the four | 0.32, 0.34, 0.35 s | 0.14 s each | 0.70, 0.77, 0.76 s | 8.9 to 9.2 MB | 9.9 to 10.3 MB | 40 |
+
+`watch` as the service runs it, `--grace 1h --idle 2d --min-free 10` (its defaults), with the fixture's folder as ROOT: at rest it spent under 0.01 s of CPU in 5 minutes, held 1.5 to 2.2 MB resident and ran no child process, at load averages of 5.5 and 13.9. For scale, the 0.0.9 release's service on a real code folder of the same Mac spent 0.07 s in those 5 minutes, at 3.3 to 3.5 MB. For each build, read it twice, 5 minutes apart, with `ps -o rss=,time= -p PID`:
+
+```sh
+(
+  export HOME="$P/home" XDG_STATE_HOME="$P/state"
+  "$NEW" watch --grace 1h --idle 2d --min-free 10 "$P" 2>"$P/watch.log" & w=$!
+  sleep 30; ps -o rss=,time= -p $w; sleep 300; ps -o rss=,time= -p $w
+  kill $w
+)
+```
+
+The Mac app's commands are in [app/AGENTS.md](app/AGENTS.md#cost): `footprint -p PID` for the app, its WebContent and its GPU process, and `ps -o time= -p PID` before and after a fixed task. The latest numbers come from the pull requests that changed them, on release builds with a scratch `HOME` on the same Mac:
+
+- One repository with 300 linked worktrees, after a scan: the app 34 to 35 MB, WebContent 113 to 117 MB, GPU 17 to 18 MB. A rescan costs WebContent 0.12 to 0.17 s of CPU ([#90](https://github.com/whiteheap/residue/pull/90)).
+- 20 s of pointer movement over the Worktrees map: WebContent 1.88 to 2.19 s of CPU (#90). Along a worktree's bar, with 150 worktrees: WebContent 1.00 s user and 0.22 s system CPU (medians), and, in a debug build with counters, 87 to 96 renders of the bar ([#113](https://github.com/whiteheap/residue/pull/113)).
+
+The website's home page (`site/`) and every file it loads come to 39,125 bytes with Brotli, not counting headers: HTML 6,355, `style.css` 4,446, `hero.js` 5,920, two fonts 8,480 and 8,612, and four SVGs 5,312, one of them the how-it-works drawing, which loads lazily. Measured on 2026-11-08 with `curl -s -o /dev/null -H 'Accept-Encoding: br' -w '%{size_download}\n' URL` for each file. With the hero on screen, the page's main thread is busy 135 to 161 ms in 10 s (median 148; headless Chrome at 1440 by 900, [#87](https://github.com/whiteheap/residue/pull/87)): the change in `TaskDuration` from the Chrome DevTools Protocol's `Performance.getMetrics` over 10 s after the page settles.
+
+Found something slow, in residue, a library or a tool it runs? Open an issue with the measurement and the command that repeats it, before there is a fix.
+
 ## Open a pull request
 
 1. Branch from `main` and keep one change per pull request.
 2. Start each commit message with a type such as `feat:`, `fix:` or `docs:`, as the history does.
 3. For a change users will notice, add a line to `CHANGELOG.md` under `## Unreleased` at the top. Create the heading if it isn't there.
 4. In the pull request description, list the exact platform, OS version and Git version you ran, and which commands you ran on which worktree states. If you covered a platform or state [docs/platforms-and-testing.md](docs/platforms-and-testing.md) does not list, add it there and adjust the short summary under the README's "Tested on" heading.
-5. CI must pass on macOS and both Linux runners.
+5. For a change to a hot path, or one that adds a dependency, a thread, a child process or a timer, add every run of both builds from [Performance](#performance).
+6. CI must pass on macOS and both Linux runners.
 
 Check ids (`ignored`, `activity`, ...) and the JSON fields under `residue.scan/v1`, `residue.explain/v1`, `residue.remove/v1` and `residue.restore/v1` are a contract with scripts, coding agents and the Mac app. Add new fields and check ids freely. Do not rename or remove existing ones.
 
