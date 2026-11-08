@@ -19,7 +19,7 @@
 # a missing   404, the bytes of 404.html
 #   path
 # crawlers    200 for /, robots.txt, sitemap.xml and llms.txt as each of
-#             Googlebot, Bingbot, OAI-SearchBot, Claude-SearchBot and
+#             Googlebot, bingbot, OAI-SearchBot, Claude-SearchBot and
 #             PerplexityBot, by user agent, so no bot rule turns them away
 #
 # It asks for each file with Accept: */*, never text/html: for a client that
@@ -50,7 +50,7 @@ header() {
 # One pass over every file. Writes a line per mismatch to $scratch/failures.
 pass() {
   : >"$scratch/failures"
-  for agent in Googlebot/2.1 Bingbot/2.0 OAI-SearchBot/1.0 Claude-SearchBot/1.0 PerplexityBot/1.0; do
+  for agent in Googlebot/2.1 bingbot/2.0 OAI-SearchBot/1.0 Claude-SearchBot/1.0 PerplexityBot/1.0; do
     for target in / /robots.txt /sitemap.xml /llms.txt; do
       status=$(curl -sS -A "$agent" -o /dev/null -w '%{http_code}' "$url$target") || status=error
       [ "$status" = 200 ] ||
