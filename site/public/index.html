@@ -39,8 +39,8 @@
             "applicationCategory": "DeveloperApplication",
             "operatingSystem": "macOS, Linux, FreeBSD",
             "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
-            "license": "https://github.com/whiteheap/residue/blob/main/LICENSE",
-            "softwareHelp": { "@type": "CreativeWork", "url": "https://github.com/whiteheap/residue#readme" },
+            "license": "https://github.com/whiteheap/residue-cli/blob/main/LICENSE",
+            "softwareHelp": { "@type": "CreativeWork", "url": "https://github.com/whiteheap/residue-cli#readme" },
             "publisher": { "@id": "https://whiteheap.com/#organization" }
           },
           {
@@ -74,7 +74,7 @@
         </a>
       </div>
       <nav aria-label="Project">
-        <a class="button button-ghost" href="https://github.com/whiteheap/residue">
+        <a class="button button-ghost" href="https://github.com/whiteheap/residue-cli">
           <svg aria-hidden="true" viewBox="0 0 256 256" fill="currentColor"><path d="M208.31,75.68A59.78,59.78,0,0,0,202.93,28,8,8,0,0,0,196,24a59.75,59.75,0,0,0-48,24H124A59.75,59.75,0,0,0,76,24a8,8,0,0,0-6.93,4,59.78,59.78,0,0,0-5.38,47.68A58.14,58.14,0,0,0,56,104v8a56.06,56.06,0,0,0,48.44,55.47A39.8,39.8,0,0,0,96,192v8H72a24,24,0,0,1-24-24A40,40,0,0,0,8,136a8,8,0,0,0,0,16,24,24,0,0,1,24,24,40,40,0,0,0,40,40H96v16a8,8,0,0,0,16,0V192a24,24,0,0,1,48,0v40a8,8,0,0,0,16,0V192a39.8,39.8,0,0,0-8.44-24.53A56.06,56.06,0,0,0,216,112v-8A58.14,58.14,0,0,0,208.31,75.68ZM200,112a40,40,0,0,1-40,40H112a40,40,0,0,1-40-40v-8a41.74,41.74,0,0,1,6.9-22.48A8,8,0,0,0,80,73.83a43.81,43.81,0,0,1,.79-33.58,43.88,43.88,0,0,1,32.32,20.06A8,8,0,0,0,119.82,64h32.35a8,8,0,0,0,6.74-3.69,43.87,43.87,0,0,1,32.32-20.06A43.81,43.81,0,0,1,192,73.83a8.09,8.09,0,0,0,1,7.65A41.72,41.72,0,0,1,200,104Z"/></svg>
           GitHub
         </a>
@@ -98,7 +98,7 @@
             </div>
             <a class="install-source" href="/install.sh">read the script</a>
           </div>
-          <p class="install-note">Installs residue, and on macOS and Linux turns on automatic cleanup · or Homebrew: <code>brew install whiteheap/tap/residue</code> · <a href="#mac-app">the Mac&nbsp;app</a> · <a href="https://github.com/whiteheap/residue#install">other ways to install</a></p>
+          <p class="install-note">Installs residue, and on macOS and Linux turns on automatic cleanup · or Homebrew: <code>brew install whiteheap/tap/residue</code> · <a href="#mac-app">the Mac&nbsp;app</a> · <a href="https://github.com/whiteheap/residue-cli#install">other ways to install</a></p>
         </div>
       </section>
 
@@ -116,7 +116,7 @@
           <p>Then turn it on:</p>
           <pre tabindex="0"><code>residue service install</code></pre>
           <p>That starts <code>residue watch</code> now and at every login, with launchd on macOS and systemd on Linux. It watches the usual code folders in your home folder that exist, such as <code>~/src</code>, <code>~/code</code> and <code>~/Work</code>, and prints which. If your code lives elsewhere, name its folder, which replaces the list: <code>residue service install ~/src</code>. <code>watch</code> runs only when you start it or install it as a service; <code>scan</code> never starts it.</p>
-          <p><a href="https://github.com/whiteheap/residue#reclaim-storage-automatically">Reclaim storage automatically</a></p>
+          <p><a href="https://github.com/whiteheap/residue-cli#reclaim-storage-automatically">Reclaim storage automatically</a></p>
         </div>
       </section>
 
@@ -132,14 +132,14 @@
             <li><strong>A trash for the whole worktree.</strong> With <code>--trash</code>, which <code>--idle</code> turns on, the worktree itself waits in the trash, every file included, until a later run purges it, after seven days by default.</li>
           </ul>
           <pre tabindex="0"><code>residue restore fix-login</code></pre>
-          <p><a href="https://github.com/whiteheap/residue#what-removal-deletes-and-what-it-keeps">What removal deletes, and what it keeps</a> · <a href="https://github.com/whiteheap/residue#restore-a-removed-worktree">Restore a removed worktree</a> · <a href="https://github.com/whiteheap/residue#the-trash">The trash</a></p>
+          <p><a href="https://github.com/whiteheap/residue-cli#what-removal-deletes-and-what-it-keeps">What removal deletes, and what it keeps</a> · <a href="https://github.com/whiteheap/residue-cli#restore-a-removed-worktree">Restore a removed worktree</a> · <a href="https://github.com/whiteheap/residue-cli#the-trash">The trash</a></p>
         </div>
       </section>
 
       <section id="install" class="section split wrap" aria-labelledby="install-title">
         <h2 id="install-title" class="label">look first</h2>
         <div class="flow">
-          <p>residue needs Git 2.36 or later on <code>PATH</code>. Debian, Ubuntu, Fedora, Arch, prebuilt binaries and building from source are in <a href="https://github.com/whiteheap/residue#install">the other ways to install</a>, and downloads are on <a href="https://github.com/whiteheap/residue/releases/latest">the latest release</a>.</p>
+          <p>residue needs Git 2.36 or later on <code>PATH</code>. Debian, Ubuntu, Fedora, Arch, prebuilt binaries and building from source are in <a href="https://github.com/whiteheap/residue-cli#install">the other ways to install</a>, and downloads are on <a href="https://github.com/whiteheap/residue-cli/releases/latest">the latest release</a>.</p>
           <pre tabindex="0"><code>residue scan ~/src/app</code></pre>
           <p>Replace the example path <code>~/src/app</code> with your repository's path. <code>scan</code> only reads: it lists each linked worktree with its size, its verdict and the reason, and every directory is still there afterwards.</p>
           <pre tabindex="0"><code>residue explain PATH</code></pre>
@@ -159,7 +159,7 @@
             <li>In System Settings, open Privacy &amp; Security and click Open Anyway next to the message about residue. The button is there for about an hour.</li>
             <li>macOS asks again: click Open, and enter your login password if it asks.</li>
           </ol>
-          <p><a href="https://github.com/whiteheap/residue#mac-app">Mac app</a> · <a href="https://github.com/whiteheap/residue#first-launch">First launch</a> · <a href="https://github.com/whiteheap/residue/releases/latest">Release notes and checksums</a></p>
+          <p><a href="https://github.com/whiteheap/residue-cli#mac-app">Mac app</a> · <a href="https://github.com/whiteheap/residue-cli#first-launch">First launch</a> · <a href="https://github.com/whiteheap/residue-cli/releases/latest">Release notes and checksums</a></p>
         </div>
       </section>
 
@@ -173,11 +173,11 @@
             </li>
             <li>
               <h3>Understand the decision.</h3>
-              <p>A worktree is a candidate only when every check passes. A failed check keeps it, and so does a check residue could not complete, shown as unknown. Each verdict comes with its reason. <a href="https://github.com/whiteheap/residue#what-makes-a-worktree-a-candidate">What makes a worktree a candidate</a></p>
+              <p>A worktree is a candidate only when every check passes. A failed check keeps it, and so does a check residue could not complete, shown as unknown. Each verdict comes with its reason. <a href="https://github.com/whiteheap/residue-cli#what-makes-a-worktree-a-candidate">What makes a worktree a candidate</a></p>
             </li>
             <li>
               <h3>Choose what happens next.</h3>
-              <p><code>residue remove</code> shows the plan and asks first, checks the worktree again, and hands the deletion to <code>git worktree remove</code> without <code>--force</code>. With <code>--trash</code>, the worktree stays restorable until the purge. <a href="https://github.com/whiteheap/residue#what-removal-deletes-and-what-it-keeps">What removal deletes, and what it keeps</a></p>
+              <p><code>residue remove</code> shows the plan and asks first, checks the worktree again, and hands the deletion to <code>git worktree remove</code> without <code>--force</code>. With <code>--trash</code>, the worktree stays restorable until the purge. <a href="https://github.com/whiteheap/residue-cli#what-removal-deletes-and-what-it-keeps">What removal deletes, and what it keeps</a></p>
             </li>
           </ol>
           <img class="diagram" src="/how-it-works-dark.svg" width="480" height="1675" loading="lazy" decoding="async" alt="Chart, top to bottom. Linked worktrees: any coding agent, or you, adds them with git worktree add; Git lists each one. Who starts residue: scan and explain (you; they never delete), remove (you, after you type yes), the Mac app (you, in its window), and watch, the service, on its own when work landed (its upstream branch is gone and it is unchanged for --grace, 1 hour) or the disk is low (free space under --min-free, 10 percent: worktrees unchanged for --idle, 2 days, go largest first). Then 15 checks in four families. Git's records: identity, locked, operation, private_refs, head and layout, from git worktree list, refs and the Git directory. The files: tracked_changes, untracked, ignored and index_flags, from git status --ignored and ls-files. The directory: nested_repo, mount_point and contents, from one walk that follows no symlinks. Use and time: activity, from processes' open files and working directories, and idle, only with --idle, from the newest change. The verdict is candidate when all passed, keep when one blocked, unknown when one could not finish, or stale when the directory is gone. Keep, unknown and stale stay where they are, each with the check that kept it; scan and explain stop there, with the report. A candidate, for remove or watch, is removed one at a time. Step 1: check again and compare with the plan. Delete, by default and for watch: 2, move it aside under a hidden name and lock it; 3, write its removal record and refs; 4, check again; 5, git worktree remove, never --force. Trash, with --trash, --idle or the Mac app: 2, move it into the trash and lock it; 3, check again; it is kept whole and locked, and frees no disk until it is purged. A failed check, or any change, moves it back to its path, where it stays. A removal record lasts 30 days (--keep-removed): residue restore recreates the worktree at its path, on its branch and HEAD, without its ignored files. A trash entry lasts 7 days (--keep-trash): residue restore puts it back whole, every file in it; after that it is purged into a removal record. residue never deletes a branch, commit or stash. residue stats: a local ledger.jsonl notes every deletion, trash move and restore; it never decides a removal and never leaves the machine.">
@@ -193,7 +193,7 @@
             <li><a href="https://worktrunk.dev"><strong>Worktrunk</strong></a>, when you want to create, switch, merge, and remove worktrees, and stop processes tied to one.</li>
             <li><strong>residue</strong>, when you want linked worktrees from any tool removed only when every check passes, with Git doing the delete and a trash on a sweep.</li>
           </ul>
-          <p><a href="https://github.com/whiteheap/residue#where-it-fits">Where it fits</a></p>
+          <p><a href="https://github.com/whiteheap/residue-cli#where-it-fits">Where it fits</a></p>
         </div>
       </section>
 
@@ -202,23 +202,23 @@
         <div class="caveat">
           <p>residue deletes directories. Start with <code>scan</code> and <code>explain</code>, and read the removal limits before you remove a worktree or turn on the service. The activity check cannot see every process or a paused session, and a write can still land after the last check. Reclaimable space is an estimate. residue runs as you; it is not a security boundary between users.</p>
           <ul>
-            <li><a href="https://github.com/whiteheap/residue#what-removal-deletes-and-what-it-keeps">Removal, and the window that remains</a></li>
-            <li><a href="https://github.com/whiteheap/residue#what-the-activity-probe-can-and-cannot-see">What the activity probe can and cannot see</a></li>
-            <li><a href="https://github.com/whiteheap/residue#tested-on">Where it was tested</a></li>
-            <li><a href="https://github.com/whiteheap/residue#limits">All limits</a></li>
+            <li><a href="https://github.com/whiteheap/residue-cli#what-removal-deletes-and-what-it-keeps">Removal, and the window that remains</a></li>
+            <li><a href="https://github.com/whiteheap/residue-cli#what-the-activity-probe-can-and-cannot-see">What the activity probe can and cannot see</a></li>
+            <li><a href="https://github.com/whiteheap/residue-cli#tested-on">Where it was tested</a></li>
+            <li><a href="https://github.com/whiteheap/residue-cli#limits">All limits</a></li>
           </ul>
         </div>
       </section>
     </main>
 
     <footer class="site-footer wrap">
-      <p>For a bug that could delete valuable data, follow <a href="https://github.com/whiteheap/residue/blob/main/SECURITY.md">SECURITY.md</a> and report it privately. Do not file a public issue.</p>
+      <p>For a bug that could delete valuable data, follow <a href="https://github.com/whiteheap/residue-cli/blob/main/SECURITY.md">SECURITY.md</a> and report it privately. Do not file a public issue.</p>
       <nav aria-label="Footer">
-        <a href="https://github.com/whiteheap/residue#readme">Docs</a>
-        <a href="https://github.com/whiteheap/residue/releases">Releases</a>
-        <a href="https://github.com/whiteheap/residue/blob/main/CONTRIBUTING.md">Contribute</a>
-        <a href="https://github.com/whiteheap/residue/blob/main/SECURITY.md">Security</a>
-        <a href="https://github.com/whiteheap/residue/blob/main/LICENSE">MIT license</a>
+        <a href="https://github.com/whiteheap/residue-cli#readme">Docs</a>
+        <a href="https://github.com/whiteheap/residue-cli/releases">Releases</a>
+        <a href="https://github.com/whiteheap/residue-cli/blob/main/CONTRIBUTING.md">Contribute</a>
+        <a href="https://github.com/whiteheap/residue-cli/blob/main/SECURITY.md">Security</a>
+        <a href="https://github.com/whiteheap/residue-cli/blob/main/LICENSE">MIT license</a>
         <a href="https://whiteheap.com">Whiteheap</a>
       </nav>
     </footer>

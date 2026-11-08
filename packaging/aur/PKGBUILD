@@ -8,7 +8,7 @@ pkgver=0.0.4
 pkgrel=1
 pkgdesc='Find the Git worktrees coding agents leave behind, and remove one only when nothing in it would be lost'
 arch=('x86_64' 'aarch64')
-url='https://github.com/whiteheap/residue'
+url='https://github.com/whiteheap/residue-cli'
 license=('MIT')
 depends=('git>=2.36')
 provides=('residue')

@@ -4,7 +4,7 @@ name: release
 # residue is the two macOS archives' binaries joined into one. It publishes
 # them with SHA256SUMS and a provenance attestation, then starts packages.yml.
 # The DMG has the same name in every release, so
-# https://github.com/whiteheap/residue/releases/latest/download/residue-macos.dmg
+# https://github.com/whiteheap/residue-cli/releases/latest/download/residue-macos.dmg
 # always serves the newest one.
 #
 # A pull request that changes this file or app/scripts/, and a manual run
@@ -233,7 +233,7 @@ jobs:
           test -s dist/notes.md
           cat >> dist/notes.md <<'EOF'
 
-          **Mac app:** `residue-macos.dmg` is the app for macOS 13 or later, on Apple silicon and Intel, with this release's residue inside. It is not notarized yet, so macOS blocks it the first time: the [README](https://github.com/whiteheap/residue#mac-app) has the steps to open it.
+          **Mac app:** `residue-macos.dmg` is the app for macOS 13 or later, on Apple silicon and Intel, with this release's residue inside. It is not notarized yet, so macOS blocks it the first time: the [README](https://github.com/whiteheap/residue-cli#mac-app) has the steps to open it.
           EOF
           cat dist/notes.md
       - name: Summary

@@ -99,7 +99,7 @@ Removal:  every check of `residue remove`, then a removal record to restore from
 Trash:    not used; entries older than 7d are purged
 Kept:     branches and commits; a restored worktree, unless the disk is low
 Fetch:    never prompts, so one that needs a password fails and is logged
-Details:  https://github.com/whiteheap/residue/blob/main/docs/automation.md
+Details:  https://github.com/whiteheap/residue-cli/blob/main/docs/automation.md
 ";
 
 /// The folders in the home folder that `watch` and `service install` use

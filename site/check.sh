@@ -201,7 +201,7 @@ done
 slugs=$(sed -n 's/^#\{1,6\} \(.*\)$/\1/p' "$readme" |
   tr '[:upper:]' '[:lower:]' |
   sed 's/[^a-z0-9 _-]//g; s/ /-/g')
-for anchor in $(grep -ohE 'https://(github\.com/whiteheap/residue|raw\.githubusercontent\.com/whiteheap/residue/main/README\.md)#[^")]*' "$public"/*.html "$public/llms.txt" | sed 's/.*#//' | sort -u); do
+for anchor in $(grep -ohE 'https://(github\.com/whiteheap/residue-cli|raw\.githubusercontent\.com/whiteheap/residue-cli/main/README\.md)#[^")]*' "$public"/*.html "$public/llms.txt" | sed 's/.*#//' | sort -u); do
   if [ "$anchor" = readme ] || printf '%s\n' "$slugs" | grep -qx -- "$anchor"; then
     ok "README anchor #$anchor exists"
   else
@@ -498,7 +498,7 @@ def need(condition; problem): if condition then empty else problem end;
   need(($app.operatingSystem | type) == "string"; "SoftwareApplication: no operatingSystem"),
   need($app.offers.price == "0"; "SoftwareApplication: offers.price is not 0"),
   need(($app.license // "") | startswith("https://"); "SoftwareApplication: no license URL"),
-  need($app.softwareHelp.url == "https://github.com/whiteheap/residue#readme"; "SoftwareApplication: softwareHelp is not the README"),
+  need($app.softwareHelp.url == "https://github.com/whiteheap/residue-cli#readme"; "SoftwareApplication: softwareHelp is not the README"),
   need($app.publisher["@id"] == $publisher; "SoftwareApplication: publisher is not \($publisher)"),
   need(($app | has("softwareVersion")) | not; "SoftwareApplication: softwareVersion, which nothing ties to the release"),
   need($website.url == $url; "WebSite: url is not \($url)"),
@@ -537,7 +537,7 @@ fi
 # security.txt (RFC 9116): renew Expires before it is 30 days away, and keep
 # it less than a year ahead.
 security="$public/.well-known/security.txt"
-for field in 'Contact: https://github.com/whiteheap/residue/security/advisories/new' \
+for field in 'Contact: https://github.com/whiteheap/residue-cli/security/advisories/new' \
   'Preferred-Languages: en' "Canonical: $site/.well-known/security.txt"; do
   if grep -qxF -- "$field" "$security"; then
     ok "security.txt has $field"

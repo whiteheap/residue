@@ -18,7 +18,7 @@ One static page that introduces residue and sends readers to the [README](../REA
 | `public/whiteheap-mark-white.svg` | The Whiteheap mark beside "by whiteheap" in the header. A copy of `brand/whiteheap-mark-white.svg` in [whiteheap/whiteheap.com](https://github.com/whiteheap/whiteheap.com), the owner (taken at 3431501); copy it again when the brand kit changes |
 | `public/install.sh` | The install script behind `curl -fsSL https://residue.whiteheap.com/install.sh \| sh`: POSIX sh, served as `text/plain` so it reads in a browser. `docs/installation.md` documents it; `check.sh` shellchecks it and checks the key hashes it pins; `.github/workflows/install.yml` runs it through every channel |
 | `public/_headers` | Response headers: Content Security Policy, `nosniff`, no framing, referrer and permissions policies, `text/plain` for `install.sh`, `charset=utf-8` for every `.txt` file, a year with `immutable` for `style.css`, `hero.js` and the fonts, whose every reference carries a version (see "Versions"), and a one-day `max-age` for the drawings, which change rarely. The pages keep Cloudflare's default, `max-age=0, must-revalidate`. Cloudflare applies it and does not serve it. HSTS comes from the zone instead (see "HTTPS") |
-| `public/_redirects` | Redirects: `/download/macos` to `residue-macos.dmg` in the newest [residue release](https://github.com/whiteheap/residue/releases/latest), whose name never changes. Cloudflare applies it and does not serve it; `check.sh` accepts a link to a redirect's source |
+| `public/_redirects` | Redirects: `/download/macos` to `residue-macos.dmg` in the newest [residue release](https://github.com/whiteheap/residue-cli/releases/latest), whose name never changes. Cloudflare applies it and does not serve it; `check.sh` accepts a link to a redirect's source |
 | `wrangler.jsonc` | The Worker: assets only, no Worker script, `public/` as the only upload, 404 page, the Custom Domain `residue.whiteheap.com`, workers.dev and preview URLs off |
 | `check.sh` | The static checks below |
 | `fonts.sh` | Cuts the two fonts again, after a change brings a character they lack (see "Fonts"). No check or deploy runs it |
@@ -28,7 +28,7 @@ One same-origin script and two same-origin fonts; no analytics, no cookies, no f
 
 ## Change the page
 
-- The hero's h1 and lede are the repository's GitHub description, word for word: its first sentence is the h1 and its second the lede. The meta description, `og:description`, the JSON-LD `description` and the `>` summary in `llms.txt` repeat it whole, and the social image and `og:image:alt` show the h1. Change the description and the page together, in the same pull request: `gh repo edit whiteheap/residue --description "..."`, then the h1, the lede, the meta tags, the JSON-LD, `llms.txt`, and the headline in `docs/assets/og.svg` (render it again, below).
+- The hero's h1 and lede are the repository's GitHub description, word for word: its first sentence is the h1 and its second the lede. The meta description, `og:description`, the JSON-LD `description` and the `>` summary in `llms.txt` repeat it whole, and the social image and `og:image:alt` show the h1. Change the description and the page together, in the same pull request: `gh repo edit whiteheap/residue-cli --description "..."`, then the h1, the lede, the meta tags, the JSON-LD, `llms.txt`, and the headline in `docs/assets/og.svg` (render it again, below).
 - Copy follows the Whiteheap writing style: the job first, the project's own words (candidate, keep, unknown), a choice as a list, and every warning before the action it qualifies. Shorter is not the test; keep every command, flag, caveat and link.
 - Every command on the page and in `llms.txt` is copied exactly from the README, and so is the minimum Git version. If the README changes one, change the page and `llms.txt` in the same pull request.
 - Link to README sections for detail instead of copying flag tables, install alternatives or release notes. Do not add a version number: the page links to the latest release instead.
@@ -97,10 +97,10 @@ The deploy job reads `CLOUDFLARE_API_TOKEN` from the GitHub environment `site`, 
 3. Store it. Without a value on the command line, `gh` prompts for it, so it stays out of the shell history:
 
    ```sh
-   gh secret set CLOUDFLARE_API_TOKEN -R whiteheap/residue --env site
+   gh secret set CLOUDFLARE_API_TOKEN -R whiteheap/residue-cli --env site
    ```
 
-4. Deploy once to prove it: `gh workflow run site.yml -R whiteheap/residue --ref main`, then `gh run watch -R whiteheap/residue`.
+4. Deploy once to prove it: `gh workflow run site.yml -R whiteheap/residue-cli --ref main`, then `gh run watch -R whiteheap/residue-cli`.
 
 ### By hand
 
