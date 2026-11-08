@@ -61,6 +61,12 @@ These are the reasons people trust the tool. Do not weaken them without an expli
 | `site/` | The one-page website: static HTML, CSS, one script (`hero.js`) and two self-hosted fonts in `site/public/`, its Cloudflare Workers Static Assets config, `site/check.sh` and `site/smoke.sh`. Live at https://residue.whiteheap.com: `.github/workflows/site.yml` checks it on pull requests and deploys it when a change to `site/` lands on `main`; `site/README.md` has the checks, the token and the manual fallback. The README stays the contract: commands on the page are copied from it |
 | `app/` | The Mac app (Tauri 2): Rust in `app/src-tauri/`, React in `app/src/`. It bundles this CLI, built by `app/scripts/sidecar.sh` from the root, or in a release joined from the two macOS archives. One version, from `Cargo.toml` (`app/scripts/tauri.sh`). Its own crate and workspace, excluded from the CLI package. `.github/workflows/app.yml` checks it, and is not required. [app/README.md](app/README.md) has the build, [app/AGENTS.md](app/AGENTS.md) the invariants |
 
+## Text and cost
+
+- Text for a person, in the CLI and the app, is brief: a heading of a few words, a sentence or two under it, one line per result, each caveat beside its action, and detail one step away (the README, `--help`, `--json`, `residue explain`). Brief never drops a warning or a limit, and keeps residue's terms: candidate, keep, unknown. A wording change leaves `--json`, exit statuses and the lines the app reads alone (#77).
+- CPU and memory belong to the user, and residue runs in the background. Measure a change to a hot path, or one that adds a dependency, a thread, a child process or a timer, before and after: both builds interleaved on one machine, three runs or more each, every run in the pull request, system CPU apart from user CPU, and how you checked the output is the same. On macOS `/usr/bin/time -l` gives wall time, CPU and residue's own `peak memory footprint`; `GIT_TRACE2_EVENT=FILE` logs each git process. A change that makes a number worse says why it is worth it (#75).
+- File an issue for a slow or heavy component you find, in residue, a library or a tool it runs, with the measurement and the command that repeats it, before there is a fix.
+
 ## Verify a change
 
 ```sh

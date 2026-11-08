@@ -3,7 +3,7 @@
 ## Unreleased
 
 - Shorter output: `--help` gives one line per command and option, then examples, and result lines and caveats say the same in fewer words. JSON documents, exit statuses and the lines the Mac app reads are unchanged (part of #77).
-- residue's `git status` calls use about half as much CPU, and take no longer. They turn off Git's `core.preloadIndex`, whose threads contend in the kernel. A `scan` of 10 worktrees used 17 to 19 s of system CPU, down from 35 to 40 s (#75).
+- residue's `git status` calls turn off Git's `core.preloadIndex`, which runs the index refresh on up to 20 threads. Each call uses a third to a half of the system CPU it did, and can take up to 0.23 s longer on a warm disk. A `scan` of 10 worktrees used 17 to 19 s of system CPU, down from 35 to 40 s, and took no longer (#75).
 - residue uses about 5 MB less memory to inspect a large worktree. It keeps only the entries it needs from `git ls-files`, not the whole list: `explain` of a 59,888-file worktree peaked at 10.5 to 11.0 MB of residue's own memory, down from 15.3 to 16.4 MB (#78).
 
 ## 0.0.9 (2026-11-08)

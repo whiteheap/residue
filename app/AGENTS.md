@@ -18,6 +18,10 @@ These are why the app can be trusted with someone's worktrees. Do not weaken the
 - Charts draw residue's numbers and shares of them, nothing else: `src/lib/viz.ts` turns residue's documents into shapes and `src/components/viz/` draws them. Emphasis is their one visual variable (`Tone`: bright, gray, hatched, rest), never a hue, and in forced colors each tone keeps a fill, an outline or the hatch. Every chart has a text equivalent on its screen (its caption, its legend's values, the list or the table), and nothing is reachable only through a chart. Never draw a count-down such as "days left": residue deletes a trash entry at the first removal or automatic cleanup in its repository after `--keep-trash`, not on a date.
 - Development aids stay out of release builds: `devshot.rs` compiles only for macOS debug builds, and the service preview (`DevPreview`) checks `cfg!(debug_assertions)`.
 
+## Text
+
+The root [AGENTS.md](../AGENTS.md#text-and-cost) rule holds on every screen and dialog. A button names its action and its object ("Move 3 to the trash", "Turn off automatic cleanup"), never "OK". A rule few readers need before they act, such as when a removal record is forgotten, goes in a disclosure.
+
 ## Verify a change
 
 On a machine that runs residue's service, its user's data and service are not test fixtures:
