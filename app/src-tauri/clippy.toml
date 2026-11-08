@@ -1,0 +1,3 @@
+# The app's own clippy settings. Without this file Clippy reads the CLI's
+# clippy.toml at the repository root, whose rule that a child starts only
+# through the CLI's run::spawn (#114) does not apply to the app.
