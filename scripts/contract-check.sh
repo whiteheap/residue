@@ -1285,5 +1285,54 @@ else
     done
 fi
 
+# 10. Linux: a process whose only link to a worktree is a mapped file
+# (/proc/PID/maps) keeps it in use. A copy of the system's libm in the
+# worktree's ignored node_modules/ is preloaded into a sleep that runs in
+# another folder, so it holds no working directory, executable or open
+# file there, only the mapping. Once it exits, the worktree is not in use.
+# The case also prints what reading every process's maps costs here.
+if [ "$(uname -s)" = Linux ]; then
+    name=activity-mapped-only
+    make_repo
+    libc=$(grep -m 1 -o '/[^ ]*/libc\.so\.6$' /proc/self/maps)
+    [ -r "${libc%/*}/libm.so.6" ] || { echo "contract-check: setup failed in $name: no libm.so.6 beside ${libc:-libc}" >&2; exit 2; }
+    setup cp "${libc%/*}/libm.so.6" "$wt/node_modules/libmapped.so"
+    before=$(sums "$wt")
+    wt_real=$(cd "$wt" && pwd -P) || exit 2
+    mapped=$wt_real/node_modules/libmapped.so
+    (cd "$work" && LD_PRELOAD=$mapped exec sleep 300) >/dev/null 2>&1 &
+    holder=$!
+    for ((i = 0; i < 100; i++)); do
+        grep -qF "$mapped" "/proc/$holder/maps" 2>/dev/null && break
+        sleep 0.1
+    done
+    grep -qF "$mapped" "/proc/$holder/maps" 2>/dev/null || { echo "contract-check: setup failed in $name: sleep never mapped $mapped" >&2; kill "$holder" 2>/dev/null; exit 2; }
+    links=$({ readlink "/proc/$holder/cwd"; readlink "/proc/$holder/exe"; for f in /proc/"$holder"/fd/*; do readlink "$f"; done; } 2>/dev/null | grep -cF "$wt_real/")
+    [ "$(readlink "/proc/$holder/cwd")" != "$wt_real" ] && [ "$links" = 0 ] || { echo "contract-check: setup failed in $name: sleep holds more than a mapping in the worktree" >&2; kill "$holder" 2>/dev/null; exit 2; }
+    TIMEFORMAT=%R
+    { time run explain --json "$wt"; } 2>"$work/$name.time"
+    explain_s=$(cat "$work/$name.time")
+    busy=$work/$name.busy
+    mv "$out" "$busy" || exit 2
+    maps_procs=0
+    for f in /proc/[0-9]*/maps; do
+        { read -r _ <"$f"; } 2>/dev/null && maps_procs=$((maps_procs + 1))
+    done
+    { time cat /proc/[0-9]*/maps >"$work/$name.maps" 2>/dev/null; } 2>"$work/$name.time"
+    maps_s=$(cat "$work/$name.time")
+    read -r maps_lines maps_bytes < <(wc -l -c <"$work/$name.maps")
+    kill "$holder" 2>/dev/null
+    wait "$holder" 2>/dev/null
+    run explain --json "$wt"
+    if [ "$status" != 0 ]; then fail "explain exit $status, want 0"
+    elif ! jq -e --argjson pid "$holder" '.worktree.activity.state == "in_use" and .worktree.verdict == "keep" and any(.worktree.activity.processes[]; .pid == $pid and .command == "sleep")' "$busy" >/dev/null; then fail "with sleep mapping a file in it, activity is $(jq -c '.worktree.activity' "$busy"), want in_use by sleep[$holder]"
+    elif ! jq -e '[.worktree.checks[] | select(.status != "pass") | .id] == ["activity"]' "$busy" >/dev/null; then fail "failing checks: $(jq -c '[.worktree.checks[] | select(.status != "pass") | .id]' "$busy"), want activity"
+    elif ! jq -e '.worktree.activity.state == "not_observed" and .worktree.verdict == "candidate"' "$out" >/dev/null; then fail "after sleep exited, activity is $(jq -c '.worktree.activity' "$out") and the verdict $(jq -r '.worktree.verdict' "$out"), want not_observed and candidate"
+    elif untouched "$before"; then
+        ok
+        echo "     maps: $maps_procs processes readable, $maps_lines lines, $maps_bytes bytes; one cat of them all took ${maps_s} s, the explain that read them ${explain_s} s"
+    fi
+fi
+
 echo "contract-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]

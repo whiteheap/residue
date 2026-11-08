@@ -1,7 +1,8 @@
 //! Is any process using this directory?
 //!
-//! One snapshot of process working directories and open files is taken per
-//! command and matched against each worktree. The answer has three states,
+//! One snapshot of process working directories and open files (and, where
+//! the backend reads them, mapped files) is taken per command and matched
+//! against each worktree. The answer has three states,
 //! never two: a process was seen using the directory (`in_use`), none of
 //! the processes the probe could inspect was (`not_observed`), or the probe
 //! failed or reads too little to show that none was (`unknown`). A probe
@@ -332,7 +333,7 @@ mod platform {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::{Seen, Snapshot, Use, unavailable};
+    use super::{Seen, Snapshot, Use, maps, unavailable};
     use std::fs;
     use std::os::unix::ffi::OsStringExt;
 
@@ -346,6 +347,7 @@ mod platform {
         let mut uses = Vec::new();
         let mut total = 0;
         let mut inspected = 0;
+        let mut paths: Vec<Vec<u8>> = Vec::new();
         for item in listing {
             let item = match item {
                 Ok(item) => item,
@@ -364,33 +366,55 @@ mod platform {
             let command = fs::read_to_string(base.join("comm"))
                 .map(|c| c.trim_end().to_string())
                 .unwrap_or_default();
-            let mut readable = false;
-            let mut push = |target: std::path::PathBuf| {
-                let bytes = target.into_os_string().into_vec();
-                if bytes.first() == Some(&b'/') {
-                    uses.push(Use {
-                        pid,
-                        command: command.clone(),
-                        path: bytes,
-                    });
-                }
-            };
+            paths.clear();
+            // A kernel thread has no executable, and a process that exits
+            // mid-scan loses its working directory: neither link is required.
             for link in ["cwd", "exe"] {
                 if let Ok(target) = fs::read_link(base.join(link)) {
-                    readable = true;
-                    push(target);
+                    paths.push(target.into_os_string().into_vec());
                 }
             }
-            if let Ok(fds) = fs::read_dir(base.join("fd")) {
-                readable = true;
-                for fd in fds.flatten() {
-                    // An fd closed between listing and readlink is gone; skip it.
-                    if let Ok(target) = fs::read_link(fd.path()) {
-                        push(target);
+            let fds_read = match fs::read_dir(base.join("fd")) {
+                Ok(fds) => {
+                    for fd in fds.flatten() {
+                        // An fd closed between listing and readlink is gone; skip it.
+                        if let Ok(target) = fs::read_link(fd.path()) {
+                            paths.push(target.into_os_string().into_vec());
+                        }
                     }
+                    true
                 }
-            }
-            if readable {
+                Err(_) => false,
+            };
+            // Mapped files: a shared library or native module loaded from a
+            // worktree, or a file a process maps and then closes (Git's
+            // index), holds no descriptor and no working directory there.
+            let maps_read = match maps::read(&base.join("maps"), &mut paths) {
+                Ok(()) => true,
+                Err(maps::Error::Unreadable) => false,
+                Err(maps::Error::TooLarge) => {
+                    return unavailable(
+                        BACKEND,
+                        "probe_failed",
+                        format!(
+                            "/proc/{pid}/maps is larger than {} MiB, so residue cannot read every file process {pid} maps",
+                            maps::CAP >> 20
+                        ),
+                    );
+                }
+            };
+            paths.retain(|p| p.first() == Some(&b'/'));
+            paths.sort_unstable();
+            paths.dedup();
+            uses.extend(paths.drain(..).map(|path| Use {
+                pid,
+                command: command.clone(),
+                path,
+            }));
+            // Inspected means residue read the process's open files and its
+            // mapped files. One it cannot read (another user's, or one that
+            // exited) is not counted; what was read of it still counts as use.
+            if fds_read && maps_read {
                 inspected += 1;
             }
         }
@@ -403,6 +427,110 @@ mod platform {
                 limits: None,
             }),
         }
+    }
+}
+
+/// The path column of `/proc/PID/maps`: the files a process has mapped into
+/// memory. Its format is in the kernel's `Documentation/filesystems/proc.rst`
+/// and proc_pid_maps(5), and is printed by `show_map_vma` in
+/// `fs/proc/task_mmu.c`:
+///
+/// ```text
+/// address           perms offset  dev   inode      pathname
+/// 7f2c3e400000-7f2c3e428000 r--p 00000000 08:01 1835234    /usr/lib/libc.so.6
+/// ```
+///
+/// Five fields, each followed by one space, then spaces to a fixed column,
+/// then the name to the end of the line. A file's name is the path `d_path`
+/// gives, which begins with `/`. Other names begin with `[` (`[heap]`,
+/// `[stack]`, `[vdso]`, `[anon:NAME]`) or are empty (an anonymous mapping),
+/// and name no file. The kernel escapes only a newline in a path, as `\012`
+/// (`seq_path(m, path, "\n")`), and appends ` (deleted)` to a file that was
+/// unlinked. Both are ambiguous, as proc_pid_maps(5) says: a path can contain
+/// the four bytes `\012` or end in ` (deleted)` itself.
+#[cfg(any(target_os = "linux", test))]
+mod maps {
+    use std::io::{BufRead, BufReader, Read};
+    use std::path::Path;
+
+    /// The most residue reads of one process's maps. A line is about 75
+    /// bytes plus its path, and Linux allows 65,530 mappings per process by
+    /// default (`vm.max_map_count`), so a real process stays well under it.
+    /// The file is read through a 64 KiB buffer, so this bounds time, not
+    /// memory.
+    pub const CAP: u64 = 64 << 20;
+
+    pub enum Error {
+        /// Not opened, or a read failed: another user's process, or one that
+        /// exited.
+        Unreadable,
+        /// Longer than `CAP`: what is past it was not read.
+        TooLarge,
+    }
+
+    /// Adds the path of every file `file` maps to `paths`.
+    pub fn read(file: &Path, paths: &mut Vec<Vec<u8>>) -> Result<(), Error> {
+        let file = std::fs::File::open(file).map_err(|_| Error::Unreadable)?;
+        let mut reader = BufReader::with_capacity(64 << 10, file.take(CAP + 1));
+        let mut line = Vec::new();
+        let mut read: u64 = 0;
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) => return Ok(()),
+                Ok(n) => read += n as u64,
+                Err(_) => return Err(Error::Unreadable),
+            }
+            if read > CAP {
+                return Err(Error::TooLarge);
+            }
+            let Some(path) = path(&line) else {
+                continue;
+            };
+            // A library maps four or five regions in a row.
+            if paths.last().is_some_and(|last| last.as_slice() == path) {
+                continue;
+            }
+            if let Some(unescaped) = unescape(path) {
+                paths.push(unescaped);
+            }
+            paths.push(path.to_vec());
+        }
+    }
+
+    /// The path a maps line names, or `None` for a mapping of no file.
+    /// ` (deleted)` is kept: it follows the path, so a deleted file inside a
+    /// directory still lies inside it, as an open one does in `fd`.
+    pub fn path(line: &[u8]) -> Option<&[u8]> {
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        let mut fields = line.splitn(6, |b| *b == b' ');
+        for _ in 0..5 {
+            fields.next()?;
+        }
+        let name = fields.next()?;
+        let start = name.iter().position(|b| *b != b' ')?;
+        let name = &name[start..];
+        (name.first() == Some(&b'/')).then_some(name)
+    }
+
+    /// `path` with each `\012` turned back into the newline the kernel
+    /// escaped, when it has one. The caller keeps both readings, since the
+    /// path may have held those four bytes: a use read either way is a use.
+    pub fn unescape(path: &[u8]) -> Option<Vec<u8>> {
+        const ESCAPED: &[u8] = b"\\012";
+        path.windows(ESCAPED.len()).position(|w| w == ESCAPED)?;
+        let mut out = Vec::with_capacity(path.len());
+        let mut rest = path;
+        while !rest.is_empty() {
+            if rest.starts_with(ESCAPED) {
+                out.push(b'\n');
+                rest = &rest[ESCAPED.len()..];
+            } else {
+                out.push(rest[0]);
+                rest = &rest[1..];
+            }
+        }
+        Some(out)
     }
 }
 
@@ -988,6 +1116,77 @@ mod tests {
         assert_eq!(
             snapshot(None).evidence(Path::new("/w/bus")).code(),
             "not_observed"
+        );
+    }
+
+    /// A maps file as Linux prints it (proc_pid_maps(5)): libraries over
+    /// several regions, the pseudo-names, an anonymous mapping, a path with
+    /// spaces, a deleted file and a path with an escaped newline.
+    const MAPS: &str = "\
+55d0c4a00000-55d0c4a02000 r--p 00000000 08:01 1835012                    /usr/bin/sleep
+55d0c4a02000-55d0c4a06000 r-xp 00002000 08:01 1835012                    /usr/bin/sleep
+55d0c5800000-55d0c5821000 rw-p 00000000 00:00 0                          [heap]
+7f2c3e400000-7f2c3e428000 r--p 00000000 08:01 1835234                    /w/busy/node_modules/a b.so
+7f2c3e428000-7f2c3e5bd000 r-xp 00028000 08:01 1835234                    /w/busy/node_modules/a b.so
+7f2c3e5bd000-7f2c3e5c0000 rw-p 00000000 00:00 0 \n\
+7f2c3e600000-7f2c3e601000 r--s 00000000 08:01 1835240                    /w/gone/.git/index (deleted)
+7f2c3e700000-7f2c3e701000 r--p 00000000 08:01 1835241                    /w/line\\012break/x.so
+7fff6b3a0000-7fff6b3c1000 rw-p 00000000 00:00 0                          [stack]
+7fff6b3fc000-7fff6b3fe000 r-xp 00000000 00:00 0                          [vdso]
+";
+
+    #[test]
+    fn maps_names_only_files_whole_and_in_both_readings() {
+        let file = std::env::temp_dir().join(format!("residue-maps-test-{}", std::process::id()));
+        std::fs::write(&file, MAPS).unwrap();
+        let mut paths = Vec::new();
+        let read = super::maps::read(&file, &mut paths);
+        std::fs::remove_file(&file).unwrap();
+        assert!(read.is_ok());
+        let paths: Vec<&[u8]> = paths.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            paths,
+            vec![
+                &b"/usr/bin/sleep"[..],
+                b"/w/busy/node_modules/a b.so",
+                b"/w/gone/.git/index (deleted)",
+                b"/w/line\nbreak/x.so",
+                b"/w/line\\012break/x.so",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mapped_file_is_a_use_of_its_directory_even_when_deleted() {
+        let s = Snapshot {
+            backend: "test",
+            state: Ok(Seen {
+                uses: vec![Use {
+                    pid: 1,
+                    command: "git".into(),
+                    path: b"/w/gone/.git/index (deleted)".to_vec(),
+                }],
+                inspected: 1,
+                total: Some(1),
+                limits: None,
+            }),
+        };
+        assert_eq!(s.evidence(Path::new("/w/gone")).code(), "in_use");
+        assert_eq!(s.evidence(Path::new("/w/gon")).code(), "not_observed");
+    }
+
+    #[test]
+    fn a_maps_line_without_a_file_names_none() {
+        use super::maps::path;
+        assert_eq!(path(b"7f00-7f01 rw-p 00000000 00:00 0 \n"), None);
+        assert_eq!(path(b"7f00-7f01 rw-p 00000000 00:00 0"), None);
+        assert_eq!(
+            path(b"7f00-7f01 rw-p 00000000 00:00 0      [anon:x /y]\n"),
+            None
+        );
+        assert_eq!(
+            path(b"7f00-7f01 r--p 00000000 08:01 7      /a  b \n"),
+            Some(&b"/a  b "[..])
         );
     }
 }
