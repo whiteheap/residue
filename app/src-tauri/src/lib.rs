@@ -27,6 +27,7 @@ use tauri::Manager;
 const SCAN_DEADLINE: Duration = Duration::from_secs(30 * 60);
 const REMOVE_DEADLINE: Duration = Duration::from_secs(30 * 60);
 const RESTORE_DEADLINE: Duration = Duration::from_secs(10 * 60);
+const STATS_DEADLINE: Duration = Duration::from_secs(2 * 60);
 
 struct State {
     sidecar: PathBuf,
@@ -302,6 +303,22 @@ async fn restore(state: AppState<'_>, entry_path: String, root: String) -> Resul
     .await
 }
 
+/// `residue stats --json`: what residue has freed on this machine, from its
+/// ledger. It reads the ledger and the trash entries of the repositories the
+/// ledger names, never a worktree, so it is quick.
+#[tauri::command]
+async fn stats(state: AppState<'_>) -> Result<Value, CliError> {
+    blocking(&state, |s| {
+        s.run(
+            vec!["stats".into(), "--json".into()],
+            &s.home,
+            STATS_DEADLINE,
+        )?
+        .document("residue.stats/v1")
+    })
+    .await
+}
+
 #[tauri::command]
 async fn service_status(state: AppState<'_>) -> Result<service::Status, CliError> {
     blocking(&state, |s| {
@@ -411,6 +428,7 @@ pub fn run() {
             remove_to_trash,
             list_restorable,
             restore,
+            stats,
             service_status,
             service_install,
             service_uninstall,

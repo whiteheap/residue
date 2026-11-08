@@ -1,6 +1,7 @@
 import { Button, Checkbox, Empty, Tabs } from "@cloudflare/kumo";
 import { ArrowClockwise, CaretRight, FolderPlus, Trash } from "@phosphor-icons/react";
-import { useId, useMemo, useState } from "react";
+import { useId, useMemo } from "react";
+import { Treemap, type ZoomLevel } from "../components/viz/Treemap";
 import {
   ErrorPanel,
   Loading,
@@ -12,23 +13,17 @@ import {
   isPermissionError,
 } from "../components/ui";
 import { baseName, bytes, inside, plural, tilde } from "../lib/format";
-import type { CliError, Repository, ScanDocument, Worktree } from "../lib/types";
+import type { CliError, FreedSum, Repository, ScanDocument, Worktree } from "../lib/types";
 import { documentTime } from "../lib/useCli";
+import { matches, type Filter } from "../lib/viz";
 import { branchLabel, displayPath, sizeOf, summary } from "../lib/worktree";
 
-type Filter = "all" | "candidate" | "kept";
-
+/** One filter scopes the chart and the list alike. */
 const FILTERS = [
   { value: "all", label: "All" },
   { value: "candidate", label: "Can go" },
   { value: "kept", label: "Kept" },
 ];
-
-function matches(w: Worktree, filter: Filter): boolean {
-  if (filter === "all") return true;
-  if (filter === "candidate") return w.verdict === "candidate";
-  return w.verdict !== "candidate";
-}
 
 export function Worktrees({
   doc,
@@ -36,26 +31,39 @@ export function Worktrees({
   scanning,
   roots,
   home,
+  filter,
+  onFilter,
+  zoom,
+  onZoom,
   selected,
   onSelect,
   onRescan,
   onOpen,
   onRemove,
   onChooseFolders,
+  freed,
+  onFreed,
 }: {
   doc: ScanDocument | undefined;
   error: CliError | undefined;
   scanning: boolean;
   roots: string[];
   home: string | undefined;
+  /** The filter and the chart's zoom live in the app, so both outlast a visit to a worktree's checks. */
+  filter: Filter;
+  onFilter: (filter: Filter) => void;
+  zoom: ZoomLevel[];
+  onZoom: (zoom: ZoomLevel[]) => void;
   selected: Set<string>;
   onSelect: (paths: string[], on: boolean) => void;
   onRescan: () => void;
   onOpen: (path: string) => void;
   onRemove: (paths: string[]) => void;
   onChooseFolders: () => void;
+  /** What residue freed in the last 7 days and its estimate note; "unavailable" when its stats could not be read, null while they are read. */
+  freed: { week: FreedSum; note: string } | "unavailable" | null;
+  onFreed: () => void;
 }) {
-  const [filter, setFilter] = useState<Filter>("all");
   const now = documentTime(doc?.generated_at) ?? 0;
 
   const repos = useMemo(() => {
@@ -151,7 +159,7 @@ export function Worktrees({
 
         {doc ? (
           <>
-            <Summary doc={doc} scanning={scanning} />
+            <Summary doc={doc} scanning={scanning} freed={freed} onFreed={onFreed} />
             {doc.errors.length > 0 ? <ScanErrors errors={doc.errors} /> : null}
             {doc.summary.linked_worktrees === 0 ? (
               <Empty
@@ -166,7 +174,7 @@ export function Worktrees({
                     size="sm"
                     tabs={FILTERS}
                     value={filter}
-                    onValueChange={(v) => setFilter(v as Filter)}
+                    onValueChange={(v) => onFilter(v as Filter)}
                   />
                 </div>
                 {repos.length === 0 ? (
@@ -176,19 +184,28 @@ export function Worktrees({
                       : "Every worktree can go."}
                   </p>
                 ) : (
-                  repos.map(({ repo, worktrees }) => (
-                    <RepoGroup
-                      key={repo.common_dir}
-                      repo={repo}
-                      worktrees={worktrees}
-                      home={home}
-                      now={now}
-                      selected={selected}
-                      onSelect={onSelect}
-                      onOpen={onOpen}
-                    />
-                  ))
+                  <Treemap
+                    doc={doc}
+                    filter={filter}
+                    now={now}
+                    busy={scanning}
+                    zoom={zoom}
+                    onZoom={onZoom}
+                    onOpen={onOpen}
+                  />
                 )}
+                {repos.map(({ repo, worktrees }) => (
+                  <RepoGroup
+                    key={repo.common_dir}
+                    repo={repo}
+                    worktrees={worktrees}
+                    home={home}
+                    now={now}
+                    selected={selected}
+                    onSelect={onSelect}
+                    onOpen={onOpen}
+                  />
+                ))}
               </>
             )}
           </>
@@ -214,7 +231,17 @@ export function Worktrees({
   );
 }
 
-function Summary({ doc, scanning }: { doc: ScanDocument; scanning: boolean }) {
+function Summary({
+  doc,
+  scanning,
+  freed,
+  onFreed,
+}: {
+  doc: ScanDocument;
+  scanning: boolean;
+  freed: { week: FreedSum; note: string } | "unavailable" | null;
+  onFreed: () => void;
+}) {
   const s = doc.summary;
   const a = doc.activity;
   return (
@@ -233,6 +260,23 @@ function Summary({ doc, scanning }: { doc: ScanDocument; scanning: boolean }) {
         <div>
           <dt>In the trash</dt>
           <dd>{plural(s.trash_entries, "entry", "entries")}</dd>
+        </div>
+        <div>
+          <dt>Freed, last 7 days</dt>
+          <dd>
+            {freed === null ? (
+              "reading…"
+            ) : freed === "unavailable" ? (
+              "unavailable"
+            ) : (
+              // The note says how residue measures sizes; the Freed screen shows it in full.
+              <button type="button" className="link-button" title={freed.note} onClick={onFreed}>
+                {freed.week.worktrees > 0
+                  ? `about ${bytes(freed.week.bytes)}, ${plural(freed.week.worktrees, "worktree")}`
+                  : "nothing"}
+              </button>
+            )}
+          </dd>
         </div>
         <div>
           <dt>Activity check</dt>

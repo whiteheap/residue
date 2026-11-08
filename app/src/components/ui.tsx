@@ -72,6 +72,25 @@ export function Flags({ flags }: { flags: string[] }) {
   );
 }
 
+/** A sentence the app writes, each `--option` in it kept on one line, as `Flags` keeps one. */
+export function FlagWords({ text }: { text: string }) {
+  const parts = text.split(/(--[a-z][a-z-]*)/);
+  return (
+    <>
+      {parts.map((part, i) =>
+        // The split alternates text and options; a part's index is its identity.
+        i % 2 === 1 ? (
+          <span key={i} className="flag">
+            {part}
+          </span>
+        ) : (
+          part
+        ),
+      )}
+    </>
+  );
+}
+
 const PERMISSION =/operation not permitted|permission denied/i;
 
 /** macOS privacy settings block a folder: the fix is in System Settings. */

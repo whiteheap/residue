@@ -1,22 +1,26 @@
 import { Button, Checkbox, Dialog } from "@cloudflare/kumo";
-import { ArrowClockwise, Eye, FolderPlus, Info } from "@phosphor-icons/react";
+import { ArrowClockwise, Eye, FolderPlus, Info, Warning } from "@phosphor-icons/react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { ErrorBoundary } from "../components/ErrorBoundary";
 import { Command, ErrorPanel, Flags, Loading, PageHeader, SolidButton, Toggle } from "../components/ui";
+import { Meter } from "../components/viz/Meter";
 import { api, asCliError } from "../lib/api";
-import { shellWord, tilde } from "../lib/format";
+import { baseName, bytes, plural, shellWord, someOf, tilde } from "../lib/format";
 import type {
   AppInfo,
   CliError,
+  ScanDocument,
   ServiceChange,
   ServicePlan,
   ServicePreview,
   ServiceProgram,
   ServiceStatus,
   WatchFetch,
+  WatchSettings,
 } from "../lib/types";
 import { useCli } from "../lib/useCli";
+import { cleanupLevels, diskMeters, type CleanupLevels, type DiskMeter } from "../lib/viz";
 import { diskLow, duration, fetchWords, settingFlags, settingLines } from "../lib/watch";
 
 export function Automatic({
@@ -25,12 +29,17 @@ export function Automatic({
   suggested,
   home,
   refreshKey,
+  scanDoc,
+  scanning,
 }: {
   info: AppInfo | null;
   roots: string[];
   suggested: string[];
   home: string | undefined;
   refreshKey: number;
+  /** The Worktrees scan, which reads each repository's free space. */
+  scanDoc: ScanDocument | undefined;
+  scanning: boolean;
 }) {
   const q = useCli(`service:${refreshKey}`, api.serviceStatus);
   const status: ServiceStatus | null = q.data ?? null;
@@ -164,6 +173,13 @@ export function Automatic({
           </section>
         ) : null}
 
+        <FreeSpace
+          doc={scanDoc}
+          scanning={scanning}
+          settings={status ? (on && program ? program.settings : status.plan.settings) : null}
+          on={on}
+        />
+
         {status ? <WhatItRemoves on={on} program={program} plan={status.plan} /> : null}
 
         {status ? (
@@ -265,6 +281,92 @@ function previewFetch(fetch: WatchFetch, done: boolean): string {
   }
 }
 
+/**
+ * One meter per disk the scanned repositories are on: how full it is, where
+ * automatic cleanup starts removing (below `--min-free`) and the free space
+ * it removes until. residue reads free space per repository; a newer residue
+ * says which disk each is on, an older one leaves equal totals to match on.
+ */
+function FreeSpace({
+  doc,
+  scanning,
+  settings,
+  on,
+}: {
+  doc: ScanDocument | undefined;
+  scanning: boolean;
+  settings: WatchSettings | null;
+  on: boolean;
+}) {
+  const { disks, unread } = useMemo(() => (doc ? diskMeters(doc) : { disks: [], unread: 0 }), [doc]);
+  const levels = settings ? cleanupLevels(settings) : null;
+  const byTotals = disks.some((d) => d.by === "totals");
+  return (
+    <section className="block" aria-labelledby="free-space-title" aria-busy={scanning}>
+      <h2 id="free-space-title">Free space</h2>
+      {!doc ? (
+        <p className="quiet">
+          {scanning ? "Free space appears when the scan finishes." : "Free space appears after a scan."}
+        </p>
+      ) : disks.length === 0 ? (
+        <p className="quiet">residue could not read the free space of any scanned repository.</p>
+      ) : (
+        <>
+          <div className="disks" data-busy={scanning}>
+            {disks.map((d) => (
+              <Disk key={d.key} disk={d} levels={levels} on={on} />
+            ))}
+          </div>
+          <p className="viz-caption">
+            The disks the scanned repositories are on, from the last scan.
+            {levels
+              ? ` The marks show where automatic cleanup starts removing idle worktrees and the free space it removes until${on ? "" : ", if you turn it on"}.`
+              : ""}
+            {byTotals
+              ? " This residue does not say which disk a repository is on, so repositories on disks of the same size show as one."
+              : ""}
+            {unread > 0 ? ` residue could not read the free space of ${plural(unread, "repository", "repositories")}.` : ""}
+          </p>
+        </>
+      )}
+    </section>
+  );
+}
+
+function Disk({ disk, levels, on }: { disk: DiskMeter; levels: CleanupLevels | null; on: boolean }) {
+  const name = someOf(disk.repos.map((r) => baseName(r.main_path)));
+  const free = `${bytes(disk.free)} free of ${bytes(disk.total)}, ${disk.freePercent.toFixed(1)}%`;
+  const low = levels !== null && disk.freePercent < levels.start;
+  return (
+    <div className="disk">
+      <p className="disk-name">{name}</p>
+      <Meter
+        value={disk.total - disk.free}
+        max={disk.total}
+        label={`Disk used, with ${name}`}
+        valueText={free}
+        ticks={
+          levels
+            ? [
+                { at: 1 - levels.start / 100, label: `starts below ${levels.start}% free`, side: "above" },
+                { at: 1 - levels.until / 100, label: `removes until ${levels.until}% free`, side: "below" },
+              ]
+            : []
+        }
+      />
+      <p className="disk-free num">{free}</p>
+      {low ? (
+        <p className="disk-low">
+          <Warning aria-hidden weight="bold" /> Below {levels.start}% free:{" "}
+          {on
+            ? "automatic cleanup removes idle worktrees at its next free-space read."
+            : "automatic cleanup would remove idle worktrees, if you turn it on."}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 /** What the service does, from its arguments; when it is off, what turning it on installs. */
 function WhatItRemoves({
   on,
@@ -301,10 +403,13 @@ function WhatItRemoves({
         running process stays. Automatic cleanup deletes the worktree instead of using the trash,
         because freeing the disk is its job. The branch and its commits stay, and a locked worktree
         stays. In each repository it removes from, it also deletes trash entries older than{" "}
-        {duration(settings.keep_trash.value)}, residue's default <Flags flags={["--keep-trash"]} />, and
-        forgets the removal records older than {duration(settings.keep_removed.value)},{" "}
+        {duration(settings.keep_trash.value)}, residue's default <Flags flags={["--keep-trash"]} />. It
+        keeps each removal record it writes for at least {duration(settings.keep_removed.value)},{" "}
         {settings.keep_removed.default ? "residue's default " : "its "}
-        <Flags flags={["--keep-removed"]} />. Until then, Restore recreates a worktree it deleted.
+        <Flags flags={["--keep-removed"]} />, and until a later removal forgets the record, Restore
+        recreates a worktree it deleted. No run forgets a record before the{" "}
+        <Flags flags={["--keep-removed"]} /> it was written with, and automatic cleanup forgets one
+        only once it is also older than its own.
       </p>
       <p className="hint">
         {set.length === 0 ? (

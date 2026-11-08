@@ -1,5 +1,6 @@
 import {
   ArrowsClockwise,
+  ChartBar,
   ClockCounterClockwise,
   FolderSimple,
   TreeStructure,
@@ -9,25 +10,30 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@cloudflare/kumo";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Mark } from "./components/Mark";
+import type { ZoomLevel } from "./components/viz/Treemap";
 import { ErrorPanel, Loading } from "./components/ui";
 import { api } from "./lib/api";
+import { rememberFreed, sinceLastOpen } from "./lib/freed";
 import { bytes } from "./lib/format";
 import type { Settings } from "./lib/types";
+import type { Filter } from "./lib/viz";
 import { useCli } from "./lib/useCli";
 import { Automatic } from "./views/Automatic";
 import { Detail } from "./views/Detail";
 import { Folders } from "./views/Folders";
+import { Freed } from "./views/Freed";
 import { RemoveDialog } from "./views/RemoveDialog";
 import { Restore } from "./views/Restore";
 import { Worktrees } from "./views/Worktrees";
 
-type View = "worktrees" | "restore" | "automatic" | "folders";
+type View = "worktrees" | "restore" | "automatic" | "freed" | "folders";
 
 const NAV: { view: View; label: string; icon: Icon; key: string }[] = [
   { view: "worktrees", label: "Worktrees", icon: TreeStructure, key: "1" },
   { view: "restore", label: "Restore", icon: ClockCounterClockwise, key: "2" },
   { view: "automatic", label: "Automatic cleanup", icon: ArrowsClockwise, key: "3" },
-  { view: "folders", label: "Folders", icon: FolderSimple, key: "4" },
+  { view: "freed", label: "Freed", icon: ChartBar, key: "4" },
+  { view: "folders", label: "Folders", icon: FolderSimple, key: "5" },
 ];
 
 const NO_ROOTS: string[] = [];
@@ -41,6 +47,9 @@ export function App() {
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [removing, setRemoving] = useState<string[] | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
+  // The Worktrees filter and chart zoom, kept here so leaving a worktree's checks returns to them.
+  const [filter, setFilter] = useState<Filter>("all");
+  const [zoom, setZoom] = useState<ZoomLevel[]>([]);
 
   const info = infoQ.data;
   const settings = saved ?? settingsQ.data;
@@ -56,11 +65,21 @@ export function App() {
   const scanDoc = scanQ.dataKey === rootsKey ? scanQ.data : undefined;
   const rescan = scanQ.reload;
 
+  // What residue has freed (`residue stats --json`): read at start, after
+  // each removal or restore, on Command-R and on Read again. It reads the
+  // ledger and the trash entries it names, never a worktree, so it is quick.
+  const statsQ = useCli(`stats:${refreshKey}`, api.stats);
+  const stats = statsQ.data;
+  const reloadStats = statsQ.reload;
+  useEffect(() => {
+    if (stats) rememberFreed(stats);
+  }, [stats]);
+
   // What opened the detail (`data-opener`), so leaving the detail returns
   // focus there, as a keyboard or screen reader user left it.
   const opener = useRef<string | null>(null);
   const open = useCallback((path: string) => {
-    const from = document.activeElement?.closest<HTMLElement>("[data-opener]");
+    const from = document.activeElement?.closest<HTMLElement | SVGElement>("[data-opener]");
     opener.current = from?.dataset.opener ?? `row:${path}`;
     setDetail(path);
   }, []);
@@ -68,17 +87,43 @@ export function App() {
     if (detail !== null || opener.current === null) return;
     const key = opener.current;
     opener.current = null;
-    document.querySelector<HTMLElement>(`[data-opener="${CSS.escape(key)}"]`)?.focus();
+    const selector = `[data-opener="${CSS.escape(key)}"]`;
+    const find = () => document.querySelector<HTMLElement | SVGElement>(selector);
+    const found = find();
+    if (found) {
+      found.focus();
+      return;
+    }
+    // A chart tile is drawn once the chart has measured its width, a frame
+    // or two after the screen: focus it when it appears, for a moment only.
+    const watch = new MutationObserver(() => {
+      const el = find();
+      if (el) {
+        watch.disconnect();
+        el.focus();
+      }
+    });
+    watch.observe(document.body, { childList: true, subtree: true });
+    const stop = window.setTimeout(() => watch.disconnect(), 2000);
+    return () => {
+      watch.disconnect();
+      window.clearTimeout(stop);
+    };
   }, [detail]);
 
-  const go = useCallback((v: View) => {
-    // Another screen: nothing on it opened a detail.
-    opener.current = null;
-    setView(v);
-    setDetail(null);
-  }, []);
+  const go = useCallback(
+    (v: View) => {
+      // Another screen: nothing on it opened a detail.
+      opener.current = null;
+      setView(v);
+      setDetail(null);
+      // The service may have freed something since the last read.
+      if (v === "freed") reloadStats();
+    },
+    [reloadStats],
+  );
 
-  // Command-1..4 switch screens, Command-R refreshes, Escape leaves a detail.
+  // Command-1..5 switch screens, Command-R refreshes, Escape leaves a detail.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (removing) return;
@@ -207,12 +252,18 @@ export function App() {
                   scanning={scanQ.loading}
                   roots={roots}
                   home={home}
+                  filter={filter}
+                  onFilter={setFilter}
+                  zoom={zoom}
+                  onZoom={setZoom}
                   selected={selected}
                   onSelect={select}
                   onRescan={rescan}
                   onOpen={open}
                   onRemove={setRemoving}
                   onChooseFolders={() => go("folders")}
+                  freed={stats ? { week: stats.freed.last_7_days, note: stats.estimate_note } : statsQ.error ? "unavailable" : null}
+                  onFreed={() => go("freed")}
                 />
               )
             ) : view === "restore" ? (
@@ -222,7 +273,10 @@ export function App() {
                 keepTrash={info?.default_keep_trash}
                 keepRemoved={info?.default_keep_removed}
                 refreshKey={refreshKey}
-                onRestored={rescan}
+                onRestored={() => {
+                  rescan();
+                  reloadStats();
+                }}
               />
             ) : view === "automatic" ? (
               <Automatic
@@ -231,6 +285,17 @@ export function App() {
                 suggested={settings.suggested}
                 home={home}
                 refreshKey={refreshKey}
+                scanDoc={scanDoc}
+                scanning={scanQ.loading}
+              />
+            ) : view === "freed" ? (
+              <Freed
+                doc={stats}
+                error={statsQ.error}
+                loading={statsQ.loading}
+                sinceOpen={stats ? sinceLastOpen(stats) : null}
+                home={home}
+                onReload={reloadStats}
               />
             ) : (
               <Folders settings={settings} home={home} onSaved={setSaved} />
@@ -246,10 +311,12 @@ export function App() {
           onClose={() => {
             setRemoving(null);
             rescan();
+            reloadStats();
           }}
         >
           <RemoveDialog
             paths={removing}
+            estimateNote={stats?.estimate_note}
             home={home}
             onClose={() => setRemoving(null)}
             onRemoved={(doc) => {
@@ -257,6 +324,7 @@ export function App() {
               setSelected((sel) => new Set([...sel].filter((p) => !moved.has(p))));
               if (detail && moved.has(detail)) setDetail(null);
               rescan();
+              reloadStats();
             }}
           />
         </ErrorBoundary>

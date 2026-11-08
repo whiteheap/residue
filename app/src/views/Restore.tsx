@@ -1,13 +1,15 @@
 import { Button, Empty } from "@cloudflare/kumo";
 import { ArrowClockwise, ArrowCounterClockwise, ClockCounterClockwise } from "@phosphor-icons/react";
 import { useState } from "react";
-import { ErrorPanel, Loading, PageHeader } from "../components/ui";
+import { ErrorPanel, Flags, FlagWords, Loading, PageHeader } from "../components/ui";
+import { Meter } from "../components/viz/Meter";
 import { api, asCliError } from "../lib/api";
-import { ageOf, baseName, bytes, shortBranch, shortHead, tilde } from "../lib/format";
+import { ageOf, baseName, bytes, plural, shortBranch, shortHead, tilde } from "../lib/format";
 import { removedBy, sized } from "../lib/records";
 import type { CliError, Listing, Restorable, RestoreDocument } from "../lib/types";
 import { documentTime, useCli } from "../lib/useCli";
-import { duration } from "../lib/watch";
+import { type TrashAge, trashAge, trashTotals } from "../lib/viz";
+import { duration, durationSeconds } from "../lib/watch";
 
 /** Everything the listings return, once each, newest first. */
 function restorables(listings: Listing[]): Restorable[] {
@@ -48,6 +50,8 @@ function restorables(listings: Listing[]): Restorable[] {
         notKept: r.not_kept,
         asidePath: r.aside_path,
         incomplete: r.incomplete,
+        keep: r.keep,
+        keepSeconds: r.keep_seconds,
       });
     }
   }
@@ -65,6 +69,23 @@ function recordNote(item: Extract<Restorable, { kind: "removed" }>, home: string
   return `Restore recreates its tracked files from its commits, not the ignored files the deletion took: ${item.notKept
     .map(sized)
     .join(", ")}. Your project's install or build makes them again.`;
+}
+
+/**
+ * How long a removal record is kept at least: no run forgets it before the
+ * --keep-removed it was written with has passed since its removal, and none
+ * forgets one whose removal did not finish. Null for a record without that
+ * value (written before residue kept it) or without a time.
+ */
+function recordKeep(
+  item: Extract<Restorable, { kind: "removed" }>,
+  now: number | null,
+): { age: TrashAge; keep: string; until: string } | null {
+  if (item.error || item.state !== "removed" || !item.keep || item.keepSeconds == null || !item.at) return null;
+  const age = trashAge(item.at, now, item.keepSeconds);
+  if (!age) return null;
+  const until = new Date(Date.parse(item.at) + item.keepSeconds * 1000);
+  return { age, keep: item.keep, until: until.toLocaleDateString(undefined, { dateStyle: "medium" }) };
 }
 
 /** How a restored worktree came back, in words. */
@@ -141,20 +162,25 @@ export function Restore({
   };
 
   const items = listings ? restorables(listings) : [];
-  const trashed = items.some((i) => i.kind === "trash");
+  const totals = trashTotals(items);
+  const trashed = totals.entries > 0;
   // Ages count to when residue listed them.
   const now = documentTime(listings?.find((l) => l.document)?.document?.generated_at);
+  // The keep window in force: the app's removals and the service both use residue's default.
+  const keepSeconds = keepTrash ? durationSeconds(keepTrash) : null;
   const failed = (listings ?? []).filter((l) => l.error);
   const listErrors = (listings ?? []).flatMap((l) => l.document?.errors ?? []);
+  // Each record keeps the --keep-removed it was written with (#55): the app's removals write residue's default, automatic cleanup the
+  // service's own, and a later removal forgets a record only once it is
+  // older than both that value and the removal's own.
   const appKeep = keepRemoved
-    ? `${duration(keepRemoved)}, residue's default --keep-removed`
-    : "residue's default --keep-removed";
-  // Automatic cleanup forgets records after its own --keep-removed, which
-  // the service's arguments set or residue's default supplies.
+    ? `${duration(keepRemoved)} for the app's removals, residue's default`
+    : "residue's default for the app's removals";
   const service = serviceQ.data?.installed ? (serviceQ.data.program?.settings.keep_removed ?? null) : null;
-  const forgets = service
-    ? `The app's removals forget the records older than ${appKeep}, and automatic cleanup those older than ${duration(service.value)}, ${service.default ? "residue's default, since the service sets none" : "the service's --keep-removed"}, each in the repositories it removes from.`
-    : `A removal in its repository forgets the records older than ${appKeep}, which the app's removals use.`;
+  const serviceKeep = service
+    ? `, and ${duration(service.value)} for automatic cleanup, ${service.default ? "residue's default too, since the service sets none" : "the service's"}`
+    : "";
+  const forgets = `Each removal keeps the records it writes for at least its --keep-removed: ${appKeep}${serviceKeep}. A later removal in the same repository forgets a record only once it is older than both the --keep-removed it was written with and its own.`;
 
   return (
     <>
@@ -219,6 +245,13 @@ export function Restore({
           />
         ) : (
           <>
+            {trashed ? (
+              <p className="stat-line">
+                <strong className="num">{bytes(totals.bytes)}</strong> reclaimable in{" "}
+                {plural(totals.entries, "trash entry", "trash entries")}
+                {totals.unmeasured > 0 ? `, ${totals.unmeasured} not measured` : ""}
+              </p>
+            ) : null}
             <ul className="rows restore-rows">
               {items.map((item) => {
                 const name = baseName(item.originalPath ?? item.name);
@@ -227,6 +260,8 @@ export function Restore({
                 const note = item.kind === "removed" && !item.error ? recordNote(item, home) : null;
                 // residue cannot restore from a record it cannot read.
                 const restorable = item.kind === "trash" || (!item.error && !item.incomplete);
+                const kept = item.kind === "trash" && !item.error ? trashAge(item.at, now, keepSeconds) : null;
+                const held = item.kind === "removed" ? recordKeep(item, now) : null;
                 return (
                   <li key={item.entryPath} className="row" data-kind={item.kind}>
                     <span className="row-main static">
@@ -248,6 +283,46 @@ export function Restore({
                                 .filter(Boolean)
                                 .join(" ")}
                       </span>
+                      {kept && keepTrash ? (
+                        <span className="row-age">
+                          <Meter
+                            size="thin"
+                            value={kept.seconds}
+                            max={kept.keep}
+                            label={`Time in the trash, against --keep-trash ${keepTrash}`}
+                            valueText={
+                              kept.eligible
+                                ? `past ${duration(keepTrash)}`
+                                : `${Math.round(kept.fraction * 100)}% of ${duration(keepTrash)}`
+                            }
+                          />
+                          <span>
+                            {kept.eligible
+                              ? `past ${duration(keepTrash)}: the next cleanup in its repository deletes it and leaves a removal record`
+                              : `the first cleanup after ${duration(keepTrash)} deletes it and leaves a removal record`}
+                          </span>
+                        </span>
+                      ) : null}
+                      {held ? (
+                        <span className="row-age">
+                          <Meter
+                            size="thin"
+                            value={held.age.seconds}
+                            max={held.age.keep}
+                            label={`Time since its removal, against the --keep-removed ${held.keep} it was written with`}
+                            valueText={
+                              held.age.eligible
+                                ? `past ${duration(held.keep)}`
+                                : `${Math.round(held.age.fraction * 100)}% of ${duration(held.keep)}`
+                            }
+                          />
+                          <span>
+                            {held.age.eligible
+                              ? `past its ${duration(held.keep)}: a later removal can forget it`
+                              : `restorable until at least ${held.until}, ${duration(held.keep)} after its removal`}
+                          </span>
+                        </span>
+                      ) : null}
                       <span className="row-path">{tilde(item.originalPath ?? item.entryPath, home)}</span>
                       {note ? <span className="row-note">{note}</span> : null}
                     </span>
@@ -278,7 +353,8 @@ export function Restore({
                 {trashed ? (
                   <p className="hint">
                     A trashed worktree still takes its disk space. The next removal or automatic
-                    cleanup in its repository deletes the entries older than its --keep-trash
+                    cleanup in its repository deletes the entries older than its{" "}
+                    <Flags flags={["--keep-trash"]} />
                     {keepTrash
                       ? `: ${duration(keepTrash)}, residue's default, which the app and automatic cleanup use`
                       : ""}
@@ -288,7 +364,7 @@ export function Restore({
                 <p className="hint">
                   A removal record takes almost no space. Restore recreates the worktree from it with
                   git worktree add, on its branch and HEAD, and refuses when something is at its
-                  path. {forgets} A forgotten record cannot be restored.
+                  path. <FlagWords text={forgets} /> A forgotten record cannot be restored.
                 </p>
               </>
             ) : null}
