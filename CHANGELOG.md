@@ -9,6 +9,7 @@
 - On macOS, each Git call residue makes starts sooner and costs less CPU. residue runs Git's own binary by its path, not through Apple's `/usr/bin/git` launcher, unless another `git` comes first on PATH or `GIT_EXEC_PATH` is set. The wait between one Git call and the next fell from a median of 17 to 34 ms to 7 to 17 ms, and `explain` of a 98,466-entry worktree used 0.17 to 0.23 s of user CPU, down from 0.21 to 0.29 s (#81).
 - The Mac app's text is brief: short headings, a sentence or two under each, buttons that name what they do, and every caveat kept beside its action. Restore and Automatic cleanup move the rules on forgetting removal records into a disclosure. Restore shows about 25% fewer words, Automatic cleanup about 30% fewer (#77).
 - The Mac app uses less CPU and memory. Moving the pointer over the Worktrees map redraws only its tooltip, a long list of worktrees is drawn only where you can see it, its stylesheet is half the size, and it keeps residue's reports as text instead of parsing them twice (#75).
+- On macOS, `explain` run from inside a worktree no longer names lsof as a process using it: lsof now runs in `/`. residue counts the running processes with `proc_listallpids` in place of starting `ps`, so a snapshot starts one program, not two, and a process whose working directory or files lsof could not read no longer counts as inspected (#85).
 
 ## 0.0.9 (2026-11-08)
 
