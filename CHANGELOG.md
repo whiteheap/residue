@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- residue's `git status` calls use about half as much CPU, and take no longer. They turn off Git's `core.preloadIndex`, whose threads contend in the kernel. A `scan` of 10 worktrees used 17 to 19 s of system CPU, down from 35 to 40 s (#75).
+
 ## 0.0.9 (2026-11-08)
 
 Faster size measurement on macOS, and a true line when residue has not counted any freed space yet.
