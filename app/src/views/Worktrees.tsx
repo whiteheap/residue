@@ -1,5 +1,5 @@
 import { Button, Checkbox, Empty, Tabs } from "@cloudflare/kumo";
-import { ArrowClockwise, CaretRight, FolderPlus, Trash } from "@phosphor-icons/react";
+import { ArrowClockwise, ArrowsClockwise, CaretRight, FolderPlus, Trash } from "@phosphor-icons/react";
 import { useId, useMemo } from "react";
 import { Treemap, type ZoomLevel } from "../components/viz/Treemap";
 import {
@@ -13,6 +13,7 @@ import {
   isPermissionError,
 } from "../components/ui";
 import { baseName, bytes, inside, plural, tilde } from "../lib/format";
+import { localTime } from "../lib/freed";
 import type { CliError, FreedSum, Repository, ScanDocument, Worktree } from "../lib/types";
 import { documentTime } from "../lib/useCli";
 import { matches, type Filter } from "../lib/viz";
@@ -42,6 +43,7 @@ export function Worktrees({
   onRemove,
   onChooseFolders,
   freed,
+  cleaned,
   onFreed,
 }: {
   doc: ScanDocument | undefined;
@@ -62,6 +64,8 @@ export function Worktrees({
   onChooseFolders: () => void;
   /** What residue freed in the last 7 days and its estimate note; "unavailable" when its stats could not be read, null while they are read. */
   freed: { week: FreedSum; note: string } | "unavailable" | null;
+  /** What automatic cleanup freed since the app was last open (`cleanedSinceLastOpen`), with the estimate note; null when there is nothing to say. */
+  cleaned: (FreedSum & { since: string; note: string }) | null;
   onFreed: () => void;
 }) {
   const now = documentTime(doc?.generated_at) ?? 0;
@@ -114,6 +118,7 @@ export function Worktrees({
       <>
         {header}
         <div className="page-body">
+          <SinceOpen cleaned={cleaned} onFreed={onFreed} />
           <Empty
             icon={<FolderPlus size={32} />}
             title="No folders to scan"
@@ -133,6 +138,7 @@ export function Worktrees({
     <>
       {header}
       <div className="page-body" aria-busy={scanning}>
+        <SinceOpen cleaned={cleaned} onFreed={onFreed} />
         {error ? (
           <ErrorPanel
             title="The scan did not finish"
@@ -228,6 +234,39 @@ export function Worktrees({
         </footer>
       ) : null}
     </>
+  );
+}
+
+/**
+ * What automatic cleanup freed while the app was closed, said once the
+ * stats arrive, so nobody has to open Freed to learn it. The status region
+ * (`<output>`: role status, polite) is always there, empty until then, so
+ * a screen reader hears the line when it fills; an empty one takes no room
+ * (`.since-open:empty`).
+ */
+function SinceOpen({
+  cleaned,
+  onFreed,
+}: {
+  cleaned: (FreedSum & { since: string; note: string }) | null;
+  onFreed: () => void;
+}) {
+  return (
+    <output className="since-open" aria-live="polite">
+      {cleaned ? (
+        <>
+          <ArrowsClockwise size={16} aria-hidden className="since-open-icon" />
+          <span>
+            Automatic cleanup freed{" "}
+            <span className="since-open-figure num">about {bytes(cleaned.bytes)}</span>,{" "}
+            {plural(cleaned.worktrees, "worktree")}, since the app was last open on {localTime(cleaned.since)}.
+          </span>
+          <button type="button" className="link-button" title={cleaned.note} onClick={onFreed}>
+            Open Freed
+          </button>
+        </>
+      ) : null}
+    </output>
   );
 }
 

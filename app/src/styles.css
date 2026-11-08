@@ -299,9 +299,11 @@
 }
 
 .page-body {
+  --page-gap: 1.25rem;
+
   display: flex;
   flex-direction: column;
-  gap: 1.25rem;
+  gap: var(--page-gap);
   min-block-size: 0;
   padding-block: 1.25rem 2.5rem;
   padding-inline: var(--pad-x);
@@ -624,6 +626,37 @@ dd {
 
 .notice p + ul {
   margin-block-start: 0.35rem;
+}
+
+/* What automatic cleanup freed since the app was last open. The status
+   region stays in place while empty, so a screen reader hears it fill; its
+   negative margin takes back the page's gap, so an empty one takes no room. */
+.since-open {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.75rem;
+  margin: 0;
+  padding: 0.75rem 1.1rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+
+.since-open:empty {
+  padding: 0;
+  border: 0;
+  margin-block-end: calc(-1 * var(--page-gap));
+}
+
+.since-open-icon {
+  flex: none;
+  color: var(--fg);
+}
+
+.since-open-figure {
+  color: var(--fg);
 }
 
 .notice.dev {
@@ -1552,6 +1585,13 @@ li:not([data-result="trashed"]) > .plan-result {
 
 .link-button:active {
   opacity: 0.7;
+}
+
+/* "Show the other N": a quiet line under a list, never stretched across it. */
+.link-button.more {
+  justify-self: start;
+  color: var(--muted);
+  font-size: 0.75rem;
 }
 
 .disks {

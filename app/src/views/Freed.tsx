@@ -1,11 +1,12 @@
 import { Button, Empty } from "@cloudflare/kumo";
 import { ArrowClockwise, ChartBar } from "@phosphor-icons/react";
+import { useState } from "react";
 import { Columns, WeekTable } from "../components/viz/Columns";
 import { Figure } from "../components/viz/Figure";
 import { Ranked } from "../components/viz/Ranked";
 import { ErrorPanel, Loading, PageHeader } from "../components/ui";
 import { bytes, plural, tilde } from "../lib/format";
-import { COMMANDS, localDay } from "../lib/freed";
+import { COMMANDS, localDay, localTime } from "../lib/freed";
 import type { CliError, FreedSum, StatsDocument } from "../lib/types";
 
 /**
@@ -67,7 +68,7 @@ export function Freed({
                     <Kpi
                       label="Since the app was last open"
                       sum={sinceOpen}
-                      note={new Date(sinceOpen.since).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}
+                      note={localTime(sinceOpen.since)}
                     />
                   ) : null}
                 </dl>
@@ -114,13 +115,15 @@ export function Freed({
                       label: c.label,
                       sum: doc.freed.all_time.by[c.by],
                       note: last
-                        ? `last ${new Date(last).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}`
+                        ? `last ${localTime(last)}`
                         : null,
                     };
                   })}
                 />
               </section>
             ) : null}
+
+            {freedAny && doc.repositories.length > 0 ? <Repositories repos={doc.repositories} home={home} /> : null}
 
             <Trash doc={doc} home={home} />
           </>
@@ -140,6 +143,39 @@ function Kpi({ label, sum, note }: { label: string; sum: FreedSum; note?: string
         {note ? `, since ${note}` : ""}
       </dd>
     </div>
+  );
+}
+
+/** How many repositories the list shows before "Show the other N". */
+const REPOS_SHOWN = 8;
+
+/**
+ * Each repository residue freed space in, most first, as `residue stats`
+ * lists them (`repositories`). Past the first eight, the rest wait behind
+ * one button, so a machine with many repositories keeps the trash in view.
+ */
+function Repositories({ repos, home }: { repos: StatsDocument["repositories"]; home: string | undefined }) {
+  const [all, setAll] = useState(false);
+  const shown = all ? repos : repos.slice(0, REPOS_SHOWN);
+  const hidden = repos.length - REPOS_SHOWN;
+  return (
+    <section className="block" aria-labelledby="freed-repos">
+      <h2 id="freed-repos">By repository, all time</h2>
+      <Ranked
+        label="Freed by repository, all time"
+        items={shown.map((r) => ({
+          key: r.common_dir,
+          label: tilde(r.path, home),
+          sum: r,
+          note: `last ${localTime(r.last_freed_at)}`,
+        }))}
+      />
+      {hidden > 0 ? (
+        <button type="button" className="link-button more" aria-expanded={all} onClick={() => setAll((a) => !a)}>
+          {all ? `Show the first ${REPOS_SHOWN} only` : `Show the other ${plural(hidden, "repository", "repositories")}`}
+        </button>
+      ) : null}
+    </section>
   );
 }
 

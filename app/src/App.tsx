@@ -13,7 +13,7 @@ import { Mark } from "./components/Mark";
 import type { ZoomLevel } from "./components/viz/Treemap";
 import { ErrorPanel, Loading } from "./components/ui";
 import { api } from "./lib/api";
-import { rememberFreed, sinceLastOpen } from "./lib/freed";
+import { cleanedSinceLastOpen, rememberFreed, sinceLastOpen } from "./lib/freed";
 import { bytes } from "./lib/format";
 import type { Settings } from "./lib/types";
 import type { Filter } from "./lib/viz";
@@ -74,6 +74,11 @@ export function App() {
   useEffect(() => {
     if (stats) rememberFreed(stats);
   }, [stats]);
+  // What automatic cleanup freed while the app was closed: the line the
+  // Worktrees screen opens with. The app's own removals are by hand, so a
+  // removal in this session never adds to it.
+  const cleanedSum = stats ? cleanedSinceLastOpen(stats) : null;
+  const cleaned = cleanedSum && stats ? { ...cleanedSum, note: stats.estimate_note } : null;
 
   // What opened the detail (`data-opener`), so leaving the detail returns
   // focus there, as a keyboard or screen reader user left it.
@@ -263,6 +268,7 @@ export function App() {
                   onRemove={setRemoving}
                   onChooseFolders={() => go("folders")}
                   freed={stats ? { week: stats.freed.last_7_days, note: stats.estimate_note } : statsQ.error ? "unavailable" : null}
+                  cleaned={cleaned}
                   onFreed={() => go("freed")}
                 />
               )
