@@ -45,8 +45,10 @@
 //! project's own install makes them again. The record and its refs are
 //! dropped only once the restored worktree holds everything they held.
 //!
-//! A record and its refs expire after `--keep-removed` (default 30 days):
-//! every remove run forgets them too, after the same confirmation. residue
+//! A record and its refs expire after `--keep-removed` (default 30 days),
+//! which the record keeps (`keep`): every remove run forgets them too,
+//! after the same confirmation, once they are older than both its own
+//! `--keep-removed` and the record's (`Item::expired`). residue
 //! deletes a ref only under `refs/residue/`, only one a record names, and
 //! only while it still points where the record says. Once they are gone, a
 //! commit only they held (a branch deleted after a squash merge, work only
@@ -162,6 +164,15 @@ impl By {
     }
 }
 
+/// How long a record is kept, as the removal that wrote it was told:
+/// `keep SECONDS TEXT` in `info`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Keep {
+    pub seconds: i64,
+    /// As the user wrote it: `12w`.
+    pub text: String,
+}
+
 /// An ignored entry the deletion took, as the plan measured it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Gone {
@@ -213,6 +224,10 @@ pub struct Record {
     pub by: Option<String>,
     /// Unix seconds.
     pub removed: i64,
+    /// The `--keep-removed` of the removal that wrote it: no run forgets
+    /// it before then (`Item::expired`). `None` for a record written
+    /// before residue kept it.
+    pub keep: Option<Keep>,
     pub allocated: Option<u64>,
     pub reclaimable: Option<u64>,
     /// The ignored entries the deletion took.
@@ -288,6 +303,9 @@ impl Record {
             "removed",
             format!("{} {}", self.removed, output::rfc3339(self.removed)).as_bytes(),
         );
+        if let Some(k) = &self.keep {
+            line("keep", format!("{} {}", k.seconds, k.text).as_bytes());
+        }
         if let Some(n) = self.allocated {
             line("allocated", n.to_string().as_bytes());
         }
@@ -323,6 +341,7 @@ impl Record {
             reason: String::new(),
             by: None,
             removed: 0,
+            keep: None,
             allocated: None,
             reclaimable: None,
             gone: Vec::new(),
@@ -357,6 +376,20 @@ impl Record {
                 b"reason" => record.reason = text(),
                 b"by" => record.by = Some(text()),
                 b"removed" => removed = Some(number("removed")?),
+                b"keep" => {
+                    let t = text();
+                    let keep = t
+                        .split_once(' ')
+                        .filter(|(_, shown)| !shown.is_empty())
+                        .and_then(|(seconds, shown)| {
+                            let seconds = seconds.parse::<i64>().ok().filter(|s| *s > 0)?;
+                            Some(Keep {
+                                seconds,
+                                text: shown.to_string(),
+                            })
+                        });
+                    record.keep = Some(keep.ok_or("keep is not SECONDS DURATION")?);
+                }
                 b"allocated" => record.allocated = number("allocated")?.try_into().ok(),
                 b"reclaimable" => record.reclaimable = number("reclaimable")?.try_into().ok(),
                 b"deleted" => {
@@ -477,19 +510,16 @@ impl Item {
         self.registered.is_some()
     }
 
-    /// An interrupted removal whose HEAD Git can no longer read: a `git
-    /// worktree remove` that failed part way deleted it. Git can neither
-    /// move nor remove that worktree, so restore cannot move it back.
-    pub fn head_gone(&self) -> bool {
-        self.registered.as_ref().is_some_and(|e| {
-            e.head
-                .as_deref()
-                .is_none_or(|h| h.bytes().all(|b| b == b'0'))
+    /// A run with `--keep-removed` of `keep` seconds forgets this record:
+    /// it is at least that old and at least as old as the `--keep-removed`
+    /// of the removal that wrote it, so no run forgets a record before the
+    /// time it was written with. A record with no `keep` line (residue
+    /// 0.0.7 and earlier) has only the run's.
+    pub fn expired(&self, now: i64, keep: i64) -> bool {
+        self.record.as_ref().ok().is_some_and(|r| {
+            let own = r.keep.as_ref().map_or(0, |k| k.seconds);
+            now - r.removed >= keep.max(own)
         })
-    }
-
-    pub fn age(&self, now: i64) -> Option<i64> {
-        self.record.as_ref().ok().map(|r| now - r.removed)
     }
 
     pub fn state(&self) -> &'static str {
@@ -1165,6 +1195,22 @@ fn holds(
     }
 }
 
+/// How to clear what is left of a worktree Git can no longer use, so that
+/// restore can recreate it: lift residue's lock when it holds one, delete
+/// the directory, and let Git drop its record.
+fn clear_steps(main: &Path, aside: &Path, ours: bool) -> String {
+    let git = format!("git -C {} worktree", output::shell(main));
+    let unlock = if ours {
+        format!("run `{git} unlock {}`, ", output::shell(aside))
+    } else {
+        String::new()
+    };
+    format!(
+        "{unlock}delete {}, run `{git} prune`, then run this restore again",
+        aside.display()
+    )
+}
+
 /// A worktree an interrupted run left where the deletion started: move it
 /// back with `git worktree move`, the same command `residue scan` prints
 /// for an interrupted removal.
@@ -1193,7 +1239,18 @@ fn move_back(
             aside.display()
         ));
     };
+    let ours = registered.locked.as_deref() == Some(crate::remove::REMOVING);
     if left.running {
+        // Git refuses to move a worktree it can no longer use, so there is
+        // no command to run while that process may be removing it. PIDs are
+        // reused, so the process may be another one that never exits.
+        if let Some(why) = &left.unusable {
+            return Err(format!(
+                "process {pid} still runs, so residue may still be removing it, and Git can no longer use it ({why}); once that process has exited, run this restore again: it says what to clear; if it is not residue (`ps -p {pid}` shows what it is): {}",
+                clear_steps(main, aside, ours),
+                pid = left.pid
+            ));
+        }
         return Err(format!(
             "process {} still runs, so residue may still be removing it; if it is not residue, put it back with: {}",
             left.pid, left.recovery
@@ -1205,7 +1262,6 @@ fn move_back(
             left.recovery
         ));
     }
-    let ours = registered.locked.as_deref() == Some(crate::remove::REMOVING);
     if registered.locked.is_some() && !ours {
         return Err(format!(
             "it is locked by someone else ({}); residue leaves that lock alone",
@@ -1241,16 +1297,12 @@ fn move_back(
         // Git then can neither move nor remove it. The record still keeps
         // its HEAD and reflog, so once Git's leftovers are cleared, this
         // restore recreates it.
-        if let Err(why) = git::identity(aside) {
-            let git = format!("git -C {} worktree", output::shell(main));
-            let unlock = if ours {
-                format!("run `{git} unlock {}`, ", output::shell(aside))
-            } else {
-                String::new()
-            };
+        // A `.git` file it lost leaves `git rev-parse` to find the repository
+        // above it, so that answer alone does not show it.
+        if let Some(why) = git::identity(aside).err().or_else(|| left.unusable.clone()) {
             return Err(format!(
-                "{e}; Git can no longer use it ({why}), so it can neither move it back nor remove it; the record keeps its HEAD and reflog: {unlock}delete {}, run `{git} prune`, then run this restore again",
-                aside.display()
+                "{e}; Git can no longer use it ({why}), so it can neither move it back nor remove it; the record keeps its HEAD and reflog: {}",
+                clear_steps(main, aside, ours)
             ));
         }
         return Err(e);
@@ -1547,6 +1599,18 @@ pub fn item_json(item: &Item) -> Json {
             "removed_at",
             Json::opt(r.map(|r| r.removed), |t| Json::str(output::rfc3339(t))),
         ),
+        // The `--keep-removed` it was written with; null for a record
+        // written before residue kept it.
+        (
+            "keep",
+            Json::opt(r.and_then(|r| r.keep.as_ref()), |k| {
+                Json::str(k.text.clone())
+            }),
+        ),
+        (
+            "keep_seconds",
+            Json::opt(r.and_then(|r| r.keep.as_ref()), |k| Json::Int(k.seconds)),
+        ),
         (
             "allocated_bytes",
             Json::opt(r.and_then(|r| r.allocated), Json::UInt),
@@ -1609,6 +1673,10 @@ mod tests {
             reason: Reason::WatchLanded.code().into(),
             by: Some(By::Watch.code().into()),
             removed: 1_794_000_000,
+            keep: Some(Keep {
+                seconds: 12 * 604_800,
+                text: "12w".into(),
+            }),
             allocated: Some(4096),
             reclaimable: Some(2048),
             gone: vec![
@@ -1648,6 +1716,48 @@ mod tests {
         let text = r.render("fix-20261107T040000Z");
         assert!(!text.split(|b| *b == b'\n').any(|l| l.starts_with(b"by ")));
         assert_eq!(Record::parse(&text).unwrap(), r);
+    }
+
+    /// A record residue 0.0.7 wrote has no `keep` line: it reads, and only
+    /// the run's `--keep-removed` decides when it is forgotten.
+    #[test]
+    fn keep_is_the_floor_of_every_run() {
+        let item = |keep: Option<Keep>| Item {
+            name: "x".into(),
+            dir: PathBuf::from("/src/app/.git/residue-removed/x"),
+            common_dir: PathBuf::from("/src/app/.git"),
+            command_dir: PathBuf::from("/src/app"),
+            record: Ok(Record { keep, ..sample() }),
+            incomplete: false,
+            worktree_config: false,
+            head_reflog: false,
+            modified: None,
+            registered: None,
+        };
+        let day = 86_400;
+        let removed = sample().removed;
+        let twelve_weeks = item(sample().keep);
+        // A plain run (30d) on day 31 leaves a record written with 12w.
+        assert!(!twelve_weeks.expired(removed + 31 * day, 30 * day));
+        assert!(!twelve_weeks.expired(removed + 84 * day - 1, 30 * day));
+        assert!(twelve_weeks.expired(removed + 84 * day, 30 * day));
+        // A run with a longer --keep-removed still waits for its own.
+        assert!(!twelve_weeks.expired(removed + 84 * day, 100 * day));
+        let old = item(None);
+        assert!(old.expired(removed + 30 * day, 30 * day));
+        assert!(!old.expired(removed + 30 * day - 1, 30 * day));
+
+        let full = String::from_utf8(sample().render("x")).unwrap();
+        let without: String = full
+            .lines()
+            .filter(|l| !l.starts_with("keep "))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(Record::parse(without.as_bytes()).unwrap().keep, None);
+        for bad in ["keep 0 0d", "keep 12w", "keep -5 1d", "keep 7257600"] {
+            let text = full.replace("keep 7257600 12w", bad);
+            assert!(Record::parse(text.as_bytes()).is_err(), "{bad}");
+        }
     }
 
     #[test]

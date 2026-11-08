@@ -98,8 +98,17 @@ pub struct Leftover {
     /// Its directory is still there. If residue stopped during the delete,
     /// part of it may already be gone.
     pub present: bool,
-    /// The one line that recovers it: moves it back, or clears Git's
-    /// record when the directory is gone.
+    /// Why Git can no longer use it, when its directory is there and Git
+    /// cannot (`unusable`): Git then refuses to move it back or remove it.
+    pub unusable: Option<String>,
+    /// The removal record that names it, which `residue restore` takes
+    /// (`with_record`).
+    pub record: Option<PathBuf>,
+    /// The one line that recovers it: moves it back, clears Git's record
+    /// when the directory is gone, or, when Git can no longer use it, the
+    /// `residue restore` of its record, which says what to clear first.
+    /// Empty when Git can no longer use it and no record names it: no one
+    /// command brings it back. Never a deletion.
     pub recovery: String,
 }
 
@@ -107,6 +116,7 @@ impl Leftover {
     pub fn of(entry: &Entry, main: &Path) -> Option<Leftover> {
         let (original, pid) = parse_aside(&entry.path)?;
         let present = fs::symlink_metadata(&entry.path).is_ok();
+        let unusable = unusable(entry);
         let git = format!("git -C {} worktree", output::shell(main));
         let path = output::shell(&entry.path);
         let unlock = if entry.locked.as_deref() == Some(REMOVING) {
@@ -114,7 +124,9 @@ impl Leftover {
         } else {
             String::new()
         };
-        let recovery = if present {
+        let recovery = if unusable.is_some() {
+            String::new()
+        } else if present {
             format!("{unlock}{git} move {path} {}", output::shell(&original))
         } else {
             format!("{unlock}{git} remove {path}")
@@ -125,31 +137,57 @@ impl Leftover {
             pid,
             running: running(pid),
             present,
+            unusable,
+            record: None,
             recovery,
         })
     }
 
+    /// The removal record that names it, if one does. When Git can no
+    /// longer use it, the record's restore is the only line that works.
+    pub fn with_record(mut self, dir: Option<PathBuf>) -> Leftover {
+        if let (Some(dir), Some(_)) = (&dir, &self.unusable) {
+            self.recovery = format!("residue restore {}", output::shell(dir));
+        }
+        self.record = dir;
+        self
+    }
+
     pub fn text(&self, places: &Places, style: &Style) -> String {
-        let action = if self.present {
-            "put it back"
-        } else {
-            "its directory is gone; clear Git's record"
+        let line = match (&self.unusable, &self.record) {
+            (Some(why), Some(_)) => format!(
+                "Git can no longer use it ({why}), so it cannot move it back; restore says what to clear, then recreates it: {}",
+                clean(&self.recovery)
+            ),
+            (Some(why), None) => format!(
+                "Git can no longer use it ({why}), so it can neither move it back nor remove it, and no removal record names it; copy out what you need, then delete it and run `git worktree prune` in its repository"
+            ),
+            (None, _) if self.present => format!("put it back: {}", clean(&self.recovery)),
+            (None, _) => format!(
+                "its directory is gone; clear Git's record: {}",
+                clean(&self.recovery)
+            ),
         };
         let line = if self.running {
             format!(
-                "process {} still runs, so residue may still be removing it; if it is not residue, {action}: {}",
-                self.pid,
-                clean(&self.recovery)
+                "process {} still runs, so residue may still be removing it; if it is not residue, {line}",
+                self.pid
             )
         } else {
-            format!("{action}: {}", clean(&self.recovery))
+            line
         };
-        format!(
+        let mut out = format!(
             "  {}  {}\n    {}\n",
             places.show(&self.path),
             style.dim(&format!("was {}", places.show(&self.original))),
             line
-        )
+        );
+        // A run that stopped after writing its removal record: restore
+        // moves it back, with the same checks.
+        if let (None, Some(dir)) = (&self.unusable, &self.record) {
+            out.push_str(&format!("    or: residue restore {}\n", output::shell(dir)));
+        }
+        out
     }
 
     pub fn json(&self) -> Json {
@@ -160,8 +198,33 @@ impl Leftover {
             ("pid_running", Json::Bool(self.running)),
             ("present", Json::Bool(self.present)),
             ("recovery", Json::str(self.recovery.clone())),
+            ("unusable", Json::opt(self.unusable.clone(), Json::Str)),
+            (
+                "removal_record",
+                Json::opt(self.record.as_deref(), Json::path),
+            ),
         ])
     }
+}
+
+/// Why Git can no longer use the worktree it lists at `entry.path`, whose
+/// directory is still there: a `git worktree remove` that stopped part
+/// way deleted the `.git` file that ties it to its Git directory, or what
+/// Git reads its HEAD from. Git then refuses to move it or remove it
+/// ("validation failed"), so the move back `scan` would print cannot work.
+pub fn unusable(entry: &Entry) -> Option<String> {
+    fs::symlink_metadata(&entry.path).ok()?;
+    if !checkout_present(&entry.path) {
+        return Some("its .git file is gone".into());
+    }
+    if entry
+        .head
+        .as_deref()
+        .is_none_or(|h| h.bytes().all(|b| b == b'0'))
+    {
+        return Some("Git reads no HEAD in its Git directory".into());
+    }
+    None
 }
 
 /// The heading over a list of [`Leftover`]s.
@@ -561,7 +624,9 @@ fn repos_of(items: &[Item]) -> Vec<Repo> {
     repos
 }
 
-/// The removal records of these repositories at least `keep` old, and the
+/// The removal records of these repositories at least `keep` old and at
+/// least as old as the `--keep-removed` each was written with
+/// (`removed::Item::expired`), and the
 /// entries with no `info` old enough to clear. A record of an interrupted
 /// removal is never forgotten: its worktree is still there, and `residue
 /// restore` is how it goes back. An unreadable record is never forgotten
@@ -586,7 +651,7 @@ fn expired_records(
                         Err(_) if item.incomplete => {}
                         Err(e) => warnings.push(format!("removal record: {e}")),
                         Ok(_) if item.interrupted() => {}
-                        Ok(_) if item.age(now).is_some_and(|a| a >= keep.seconds) => {
+                        Ok(_) if item.expired(now, keep.seconds) => {
                             out.push(Forget {
                                 item,
                                 outcome: None,
@@ -1079,7 +1144,15 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
     // syncing them does not widen the time between that check and the
     // deletion; if the check fails, they are undone. Without them residue
     // deletes nothing.
-    let record = removal_record(original, &dest, &listed, before, mode.reason, mode.by);
+    let record = removal_record(
+        original,
+        &dest,
+        &listed,
+        before,
+        mode.reason,
+        mode.by,
+        &mode.keep_removed,
+    );
     let git_dir = before
         .fingerprint
         .as_ref()
@@ -1123,7 +1196,8 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
 
 /// What the removal record keeps of a worktree about to be deleted at
 /// `aside`: `listed` is Git's entry for it, `before` the plan's report,
-/// `by` the command this run is.
+/// `by` the command this run is, `keep` its `--keep-removed`, which the
+/// record keeps so that no later run forgets it sooner.
 fn removal_record(
     original: &Path,
     aside: &Path,
@@ -1131,6 +1205,7 @@ fn removal_record(
     before: &Report,
     reason: Reason,
     by: By,
+    keep: &Span,
 ) -> removed::Record {
     removed::Record {
         original: original.to_path_buf(),
@@ -1146,6 +1221,10 @@ fn removal_record(
         reason: reason.code().to_string(),
         by: Some(by.code().to_string()),
         removed: output::now(),
+        keep: Some(removed::Keep {
+            seconds: keep.seconds,
+            text: keep.text.clone(),
+        }),
         allocated: before.usage.as_ref().map(|u| u.allocated),
         reclaimable: before.usage.as_ref().map(|u| u.reclaimable),
         gone: before
@@ -1406,6 +1485,7 @@ fn purge(p: &Purge, policy: &Policy, mode: &Mode) -> Outcome {
         before,
         Reason::TrashPurge,
         mode.by,
+        &mode.keep_removed,
     );
     let git_dir = before
         .fingerprint
