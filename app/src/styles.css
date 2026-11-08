@@ -1,6 +1,17 @@
-@source "../node_modules/@cloudflare/kumo/dist/**/*.{js,jsx,ts,tsx}";
+/* Tailwind writes a utility for each class name it finds in the files below,
+   and only those. Kumo's README scans all of its dist/, which adds the
+   utilities of every Kumo component, about 80 KB the window parses and
+   matches on each style change for components it never draws. So the scan
+   takes this app's src/ and the chunks of the Kumo components it renders:
+   the ones it imports (Button, Checkbox, Dialog, Empty, Loader, Tabs) and the
+   Kumo components those draw (Label, LayerCard, Text, Tooltip). Importing
+   another Kumo component, or a Kumo upgrade that changes what these draw,
+   adds its name here; a component missing from the list renders unstyled. */
+@source "./";
+@source "../node_modules/@cloudflare/kumo/dist/chunks/{button,checkbox,dialog,empty,label,layer-card,loader,tabs,text,tooltip}-*.js";
+@source not "../node_modules/@cloudflare/kumo/dist/chunks/button-group-*.js";
 @import "@cloudflare/kumo/styles/tailwind";
-@import "tailwindcss";
+@import "tailwindcss" source(none);
 
 /* Whiteheap, as on the residue site: black, white and grays with no color
    accent; IBM Plex Mono for the wordmark, headings, labels, names and code,
@@ -442,6 +453,13 @@ dd {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   overflow: clip;
+  /* A list out of view is not laid out or painted: 300 worktrees take about
+     30 MB less in the window. Its paint containment clips as overflow: clip
+     already does. Until a list is first drawn it holds the height of its
+     rows (--rows, from Worktrees.tsx) at one row's usual 4.25rem, so the
+     scroll bar stays about right; after that it keeps its drawn height. */
+  content-visibility: auto;
+  contain-intrinsic-block-size: auto calc(var(--rows, 1) * 4.25rem);
 }
 
 .row {

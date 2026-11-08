@@ -22,6 +22,14 @@ These are why the app can be trusted with someone's worktrees. Do not weaken the
 
 The root [AGENTS.md](../AGENTS.md#text-and-cost) rule holds on every screen and dialog. A button names its action and its object ("Move 3 to the trash", "Turn off automatic cleanup"), never "OK". A rule few readers need before they act, such as when a removal record is forgotten, goes in a disclosure.
 
+## Cost
+
+The root [AGENTS.md](../AGENTS.md#text-and-cost) rule holds. Measure memory as `footprint -p PID` of the app, its WebContent and its GPU process, and CPU as `ps -o time= -p PID` before and after a fixed task (#90).
+
+- Tailwind scans only `src/` and the chunks of the Kumo components the app draws, listed in `src/styles.css`. Importing another Kumo component adds its chunk there, or it renders unstyled.
+- What follows the pointer is written to its element, not to state: a render of the Worktrees map draws every tile.
+- residue's JSON reaches the window as the text residue printed (`cli::Document`). The app reads only its `schema`.
+
 ## Verify a change
 
 On a machine that runs residue's service, its user's data and service are not test fixtures:

@@ -3,8 +3,9 @@
 //! contract between the CLI and this app; nothing here decides what is safe
 //! to remove.
 
-use serde::Serialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
+use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::Path;
@@ -104,6 +105,10 @@ impl Run<'_> {
         let stdout = child.stdout.take().map(reader);
         let stderr = child.stderr.take().map(reader);
         let started = Instant::now();
+        // Look often at first, so a quick command returns at once, then every
+        // 25 ms, as before: a longer pause would delay the answer to every slow
+        // command to save almost no CPU.
+        let mut pause = Duration::from_millis(1);
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
@@ -127,7 +132,10 @@ impl Run<'_> {
                         exit_code: None,
                     });
                 }
-                Ok(None) => thread::sleep(Duration::from_millis(25)),
+                Ok(None) => {
+                    thread::sleep(pause);
+                    pause = (pause * 2).min(Duration::from_millis(25));
+                }
                 Err(e) => {
                     return Err(CliError {
                         kind: ErrorKind::Failed,
@@ -154,7 +162,9 @@ fn reader(stream: impl Read + Send + 'static) -> Reader {
     thread::spawn(move || {
         let mut text = Vec::new();
         stream.take(OUTPUT_CAP).read_to_end(&mut text)?;
-        Ok(String::from_utf8_lossy(&text).into_owned())
+        // Valid UTF-8, as residue prints, becomes the String without a copy.
+        Ok(String::from_utf8(text)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
     })
 }
 
@@ -168,12 +178,25 @@ fn join_reader(handle: Reader) -> String {
     }
 }
 
+/// One of residue's JSON documents, as the text residue printed. The window
+/// is what reads it, so the app checks that it is JSON with the expected
+/// `schema` and passes the text on, without building a tree of it that would
+/// only be written back to text: a scan of many worktrees is megabytes.
+pub type Document = Box<RawValue>;
+
+/// The one field of a document the app reads.
+#[derive(Deserialize)]
+struct Head<'a> {
+    #[serde(borrow)]
+    schema: Option<Cow<'a, str>>,
+}
+
 impl Output {
     /// The JSON document residue printed, when its `schema` is `schema`.
     /// residue prints one on success and on the exit statuses that still
     /// report (remove's 3, a restore listing that missed a path). Anything
     /// else is an error carrying stderr.
-    pub fn document(&self, schema: &str) -> Result<Value, CliError> {
+    pub fn document(&self, schema: &str) -> Result<Document, CliError> {
         let trimmed = self.stdout.trim();
         if trimmed.is_empty() {
             return Err(self.error(
@@ -186,13 +209,20 @@ impl Output {
                 },
             ));
         }
-        let doc: Value = serde_json::from_str(trimmed).map_err(|e| {
+        // Parsing into a RawValue checks the whole text and keeps it as is.
+        let doc: Document = serde_json::from_str(trimmed).map_err(|e| {
             self.error(
                 ErrorKind::BadOutput,
                 format!("residue printed something that is not JSON ({e})"),
             )
         })?;
-        match doc.get("schema").and_then(Value::as_str) {
+        // The text is valid JSON, so this fails only when it is not an
+        // object or its `schema` is not a string: either way it has no
+        // schema, which the error below says.
+        let found = serde_json::from_str::<Head>(doc.get())
+            .ok()
+            .and_then(|h| h.schema);
+        match found.as_deref() {
             Some(s) if s == schema => Ok(doc),
             other => Err(self.error(
                 ErrorKind::BadOutput,
