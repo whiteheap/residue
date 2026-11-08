@@ -366,14 +366,16 @@ fn absolute(path: &str) -> Result<PathBuf, CliError> {
 
 /// The bundled residue binary. Tauri places each `externalBin` next to the
 /// app's own executable without its target-triple suffix, in `tauri dev` and
-/// in the bundle (`residue.app/Contents/MacOS/residue`).
+/// in the bundle (`residue.app/Contents/MacOS/residue-cli`). It is not named
+/// residue: that is the app's own executable, which must never run in place
+/// of the CLI.
 fn sidecar() -> Result<PathBuf, String> {
     let exe =
         std::env::current_exe().map_err(|e| format!("cannot find the app's executable: {e}"))?;
     let dir = exe
         .parent()
         .ok_or_else(|| "the app's executable has no parent directory".to_string())?;
-    Ok(dir.join("residue"))
+    Ok(dir.join("residue-cli"))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

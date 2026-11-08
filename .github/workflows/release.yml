@@ -164,20 +164,25 @@ jobs:
           test "$(plutil -extract CFBundleName raw -o - "$plist")" = residue
           # One version: the app's is the tag's, like the residue inside it.
           test "$(plutil -extract CFBundleShortVersionString raw -o - "$plist")" = "$VERSION"
+          # The app's executable is residue, the name macOS shows; the CLI
+          # inside it is residue-cli.
+          ls -la "$app/Contents/MacOS"
           main=$(plutil -extract CFBundleExecutable raw -o - "$plist")
+          test "$main" = residue
           test "$(lipo -archs "$app/Contents/MacOS/$main")" = "x86_64 arm64"
-          test "$(lipo -archs "$app/Contents/MacOS/residue")" = "x86_64 arm64"
-          test "$("$app/Contents/MacOS/residue" --version)" = "residue $VERSION"
+          cli="$app/Contents/MacOS/residue-cli"
+          test "$(lipo -archs "$cli")" = "x86_64 arm64"
+          test "$("$cli" --version)" = "residue $VERSION"
           # The bundled residue is the archives' binaries: signing rewrites
           # the signature, never the linker's UUID of each architecture.
           for t in aarch64-apple-darwin x86_64-apple-darwin; do
             dwarfdump --uuid "archives/residue-$TAG-$t/residue"
           done | awk '{ print $2, $3 }' | sort > "$RUNNER_TEMP/uuid-archives"
-          dwarfdump --uuid "$app/Contents/MacOS/residue" | awk '{ print $2, $3 }' | sort > "$RUNNER_TEMP/uuid-app"
+          dwarfdump --uuid "$cli" | awk '{ print $2, $3 }' | sort > "$RUNNER_TEMP/uuid-app"
           cat "$RUNNER_TEMP/uuid-app"
           diff "$RUNNER_TEMP/uuid-archives" "$RUNNER_TEMP/uuid-app"
           codesign --verify --deep --strict --verbose=2 "$app"
-          codesign --verify --strict --verbose=2 "$app/Contents/MacOS/residue"
+          codesign --verify --strict --verbose=2 "$cli"
           codesign -dv --verbose=2 "$app" 2>&1 | tee "$RUNNER_TEMP/codesign.txt"
           grep -qx 'Signature=adhoc' "$RUNNER_TEMP/codesign.txt"
           # The app starts from the volume and is still running a few seconds

@@ -21,9 +21,9 @@ pnpm tauri build --target universal-apple-darwin
 
 ### The bundled residue
 
-Tauri's `externalBin` takes `src-tauri/binaries/residue-<target>`, which is never committed. `scripts/sidecar.sh` puts it there:
+Tauri's `externalBin` takes `src-tauri/binaries/residue-cli-<target>` and copies it into the bundle as `Contents/MacOS/residue-cli`, beside the app's own executable, `residue`; a `tauri dev` run puts it beside `src-tauri/target/debug/residue`. The folder is never committed. `scripts/sidecar.sh` fills it:
 
-- With no argument, it builds residue from the repository root with `cargo build --locked --release` for `aarch64-apple-darwin` and `x86_64-apple-darwin`, and joins the two with `lipo` into `residue-universal-apple-darwin`. It runs cargo in `app/`, so rustup takes `app/rust-toolchain.toml`; the binaries go to the root's `target/`.
+- With no argument, it builds residue from the repository root with `cargo build --locked --release` for `aarch64-apple-darwin` and `x86_64-apple-darwin`, and joins the two with `lipo` into `residue-cli-universal-apple-darwin`. It runs cargo in `app/`, so rustup takes `app/rust-toolchain.toml`; the binaries go to the root's `target/`.
 - `--from ARM64_BINARY X86_64_BINARY` joins two binaries that are already built. The release passes the binaries of its two macOS archives.
 - `--check` only checks what is there. `tauri build` runs it, so a build never bundles a missing binary or one of another version.
 

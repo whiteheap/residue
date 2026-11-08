@@ -39,7 +39,7 @@
     "license": "MIT",
     "homepage": "https://github.com/whiteheap/residue",
     "externalBin": [
-      "binaries/residue"
+      "binaries/residue-cli"
     ],
     "icon": [
       "icons/32x32.png",
