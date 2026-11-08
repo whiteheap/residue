@@ -1,9 +1,9 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { bytes } from "../../lib/format";
 import { shareText, type Part } from "../../lib/viz";
 import { Hatch, Legend, Mark, useSvgId } from "./Figure";
 import { labelWidth, useWidth } from "./measure";
-import { TipLines, Tooltip } from "./Tooltip";
+import { TipLines, Tooltip, tipTranslate } from "./Tooltip";
 
 const HEIGHT = 28;
 const GAP = 2;
@@ -36,10 +36,14 @@ function blocks(parts: Part[], total: number, width: number): { x: number; w: nu
  */
 export function SegmentedBar({ parts, total }: { parts: Part[]; total: number }) {
   const [ref, width] = useWidth<HTMLDivElement>();
+  // The part under the pointer, and where the pointer came onto it. A move
+  // within the part moves its tooltip through `tip`, not by drawing the bar
+  // again.
   const [hover, setHover] = useState<{ i: number; x: number } | null>(null);
+  const tip = useRef<HTMLDivElement>(null);
   const hatch = useSvgId("bar-hatch");
   const placed = blocks(parts, total, width);
-  const tip = hover ? parts[hover.i] : undefined;
+  const tipPart = hover ? parts[hover.i] : undefined;
 
   return (
     <div className="viz-bar">
@@ -62,7 +66,15 @@ export function SegmentedBar({ parts, total }: { parts: Part[]; total: number })
                   data-tone={p.tone}
                   onPointerMove={(e) => {
                     const box = e.currentTarget.ownerSVGElement?.getBoundingClientRect();
-                    if (box) setHover({ i, x: e.clientX - box.left });
+                    if (!box) return;
+                    const x = e.clientX - box.left;
+                    if (hover?.i === i) {
+                      // React sets the style again only when a render changes
+                      // `hover`, which starts from where the pointer is then.
+                      if (tip.current) tip.current.style.translate = tipTranslate(x, HEIGHT, width, HEIGHT, true);
+                      return;
+                    }
+                    setHover({ i, x });
                   }}
                 >
                   <Mark tone={p.tone} hatch={hatch} x={b.x} y={0} width={b.w} height={HEIGHT} radius={4} />
@@ -78,11 +90,11 @@ export function SegmentedBar({ parts, total }: { parts: Part[]; total: number })
         ) : (
           <div style={{ blockSize: HEIGHT }} />
         )}
-        {hover && tip ? (
-          <Tooltip x={hover.x} y={HEIGHT} width={width} height={HEIGHT} below>
+        {hover && tipPart ? (
+          <Tooltip ref={tip} x={hover.x} y={HEIGHT} width={width} height={HEIGHT} below>
             <TipLines
-              value={`${bytes(tip.bytes)}, ${shareText(tip.bytes, total)}`}
-              lines={[<code key="name">{tip.label}</code>, tip.note]}
+              value={`${bytes(tipPart.bytes)}, ${shareText(tipPart.bytes, total)}`}
+              lines={[<code key="name">{tipPart.label}</code>, tipPart.note]}
             />
           </Tooltip>
         ) : null}

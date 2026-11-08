@@ -17,7 +17,7 @@ use cli::{CliError, Document, ErrorKind, Run};
 use serde::Serialize;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tauri::Manager;
 
@@ -34,6 +34,8 @@ struct State {
     config_dir: PathBuf,
     data_dir: PathBuf,
     dev: service::DevPreview,
+    /// The bundled residue's version, once a read has given it.
+    version: Mutex<Option<String>>,
 }
 
 type AppState<'a> = tauri::State<'a, Arc<State>>;
@@ -67,7 +69,21 @@ impl State {
         .output()
     }
 
+    /// The bundled residue's version. The binary ships inside the app, so the
+    /// first read that gives a version serves every later call; an app
+    /// replaced on disk while it runs shows the old version, like its old
+    /// window, until it restarts. A failed read is not kept: the next call
+    /// runs `residue --version` again, so a passing failure (a start slower
+    /// than the deadline, a spawn the system refused) does not last until the
+    /// app quits, and a lasting one reports its own error each time.
     fn bundled_version(&self) -> Result<String, CliError> {
+        // Held through the read, so calls that come together start one
+        // process. A poisoned lock still holds a whole value: the one write is
+        // a single assignment after a read succeeds.
+        let mut cached = self.version.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(v) = cached.as_ref() {
+            return Ok(v.clone());
+        }
         let out = self.run(
             vec!["--version".into()],
             &self.home,
@@ -75,7 +91,7 @@ impl State {
         )?;
         let text = out.stdout.trim();
         match text.strip_prefix("residue ") {
-            Some(v) if out.code == Some(0) => Ok(v.to_string()),
+            Some(v) if out.code == Some(0) => Ok(cached.insert(v.to_string()).clone()),
             _ => Err(out.error(
                 ErrorKind::BadOutput,
                 format!("residue --version printed {text:?}"),
@@ -411,6 +427,7 @@ pub fn run() {
                 config_dir: paths.app_config_dir()?,
                 data_dir: paths.app_local_data_dir()?,
                 dev: service::DevPreview::from_env(),
+                version: Mutex::new(None),
             };
             app.manage(Arc::new(state));
             // Read the login shell's PATH while the window loads.

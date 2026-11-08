@@ -8,6 +8,11 @@ export interface TreeItem {
   expanded: boolean | null;
 }
 
+interface ItemHandlers {
+  ref: (el: SVGElement | null) => void;
+  onFocus: (e: FocusEvent) => void;
+}
+
 /**
  * The WAI-ARIA tree keys over `items`, with one tab stop: Up and Down move
  * through the visible nodes, Home and End to the first and last, Right opens a
@@ -24,6 +29,7 @@ export function useTreeKeys(
 ) {
   const [chosen, setChosen] = useState<string | null>(null);
   const nodes = useRef(new Map<string, SVGElement>());
+  const handlers = useRef(new Map<string, ItemHandlers>());
   const pending = useRef<string | null>(null);
   // The tab stop stays on the node last focused while it is in the tree.
   const active = items.some((i) => i.id === chosen) ? chosen : (items[0]?.id ?? null);
@@ -37,6 +43,12 @@ export function useTreeKeys(
       node.focus();
     }
   });
+
+  // A node that left the tree lets go of its functions.
+  useEffect(() => {
+    const ids = new Set(items.map((i) => i.id));
+    for (const id of handlers.current.keys()) if (!ids.has(id)) handlers.current.delete(id);
+  }, [items]);
 
   const focus = (id: string) => {
     setChosen(id);
@@ -89,17 +101,25 @@ export function useTreeKeys(
   };
 
   /** The props each node needs: its tab stop, its element, and focus tracking. */
-  const itemProps = (id: string) => ({
-    tabIndex: id === active ? 0 : -1,
-    ref: (el: SVGElement | null) => {
-      if (el) nodes.current.set(id, el);
-      else nodes.current.delete(id);
-    },
-    // A child's focus bubbles through its parent node, which keeps out of it.
-    onFocus: (e: FocusEvent) => {
-      if (e.target === e.currentTarget) setChosen(id);
-    },
-  });
+  const itemProps = (id: string) => {
+    // Each node keeps the same functions from render to render: React
+    // detaches and attaches an element again whenever its ref function is new.
+    let own = handlers.current.get(id);
+    if (!own) {
+      own = {
+        ref: (el) => {
+          if (el) nodes.current.set(id, el);
+          else nodes.current.delete(id);
+        },
+        // A child's focus bubbles through its parent node, which keeps out of it.
+        onFocus: (e) => {
+          if (e.target === e.currentTarget) setChosen(id);
+        },
+      };
+      handlers.current.set(id, own);
+    }
+    return { tabIndex: id === active ? 0 : -1, ...own };
+  };
 
   return { active, onKeyDown, itemProps, focusAfterRender };
 }
