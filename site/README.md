@@ -115,7 +115,7 @@ npx --yes wrangler@4.158.0 deploy --message "site at $(git rev-parse --short HEA
 sh smoke.sh
 ```
 
-Leave https://whiteheap.github.io/residue/ alone. GitHub Pages serves the signed apt, dnf and pacman repositories there; this site never replaces or redirects it.
+Leave https://whiteheap.github.io/residue/ alone. The organization's GitHub Pages site, from whiteheap/whiteheap.github.io, serves the signed apt, dnf and pacman repositories there, and `.github/workflows/packages.yml` publishes them; this site never replaces or redirects it.
 
 ## Search engines and agents
 

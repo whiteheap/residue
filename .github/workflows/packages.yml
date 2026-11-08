@@ -2,14 +2,18 @@ name: packages
 
 # Builds .deb, .rpm and Arch packages from a published release's static Linux
 # archives, attests them, and adds them and an updated SHA256SUMS to that
-# release. When the tag is the latest release, it also publishes signed apt,
-# dnf and pacman repositories to https://whiteheap.github.io/residue/ with
-# GitHub Pages.
+# release. When the tag is the latest release, it also rebuilds the signed
+# apt, dnf and pacman repositories from those packages and publishes them at
+# https://whiteheap.github.io/residue/, by pushing them to residue/ in
+# whiteheap/whiteheap.github.io, the organization's GitHub Pages site.
 # It also builds the FreeBSD x86_64 and aarch64 binaries, each in a FreeBSD
 # virtual machine of its architecture from the tag's source, for releases
 # that have the FreeBSD activity probe.
 # release.yml starts it after publishing. To package an existing release by
 # hand: gh workflow run packages.yml -f tag=vX.Y.Z
+# To publish the repositories again from the packages already in the latest
+# release, building and uploading nothing:
+# gh workflow run packages.yml -f tag=vX.Y.Z -f republish=true
 # To check a change to this workflow without uploading or deploying anything:
 # gh workflow run packages.yml --ref BRANCH -f tag=vX.Y.Z -f dry_run=true
 
@@ -22,6 +26,10 @@ on:
         required: true
       dry_run:
         description: Build and check everything, but upload and deploy nothing
+        type: boolean
+        default: false
+      republish:
+        description: Build nothing; publish the repositories again from the release's packages
         type: boolean
         default: false
 
@@ -38,9 +46,10 @@ jobs:
   # Each leg builds, runs and smoke-tests its binary on its own architecture;
   # one failing never drops the other's archive. A release without the
   # FreeBSD activity probe gets no binary: every worktree would be `unknown`
-  # there, so it could never remove one.
+  # there, so it could never remove one. A republish builds nothing.
   freebsd:
     name: freebsd-${{ matrix.arch }}
+    if: ${{ !inputs.republish }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
@@ -95,28 +104,20 @@ jobs:
 
   # Runs even when a FreeBSD build failed, so the Linux packages and the
   # repositories never wait on a broken one; it takes the archives of the
-  # legs that succeeded.
+  # legs that succeeded. A republish skips it, and uploads nothing.
   linux:
     needs: freebsd
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && !inputs.republish }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
       id-token: write
       attestations: write
-    outputs:
-      latest: ${{ steps.latest.outputs.latest }}
     env:
       TAG: ${{ inputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Is this the latest release
-        id: latest
-        run: |
-          latest=$(gh release view --json tagName --jq .tagName)
-          echo "latest release is $latest"
-          if [ "$latest" = "$TAG" ]; then echo latest=true; else echo latest=false; fi >> "$GITHUB_OUTPUT"
       - name: nfpm
         run: |
           curl -fsSLo "$RUNNER_TEMP/nfpm.tar.gz" https://github.com/goreleaser/nfpm/releases/download/v2.48.0/nfpm_2.48.0_Linux_x86_64.tar.gz
@@ -157,19 +158,54 @@ jobs:
         run: gh release upload "$TAG" pkgs/* SHA256SUMS --clobber
 
   # The package repositories hold only the latest release, so packaging an
-  # older tag never rolls them back. The signing key is a secret of the
-  # github-pages environment, which only this job can read.
-  repositories:
+  # older tag never rolls them back. It runs after the linux job, or at once
+  # in a republish. The repositories job checks again right before it pushes.
+  latest:
     needs: linux
-    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.linux.outputs.latest == 'true' && !inputs.dry_run }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
+    outputs:
+      latest: ${{ steps.latest.outputs.latest }}
+    env:
+      TAG: ${{ inputs.tag }}
+      REPUBLISH: ${{ inputs.republish }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Is this the latest release
+        id: latest
+        run: |
+          # Fails when TAG has no release.
+          gh release view "$TAG" --json tagName --jq .tagName
+          latest=$(gh release view --json tagName --jq .tagName)
+          echo "latest release is $latest"
+          if [ "$latest" = "$TAG" ]; then echo latest=true; else echo latest=false; fi >> "$GITHUB_OUTPUT"
+          if [ "$REPUBLISH" = true ] && [ "$latest" != "$TAG" ]; then
+            echo "::error::A republish publishes only the latest release, $latest, never an older one"
+            exit 1
+          fi
+
+  # Rebuilds the repositories from the release's packages, the ones the linux
+  # job just uploaded or, in a republish, the ones already there, and pushes
+  # them to whiteheap/whiteheap.github.io. That repository's GitHub Pages site
+  # serves them at https://whiteheap.github.io/residue/, an address that does
+  # not change with this repository's name. Both secrets, the signing key and
+  # the deploy key that can push there, belong to the github-pages
+  # environment, which only main and v* tags can use, so only this job can
+  # read them. One run publishes at a time; the push's lease and the second
+  # latest-release check keep a late run from replacing a newer release.
+  repositories:
+    needs: [latest, linux]
+    if: >-
+      ${{ !cancelled() && !inputs.dry_run && needs.latest.outputs.latest == 'true' &&
+      (needs.linux.result == 'success' || (inputs.republish && needs.linux.result == 'skipped')) }}
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: package-repositories
+      cancel-in-progress: false
     environment:
       name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
+      url: https://whiteheap.github.io/residue/
     env:
       TAG: ${{ inputs.tag }}
       GH_TOKEN: ${{ github.token }}
@@ -181,7 +217,13 @@ jobs:
       - name: Download the packages
         run: |
           gh release download "$TAG" --dir pkgs --pattern '*.deb' --pattern '*.rpm' --pattern '*.pkg.tar.zst' --pattern SHA256SUMS
-          cd pkgs && grep -E '\.(deb|rpm|pkg\.tar\.zst)$' SHA256SUMS | sha256sum -c
+          cd pkgs
+          # Every package downloaded is listed in SHA256SUMS, and matches it.
+          find . -type f ! -name SHA256SUMS | sed 's|^\./||' | LC_ALL=C sort > "$RUNNER_TEMP/downloaded"
+          grep -E '\.(deb|rpm|pkg\.tar\.zst)$' SHA256SUMS | awk '{ print $2 }' | LC_ALL=C sort > "$RUNNER_TEMP/listed"
+          diff "$RUNNER_TEMP/listed" "$RUNNER_TEMP/downloaded" ||
+            { echo "::error::The packages downloaded (>) and those SHA256SUMS lists (<) differ"; exit 1; }
+          grep -E '\.(deb|rpm|pkg\.tar\.zst)$' SHA256SUMS | sha256sum -c
       - name: Build and sign the apt, dnf and pacman repositories
         env:
           PACKAGE_SIGNING_KEY: ${{ secrets.PACKAGE_SIGNING_KEY }}
@@ -190,28 +232,60 @@ jobs:
           export GNUPGHOME="$RUNNER_TEMP/gnupg"
           mkdir -m 700 "$GNUPGHOME"
           printf '%s\n' "$PACKAGE_SIGNING_KEY" | gpg --batch --import
-          packaging/apt-repo.sh pkgs site/apt "$fpr"
-          packaging/rpm-repo.sh pkgs site/rpm "$fpr"
+          packaging/apt-repo.sh pkgs repositories/apt "$fpr"
+          packaging/rpm-repo.sh pkgs repositories/rpm "$fpr"
           # repo-add only exists on Arch.
           docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e PACKAGE_SIGNING_KEY \
             -v "$PWD:/w" -w /w archlinux:base bash -c '
               export GNUPGHOME=$(mktemp -d)
               printf "%s\n" "$PACKAGE_SIGNING_KEY" | gpg --batch --quiet --import
-              packaging/arch-repo.sh pkgs site/arch "$0"' "$fpr"
+              packaging/arch-repo.sh pkgs repositories/arch "$0"' "$fpr"
           rm -rf "$GNUPGHOME"
-          cp "$KEYRING" site/residue-signing-key.asc
-          gpg --dearmor < "$KEYRING" > site/apt/residue-archive-keyring.gpg
-          cp packaging/rpm/residue.repo site/rpm/residue.repo
+          cp "$KEYRING" repositories/residue-signing-key.asc
+          gpg --dearmor < "$KEYRING" > repositories/apt/residue-archive-keyring.gpg
+          cp packaging/rpm/residue.repo repositories/rpm/residue.repo
       - name: Check every signature against the committed public key
         run: |
-          keyring=site/apt/residue-archive-keyring.gpg
-          gpgv --keyring "$keyring" site/apt/dists/stable/InRelease
-          gpgv --keyring "$keyring" site/apt/dists/stable/Release.gpg site/apt/dists/stable/Release
-          for sig in site/arch/*/*.sig site/rpm/*/repodata/repomd.xml.asc; do
+          keyring=repositories/apt/residue-archive-keyring.gpg
+          gpgv --keyring "$keyring" repositories/apt/dists/stable/InRelease
+          gpgv --keyring "$keyring" repositories/apt/dists/stable/Release.gpg repositories/apt/dists/stable/Release
+          for sig in repositories/arch/*/*.sig repositories/rpm/*/repodata/repomd.xml.asc; do
             gpgv --keyring "$keyring" "$sig" "${sig%.*}"
           done
-      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
-        with:
-          path: site
-      - id: deploy
-        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+      # The deploy key is a write key for whiteheap/whiteheap.github.io only.
+      # packaging/github-known-hosts pins GitHub's host keys.
+      - name: Push to whiteheap/whiteheap.github.io
+        id: push
+        env:
+          PAGES_DEPLOY_KEY: ${{ secrets.PAGES_DEPLOY_KEY }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          latest=$(gh release view --json tagName --jq .tagName)
+          if [ "$latest" != "$TAG" ]; then
+            echo "::notice::$latest is the latest release now, so $TAG does not replace the repositories"
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$PAGES_DEPLOY_KEY" ]; then
+            echo "::error::The github-pages environment has no PAGES_DEPLOY_KEY secret"
+            exit 1
+          fi
+          key="$RUNNER_TEMP/pages-deploy-key"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$PAGES_DEPLOY_KEY" > "$key")
+          export GIT_SSH_COMMAND="ssh -F /dev/null -i $key -o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o UserKnownHostsFile=$PWD/packaging/github-known-hosts"
+          message=$(printf '%s\n\n%s' "Publish residue $TAG's apt, dnf and pacman repositories" \
+            "From $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
+          packaging/publish-repositories.sh repositories git@github.com:whiteheap/whiteheap.github.io.git main residue "$message"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+      # On a test site on 2026-11-08, a Pages build from a push served the new
+      # file 16 and 24 seconds after the push, and its deploy replaced the
+      # copy the CDN had cached, which otherwise lives 600 seconds. Fifteen
+      # minutes covers a queued build and that cache.
+      - name: Wait until https://whiteheap.github.io/residue/ serves them
+        if: steps.push.outputs.pushed == 'true'
+        timeout-minutes: 20
+        run: packaging/wait-for-repositories.sh repositories https://whiteheap.github.io/residue 900
