@@ -1044,7 +1044,7 @@ fn check_size(r: &mut Report, dir: &Path, usage: std::io::Result<Usage>) {
             "nested_repo",
             "nested repository",
             format!(
-                "contains another repository or checkout at {}; removal would delete it",
+                "contains a .git entry in {}: another repository or checkout, or files Git does not list; removal would delete it",
                 show(&usage.nested_repos)
             ),
         );

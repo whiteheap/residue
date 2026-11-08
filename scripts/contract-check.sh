@@ -1429,6 +1429,16 @@ layout_removed ignored-empty-folders 'secrets/\n' 'mkdir -p secrets sub/secrets/
 # blocks.
 layout_refused ignored-nested-repo-only ignored,nested_repo "node_modules/ sub/secrets/" \
     'secrets/\n' 'mkdir -p sub/secrets && git init -q sub/secrets/dep'
+# A `.git` entry in any case hides what is in it from Git when
+# core.ignorecase is set, as it is on macOS: `private/` is then no ignored
+# entry, and nested_repo blocks (#102). With it unset, Git lists `private/`
+# as well. A plain folder named `.git` blocks the same way in either.
+layout_refused ignored-dotgit-upper-ignorecase nested_repo "node_modules/" \
+    'private/\n' 'git config core.ignorecase true && mkdir -p private/.GIT && echo notes >private/.GIT/notes.txt'
+layout_refused ignored-dotgit-upper-case-sensitive ignored,nested_repo "node_modules/ private/" \
+    'private/\n' 'git config core.ignorecase false && mkdir -p private/.GIT && echo notes >private/.GIT/notes.txt'
+layout_refused ignored-dotgit-plain-folder nested_repo "node_modules/" \
+    'private/\n' 'mkdir -p private/.git && echo notes >private/.git/notes.txt'
 # An untracked folder of ignored entries is one entry, `orphan/`, which the
 # rules for what is inside it do not match. Matching mode would list
 # `orphan/a.log` and `orphan/node_modules/`, which they do.

@@ -163,7 +163,13 @@ pub fn measure(
                     continue;
                 }
             };
-            if item.git && dir != root {
+            // Any case of `.git`, as Git skips the name when
+            // `core.ignorecase` is set, which hides the files inside from
+            // `git status` (#102). A case-sensitive configuration lists a
+            // `.GIT` folder's files, so there this keeps a worktree that
+            // need not be kept: the safe direction. One folder can hold two
+            // such names on a case-sensitive file system; it is named once.
+            if item.git_name && dir != root && usage.nested_repos.last() != Some(&dir) {
                 usage.nested_repos.push(dir.clone());
             }
             let mut here = place;
@@ -370,8 +376,6 @@ impl From<&Metadata> for Stat {
 /// One entry of a directory listing.
 struct Listed {
     path: PathBuf,
-    /// The entry is named `.git`.
-    git: bool,
     /// The entry is named `.git` in any case, as Git matches the name when
     /// `core.ignorecase` is set.
     git_name: bool,
@@ -389,7 +393,6 @@ fn list_std(dir: &Path) -> io::Result<Listing> {
     let mut out = Vec::new();
     for item in fs::read_dir(dir)? {
         out.push(item.map(|item| Listed {
-            git: item.file_name() == ".git",
             git_name: item.file_name().as_bytes().eq_ignore_ascii_case(b".git"),
             path: item.path(),
             stat: item.metadata().map(|meta| Stat::from(&meta)),
@@ -520,7 +523,6 @@ mod bulk {
                     None => fstatat(fd.0, entry.name),
                 };
                 out.push(Ok(Listed {
-                    git: entry.name == b".git",
                     git_name: entry.name.eq_ignore_ascii_case(b".git"),
                     path,
                     stat,

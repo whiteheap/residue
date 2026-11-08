@@ -121,7 +121,7 @@ residue runs every check below on every linked worktree. A worktree is a **candi
 | `private_refs` | It has per-worktree refs (`refs/worktree/`, `refs/bisect/`, `refs/rewritten/`) |
 | `head` | HEAD is detached and no branch, tag or remote-tracking ref contains it |
 | `layout` | It has submodules or is a sparse checkout |
-| `nested_repo` | It contains another repository or checkout |
+| `nested_repo` | It contains a `.git` entry, in any case: another repository or checkout, or files Git does not list |
 | `mount_point` | It contains a mount point |
 | `contents` | residue could not read some of its entries |
 
