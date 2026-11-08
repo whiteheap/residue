@@ -17,8 +17,8 @@
 #    inline block allowed is the home page's JSON-LD, which is data that
 #    browsers do not run.
 # 7. The fonts load from the site itself, with font-display: swap, the 400
-#    weight is preloaded, and the Content Security Policy is the exact one
-#    below.
+#    weight is preloaded from the URL style.css loads it from, and the
+#    Content Security Policy is the exact one below.
 # 8. install.sh passes shellcheck (when it is installed), and the signing key
 #    hashes it pins match packaging/signing-key.asc.
 # 9. Search engines, link previews and agents: robots.txt has one group for
@@ -31,6 +31,10 @@
 #    every .txt file with charset=utf-8; the security.txt Expires is more
 #    than 30 days and less than a year away; the IndexNow key file holds its
 #    own name.
+# 10. Each file that _headers keeps a year (immutable) changes its URL when it
+#    changes: every reference to it, in the pages and in style.css, ends in
+#    ?v= and the first 12 hex digits of its SHA-256. No other local reference
+#    has a query, and no page is kept a year.
 set -u
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -147,11 +151,12 @@ else
   fail "minimum Git version on the page ('$git_version') does not match README.md"
 fi
 
-# 4. Local links and fragments.
+# 4. Local links and fragments. A ?v= version (rule 10) is not part of the
+#    file's name.
 for page in "$public"/*.html; do
   name=$(basename "$page")
   for ref in $(grep -oE '(href|src)="/[^"]*"' "$page" | sed 's/^[a-z]*="\(.*\)"$/\1/' | sort -u); do
-    path=${ref%%#*}
+    path=${ref%%[?#]*}
     case $path in
       /) path=/index.html ;;
     esac
@@ -175,7 +180,7 @@ done
 for ref in $(grep -oE 'url\([^)]*\)' "$public/style.css" | sed 's/^url(//; s/)$//; s/^["'"'"']//; s/["'"'"']$//' | sort -u); do
   case $ref in
     /*)
-      if [ -f "$public$ref" ]; then
+      if [ -f "$public${ref%%[?#]*}" ]; then
         ok "style.css: $ref exists"
       else
         fail "style.css: $ref has no file in site/public"
@@ -200,8 +205,10 @@ done
 
 # 6. One script, from the site itself, and nothing else runs. The Content
 #    Security Policy (rule 7) enforces this in the browser; these lines keep
-#    a change that would need a looser policy from reaching it.
-script='<script src="/hero.js" defer></script>'
+#    a change that would need a looser policy from reaching it. Rule 10
+#    checks the version.
+script='<script src="/hero.js?v=VERSION" defer></script>'
+script_re='<script src="/hero\.js\?v=[0-9a-f]{12}" defer></script>'
 # The one other <script> tag: the home page's JSON-LD, a data block for
 # search engines that browsers do not run. Rule 9 checks what it holds; any
 # other type, or a src on it, counts as a script here.
@@ -209,7 +216,7 @@ data='<script type="application/ld+json">'
 for page in "$public"/*.html; do
   name=$(basename "$page")
   tags=$(grep -oi '<script' "$page" | wc -l | tr -d ' ')
-  exact=$(grep -oF "$script" "$page" | wc -l | tr -d ' ')
+  exact=$(grep -oE "$script_re" "$page" | wc -l | tr -d ' ')
   blocks=$(grep -oF "$data" "$page" | wc -l | tr -d ' ')
   case $name in
     index.html) allowed=1 ;;
@@ -221,7 +228,7 @@ for page in "$public"/*.html; do
     fail "$name: a script other than one $script, and on index.html one $data block"
   fi
 done
-if grep -qF "$script" "$public/index.html"; then
+if grep -qE "$script_re" "$public/index.html"; then
   ok "index.html loads /hero.js"
 else
   fail "index.html does not load the hero with $script"
@@ -271,7 +278,11 @@ if [ "$faces" -gt 0 ] && [ "$faces" -eq "$swaps" ]; then
 else
   fail "style.css has $faces @font-face rules and $swaps font-display: swap"
 fi
-preload='<link rel="preload" href="/ibm-plex-mono-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>'
+# The preload names the URL that style.css loads the 400 weight from, version
+# and all; a preload for any other URL makes the browser fetch the font twice.
+font400=$(sed -n 's|.*url("\(/ibm-plex-mono-latin-400-normal\.woff2[^"]*\)").*|\1|p' "$public/style.css")
+[ -n "$font400" ] || fail "style.css has no url(\"/ibm-plex-mono-latin-400-normal.woff2...\") for the 400 weight"
+preload="<link rel=\"preload\" href=\"$font400\" as=\"font\" type=\"font/woff2\" crossorigin>"
 for page in "$public"/*.html; do
   if grep -qF "$preload" "$page"; then
     ok "$(basename "$page") preloads the 400 weight"
@@ -560,6 +571,92 @@ case $keys in
     fi
     ;;
 esac
+
+# 10. Versions. A browser keeps a file that _headers marks immutable for a
+#     year and never asks for it again, so the file gets a new URL whenever it
+#     changes: each reference ends in ?v= and the first 12 hex digits of the
+#     file's SHA-256. Cloudflare ignores the query, so no file is renamed. The
+#     pages keep Cloudflare's default, max-age=0 with must-revalidate: a
+#     reader always gets the newest page and, through it, the newest URLs.
+year='public, max-age=31536000, immutable'
+# Each path rule in _headers with its Cache-Control value, one per line.
+awk '/^[^ #]/ { path = $0 } path != "" && sub(/^  Cache-Control: /, "") { print path " " $0 }' \
+  "$public/_headers" >"$scratch/cache"
+# A rule kept a year names one file. Cloudflare applies a rule to the 404
+# page it serves for a missing path the rule matches, so a pattern such as
+# /*.woff2 would keep that 404 a year.
+: >"$scratch/kept"
+while read -r rule value; do
+  case $value in
+    *immutable*) ;;
+    *) continue ;;
+  esac
+  file=${rule#/}
+  [ -n "$file" ] || file=index.html
+  # A splat or a :placeholder makes the rule a pattern.
+  case $rule in
+    *'*'* | *:*) pattern=yes ;;
+    *) pattern=no ;;
+  esac
+  if [ "$value" != "$year" ]; then
+    fail "_headers: $rule is '$value'; a file kept a year has exactly: Cache-Control: $year"
+  elif [ "$pattern" = yes ]; then
+    fail "_headers keeps the pattern $rule a year; name each file, or the 404 page for a missing path it matches is kept a year too"
+  elif [ ! -f "$public/$file" ]; then
+    fail "_headers keeps $rule a year, and site/public has no such file"
+  else
+    printf '%s\n' "$file" >>"$scratch/kept"
+  fi
+done <"$scratch/cache"
+# True when _headers keeps site/public/FILE a year.
+kept_a_year() {
+  grep -qxF -- "$1" "$scratch/kept"
+}
+if [ ! -s "$scratch/kept" ]; then
+  fail "_headers keeps no file a year; style.css, hero.js and the fonts need Cache-Control: $year"
+fi
+for page in "$public"/*.html; do
+  name=$(basename "$page")
+  if kept_a_year "$name"; then
+    fail "_headers keeps $name a year; a page must keep the default, max-age=0 with must-revalidate"
+  fi
+done
+# Every local reference, as NAME REF: each page's href and src, and the
+# url()s in style.css.
+for page in "$public"/*.html; do
+  grep -oE '(href|src)="/[^"]*"' "$page" | sed "s/^[a-z]*=\"\(.*\)\"$/$(basename "$page") \1/"
+done >"$scratch/refs"
+grep -oE 'url\([^)]*\)' "$public/style.css" |
+  sed 's/^url(//; s/)$//; s/^["'"'"']//; s/["'"'"']$//; s/^/style.css /' >>"$scratch/refs"
+LC_ALL=C sort -u "$scratch/refs" | while read -r name ref; do
+  path=${ref%%[?#]*}
+  file=${path#/}
+  case $ref in
+    *\?*)
+      query=${ref#*\?}
+      query=${query%%#*}
+      ;;
+    *) query= ;;
+  esac
+  # A fix inside style.css changes style.css's own version too.
+  case $name in
+    style.css) then_again='; then run the check again for the pages' ;;
+    *) then_again= ;;
+  esac
+  if [ -n "$file" ] && [ -f "$public/$file" ] && kept_a_year "$file"; then
+    want="$path?v=$(sha256 "$public/$file" | cut -c1-12)"
+    if [ "$ref" = "$want" ]; then
+      printf 'ok   %s: %s is the version of %s\n' "$name" "$ref" "$file"
+    elif [ -z "$query" ]; then
+      printf 'FAIL %s: %s has no version; _headers keeps it a year, so write %s%s\n' "$name" "$ref" "$want" "$then_again"
+    else
+      printf 'FAIL %s: %s is stale; %s has changed, so write %s%s\n' "$name" "$ref" "$file" "$want" "$then_again"
+    fi
+  elif [ -n "$query" ]; then
+    printf 'FAIL %s: %s has a query, which only a file that _headers keeps a year takes\n' "$name" "$ref"
+  fi
+done | tee "$scratch/versions"
+failures=$((failures + $(grep -c '^FAIL' "$scratch/versions")))
 
 if [ "$failures" -eq 0 ]; then
   printf 'site check passed\n'

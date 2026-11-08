@@ -6,7 +6,9 @@
 # before it fails.
 #
 # /           200, the bytes of index.html, the Content-Security-Policy
-#             header of public/_headers, exactly, and over https a
+#             header of public/_headers, exactly, Cloudflare's default
+#             Cache-Control (public, max-age=0, must-revalidate), so a reader
+#             always gets the newest page, and over https a
 #             Strict-Transport-Security header with includeSubDomains and a
 #             max-age of at least 2592000 (30 days), which the whiteheap.com
 #             zone sends
@@ -16,6 +18,9 @@
 #             install.sh is text/plain, each .txt file text/plain with
 #             charset=utf-8 (security.txt and llms.txt require it), the
 #             sitemap XML, and each .png image/png
+# /NAME?v=V   each versioned URL the pages and style.css name (check.sh rule
+#             10): 200, the bytes of site/public/NAME, since Cloudflare
+#             ignores the query, and the year's Cache-Control from _headers
 # /SOURCE     each line of public/_redirects: its code and Location, exactly
 # a missing   404, the bytes of 404.html
 #   path
@@ -40,8 +45,17 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 public="$root/site/public"
 # The policy public/_headers sets, the one line check.sh holds to its value.
 csp=$(sed -n 's/^  Content-Security-Policy: //p' "$public/_headers")
+# The Cache-Control of the files kept a year, which check.sh holds to one
+# value, and Cloudflare's default, which the pages keep.
+year=$(sed -n 's/^  Cache-Control: \(.*immutable\)$/\1/p' "$public/_headers" | sort -u)
+page_cache='public, max-age=0, must-revalidate'
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
+# Every versioned URL the pages and style.css name, once each.
+{
+  grep -ohE '(href|src)="/[^"?#]*\?v=[0-9a-f]{12}"' "$public"/*.html | sed 's/^[a-z]*="//; s/"$//'
+  grep -oE 'url\("/[^"?#]*\?v=[0-9a-f]{12}"\)' "$public/style.css" | sed 's/^url("//; s/")$//'
+} | LC_ALL=C sort -u >"$scratch/versioned"
 
 # The value of one response header, by its lower-case name.
 header() {
@@ -95,6 +109,9 @@ pass() {
           *) printf 'FAIL %s: %s is "%s", expected "%s"\n' "$target" "$check" "$got" "$expect" >>"$scratch/failures" ;;
         esac
       fi
+      if [ "$name" = index.html ] && [ "$(header cache-control)" != "$page_cache" ]; then
+        printf 'FAIL %s: cache-control is "%s", expected "%s"\n' "$target" "$(header cache-control)" "$page_cache" >>"$scratch/failures"
+      fi
       # HSTS comes from the whiteheap.com zone's setting, not from _headers
       # (site/README.md, "HTTPS").
       if [ "$name" = index.html ] && [ "$secure" = yes ]; then
@@ -115,6 +132,19 @@ pass() {
       fi
     fi
   done
+  # Each versioned URL serves the current file and keeps it a year.
+  while read -r ref; do
+    file=${ref%%\?*}
+    status=$(curl -sS -H 'Accept: */*' -o "$scratch/body" -D "$scratch/headers" -w '%{http_code}' "$url$ref") ||
+      status=error
+    if [ "$status" != 200 ]; then
+      printf 'FAIL %s: HTTP %s, expected 200\n' "$ref" "$status" >>"$scratch/failures"
+    elif ! cmp -s "$public$file" "$scratch/body"; then
+      printf 'FAIL %s: differs from site/public%s\n' "$ref" "$file" >>"$scratch/failures"
+    elif [ "$(header cache-control)" != "$year" ]; then
+      printf 'FAIL %s: cache-control is "%s", expected "%s"\n' "$ref" "$(header cache-control)" "$year" >>"$scratch/failures"
+    fi
+  done <"$scratch/versioned"
   # Each redirect answers with its own code and destination, not followed.
   grep -v '^#' "$public/_redirects" | while read -r source destination code; do
     [ -n "$source" ] || continue
