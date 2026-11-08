@@ -29,6 +29,11 @@
 #                  residue there (scenario 1)
 #   touch-aside    create a file in ASIDE before the check after the move
 #                  runs `status` there, so that check fails (scenarios 2, 3)
+#   plant-nested, plant-mount, plant-unreadable
+#                  at the same point, put in ASIDE what Git's status does
+#                  not list and Git's remove would delete or stop at: a
+#                  repository in a tracked folder, a volume mounted at an
+#                  ignored path, or a folder nobody can read (2b, 2c, 2d)
 #   fail-back      fail `worktree move ASIDE ORIGINAL`, the move back (3)
 #   occupy-original with touch-aside, also create a directory at the
 #                  original path, so residue cannot move it back there (3b)
@@ -122,6 +127,34 @@ forget() { # PID
     done
     started=("${keep[@]+"${keep[@]}"}")
 }
+# The volume scenario 2c mounts: a disk image, which any user may attach on
+# macOS; elsewhere a tmpfs, which only root may mount.
+mount_how=
+case $(uname -s) in
+Darwin) mount_how=hdiutil ;;
+Linux | FreeBSD) [ "$(id -u)" = 0 ] && mount_how=tmpfs ;;
+SunOS) [ "$(id -u)" = 0 ] && mount_how=swap ;;
+esac
+# Unmount that volume, at PATH (where the moves left it) or where it was
+# mounted, and wait until it is gone: at most 10 s.
+unmount_planted() { # [PATH]
+    local at i gone
+    [ -e "$work/mounted-at" ] || return 0
+    at=$(cat "$work/mounted-at")
+    for ((i = 0; i < 10; i++)); do
+        umount "${1:-$at}" 2>/dev/null || umount "$at" 2>/dev/null
+        [ -e "$work/mounted-dev" ] && hdiutil detach -quiet "$(cat "$work/mounted-dev")" 2>/dev/null
+        gone=yes
+        mount | grep -qF "/$(basename "$work")/" && gone=
+        [ "$mount_how" = hdiutil ] && hdiutil info | grep -qF "/$(basename "$work")/" && gone=
+        if [ -n "$gone" ]; then
+            rm -f "$work/mounted-at" "$work/mounted-dev"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
 cleanup() {
     local p
     for p in "${started[@]+"${started[@]}"}"; do
@@ -129,6 +162,8 @@ cleanup() {
     done
     [ -f "$work/held" ] && kill -TERM "$(cat "$work/held")" 2>/dev/null
     wait 2>/dev/null
+    unmount_planted "${wt:-}/node_modules/mnt" || echo "recovery-check: could not unmount the scratch volume in $work" >&2
+    chmod -R u+rwx -- "$work" 2>/dev/null # scenario 2d's unreadable folder
     rm -rf -- "$work"
 }
 trap cleanup EXIT
@@ -227,6 +262,41 @@ case " \$* " in
             : >"\$work/touched"
         fi
         ;;
+    *residue-removing-*plant-*)
+        if [ ! -e "\$work/touched" ]; then
+            case \$mode in
+            *plant-nested*)
+                # A repository in src/, which the worktree tracks, holding
+                # only the file the worktree tracks there. Status skips
+                # .git, so it lists nothing.
+                "\$real" init -q "\$dir/src" &&
+                    "\$real" -C "\$dir/src" add a.txt &&
+                    "\$real" -C "\$dir/src" commit -qm inner &&
+                    "\$real" -C "\$dir/src" rev-parse HEAD >"\$work/inner" || exit 1
+                ;;
+            *plant-mount*)
+                # Over node_modules/mnt, an empty folder with an old time,
+                # so the ignored folder's files, bytes and times stay.
+                at=\$dir/node_modules/mnt
+                echo "\$at" >"\$work/mounted-at"
+                case '$mount_how' in
+                hdiutil)
+                    out=\$(hdiutil attach -nobrowse -noverify -noautoopen -mountpoint "\$at" "\$work/vol.dmg") || exit 1
+                    echo "\${out%%[[:space:]]*}" >"\$work/mounted-dev"
+                    ;;
+                tmpfs) mount -t tmpfs tmpfs "\$at" && echo kept >"\$at/kept.txt" || exit 1 ;;
+                swap) mount -F tmpfs swap "\$at" && echo kept >"\$at/kept.txt" || exit 1 ;;
+                *) exit 1 ;;
+                esac
+                ;;
+            *plant-unreadable*)
+                # Status warns that it cannot open x/, and lists nothing.
+                mkdir "\$dir/x" && echo kept >"\$dir/x/kept.txt" && chmod 000 "\$dir/x" || exit 1
+                ;;
+            esac
+            : >"\$work/touched"
+        fi
+        ;;
     esac
     ;;
 *" worktree add "*)
@@ -285,7 +355,7 @@ ok() {
 # With ref_format set, Git stores its refs that way (`--ref-format`).
 make_repo() {
     repo=$work/$name
-    rm -f "$work"/at-* "$work"/go-* "$work"/abort-* "$work/touched" "$work/held" "$work/part-done"
+    rm -f "$work"/at-* "$work"/go-* "$work"/abort-* "$work/touched" "$work/held" "$work/part-done" "$work/inner"
     setup git init -q ${ref_format:+--ref-format="$ref_format"} "$repo"
     printf 'node_modules/\n' >"$repo/.gitignore"
     echo hello >"$repo/README.md"
@@ -413,7 +483,8 @@ if [ -n "$partial_probe" ]; then
     for scenario in stopped-after-move stopped-after-move-restore stopped-after-move-control refused-after-move \
         refused-after-move-control move-back-fails original-taken two-removers two-removers-trash trash-move-in-flight \
         remove-fails-part-way-reflog remove-fails-part-way-head remove-fails-part-way-dotgit remove-fails-part-way-running \
-        restore-forget-race forget-restore-race forget-before-restore-reads restore-forget-race-reftable; do
+        nested-repo-after-move mount-after-move unreadable-after-move restore-forget-race forget-restore-race \
+        forget-before-restore-reads restore-forget-race-reftable; do
         skip_partial "$scenario"
     done
     echo "recovery-check: $passes passed, $failures failed"
@@ -531,6 +602,90 @@ if [ "$status" != 0 ]; then fail "exit $status, want 0"
 elif [ -e "$wt" ] || [ -n "$(asides)" ]; then fail "something of w is left"
 elif [ "$(records)" != "1 records, 1 refs" ]; then fail "removal records: $(records), want 1 records, 1 refs"
 elif common_ok; then ok "with no fault, the same run removes it"; fi
+
+# --- 2b-2d. The check after the move judges what the walk finds ------------
+# Each mode plants in the moved worktree what Git's status does not list
+# and Git's remove, which runs without --force, deletes or stops at: 2b a
+# repository in a tracked folder, whose commits would be lost; 2c a volume
+# mounted at an ignored path, which Git deletes into; 2d a folder nobody
+# can read, where Git stops part way. The plan held none of them, since a
+# worktree whose walk finds one is no candidate. The check after the move
+# must refuse with REASON and put w back.
+outcome() { # what residue says it did with w: "RESULT: REASON"
+    jq -r '.results[0] | "\(.result): \(.reason)"' "$work/$name.out"
+}
+refused_after_plant() { # REASON
+    local out=$work/$name.out
+    if [ "$status" != 3 ]; then fail "exit $status, want 3"
+    elif [ ! -e "$work/touched" ]; then fail "nothing was planted: no status ran in the moved-aside directory"
+    elif [ "$(jq -r '.results[0].result' "$out")" != skipped ]; then fail "result $(outcome), want skipped"
+    elif [ "$(jq -r '.results[0].reason' "$out")" != "$1" ]; then fail "reason: $(jq -r '.results[0].reason' "$out"); want: $1"
+    elif [ "$(record "$wt")" != registered ]; then fail "at its original path Git has: $(record "$wt")"
+    elif [ -n "$(asides)" ]; then fail "a moved-aside directory is left: $(asides)"
+    elif [ "$(interrupted)" != "[]" ]; then fail "scan lists an interrupted removal: $(interrupted)"
+    elif [ "$(records)" != "0 records, 0 refs" ]; then fail "removal records: $(records), want 0 records, 0 refs"
+    else return 0; fi
+    return 1
+}
+
+name=nested-repo-after-move
+make_repo
+mkdir "$wt/src" && echo a >"$wt/src/a.txt" || exit 2
+setup git -C "$wt" add src
+setup git -C "$wt" commit -qm src
+w_sha=$(git -C "$repo" rev-parse w) || exit 2
+w_sum=$(sums "$wt") || exit 2
+echo plant-nested >"$work/mode"
+start "" remove --yes --json "$wt"
+finish "$pid"
+if [ -e "$work/inner" ] && [ "$(git -C "$wt/src" rev-parse HEAD 2>/dev/null)" != "$(cat "$work/inner")" ]; then fail "the repository made in src/ after the move is gone, and its commit with it; residue: $(outcome)"
+elif ! refused_after_plant "contains a .git entry at src/.git after residue moved it aside; it is back in place"; then :
+elif [ "$(sums "$wt" | grep -v '^\./src/\.git/')" != "$w_sum" ]; then fail "the restored worktree's other files changed"
+elif common_ok; then ok "$(jq -r '.results[0].reason' "$work/$name.out")"; fi
+
+name=mount-after-move
+if [ -z "$mount_how" ]; then
+    echo "skip $name: only root may mount a volume on $(uname -s), so a mount point is not witnessed here"
+else
+    make_repo
+    mkdir "$wt/node_modules/mnt" && touch -t 202001010000 "$wt/node_modules/mnt" || exit 2
+    w_sum=$(sums "$wt") || exit 2
+    if [ "$mount_how" = hdiutil ]; then
+        # No Spotlight index and no event log, which macOS would otherwise
+        # keep open on the volume.
+        mkdir -p "$work/vol/.fseventsd" && echo kept >"$work/vol/kept.txt" || exit 2
+        : >"$work/vol/.metadata_never_index" && : >"$work/vol/.fseventsd/no_log" || exit 2
+        setup hdiutil create -quiet -fs HFS+ -volname residue-recovery -layout NONE -format UDRW -srcfolder "$work/vol" "$work/vol.dmg"
+    fi
+    echo plant-mount >"$work/mode"
+    start "" remove --yes --json "$wt"
+    finish "$pid"
+    kept=$(cat "$wt/node_modules/mnt/kept.txt" 2>/dev/null)
+    unmount_planted "$wt/node_modules/mnt"
+    unmounted=$?
+    if [ -e "$work/touched" ] && [ "$kept" != kept ]; then fail "the file on the volume mounted after the move is gone; residue: $(outcome)"
+    elif ! refused_after_plant "contains a mount point at node_modules/mnt after residue moved it aside; it is back in place"; then :
+    elif [ "$unmounted" != 0 ]; then fail "the volume did not unmount within 10 s"
+    elif [ "$(sums "$wt")" != "$w_sum" ]; then fail "the restored worktree's other files changed"
+    elif common_ok; then ok "$(jq -r '.results[0].reason' "$work/$name.out")"; fi
+fi
+
+name=unreadable-after-move
+if [ "$(id -u)" = 0 ]; then
+    echo "skip $name: root may list any folder, so chmod 000 makes none unreadable"
+else
+    make_repo
+    echo plant-unreadable >"$work/mode"
+    start "" remove --yes --json "$wt"
+    finish "$pid"
+    for d in "$wt/x" "$repo"/.worktrees/.w.residue-removing-*/x; do
+        [ -d "$d" ] && chmod 755 "$d"
+    done
+    if ! refused_after_plant "could not read 1 entry after residue moved it aside: x: Permission denied (os error 13); it is back in place"; then :
+    elif [ "$(cat "$wt/x/kept.txt" 2>/dev/null)" != kept ]; then fail "the file in the unreadable folder changed"
+    elif [ "$(sums "$wt" | grep -v '^\./x/kept\.txt ')" != "$w_sum" ]; then fail "the restored worktree's other files changed"
+    elif common_ok; then ok "$(jq -r '.results[0].reason' "$work/$name.out")"; fi
+fi
 
 # --- 3. The check after the move fails, and so does the move back ----------
 name=move-back-fails

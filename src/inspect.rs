@@ -1364,6 +1364,41 @@ fn stamp(path: &Path) -> Result<Option<Stamp>, String> {
     }
 }
 
+/// What the walk of a moved worktree at `dir` found that the plan could not
+/// have held, since only a worktree whose walk found none of it is a
+/// candidate. An ignored entry is `incomplete` only beside one of these.
+fn found_after_move(dir: &Path, usage: &Usage) -> Option<String> {
+    let at = |paths: &[PathBuf]| {
+        let rel: Vec<String> = paths
+            .iter()
+            .map(|p| p.strip_prefix(dir).unwrap_or(p).display().to_string())
+            .collect();
+        examples(&rel, 3)
+    };
+    if !usage.nested_repos.is_empty() {
+        return Some(format!(
+            "contains a .git entry at {} after residue moved it aside",
+            at(&usage.nested_repos)
+        ));
+    }
+    if !usage.mount_points.is_empty() {
+        return Some(format!(
+            "contains a mount point at {} after residue moved it aside",
+            at(&usage.mount_points)
+        ));
+    }
+    if usage.unreadable > 0 {
+        let first = usage.first_error.as_deref().unwrap_or_default();
+        let inside = format!("{}/", dir.display());
+        return Some(format!(
+            "could not read {} after residue moved it aside: {}",
+            plural(usage.unreadable as usize, "entry", "entries"),
+            first.strip_prefix(&inside).unwrap_or(first)
+        ));
+    }
+    None
+}
+
 impl Fingerprint {
     fn of(
         head: Option<String>,
@@ -1401,20 +1436,28 @@ impl Fingerprint {
 
     /// The same measurement taken again at `dir`, the worktree's directory
     /// now (after a move, its new path), with `head` as Git lists it there.
+    /// It refuses what `check_size` refuses, which the fingerprint does not
+    /// hold: an entry the walk cannot read, a nested repository or a mount
+    /// point (#106). Each error is the reason, a whole sentence.
     pub fn again(
         &self,
         dir: &Path,
         head: Option<String>,
         policy: &Policy,
     ) -> Result<Fingerprint, String> {
-        let mut status = Ok(git::status(dir)?);
+        let unmeasured = |e: String| format!("cannot measure it after moving it aside: {e}");
+        let mut status = Ok(git::status(dir).map_err(unmeasured)?);
         let repo = RepoRules::read(dir);
         if let Some((_, problem)) = &repo.problem {
-            return Err(problem.clone());
+            return Err(unmeasured(problem.clone()));
         }
         let rules = policy.with(&repo.rules);
         let (_, usage) = walk(dir, &mut status, &rules);
-        Fingerprint::of(head, &self.git_dir, &status?, &usage)
+        if let Some(found) = usage.as_ref().ok().and_then(|u| found_after_move(dir, u)) {
+            return Err(found);
+        }
+        Fingerprint::of(head, &self.git_dir, &status.map_err(unmeasured)?, &usage)
+            .map_err(unmeasured)
     }
 
     /// The first difference from `now`, as a sentence that names what

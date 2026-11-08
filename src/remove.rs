@@ -9,10 +9,11 @@
 //! the trash, and locks it. After the rename no new process can reach it by
 //! its old path, so residue checks once more at the new path: a fresh
 //! process snapshot (which sees any process that still holds a directory
-//! or file inside it) and the fingerprint. Only then does `git worktree
-//! remove`, without `--force`, delete it; Git applies its own refusals
-//! (modified or untracked files, submodules) on top. On any doubt or
-//! failure residue moves the worktree back where it was.
+//! or file inside it), the fingerprint, and the walk, which must find no
+//! nested repository, mount point or unreadable entry. Only then does
+//! `git worktree remove`, without `--force`, delete it; Git applies its own
+//! refusals (modified or untracked files, submodules) on top. On any doubt
+//! or failure residue moves the worktree back where it was.
 //!
 //! What remains: from the last check to the end of the delete, a process
 //! that opens the hidden directory by its new name, or one the probe cannot
@@ -1403,7 +1404,8 @@ impl Moved<'_> {
 
 /// After the move: Git lists the worktree at its new path, locked by
 /// residue, with the HEAD and branch of the plan; no process the probe can
-/// see is inside it; and its fingerprint still matches the plan.
+/// see is inside it; its fingerprint still matches the plan; and the walk
+/// finds no nested repository, mount point or unreadable entry there.
 fn verify_moved(
     dest: &Path,
     before: &Report,
@@ -1449,9 +1451,7 @@ fn verify_moved(
         .fingerprint
         .as_ref()
         .map_err(|e| format!("residue could not record what the plan showed: {e}"))?;
-    let now = planned
-        .again(dest, listed.head.clone(), policy)
-        .map_err(|e| format!("cannot measure it after moving it aside: {e}"))?;
+    let now = planned.again(dest, listed.head.clone(), policy)?;
     if let Some(why) = planned.changed(&now, since) {
         return Err(why);
     }
