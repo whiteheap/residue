@@ -16,8 +16,8 @@
 #    inline block allowed is the home page's JSON-LD, which is data that
 #    browsers do not run.
 # 7. The fonts load from the site itself, with font-display: swap, the 400
-#    weight is preloaded, and the Content Security Policy and the
-#    Strict-Transport-Security header are the exact ones below.
+#    weight is preloaded, and the Content Security Policy is the exact one
+#    below.
 # 8. install.sh passes shellcheck (when it is installed), and the signing key
 #    hashes it pins match packaging/signing-key.asc.
 # 9. Search engines, link previews and agents: robots.txt has one group for
@@ -26,9 +26,10 @@
 #    public page a description, a canonical, and Open Graph and Twitter tags;
 #    the social image is 1200 by 630 and the icons their sizes; the JSON-LD
 #    parses and has the fields search engines need (this needs jq); llms.txt
-#    meets the llmstxt.org shape and Lighthouse's audit; the security.txt
-#    Expires is more than 30 days and less than a year away; the IndexNow key
-#    file holds its own name.
+#    meets the llmstxt.org shape and Lighthouse's audit; _headers serves
+#    every .txt file with charset=utf-8; the security.txt Expires is more
+#    than 30 days and less than a year away; the IndexNow key file holds its
+#    own name.
 set -u
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -259,14 +260,6 @@ if [ "$(sed -n 's/^  Content-Security-Policy: //p' "$public/_headers")" = "$csp"
 else
   fail "_headers' Content-Security-Policy is not exactly: $csp"
 fi
-# HTTPS only, for two years. The zone's own HSTS setting can replace it
-# (site/README.md, "HTTPS"), so smoke.sh does not check the served value.
-hsts='max-age=63072000'
-if [ "$(sed -n 's/^  Strict-Transport-Security: //p' "$public/_headers")" = "$hsts" ]; then
-  ok "_headers has Strict-Transport-Security: $hsts"
-else
-  fail "_headers' Strict-Transport-Security is not exactly: $hsts"
-fi
 faces=$(grep -c '@font-face' "$public/style.css")
 swaps=$(grep -c 'font-display: swap;' "$public/style.css")
 if [ "$faces" -gt 0 ] && [ "$faces" -eq "$swaps" ]; then
@@ -356,6 +349,14 @@ if grep -qi 'x-robots-tag' "$public/_headers"; then
   fail "_headers sets X-Robots-Tag; public pages must not carry noindex"
 else
   ok "_headers sets no X-Robots-Tag"
+fi
+# Cloudflare serves a .txt file as text/plain with no charset, and llms.txt
+# and security.txt need one. wrangler dev adds it anyway, so check the rule.
+txt_type=$(awk '/^[^ #]/ { path = $0 } path == "/*.txt" && sub(/^  Content-Type: /, "")' "$public/_headers")
+if [ "$txt_type" = 'text/plain; charset=utf-8' ]; then
+  ok "_headers serves every .txt file as text/plain; charset=utf-8"
+else
+  fail "_headers needs a /*.txt rule with one line, Content-Type: text/plain; charset=utf-8"
 fi
 
 titles=
