@@ -163,12 +163,55 @@ fn run_inner(
     let stdout = drain(child.stdout.take(), max_output, filter);
     let stderr = drain(child.stderr.take(), max_output, None);
     let deadline = Instant::now() + timeout;
-    let mut pause = Duration::from_millis(1);
-    let status = loop {
+    // Each drain thread ends when its pipe closes, which happens when the
+    // child exits, so this wakes at the exit and not on a timer (#82).
+    let stdout = finish(&mut child, stdout, deadline, timeout)?;
+    let stderr = finish(&mut child, stderr, deadline, timeout)?;
+    let status = reap(&mut child, deadline, timeout)?;
+    Ok(Captured {
+        status,
+        stdout: checked(stdout, max_output)?,
+        stderr: checked(stderr, max_output)?,
+    })
+}
+
+/// Wait for a drain thread until the deadline. A child that is still
+/// running then is stopped. One that has exited while its pipe stays open
+/// left a grandchild holding it, which is not waited for either.
+fn finish(
+    child: &mut Child,
+    rx: Receiver<Stream>,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<Stream, RunError> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if let Ok(stream) = rx.recv_timeout(left) {
+        return Ok(stream);
+    }
+    match child.try_wait() {
+        Ok(Some(_)) => Err(RunError::Timeout(timeout)),
+        Ok(None) => {
+            stop(child);
+            Err(RunError::Timeout(timeout))
+        }
+        Err(e) => {
+            stop(child);
+            Err(RunError::Wait(e))
+        }
+    }
+}
+
+/// Reap a child whose pipes have closed. It has almost always exited, but
+/// the kernel closes its files a moment before it can be reaped, and a
+/// child can close both pipes and keep running, so check at once, then
+/// back off up to 20 ms until the deadline.
+fn reap(child: &mut Child, deadline: Instant, timeout: Duration) -> Result<ExitStatus, RunError> {
+    let mut pause = Duration::from_micros(50);
+    loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => return Ok(status),
             Ok(None) if Instant::now() >= deadline => {
-                stop(&mut child);
+                stop(child);
                 return Err(RunError::Timeout(timeout));
             }
             Ok(None) => {
@@ -176,18 +219,11 @@ fn run_inner(
                 pause = (pause * 2).min(Duration::from_millis(20));
             }
             Err(e) => {
-                stop(&mut child);
+                stop(child);
                 return Err(RunError::Wait(e));
             }
         }
-    };
-    let stdout = collect(stdout, deadline, timeout, max_output)?;
-    let stderr = collect(stderr, deadline, timeout, max_output)?;
-    Ok(Captured {
-        status,
-        stdout,
-        stderr,
-    })
+    }
 }
 
 /// Kill and reap a child that overran its deadline. A child that leads its
@@ -266,18 +302,8 @@ fn drain<R: Read + Send + 'static>(
     rx
 }
 
-fn collect(
-    rx: Receiver<Stream>,
-    deadline: Instant,
-    timeout: Duration,
-    max: usize,
-) -> Result<Vec<u8>, RunError> {
-    // A grandchild can inherit the pipe and keep it open after the child
-    // exits, so wait for the reader only until the original deadline.
-    let left = deadline.saturating_duration_since(Instant::now());
-    let stream = rx
-        .recv_timeout(left.max(Duration::from_millis(100)))
-        .map_err(|_| RunError::Timeout(timeout))?;
+/// The bytes of a finished stream, or the read error or overflow it had.
+fn checked(stream: Stream, max: usize) -> Result<Vec<u8>, RunError> {
     if let Some(e) = stream.error {
         return Err(RunError::Wait(e));
     }
@@ -339,5 +365,50 @@ mod tests {
             Err(RunError::TooLarge(5)) => {}
             other => panic!("expected TooLarge(5), got {:?}", other.map(|o| o.stdout)),
         }
+    }
+
+    fn shell(script: &str) -> Command {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(script);
+        cmd
+    }
+
+    #[test]
+    fn a_child_past_its_deadline_is_stopped() {
+        let started = Instant::now();
+        match run(&mut shell("sleep 30"), Duration::from_millis(200), 1 << 20) {
+            Err(RunError::Timeout(_)) => {}
+            other => panic!("expected Timeout, got {:?}", other.map(|o| o.status)),
+        }
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_grandchild_holding_a_pipe_ends_at_the_deadline() {
+        let started = Instant::now();
+        match run(
+            &mut shell("sleep 30 & exit 0"),
+            Duration::from_millis(300),
+            1 << 20,
+        ) {
+            Err(RunError::Timeout(_)) => {}
+            other => panic!("expected Timeout, got {:?}", other.map(|o| o.status)),
+        }
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(300), "{took:?}");
+        assert!(took < Duration::from_secs(10), "{took:?}");
+    }
+
+    #[test]
+    fn a_child_that_closes_its_pipes_is_still_waited_for() {
+        let started = Instant::now();
+        let out = run(
+            &mut shell("exec >&- 2>&-; sleep 0.3; exit 3"),
+            Duration::from_secs(20),
+            1 << 20,
+        )
+        .unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        assert!(started.elapsed() >= Duration::from_millis(300));
     }
 }
