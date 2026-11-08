@@ -1,15 +1,17 @@
 //! Running residue: an explicit argv, a known PATH, a deadline, and the output
 //! read back as one of residue's JSON documents. The documents are the
 //! contract between the CLI and this app; nothing here decides what is safe
-//! to remove.
+//! to remove. Every child the app starts, residue or not, is started by
+//! [`spawn`].
 
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -86,21 +88,20 @@ pub struct Run<'a> {
 impl Run<'_> {
     pub fn output(&self) -> Result<Output, CliError> {
         let command = shown(self.bin, &self.args);
-        let mut child = Command::new(self.bin)
-            .args(&self.args)
+        let mut cmd = Command::new(self.bin);
+        cmd.args(&self.args)
             .current_dir(self.cwd)
             .env("PATH", self.path_env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| CliError {
-                kind: ErrorKind::Missing,
-                message: format!("cannot start {}: {e}", self.bin.display()),
-                command: Some(command.clone()),
-                stderr: None,
-                exit_code: None,
-            })?;
+            .stderr(Stdio::piped());
+        let mut child = spawn(&mut cmd).map_err(|e| CliError {
+            kind: ErrorKind::Missing,
+            message: format!("cannot start {}: {e}", self.bin.display()),
+            command: Some(command.clone()),
+            stderr: None,
+            exit_code: None,
+        })?;
 
         let stdout = child.stdout.take().map(reader);
         let stderr = child.stderr.take().map(reader);
@@ -154,6 +155,30 @@ impl Run<'_> {
             code: status.code(),
         })
     }
+}
+
+/// Start `cmd`, one child at a time. On macOS, which has no `pipe2`, the
+/// standard library makes a child's pipes with `pipe()` and marks them
+/// close-on-exec in a second step. The window's requests run on several
+/// threads at once (`lib.rs`, `blocking`), and a child another thread starts
+/// between the two steps inherits them: then the first child's output ends
+/// only when that other child, and anything it left running, exits (#116).
+/// Under this lock no child starts while another start is making its pipes.
+///
+/// The lock covers only the children started here, so this is the one call
+/// of `Command::spawn` in the app, and `clippy.toml` refuses `spawn`,
+/// `output` and `status` anywhere else. A start holds the lock for the
+/// `posix_spawn` or `fork` and `exec` alone, never while the child runs.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the one place a child starts, under the lock"
+)]
+pub fn spawn(cmd: &mut Command) -> io::Result<Child> {
+    static STARTING: Mutex<()> = Mutex::new(());
+    // The lock guards no data, so a start that panicked holding it left
+    // nothing half done.
+    let _starting = STARTING.lock().unwrap_or_else(PoisonError::into_inner);
+    cmd.spawn()
 }
 
 type Reader = thread::JoinHandle<std::io::Result<String>>;
