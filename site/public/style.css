@@ -630,10 +630,10 @@ pre code::before {
   color: var(--muted);
 }
 
-/* Shown at 420 by 504 (drawn at 500 by 600); never wider, so its labels stay
-   at that size. */
+/* Shown at its drawn size, 480 by 1675, so its smallest labels stay at 14 px;
+   a narrower column scales it down. */
 .diagram {
-  inline-size: 26.25rem;
+  inline-size: 30rem;
   margin-block-start: 1.5rem;
 }
 
