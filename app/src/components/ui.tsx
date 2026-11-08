@@ -101,8 +101,8 @@ export function isPermissionError(text: string | null | undefined): boolean {
 export function PermissionHint() {
   return (
     <p className="hint">
-      macOS kept residue from reading a folder. Open System Settings, Privacy & Security, Files
-      and Folders (or Full Disk Access), allow residue, then try again.
+      macOS blocked residue from a folder. Allow residue in System Settings, Privacy & Security,
+      Files and Folders (or Full Disk Access), then try again.
     </p>
   );
 }
@@ -127,8 +127,8 @@ export function ErrorPanel({
       <p>{error.message}</p>
       {error.kind === "missing" ? (
         <p className="hint">
-          The residue binary inside the app is missing or cannot start. Download the app again
-          from github.com/whiteheap/residue/releases.
+          The residue inside the app is missing or cannot start. Download the app again from
+          github.com/whiteheap/residue/releases.
         </p>
       ) : null}
       {permission ? <PermissionHint /> : null}

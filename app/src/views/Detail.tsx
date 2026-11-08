@@ -87,7 +87,7 @@ export function Detail({
                 </Button>
                 {w.verdict === "candidate" ? (
                   <SolidButton icon={<Trash />} onClick={() => onRemove([w.path])}>
-                    Move to trash…
+                    Move this worktree to the trash…
                   </SolidButton>
                 ) : null}
               </div>
@@ -221,8 +221,7 @@ export function Detail({
                 </table>
                 {w.size ? (
                   <p className="hint">
-                    Sizes are apparent: the bytes the files hold. Share is of the worktree's{" "}
-                    {bytes(w.size.apparent_bytes)}.
+                    Apparent sizes. Share is of the worktree's {bytes(w.size.apparent_bytes)}.
                   </p>
                 ) : null}
               </section>
@@ -231,8 +230,7 @@ export function Detail({
             <section className="block">
               <h2>Keep it</h2>
               <p className="quiet">
-                A locked worktree stays through every cleanup, by hand or automatic, until you
-                unlock it.
+                A locked worktree stays through every cleanup, by hand or automatic.
               </p>
               <Command text={`git worktree lock --reason "keep" ${quote(w.path)}`} label="lock command" />
             </section>
@@ -260,18 +258,16 @@ function Space({ size, ignored }: { size: Size; ignored: IgnoredEntry[] }) {
         valueText={`${back}, ${shareText(size.reclaimable_bytes, size.allocated_bytes)}`}
       />
       <p className="viz-caption">
-        Removing it gives back {back} ({shareText(size.reclaimable_bytes, size.allocated_bytes)}).
-        residue's caveat: reclaimable excludes files hard-linked from outside; copy-on-write clones
-        are not detected.
+        Deleting it frees {back} ({shareText(size.reclaimable_bytes, size.allocated_bytes)}). Files
+        hard-linked from outside are not counted, and copy-on-write clones are not detected.
       </p>
       {comp ? (
         <>
           <SegmentedBar parts={comp.parts} total={comp.total} />
           <p className="viz-caption">
-            Its files by apparent size, {bytes(size.apparent_bytes)} in all: the largest ignored
-            entries, then everything else.
+            Files by apparent size, {bytes(size.apparent_bytes)} in all, largest ignored entries first.
             {comp.parts.some((p) => p.tone === "bright")
-              ? " A full-strength block is an ignored entry that is not regenerable, which keeps the worktree."
+              ? " A full-strength block is an ignored entry that is not regenerable: it keeps the worktree."
               : ""}
           </p>
         </>
@@ -284,14 +280,14 @@ function verdictText(w: Worktree): string {
   if (w.verdict === "stale") return w.stale_reason ?? VERDICT_HELP.stale;
   const kept = keptBy(w).map((c) => checkLabel(c.id).toLowerCase());
   if (w.verdict === "keep" && kept.length > 0) {
-    return `Kept by: ${kept.join(", ")}. It stays until every check passes.`;
+    return `Kept by: ${kept.join(", ")}, until every check passes.`;
   }
   if (w.verdict === "unknown" && kept.length > 0) {
-    return `Could not finish: ${kept.join(", ")}. residue keeps it until every check can run.`;
+    return `Could not finish: ${kept.join(", ")}. Kept until every check can run.`;
   }
   return (
     verdictHelp(w.verdict) ??
-    `residue's verdict is "${w.verdict}", which this version of the app does not know.`
+    `residue's verdict "${w.verdict}" is new to this app version.`
   );
 }
 

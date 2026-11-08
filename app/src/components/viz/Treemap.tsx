@@ -165,8 +165,8 @@ export function Treemap({
     return (
       <p className="quiet">
         {tree.unmeasured > 0
-          ? "residue could not measure these worktrees, so there is nothing to draw. The list has each one."
-          : "None of these worktrees holds space that removing it would give back."}
+          ? "residue could not measure these worktrees. The list below has each one."
+          : "Removing these worktrees would free no space."}
       </p>
     );
   }
@@ -241,8 +241,8 @@ export function Treemap({
       }
       caption={
         <>
-          Each tile is a worktree, sized by the space removing it gives back. Click a tile for its
-          checks{single ? "" : ", a repository to zoom in"}.{current ? " Escape zooms out." : ""}
+          Each tile is a worktree, sized by the space removing it frees. Click a tile for
+          its checks{single ? "" : ", a repository to zoom in"}.{current ? " Escape zooms out." : ""}
           {missing > 0 ? ` ${notDrawn(missing, "residue could not measure")}` : ""}
           {empty > 0 ? ` ${notDrawn(empty, "with nothing to reclaim")}` : ""}
         </>

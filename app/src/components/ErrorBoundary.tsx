@@ -50,9 +50,8 @@ export class ErrorBoundary extends Component<Props, State> {
       <>
         <p>{error.message}</p>
         <p className="hint">
-          Drawing failed. An action you confirmed may have finished: check Worktrees, Restore and
-          Automatic cleanup. If it happens again, residue may have sent something this version of
-          the app does not know.
+          An action you confirmed may still have run: check Worktrees, Restore and Automatic cleanup.
+          If this repeats, residue may have sent something this app version does not know.
         </p>
         {error.stack ? (
           <details>

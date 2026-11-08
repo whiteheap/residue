@@ -96,7 +96,7 @@ export function Worktrees({
       description={
         roots.length > 0
           ? `Linked Git worktrees under ${roots.map((r) => tilde(r, home)).join(", ")}`
-          : "Choose the folders that hold your repositories."
+          : "Choose the folders that hold your code."
       }
       actions={
         <Button
@@ -122,7 +122,7 @@ export function Worktrees({
           <Empty
             icon={<FolderPlus size={32} />}
             title="No folders to scan"
-            description="residue looks for Git repositories in the folders you choose, and in every folder under them."
+            description="residue scans each folder you choose and every folder inside it."
             contents={
               <SolidButton icon={<FolderPlus />} onClick={onChooseFolders}>
                 Choose folders
@@ -159,7 +159,7 @@ export function Worktrees({
         {scanning && !doc ? (
           <Loading
             title={`Scanning ${roots.map((r) => tilde(r, home)).join(", ")}`}
-            detail="residue checks and measures every linked worktree. A large folder takes a minute."
+            detail="A large folder can take a minute."
           />
         ) : null}
 
@@ -170,7 +170,7 @@ export function Worktrees({
             {doc.summary.linked_worktrees === 0 ? (
               <Empty
                 title="No linked worktrees"
-                description="These folders have no Git worktrees besides each repository's main checkout. Nothing takes extra space."
+                description="These folders hold only each repository's main checkout."
               />
             ) : (
               <>
@@ -186,7 +186,7 @@ export function Worktrees({
                 {repos.length === 0 ? (
                   <p className="quiet">
                     {filter === "candidate"
-                      ? "No worktree can go right now: each one has a check that keeps it."
+                      ? "None can go now: a check keeps each one."
                       : "Every worktree can go."}
                   </p>
                 ) : (
@@ -228,7 +228,7 @@ export function Worktrees({
               Clear
             </Button>
             <SolidButton icon={<Trash />} onClick={() => onRemove(chosen)}>
-              Move to trash…
+              Move {chosen.length} to the trash…
             </SolidButton>
           </div>
         </footer>
@@ -259,9 +259,14 @@ function SinceOpen({
           <span>
             Automatic cleanup freed{" "}
             <span className="since-open-figure num">about {bytes(cleaned.bytes)}</span>,{" "}
-            {plural(cleaned.worktrees, "worktree")}, since the app was last open on {localTime(cleaned.since)}.
+            {plural(cleaned.worktrees, "worktree")}, since the app was last open.
           </span>
-          <button type="button" className="link-button" title={cleaned.note} onClick={onFreed}>
+          <button
+            type="button"
+            className="link-button"
+            title={`Since ${localTime(cleaned.since)}. ${cleaned.note}`}
+            onClick={onFreed}
+          >
             Open Freed
           </button>
         </>
@@ -288,7 +293,7 @@ function Summary({
       <div className="summary-main">
         <p className="summary-figure num">{bytes(s.candidate_reclaimable_bytes)}</p>
         <p className="summary-caption">
-          reclaimable: {s.candidates} of {plural(s.linked_worktrees, "linked worktree")} can go
+          reclaimable: {s.candidates} of {plural(s.linked_worktrees, "worktree")} can go
         </p>
       </div>
       <dl className="summary-facts">
@@ -329,7 +334,7 @@ function Summary({
           <div>
             <dt>Interrupted removals</dt>
             <dd>
-              {s.interrupted_removals}; run <code>residue scan</code> in a terminal for details
+              {s.interrupted_removals}: <code>residue scan</code> in a terminal shows them
             </dd>
           </div>
         ) : null}
@@ -381,7 +386,7 @@ function RepoGroup({
         <span className="repo-check">
           {candidates.length > 0 ? (
             <Checkbox
-              aria-label={`Select every worktree that can go in ${name}`}
+              aria-label={`Select all that can go in ${name}`}
               checked={chosen > 0 && chosen === candidates.length}
               indeterminate={chosen > 0 && chosen < candidates.length}
               onCheckedChange={(on) => onSelect(candidates, on === true)}

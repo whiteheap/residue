@@ -43,7 +43,7 @@ export function Folders({
     <>
       <PageHeader
         title="Folders"
-        description="residue looks for Git repositories in these folders and every folder under them."
+        description="residue scans these folders and every folder inside them."
         actions={
           <SolidButton icon={<FolderPlus />} onClick={add} disabled={saving}>
             Add a folder…
@@ -54,12 +54,11 @@ export function Folders({
         {error ? <ErrorPanel title="The folders were not saved" error={error} /> : null}
         {!settings.saved && settings.roots.length > 0 ? (
           <p className="notice">
-            These are the usual code folders found in your home folder. Add or remove one to save
-            your own list.
+            Found in your home folder. Add or remove one to save your own list.
           </p>
         ) : null}
         {settings.roots.length === 0 ? (
-          <p className="quiet">No folders yet. Add the folders that hold your repositories.</p>
+          <p className="quiet">No folders yet. Add the ones that hold your code.</p>
         ) : (
           <ul className="rows folder-rows">
             {settings.roots.map((root) => (

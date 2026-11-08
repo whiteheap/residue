@@ -70,7 +70,7 @@ export function Automatic({
     <>
       <PageHeader
         title="Automatic cleanup"
-        description="residue watch runs at login and removes a worktree when its work has landed, or when the disk runs low."
+        description="residue watch runs at login and removes worktrees whose work landed, or when the disk runs low."
         actions={
           <Button variant="secondary" icon={<ArrowClockwise />} loading={loading} disabled={loading} onClick={load}>
             Refresh
@@ -82,9 +82,8 @@ export function Automatic({
           <section className="notice dev">
             <h2>Development preview</h2>
             <p>
-              RESIDUE_APP_DEV_SERVICE=preview is set in this debug build. The switch never runs
-              residue service install or uninstall: it shows the command it would run and the
-              output of residue watch --once --dry-run, which removes nothing.
+              RESIDUE_APP_DEV_SERVICE=preview: the switch never installs or uninstalls the service. It
+              shows the command and runs only residue watch --once --dry-run, which removes nothing.
             </p>
           </section>
         ) : null}
@@ -125,7 +124,7 @@ export function Automatic({
                 {program.dry_run ? (
                   <div>
                     <dt>Mode</dt>
-                    <dd>log only (--dry-run): it records what it would remove and removes nothing</dd>
+                    <dd>log only (--dry-run): removes nothing</dd>
                   </div>
                 ) : null}
                 {program.options.length > 0 ? (
@@ -203,15 +202,15 @@ export function Automatic({
 
         <section className="block">
           <h2>Without the app</h2>
-          <p className="quiet">The service does not need the app. To turn it off from a terminal:</p>
+          <p className="quiet">The service runs without the app. Turn it off from a terminal:</p>
           {/* The binary the service runs: the app's own copy is not on PATH. */}
           <Command
             text={`${program ? shellWord(program.binary) : "residue"} service uninstall`}
           />
           {info?.path_source === "fallback" ? (
             <p className="hint">
-              The app could not read your login shell's PATH, so residue runs with the standard
-              folders only. If Git lives somewhere else, the service may not find it.
+              The app could not read your login shell's PATH, so residue uses the standard folders
+              only. The service may not find a Git installed elsewhere.
             </p>
           ) : null}
         </section>
@@ -254,11 +253,11 @@ function OtherOptions({ options }: { options: string[] }) {
   if (each.length === 0) return null;
   return (
     <>
-      {". The app does not know "}
+      {". Unknown to this app: "}
       <code>
         <Flags flags={each} />
       </code>
-      , and a save passes {each.length === 1 ? "it" : "them"} on as written
+      ; a save keeps {each.length === 1 ? "it" : "them"} as written
     </>
   );
 }
@@ -268,12 +267,12 @@ function previewFetch(fetch: WatchFetch, done: boolean): string {
   switch (fetch.mode) {
     case "every":
       return done
-        ? `It fetched each repository first, as the service does on its first pass and about every ${duration(fetch.value)} after, so a worktree whose branch was deleted on the remote shows here. A fetch changes only remote-tracking refs.`
-        : "Like the service's first pass, it fetches each repository first, which can take a while. A fetch changes only remote-tracking refs.";
+        ? `It fetched first, as the service does about every ${duration(fetch.value)}, so a branch deleted on the remote shows here. A fetch changes only remote-tracking refs.`
+        : "It fetches first, as the service does, which can take a while. A fetch changes only remote-tracking refs.";
     case "off":
       return done
-        ? "It did not fetch (--no-fetch), as the service does not: a branch deleted on the remote shows after your next git fetch --prune."
-        : "It does not fetch (--no-fetch), as the service does not.";
+        ? "It did not fetch (--no-fetch), like the service: a branch deleted on the remote shows after your next git fetch --prune."
+        : "It does not fetch (--no-fetch), like the service.";
     case "never":
       return `A residue older than ${fetch.since} never fetches, so neither ${done ? "did" : "does"} the preview.`;
     default:
@@ -318,12 +317,12 @@ function FreeSpace({
             ))}
           </div>
           <p className="viz-caption">
-            The disks the scanned repositories are on, from the last scan.
+            Each disk the scanned repositories are on, from the last scan.
             {levels
-              ? ` The marks show where automatic cleanup starts removing idle worktrees and the free space it removes until${on ? "" : ", if you turn it on"}.`
+              ? ` The marks show where automatic cleanup ${on ? "starts" : "would start"} removing idle worktrees, and where it stops.`
               : ""}
             {byTotals
-              ? " This residue does not say which disk a repository is on, so repositories on disks of the same size show as one."
+              ? " This residue does not name each repository's disk, so disks of the same size show as one."
               : ""}
             {unread > 0 ? ` residue could not read the free space of ${plural(unread, "repository", "repositories")}.` : ""}
           </p>
@@ -360,7 +359,7 @@ function Disk({ disk, levels, on }: { disk: DiskMeter; levels: CleanupLevels | n
           <Warning aria-hidden weight="bold" /> Below {levels.start}% free:{" "}
           {on
             ? "automatic cleanup removes idle worktrees at its next free-space read."
-            : "automatic cleanup would remove idle worktrees, if you turn it on."}
+            : "automatic cleanup would remove idle worktrees once turned on."}
         </p>
       ) : null}
     </div>
@@ -389,46 +388,61 @@ function WhatItRemoves({
       </h2>
       <ul className="plain-list bullets">
         <li>
-          A worktree whose work landed: its upstream branch was deleted, as merging a pull request
-          with branch deletion does, and the worktree has not changed for{" "}
+          Work landed: its upstream branch is gone and it is unchanged for{" "}
           {duration(settings.grace.value)}. {fetchWords(settings.fetch, version)}
         </li>
         <li>
-          When a disk is below {low.below} free: worktrees unchanged for{" "}
-          {duration(settings.idle.value)}, largest first, until {low.until} is free.
+          Disk below {low.below} free: worktrees unchanged for {duration(settings.idle.value)},
+          largest first, until {low.until} is free.
         </li>
       </ul>
-      <p>
-        Every check runs before each removal, so a worktree with changes, untracked files or a
-        running process stays. Automatic cleanup deletes the worktree instead of using the trash,
-        because freeing the disk is its job. The branch and its commits stay, and a locked worktree
-        stays. In each repository it removes from, it also deletes trash entries older than{" "}
-        {duration(settings.keep_trash.value)}, residue's default <Flags flags={["--keep-trash"]} />. It
-        keeps each removal record it writes for at least {duration(settings.keep_removed.value)},{" "}
-        {settings.keep_removed.default ? "residue's default " : "its "}
-        <Flags flags={["--keep-removed"]} />, and until a later removal forgets the record, Restore
-        recreates a worktree it deleted. No run forgets a record before the{" "}
-        <Flags flags={["--keep-removed"]} /> it was written with, and automatic cleanup forgets one
-        only once it is also older than its own.
-      </p>
+      <ul className="plain-list bullets">
+        <li>
+          Every check runs first: changes, untracked files, a running process or a lock keep a
+          worktree.
+        </li>
+        <li>It deletes instead of using the trash. Branches and commits stay.</li>
+        <li>
+          Restore recreates what it deleted for at least {duration(settings.keep_removed.value)} (
+          {settings.keep_removed.default ? "residue's default " : "the service's "}
+          <Flags flags={["--keep-removed"]} />
+          ).
+        </li>
+        <li>
+          It also deletes trash entries older than {duration(settings.keep_trash.value)} (residue's
+          default <Flags flags={["--keep-trash"]} />) in each repository it removes from.
+        </li>
+      </ul>
+      <details className="viz-details">
+        <summary>When a removal record is forgotten</summary>
+        <p className="hint">
+          No run forgets a record before the <Flags flags={["--keep-removed"]} /> it was written
+          with, and automatic cleanup forgets one only once it is also older than its own. A
+          forgotten record cannot be restored.
+        </p>
+      </details>
       <p className="hint">
         {set.length === 0 ? (
           running ? (
             "The service sets no options."
-          ) : (
-            "Turning it on starts from residue's defaults."
-          )
+          ) : null
         ) : (
           <>
-            {running ? "From the service's arguments: " : "Turning it on keeps "}
+            {running ? "The service sets " : "Turning it on keeps "}
             <Flags flags={set} />.
           </>
         )}
         {defaults.length > 0 ? (
           <>
-            {" residue's defaults, where it sets none: "}
+            {set.length > 0
+              ? " residue's defaults for the rest: "
+              : running
+                ? " It uses residue's defaults: "
+                : "Turning it on uses residue's defaults: "}
             <Flags flags={defaults} />.
           </>
+        ) : set.length === 0 && !running ? (
+          "Turning it on uses residue's defaults."
         ) : null}
         {running ? "" : ` It would run ${version ?? "a residue of unknown version"}.`}
       </p>
@@ -520,7 +534,7 @@ function TurnOnDialog({
                 }
               />
             ) : (
-              <Loading title="Reading the service" detail="A save plans from what residue reports now." />
+              <Loading title="Reading the service" />
             )}
             <div className="dialog-buttons">
               <Button variant="secondary" onClick={close}>
@@ -643,11 +657,10 @@ function SaveForm({
         {replacing ? "Change the watched folders" : "Turn on automatic cleanup"}
       </Dialog.Title>
       <Dialog.Description className="dialog-text">
-        residue watch starts now and at every login. It deletes a worktree in the folders below
-        when its upstream branch is gone and it has not changed for{" "}
-        {duration(settings.grace.value)}, or when the disk is below {low.below} free and it has
-        not changed for {duration(settings.idle.value)}. Every check runs first. It deletes
-        instead of using the trash; branches and commits stay.
+        Deletes a worktree when its upstream branch is gone and it is unchanged for{" "}
+        {duration(settings.grace.value)}, or when the disk is below {low.below} free and it is
+        unchanged for {duration(settings.idle.value)}. It starts now and at every login, runs every
+        check first, and deletes instead of using the trash; branches and commits stay.
       </Dialog.Description>
 
       <fieldset className="folder-choice">
@@ -666,7 +679,7 @@ function SaveForm({
       </fieldset>
 
       <Checkbox
-        label="Log only: record what it would remove, and remove nothing (--dry-run)"
+        label="Log only, remove nothing (--dry-run)"
         checked={dryRun}
         onCheckedChange={(on) => setDryRun(on === true)}
       />
@@ -687,11 +700,11 @@ function SaveForm({
             <dd>
               {plan.keep.length > 0 ? (
                 <>
-                  <code>{plan.keep.join(" ")}</code>, kept from the service as written
+                  <code>{plan.keep.join(" ")}</code>, kept as written
                   <OtherOptions options={current?.other_options ?? []} />
                 </>
               ) : replacing ? (
-                "the service sets none, so residue's defaults apply"
+                "none set, so residue's defaults"
               ) : (
                 "residue's defaults"
               )}
@@ -710,7 +723,7 @@ function SaveForm({
         </dl>
         {plan.blocked ? (
           <p className="notice" role="alert">
-            <strong className="warn">Saving is off. </strong>
+            <strong className="warn">Cannot save. </strong>
             {plan.blocked}
           </p>
         ) : null}
@@ -718,7 +731,7 @@ function SaveForm({
 
       <section className="plan-section">
         <div className="plan-section-head">
-          <h3>What it would remove right now</h3>
+          <h3>What it would remove now</h3>
           <Button
             variant="secondary"
             size="sm"
@@ -734,17 +747,14 @@ function SaveForm({
           <>
             <Command text={previewed.command} />
             <pre className="log full" aria-label="Preview">
-              {previewed.lines.length > 0 ? previewed.lines.join("\n") : "Nothing to remove right now."}
+              {previewed.lines.length > 0 ? previewed.lines.join("\n") : "Nothing to remove now."}
             </pre>
             <p className="hint">{previewFetch(previewed.fetch, true)}</p>
           </>
         ) : (
           <p className="hint">
-            Runs one pass of the service as a save sets it up:{" "}
-            <span className="flag">residue watch --once --dry-run</span> on these folders, with every
-            option above, by the residue under Runs
-            {plan.managed ? " (for now the one inside the app, which a save copies there)" : ""}.{" "}
-            <Flags flags={["--dry-run"]} /> removes nothing. {previewFetch(settings.fetch, false)}
+            One pass of the service as saved, with <Flags flags={["--dry-run"]} />, which removes
+            nothing. {previewFetch(settings.fetch, false)}
           </p>
         )}
       </section>
@@ -752,8 +762,8 @@ function SaveForm({
       {changedSince ? (
         <div className="notice" role="alert">
           <p>
-            <strong className="warn">Nothing was saved: the service changed after this dialog read it. </strong>
-            The dialog now shows it as it is. Check it, then save again.
+            <strong className="warn">Nothing saved: the service changed after this dialog opened. </strong>
+            Check it as it is now, then save again.
           </p>
           <ul>
             {changedSince.map((line) => (
@@ -774,7 +784,7 @@ function SaveForm({
           disabled={working !== null || roots.length === 0 || plan.blocked !== null}
           onClick={install}
         >
-          {replacing ? "Save" : "Turn on"}
+          {replacing ? "Save folders" : "Turn on automatic cleanup"}
         </SolidButton>
       </div>
     </>
@@ -814,8 +824,7 @@ function TurnOffDialog({ onClose, onChanged }: { onClose: () => void; onChanged:
       <Dialog size="lg" className="dialog">
         <Dialog.Title className="dialog-title">Turn off automatic cleanup?</Dialog.Title>
         <Dialog.Description className="dialog-text">
-          residue service uninstall stops residue watch and removes its login item. Worktrees stay
-          until you remove them. The log stays.
+          Stops residue watch and removes its login item. Worktrees and the log stay.
         </Dialog.Description>
         {error ? <ErrorPanel title="residue could not turn it off" error={error} /> : null}
         <div className="dialog-buttons">
@@ -823,7 +832,7 @@ function TurnOffDialog({ onClose, onChanged }: { onClose: () => void; onChanged:
             Cancel
           </Button>
           <SolidButton loading={working} disabled={working} onClick={off}>
-            Turn off
+            Turn off automatic cleanup
           </SolidButton>
         </div>
       </Dialog>

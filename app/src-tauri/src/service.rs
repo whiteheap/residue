@@ -967,10 +967,9 @@ fn plan(
         (true, Some(program)) => {
             if !program.unknown.is_empty() {
                 blocked = Some(format!(
-                    "The service runs arguments the app cannot read as residue watch options or \
-                     folders: {}. A save here would drop them. Change the service in a terminal \
-                     with residue service install, or turn automatic cleanup off and on again to \
-                     start from residue's defaults.",
+                    "A save would drop arguments the app cannot read: {}. Change the service with \
+                     residue service install in a terminal, or turn automatic cleanup off and on \
+                     again to start from residue's defaults.",
                     program.unknown.join(" ")
                 ));
             }
@@ -978,9 +977,9 @@ fn plan(
         }
         (true, None) => {
             blocked = Some(format!(
-                "The service is running, but its agent file {} is missing, so the app cannot \
-                 read its settings, and a save would replace them with residue's defaults. Turn \
-                 automatic cleanup off and on again to start from those defaults.",
+                "The service runs, but its agent file {} is missing, so a save would reset its \
+                 settings to residue's defaults. Turn automatic cleanup off and on again to start \
+                 from them.",
                 agent_file(ctx.home).display()
             ));
             Vec::new()
@@ -990,9 +989,9 @@ fn plan(
     if blocked.is_none() && !fetch.is_empty() && fetches(installer.version.as_deref()) != Some(true)
     {
         blocked = Some(format!(
-            "The service sets {}, which needs residue {FETCH_SINCE_TEXT} or newer, and the app \
-             would install it with {} ({}). Install residue {FETCH_SINCE_TEXT} or newer, or turn \
-             automatic cleanup off and on again to start from residue's defaults.",
+            "The service sets {}, which needs residue {FETCH_SINCE_TEXT} or newer, and a save \
+             would install {} ({}). Install a newer residue, or turn automatic cleanup off and on \
+             again to start from residue's defaults.",
             fetch.join(" "),
             installer.bin.display(),
             installer.version.as_deref().unwrap_or("version unknown"),

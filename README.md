@@ -324,11 +324,11 @@ The launchd plist, the systemd unit and timer, how to stop them, and the sweep's
 The Mac app is residue in a window. It lists the linked worktrees under your code folders with their size and verdict, shows why each one is kept, moves the ones that can go to the trash, restores them, shows what residue has freed, and turns automatic cleanup on or off. Every check, size and removal comes from the residue binary inside the app, which is this release's own residue, with the same version.
 
 <p>
-<img src="docs/screenshots/worktrees.png" width="830" alt="The Worktrees screen: a line that says automatic cleanup freed about 67.1 MB, 1 worktree, since the app was last open, with a link to Freed. Below it, 1.3 GB reclaimable, 7 of 12 linked worktrees can go, about 925 MB freed in the last 7 days. A treemap sizes each worktree by the space removing it gives back, grouped by repository: white for can go, gray for kept, hatched for unknown. Below it, each worktree's checks and verdict.">
+<img src="docs/screenshots/worktrees.png" width="830" alt="The Worktrees screen: a line that says automatic cleanup freed about 70.3 MB, 1 worktree, since the app was last open, with a link to Freed. Below it, 1.3 GB reclaimable, 6 of 11 worktrees can go, about 975 MB freed in the last 7 days. A treemap sizes each worktree by the space removing it frees, grouped by repository: white for can go, gray for kept, hatched for unknown. Below it, each worktree's checks and verdict.">
 </p>
 
 <p>
-<img src="docs/screenshots/freed.png" width="830" alt="The Freed screen: 925 MB freed in the last 7 days, 2.4 GB in the last 30, 6.4 GB all time and 67.1 MB since the app was last open, a column for each of the last 12 weeks, the space each command freed (residue watch, residue remove --all and residue remove by hand), and the space freed in each repository, most first.">
+<img src="docs/screenshots/freed.png" width="830" alt="The Freed screen: 975 MB freed in the last 7 days, 2.1 GB in the last 30, 5.9 GB all time and 215 MB since the app was last open, a column for each of the last 12 weeks, the space each command freed (residue watch, residue remove --all and residue remove by hand), and the space freed in each repository, most first.">
 </p>
 
 Both screenshots show example repositories and a made-up history of removals. The Restore screen, with its trash entries and removal records: [docs/screenshots/restore.png](docs/screenshots/restore.png).

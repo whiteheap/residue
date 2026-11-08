@@ -63,10 +63,10 @@ function recordNote(item: Extract<Restorable, { kind: "removed" }>, home: string
   if (item.state === "interrupted") {
     return `Its removal did not finish, and Git still lists it${
       item.asidePath ? ` at ${tilde(item.asidePath, home)}` : ""
-    }: restore moves it back.`;
+    }. Restore moves it back.`;
   }
   if (item.notKept.length === 0) return null;
-  return `Restore recreates its tracked files from its commits, not the ignored files the deletion took: ${item.notKept
+  return `Comes back without its ignored files: ${item.notKept
     .map(sized)
     .join(", ")}. Your project's install or build makes them again.`;
 }
@@ -103,7 +103,7 @@ function restoredText(doc: RestoreDocument, item: Restorable, home: string | und
       case "recreated_branch":
         return `${branch ?? "its branch"} had been deleted, so restore created it again at the recorded HEAD`;
       case "new_branch":
-        return `${branch ?? "its branch"} no longer contains the recorded HEAD, so restore created ${done.new_branch ?? "a new branch"} there; ${branch ?? "the branch"} stays as it is`;
+        return `${branch ?? "its branch"} no longer contains the recorded HEAD, so restore created ${done.new_branch ?? "a new branch"} there; ${branch ?? "the branch"} is unchanged`;
       case "detached":
         return `detached at ${shortHead(done.head) ?? "the recorded HEAD"}, as it was`;
       default:
@@ -174,19 +174,20 @@ export function Restore({
   // service's own, and a later removal forgets a record only once it is
   // older than both that value and the removal's own.
   const appKeep = keepRemoved
-    ? `${duration(keepRemoved)} for the app's removals, residue's default`
+    ? `${duration(keepRemoved)} for the app's removals (residue's default --keep-removed)`
     : "residue's default for the app's removals";
   const service = serviceQ.data?.installed ? (serviceQ.data.program?.settings.keep_removed ?? null) : null;
   const serviceKeep = service
-    ? `, and ${duration(service.value)} for automatic cleanup, ${service.default ? "residue's default too, since the service sets none" : "the service's"}`
+    ? ` and ${duration(service.value)} for automatic cleanup (${service.default ? "residue's default too; the service sets none" : "the service's --keep-removed"})`
     : "";
-  const forgets = `Each removal keeps the records it writes for at least its --keep-removed: ${appKeep}${serviceKeep}. A later removal in the same repository forgets a record only once it is older than both the --keep-removed it was written with and its own.`;
+  const lasts = `A removal record lasts at least ${appKeep}${serviceKeep}.`;
+  const forgets = "A later removal in the same repository forgets a record only once it is older than both the --keep-removed it was written with and its own.";
 
   return (
     <>
       <PageHeader
         title="Restore"
-        description="Worktrees residue moved to the trash or deleted. Restore puts one back where it was, on its branch."
+        description="Put back a worktree residue moved to the trash or deleted, at its path, on its branch."
         actions={
           <Button
             variant="secondary"
@@ -233,7 +234,7 @@ export function Restore({
         {roots.length === 0 ? (
           <Empty
             title="No folders to look in"
-            description="Choose folders first; Restore lists the trash and the removal records of the repositories in them."
+            description="Choose folders first, in Folders."
           />
         ) : loading && !listings ? (
           <Loading title="Reading the trash and the removal records" />
@@ -241,7 +242,7 @@ export function Restore({
           <Empty
             icon={<ClockCounterClockwise size={32} />}
             title="Nothing to restore"
-            description={`A worktree residue moves to the trash is listed here until residue deletes it from the trash. One it deletes leaves a removal record, listed here until a later removal forgets it. ${forgets}`}
+            description={`Trash entries and removal records show here. ${lasts}`}
           />
         ) : (
           <>
@@ -352,20 +353,23 @@ export function Restore({
               <>
                 {trashed ? (
                   <p className="hint">
-                    A trashed worktree still takes its disk space. The next removal or automatic
-                    cleanup in its repository deletes the entries older than its{" "}
-                    <Flags flags={["--keep-trash"]} />
-                    {keepTrash
-                      ? `: ${duration(keepTrash)}, residue's default, which the app and automatic cleanup use`
-                      : ""}
-                    . Each one it deletes leaves a removal record, listed here.
+                    A trash entry still takes its disk space. The next removal or automatic cleanup in
+                    its repository deletes entries older than <Flags flags={["--keep-trash"]} />
+                    {keepTrash ? ` (${duration(keepTrash)}, residue's default)` : ""}, leaving a removal
+                    record here.
                   </p>
                 ) : null}
                 <p className="hint">
-                  A removal record takes almost no space. Restore recreates the worktree from it with
-                  git worktree add, on its branch and HEAD, and refuses when something is at its
-                  path. <FlagWords text={forgets} /> A forgotten record cannot be restored.
+                  <FlagWords text={lasts} /> A forgotten record cannot be restored.
                 </p>
+                <details className="viz-details">
+                  <summary>How restore and forgetting work</summary>
+                  <p className="hint">
+                    Restore recreates the worktree with git worktree add, on its branch and HEAD, and
+                    refuses when something is at its path. A removal record takes almost no space.{" "}
+                    <FlagWords text={forgets} />
+                  </p>
+                </details>
               </>
             ) : null}
           </>
