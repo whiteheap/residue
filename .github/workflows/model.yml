@@ -1,0 +1,30 @@
+name: model
+
+# The removal model: TLC checks .agents/skills/verify-removal-races/model
+# against model/expected, with the tools check.sh pins. It reads the model,
+# not the Rust, so it runs when the model or its check changes; a change to
+# the code the model covers updates the model in the same pull request
+# (AGENTS.md, "Verify a change"). It is not a required check.
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".agents/skills/verify-removal-races/**"
+      - ".github/workflows/model.yml"
+  pull_request:
+    paths:
+      - ".agents/skills/verify-removal-races/**"
+      - ".github/workflows/model.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  removal-model:
+    name: removal-model
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Model check
+        run: bash .agents/skills/verify-removal-races/check.sh
