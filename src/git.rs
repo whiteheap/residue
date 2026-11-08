@@ -1006,6 +1006,10 @@ pub fn head_reflog_commits(dir: &Path) -> Result<Vec<String>, String> {
 /// refs'), never another worktree's. `--single-worktree` must come before
 /// `--reflog`, which reads every worktree's otherwise. A commit Git no
 /// longer has is left out.
+/// With no reflog at all (`git gc` with `gc.reflogExpire=now` leaves
+/// none), rev-list prints its usage and exits 129 unless it is to read
+/// commits from standard input: `--stdin`, on the null standard input
+/// `git` gives it, adds none.
 pub fn reflogs_commits(dir: &Path) -> Result<Vec<String>, String> {
     let out = git(
         dir,
@@ -1015,6 +1019,7 @@ pub fn reflogs_commits(dir: &Path) -> Result<Vec<String>, String> {
             "--ignore-missing",
             "--single-worktree",
             "--reflog",
+            "--stdin",
         ],
     )?;
     Ok(lines(&out)
