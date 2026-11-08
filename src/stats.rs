@@ -1532,6 +1532,9 @@ mod tests {
             ))),
             // Git lists it there, so the entry holds a worktree.
             registered: Some(entry(&format!("/src/app/.git/residue-trash/{name}/old"))),
+            incomplete: false,
+            bare: false,
+            modified: Some(50),
         }
     }
 

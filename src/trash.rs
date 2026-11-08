@@ -18,7 +18,7 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -26,11 +26,15 @@ use std::path::{Path, PathBuf};
 use crate::git::{self, Entry};
 use crate::json::Json;
 use crate::output;
+use crate::removed;
 
 pub const DIR: &str = "residue-trash";
 /// The lock reason on every worktree in the trash.
 pub const LOCK: &str = "residue: in trash";
 const INFO: &str = "info";
+/// `info` while it is written: synced, then renamed to `info`, so an entry
+/// never has a partial `info`.
+const INFO_NEW: &str = "info.new";
 
 pub fn root(common_dir: &Path) -> PathBuf {
     common_dir.join(DIR)
@@ -140,6 +144,14 @@ pub struct Item {
     pub worktree: Option<PathBuf>,
     /// Git's record of that worktree, when Git lists it.
     pub registered: Option<Entry>,
+    /// The entry has no `info`: the run that made it is writing it, or
+    /// stopped before it finished.
+    pub incomplete: bool,
+    /// Its `info` is missing or does not parse, and the entry holds nothing
+    /// but `info` and `info.new`. False for a readable record.
+    pub bare: bool,
+    /// The entry directory's modification time, in Unix seconds.
+    pub modified: Option<i64>,
 }
 
 impl Item {
@@ -150,11 +162,31 @@ impl Item {
             .is_some_and(|w| fs::symlink_metadata(w).is_ok())
     }
 
-    /// A record whose worktree never arrived (residue stopped between
-    /// writing `info` and the move) or was deleted by hand: nothing to
-    /// keep, so any purge clears it.
+    /// A record whose worktree is not in the entry: it never arrived
+    /// (residue stopped between writing `info` and the move), is arriving
+    /// now (a run is between the two), or was deleted by hand.
     pub fn is_empty_record(&self) -> bool {
         self.record.is_ok() && !self.holds_worktree() && self.registered.is_none()
+    }
+
+    /// An entry that holds only its record files: an empty record, or a
+    /// bare entry whose `info` is missing or damaged.
+    pub fn holds_only_record(&self) -> bool {
+        self.is_empty_record() || (self.record.is_err() && self.bare)
+    }
+
+    /// An entry that holds only its record files and is old enough that no
+    /// run can still be moving a worktree into it, so a purge clears it.
+    /// The run that made it moves the worktree in milliseconds after it
+    /// writes `info`; clearing it in between would leave that worktree in
+    /// the trash with no `info`. An empty record's age is its `trashed`
+    /// time, a bare one's its directory's.
+    pub fn clearable(&self, now: i64) -> bool {
+        let settled = |since: i64| now - since >= removed::INCOMPLETE_AFTER;
+        match &self.record {
+            Ok(r) => self.is_empty_record() && settled(r.trashed),
+            Err(_) => self.bare && self.modified.is_some_and(settled),
+        }
     }
 
     pub fn age(&self, now: i64) -> Option<i64> {
@@ -189,12 +221,32 @@ pub fn list(
         if !is_dir || name.starts_with('.') {
             continue;
         }
-        let record = match fs::read(dir.join(INFO)) {
+        let modified = child.metadata().ok().map(|m| m.mtime());
+        // `missing_or_damaged`: an `info` residue can tell it did not finish
+        // (none, or one that does not parse), as opposed to one it could
+        // not read at all.
+        let (record, incomplete, missing_or_damaged) = match fs::read(dir.join(INFO)) {
             Ok(bytes) => {
-                Record::parse(&bytes).map_err(|e| format!("{}: {e}", dir.join(INFO).display()))
+                let record =
+                    Record::parse(&bytes).map_err(|e| format!("{}: {e}", dir.join(INFO).display()));
+                let damaged = record.is_err();
+                (record, false, damaged)
             }
-            Err(e) => Err(format!("{}: {e}", dir.join(INFO).display())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (
+                Err(format!(
+                    "{}: it has no info, so residue cannot tell what it holds",
+                    dir.display()
+                )),
+                true,
+                true,
+            ),
+            Err(e) => (
+                Err(format!("{}: {e}", dir.join(INFO).display())),
+                false,
+                false,
+            ),
         };
+        let bare = missing_or_damaged && holds_only_info(&dir);
         let worktree = record
             .as_ref()
             .ok()
@@ -216,6 +268,9 @@ pub fn list(
             record,
             worktree,
             registered,
+            incomplete,
+            bare,
+            modified,
         });
     }
     items.sort_by_key(|i| {
@@ -239,6 +294,7 @@ pub fn create(common_dir: &Path, record: &Record) -> Result<PathBuf, String> {
         return Err("its path contains a newline, which the trash record cannot hold".into());
     }
     let root = root(common_dir);
+    let new_root = !root.is_dir();
     fs::create_dir_all(&root).map_err(|e| format!("cannot create {}: {e}", root.display()))?;
     let stamp = output::stamp(record.trashed);
     for n in 1..100 {
@@ -249,7 +305,7 @@ pub fn create(common_dir: &Path, record: &Record) -> Result<PathBuf, String> {
         }
         // Trash entries and removal records share one list in `residue
         // restore`, so a name a record already has is skipped.
-        if fs::symlink_metadata(crate::removed::root(common_dir).join(&entry_name)).is_ok() {
+        if fs::symlink_metadata(removed::root(common_dir).join(&entry_name)).is_ok() {
             continue;
         }
         let entry = root.join(&entry_name);
@@ -258,12 +314,25 @@ pub fn create(common_dir: &Path, record: &Record) -> Result<PathBuf, String> {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(format!("cannot create {}: {e}", entry.display())),
         }
-        let written = fs::File::create_new(entry.join(INFO)).and_then(|mut f| {
-            f.write_all(&record.render(&entry))
-                .and_then(|()| f.sync_all())
-        });
-        if let Err(e) = written {
-            let message = format!("cannot write {}: {e}", entry.join(INFO).display());
+        // As a removal record's: `info.new`, synced, renamed, then the
+        // directories synced, so a power loss leaves a whole `info` or none.
+        let staged = entry.join(INFO_NEW);
+        let written = removed::write_new(&staged, &record.render(&entry))
+            .map_err(|e| format!("cannot write {}: {e}", staged.display()))
+            .and_then(|()| {
+                fs::rename(&staged, entry.join(INFO))
+                    .map_err(|e| format!("cannot rename {}: {e}", staged.display()))
+            })
+            .and_then(|()| removed::sync_dir(&entry))
+            .and_then(|()| removed::sync_dir(&root))
+            .and_then(|()| {
+                if new_root {
+                    removed::sync_dir(common_dir)
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err(message) = written {
             return Err(match discard(&entry) {
                 Ok(()) => message,
                 Err(more) => format!("{message}; {more}"),
@@ -282,10 +351,12 @@ pub fn create(common_dir: &Path, record: &Record) -> Result<PathBuf, String> {
 /// directory once it is empty. Never recursive: if anything else is left
 /// in the entry, it stays and the error says so.
 pub fn discard(entry: &Path) -> Result<(), String> {
-    match fs::remove_file(entry.join(INFO)) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("cannot remove {}: {e}", entry.join(INFO).display())),
+    for file in [INFO, INFO_NEW] {
+        match fs::remove_file(entry.join(file)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("cannot remove {}: {e}", entry.join(file).display())),
+        }
     }
     fs::remove_dir(entry).map_err(|e| format!("cannot remove {}: {e}", entry.display()))?;
     if let Some(root) = entry.parent() {
@@ -293,6 +364,22 @@ pub fn discard(entry: &Path) -> Result<(), String> {
         remove_dir_if_empty(root).map_err(|e| format!("cannot remove {}: {e}", root.display()))?;
     }
     Ok(())
+}
+
+/// The entry directory holds nothing but `info` and `info.new`. One that
+/// cannot be read counts as holding more.
+fn holds_only_info(entry: &Path) -> bool {
+    let Ok(listing) = fs::read_dir(entry) else {
+        return false;
+    };
+    let mut only = true;
+    for child in listing {
+        match child {
+            Ok(c) if c.file_name() == INFO || c.file_name() == INFO_NEW => {}
+            _ => only = false,
+        }
+    }
+    only
 }
 
 /// Remove a directory if it is empty; one that still has entries stays and
@@ -397,7 +484,7 @@ pub fn restore(item: &Item, to: Option<&Path>) -> Result<(PathBuf, Option<String
 /// and drop the entry. The caller has re-checked it. If Git refuses, the
 /// worktree is locked again and stays in the trash.
 pub fn purge(item: &Item) -> Result<(), String> {
-    if item.is_empty_record() {
+    if item.holds_only_record() {
         return discard(&item.dir);
     }
     let worktree = item
