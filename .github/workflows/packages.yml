@@ -144,9 +144,12 @@ jobs:
       - name: Checksums
         run: |
           # Every archive already listed (release.yml's four, and a FreeBSD one
-          # from an earlier run) and the Mac app (release.yml's
-          # residue-macos.dmg), except those this run rebuilt, then
-          # everything this run built. A re-run replaces lines, never doubles.
+          # from an earlier run), and in 0.0.8 to 0.0.10 the Mac app's
+          # residue-macos.dmg, except those this run rebuilt, then everything
+          # this run built. A re-run replaces lines, never doubles. The Mac
+          # app now releases from whiteheap/residue-ui, but keep .dmg in the
+          # filter: packaging 0.0.10 or earlier by hand would otherwise drop
+          # the DMG's line from that release's SHA256SUMS.
           (cd pkgs && ls) > "$RUNNER_TEMP/built"
           {
             grep -E '\.(tar\.gz|dmg)$' dist/SHA256SUMS | awk 'NR == FNR { built[$0]; next } !($2 in built)' "$RUNNER_TEMP/built" -

@@ -34,7 +34,7 @@ cargo build
 
 [AGENTS.md](AGENTS.md#layout) maps each source file to what it owns. The [README](README.md) is the user contract: if your change alters what residue does, update the README in the same pull request.
 
-The Mac app is in `app/`, with its own setup and checks in [app/README.md](app/README.md) and rules in [app/AGENTS.md](app/AGENTS.md). It bundles the CLI from your checkout, so a change to a JSON document or a `watch` option is checked there too.
+The Mac app is [whiteheap/residue-ui](https://github.com/whiteheap/residue-ui), with its own setup and checks. It bundles one residue-cli release that it pins and reads that release's JSON documents and exit statuses, so it gets a change made here only once residue-ui pins a release that has it. To try a change here in the app first, build the app [with a residue from your checkout](https://github.com/whiteheap/residue-ui/blob/main/CONTRIBUTING.md#a-residue-from-your-checkout).
 
 ## Verify a change
 
@@ -149,7 +149,7 @@ A change that adds a state or a move:
 - reads the state where the table says, and again right before it acts, never from an earlier listing;
 - makes each move one Git command (`git worktree move`, `lock`, `remove`, `update-ref` with old values) or one `rename(2)`, `mkdir(2)` or `O_EXCL` create, so a second writer's move fails. That failure is reported, never taken as success;
 - writes a record ahead of a deletion only as intent: what Git and the filesystem show decides the state, and a record whose deletion did not happen is undone or reads as interrupted;
-- adds the state to this table and to the owner's `Item`, and to the JSON `state` and `app/src/lib/types.ts` when the app reads it, and adds a `scripts/recovery-check.sh` or `scripts/race-check.sh` case for the move and for another writer that gets there first.
+- adds the state to this table and to the owner's `Item`, and to the JSON `state`, with an issue in [residue-ui](https://github.com/whiteheap/residue-ui/issues) for its `src/lib/types.ts` when the app reads it, and adds a `scripts/recovery-check.sh` or `scripts/race-check.sh` case for the move and for another writer that gets there first.
 
 ## Performance
 
@@ -231,11 +231,6 @@ Main at c61d629 on 2026-11-08: Apple M4 Max, 14 cores, 36 GB, macOS 26.3.1, Appl
   kill $w
 )
 ```
-
-The Mac app's commands are in [app/AGENTS.md](app/AGENTS.md#cost): `footprint -p PID` for the app, its WebContent and its GPU process, and `ps -o time= -p PID` before and after a fixed task. The latest numbers come from the pull requests that changed them, on release builds with a scratch `HOME` on the same Mac:
-
-- One repository with 300 linked worktrees, after a scan: the app 34 to 35 MB, WebContent 113 to 117 MB, GPU 17 to 18 MB. A rescan costs WebContent 0.12 to 0.17 s of CPU ([#90](https://github.com/whiteheap/residue-cli/pull/90)).
-- 20 s of pointer movement over the Worktrees map: WebContent 1.88 to 2.19 s of CPU (#90). Along a worktree's bar, with 150 worktrees: WebContent 1.00 s user and 0.22 s system CPU (medians), and, in a debug build with counters, 87 to 96 renders of the bar ([#113](https://github.com/whiteheap/residue-cli/pull/113)).
 
 The website's home page (`site/`) and every file it loads come to 39,125 bytes with Brotli, not counting headers: HTML 6,355, `style.css` 4,446, `hero.js` 5,920, two fonts 8,480 and 8,612, and four SVGs 5,312, one of them the how-it-works drawing, which loads lazily. Measured on 2026-11-08 with `curl -s -o /dev/null -H 'Accept-Encoding: br' -w '%{size_download}\n' URL` for each file. With the hero on screen, the page's main thread is busy 135 to 161 ms in 10 s (median 148; headless Chrome at 1440 by 900, [#87](https://github.com/whiteheap/residue-cli/pull/87)): the change in `TaskDuration` from the Chrome DevTools Protocol's `Performance.getMetrics` over 10 s after the page settles.
 

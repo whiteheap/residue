@@ -1,5 +1,7 @@
 # Redirects. Cloudflare reads this file at deploy time and does not serve it,
-# like _headers. Each line: SOURCE DESTINATION CODE. The Mac app's DMG keeps
-# one name across releases, so this always answers with the one in the newest
-# residue release.
-/download/macos https://github.com/whiteheap/residue-cli/releases/latest/download/residue-macos.dmg 302
+# like _headers. Each line: SOURCE DESTINATION CODE. The Mac app's DMG: 0.0.10
+# is the last residue-cli release that has one, and from 0.0.11 on the app
+# releases from whiteheap/residue-ui. So this points at 0.0.10's DMG, not
+# residue-cli's latest release, until residue-ui has published its first
+# release; then the next change points it at residue-ui's latest one.
+/download/macos https://github.com/whiteheap/residue-cli/releases/download/v0.0.10/residue-macos.dmg 302
