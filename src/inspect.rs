@@ -398,7 +398,7 @@ pub fn worktree(entry: &Entry, common_dir: &Path, snapshot: &Snapshot, policy: &
     check_layout(&mut r, &canonical);
     check_size(&mut r, &canonical, usage);
     if let Some(idle) = &policy.idle {
-        check_idle(&mut r, idle);
+        check_idle(&mut r, idle, policy.idle_at);
     }
     r.rule_sources = effective_sources(policy, repo.values);
     gather_facts(&mut r, entry, &canonical);
@@ -475,9 +475,10 @@ fn last_change(
 /// `--idle`: keep a worktree that changed within the threshold. A failed
 /// check keeps it (`block`); a last change residue could not read is
 /// `unknown`, which keeps it too. Reported right after `activity`, the
-/// other check about whether someone is using the worktree.
-fn check_idle(r: &mut Report, idle: &crate::cli::Span) {
-    let now = crate::output::now();
+/// other check about whether someone is using the worktree. The age is
+/// measured at `at` (`remove --as-of`) when given, otherwise now.
+fn check_idle(r: &mut Report, idle: &crate::cli::Span, at: Option<i64>) {
+    let now = at.unwrap_or_else(crate::output::now);
     let (status, short, detail) = match &r.last_change {
         Ok(Some(c)) => {
             let ago = crate::output::age(now - c.time);

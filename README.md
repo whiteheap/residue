@@ -205,6 +205,8 @@ A trashed worktree is locked with the reason `residue: in trash`, and `git workt
 
 The trash does not free disk space: a trashed worktree takes all the space it took before. The purge frees it. Every `remove` run purges the trash entries older than `--keep-trash DURATION` (default `7d`) in the repositories it covers, and lists them in its plan before you confirm. The purge runs every check on each entry again, except `--idle`, since `--keep-trash` is the trash's only clock, and deletes it with `git worktree remove`, without `--force`. An entry that someone changed in the trash stays, and the run says why. A preview, or a run you do not confirm, purges nothing. An entry that holds only its record, left by a run that stopped before it moved the worktree in, is cleared by the first remove run an hour or more after it was made; a younger one may be another run's, still moving its worktree in.
 
+A program that shows the plan in one run and removes in a second, once you confirm, passes the plan's `generated_at` to the second as `--as-of`. That run then purges no trash entry and forgets no removal record the plan did not list, such as one that expired while you read it ([reference](docs/reference.md#for-coding-agents)).
+
 ### Restore a removed worktree
 
 Every deletion leaves a removal record: `remove`, `remove --no-trash`, a sweep, `watch`, and the trash purge. The line that reports the removal ends with the command that brings it back:

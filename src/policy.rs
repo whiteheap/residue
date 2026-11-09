@@ -226,6 +226,9 @@ pub struct Policy {
     pub ignored_environment: Result<Vec<String>, String>,
     /// `--idle`: keep a worktree changed more recently than this.
     pub idle: Option<Span>,
+    /// `remove --as-of`: measure `--idle` at this time, in Unix seconds,
+    /// not at the moment of each check.
+    pub idle_at: Option<i64>,
 }
 
 impl Policy {
@@ -278,6 +281,7 @@ impl Policy {
             sources,
             ignored_environment: Ok(Vec::new()),
             idle: None,
+            idle_at: None,
         })
     }
 

@@ -169,6 +169,7 @@ json_ok() { # N
             .schema == "residue.remove/v1"
             and (.version | type) == "string"
             and (.generated_at | type) == "string"
+            and (.as_of | type) == "string"
             and (.results | type) == "array" and (.results | length) == $n
             and (.errors | type) == "array"
             and (.warnings | type) == "array"
@@ -411,6 +412,8 @@ usage usage-trash-and-no-trash remove --yes --trash --no-trash "$work/x"
 usage usage-keep-removed-not-remove scan --keep-removed 1d "$work/x"
 usage usage-removal-reason-unknown remove --yes --removal-reason sweep "$work/x"
 usage usage-to-without-entry restore --to "$work/x"
+usage usage-as-of-not-remove scan --as-of 2026-11-09T00:00:00Z "$work/x"
+usage usage-as-of-invalid remove --yes --as-of yesterday "$work/x"
 
 # 8. Removal records: every removal writes one before it deletes, and
 # `residue restore` recreates the worktree from it. A record that cannot be
@@ -1553,6 +1556,96 @@ layout_limited limited-nested-repos 3 2 '*.log\nbuild/\n' \
 # Past 64 folders, the whole worktree runs in traditional mode.
 layout_limited limited-past-cap 2 0 '*.log\n' \
     'i=0; while [ $i -lt 65 ]; do mkdir u$i && echo l >u$i/x.log; i=$((i + 1)); done'
+
+# 14. --as-of TIME: a run confirming a plan made at TIME judges every age
+# at TIME. TIME is 2026-01-01T00:01:00Z, so an entry trashed or a record
+# written at 2026-01-01T00:00:30Z is 30 seconds old at TIME, under
+# --keep-trash 1m and --keep-removed 1m, and long expired now. Each case
+# needs a move into the trash and a removal, so a partial probe skips them.
+
+# Trash t and remove r (with --keep-removed 1m) in $repo, and say both
+# happened at AT, Unix seconds and RFC 3339.
+as_of_fixture() { # AT AT-RFC3339
+    setup git -C "$repo" worktree add -q "$repo/.worktrees/t" -b t
+    setup git -C "$repo" worktree add -q "$repo/.worktrees/r" -b r
+    run remove --yes --json --trash "$repo/.worktrees/t"
+    entry=$(result 0 trash_entry)
+    [ "$status" = 0 ] && [ -d "$entry" ] || { echo "contract-check: setup failed in $name: remove --trash t exit $status" >&2; exit 2; }
+    run remove --yes --json --keep-removed 1m "$repo/.worktrees/r"
+    rec=$(result 0 removal_record)
+    [ "$status" = 0 ] && [ -d "$rec" ] || { echo "contract-check: setup failed in $name: remove r exit $status" >&2; exit 2; }
+    sed "s/^trashed [0-9]* .*/trashed $1 $2/" "$entry/info" >"$work/$name.info" && cat "$work/$name.info" >"$entry/info" || exit 2
+    sed "s/^removed [0-9]* .*/removed $1 $2/" "$rec/info" >"$work/$name.info" && cat "$work/$name.info" >"$rec/info" || exit 2
+}
+
+# The sweep that confirms the plan: it removes nothing (w and u changed
+# within --idle 30d), and purges and forgets what expired by TIME.
+as_of_sweep() { # ARGS...
+    run remove --all --yes --json --idle 30d --keep-trash 1m --keep-removed 1m "$@" "$repo"
+}
+
+taken() { # what the run purged and forgot
+    jq -r '[(.purged[] | .result + " " + .entry.entry), (.forgotten[] | .result + " " + .entry.entry)] | join(",")' "$out"
+}
+
+if [ -z "$partial_probe" ]; then
+    # An entry and a record 30 seconds old at TIME stay; a run without
+    # --as-of takes both.
+    name=as-of-ages
+    make_repo
+    as_of_fixture 1767225630 2026-01-01T00:00:30Z
+    touch -t 202512310000 "$entry" "$rec" "$repo/.git/worktrees" || exit 2
+    as_of_sweep --as-of 2026-01-01T00:01:00Z
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif ! json_ok 2; then fail "stdout is not one valid remove document with 2 results"
+    elif [ "$(jq -r .as_of "$out")" != 2026-01-01T00:01:00Z ]; then fail "as_of $(jq -r .as_of "$out"), want 2026-01-01T00:01:00Z"
+    elif [ -n "$(taken)" ]; then fail "took what was 30 seconds old at TIME: $(taken)"
+    elif [ ! -d "$entry" ] || [ ! -d "$rec" ]; then fail "the trash entry or the record is gone"
+    else
+        as_of_sweep
+        if [ "$status" != 0 ]; then fail "without --as-of: exit $status, want 0"
+        elif [ "$(taken)" != "purged $(basename "$entry"),forgotten $(basename "$rec")" ]; then fail "without --as-of, took: $(taken)"
+        elif [ "$(jq -r '.as_of == .generated_at' "$out")" != true ]; then fail "without --as-of, as_of $(jq -r .as_of "$out") is not generated_at"
+        elif common_ok; then ok; fi
+    fi
+
+    # Expired at TIME, but changed after it: the entry's directory, where
+    # a stalled run wrote info or moved the worktree in, and Git's list of
+    # worktrees, where a removal still running at TIME finished. A plan at
+    # TIME could not have listed either, so both stay; once both changed
+    # before TIME, the same run takes both.
+    name=as-of-changed-after
+    make_repo
+    as_of_fixture 1767225600 2026-01-01T00:00:00Z
+    touch -t 202512310000 "$rec" || exit 2
+    touch "$entry" "$repo/.git/worktrees" || exit 2
+    as_of_sweep --as-of 2026-01-01T02:01:00+02:00
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif [ "$(jq -r .as_of "$out")" != 2026-01-01T00:01:00Z ]; then fail "as_of $(jq -r .as_of "$out"), want 2026-01-01T00:01:00Z"
+    elif [ -n "$(taken)" ]; then fail "took what changed after TIME: $(taken)"
+    elif [ ! -d "$entry" ] || [ ! -d "$rec" ]; then fail "the trash entry or the record is gone"
+    else
+        touch -t 202512310000 "$entry" "$repo/.git/worktrees" || exit 2
+        as_of_sweep --as-of 2026-01-01T00:01:00Z
+        if [ "$status" != 0 ]; then fail "once unchanged since TIME: exit $status, want 0"
+        elif [ "$(taken)" != "purged $(basename "$entry"),forgotten $(basename "$rec")" ]; then fail "once unchanged since TIME, took: $(taken)"
+        elif [ -e "$entry" ] || [ -e "$rec" ]; then fail "the trash entry or the record is still on disk"
+        elif common_ok; then ok; fi
+    fi
+else
+    skip_partial as-of-ages
+    skip_partial as-of-changed-after
+fi
+
+# A TIME after the run's start counts as the start: the flag never makes a
+# run purge sooner.
+name=as-of-later-than-start
+make_repo
+before=$(sums "$wt")
+run remove --all --yes --json --idle 30d --as-of 2100-01-01T00:00:00Z "$repo"
+if [ "$status" != 0 ]; then fail "exit $status, want 0"
+elif [ "$(jq -r '.as_of == .generated_at' "$out")" != true ]; then fail "as_of $(jq -r .as_of "$out"), generated_at $(jq -r .generated_at "$out")"
+elif untouched "$before"; then ok; fi
 
 echo "contract-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]
