@@ -8,13 +8,16 @@
 //! failed or reads too little to show that none was (`unknown`). A probe
 //! that does not read open files (`Seen::limits`) can show a use, never its
 //! absence, so where it finds none the answer is `unknown`, which keeps the
-//! worktree. `not_observed` is not proof of
-//! inactivity: processes owned by other users, in containers or on other
-//! machines are outside what a same-user probe can see, and a process can
-//! open the directory a moment later.
+//! worktree. A file a process holds whose path the probe could not read
+//! (`Seen::unnamed`) is looked for in the directory by its inode, and where
+//! residue cannot look the answer is `unknown` too. `not_observed` is not
+//! proof of inactivity: processes owned by other users, in containers or on
+//! other machines are outside what a same-user probe can see, and a process
+//! can open the directory a moment later.
 
 use std::borrow::Cow;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 #[derive(Clone)]
@@ -22,8 +25,10 @@ pub struct Unavailable {
     /// Stable reason code: `probe_missing`, `timeout`, `probe_failed`,
     /// `parse_error`, `unsupported`, `partial_probe` (the probe found no
     /// use but does not read open files, so it cannot show the directory
-    /// is unused), or `unmatchable_path` (the probe prints the paths it
-    /// read escaped, and residue cannot be sure how it prints this one).
+    /// is unused), `unmatchable_path` (the probe prints the paths it read
+    /// escaped, and residue cannot be sure how it prints this one), or
+    /// `unnamed_file` (a process holds a file whose path the probe could
+    /// not read, and residue could not look for it in the directory).
     pub reason: &'static str,
     pub detail: String,
 }
@@ -51,6 +56,22 @@ pub struct Seen {
     /// cannot be sure of, whose activity is then `unknown`
     /// (`unmatchable_path`), never `not_observed`.
     pub spelling: Option<Spell>,
+    /// Files the backend saw a process hold but could not name. A
+    /// directory holding one of them, found by its device and inode, is in
+    /// use by that process; where residue cannot look, it is `unknown`
+    /// (`unnamed_file`), never `not_observed`. Only the illumos backend
+    /// fills it.
+    pub unnamed: Vec<Unnamed>,
+}
+
+/// A file a process holds whose path the backend could not read, such as
+/// one below a folder renamed after the kernel cached its path.
+pub struct Unnamed {
+    pub pid: u32,
+    pub command: String,
+    /// The file's `st_dev` and `st_ino`; `None` when residue could not
+    /// read them, so it may be anywhere.
+    pub file: Option<(u64, u64)>,
 }
 
 /// Writes a path the way a backend's tool prints one (`lsof::spell`).
@@ -88,6 +109,7 @@ impl Snapshot {
             Ok(seen) => seen,
             Err(unavailable) => return Evidence::Unknown(unavailable.clone()),
         };
+        let path = dir;
         let dir = dir.as_os_str().as_bytes();
         // The directory as the backend writes the paths it read: a use is
         // inside it in that form exactly when it is inside it byte for byte.
@@ -116,6 +138,12 @@ impl Snapshot {
                 hits.push((item.pid, item.command.clone()));
             }
         }
+        if hits.is_empty() {
+            match self.unnamed_within(seen, path, me) {
+                Ok(holders) => hits = holders,
+                Err(unavailable) => return Evidence::Unknown(unavailable),
+            }
+        }
         if !hits.is_empty() {
             hits.sort();
             return Evidence::InUse(hits);
@@ -133,6 +161,75 @@ impl Snapshot {
                 ),
             }),
         }
+    }
+
+    /// The other processes holding a file inside `dir` that the backend
+    /// could not name, found by the file's device and inode in `dir`
+    /// (`inodes_within`); or why residue cannot tell: it could not read
+    /// such a file's device and inode, `dir`'s, or all of `dir`. Nothing
+    /// is inside a directory that does not exist. `dir` is read only when
+    /// the snapshot holds such a file, and walked only when one is on its
+    /// filesystem.
+    fn unnamed_within(
+        &self,
+        seen: &Seen,
+        dir: &Path,
+        me: u32,
+    ) -> Result<Vec<(u32, String)>, Unavailable> {
+        let others: Vec<&Unnamed> = seen.unnamed.iter().filter(|u| u.pid != me).collect();
+        let Some(first) = others.first() else {
+            return Ok(Vec::new());
+        };
+        let unknown = |file: &Unnamed, why: String| {
+            let who = if file.command.is_empty() {
+                format!("process {}", file.pid)
+            } else {
+                format!("process {} ({})", file.pid, file.command)
+            };
+            Unavailable {
+                reason: "unnamed_file",
+                detail: format!(
+                    "{} cannot give the path of a file {who} holds, and residue {why}, so it cannot show that no process is using it",
+                    self.backend
+                ),
+            }
+        };
+        let root = match std::fs::metadata(dir) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(unknown(first, format!("cannot read this directory ({e})"))),
+        };
+        if let Some(file) = others.iter().find(|u| u.file.is_none()) {
+            return Err(unknown(file, "cannot read where that file is".into()));
+        }
+        let wanted: Vec<&Unnamed> = others
+            .into_iter()
+            .filter(|u| u.file.is_some_and(|(device, _)| device == root.dev()))
+            .collect();
+        let mut inodes: Vec<u64> = wanted
+            .iter()
+            .filter_map(|u| u.file)
+            .map(|(_, i)| i)
+            .collect();
+        inodes.sort_unstable();
+        inodes.dedup();
+        let Some(first) = wanted.first() else {
+            return Ok(Vec::new());
+        };
+        let found = inodes_within(dir, &root, &inodes).map_err(|e| {
+            unknown(
+                first,
+                format!("could not read all of this directory to look for it ({e})"),
+            )
+        })?;
+        let mut holders: Vec<(u32, String)> = Vec::new();
+        for file in wanted {
+            let inside = file.file.is_some_and(|(_, inode)| found.contains(&inode));
+            if inside && !holders.iter().any(|(pid, _)| *pid == file.pid) {
+                holders.push((file.pid, file.command.clone()));
+            }
+        }
+        Ok(holders)
     }
 
     /// What the snapshot covers, in words: the header of `scan` and
@@ -162,6 +259,50 @@ impl Snapshot {
 /// `/x/cache2` is not inside `/x/cache`.
 fn within(path: &[u8], dir: &[u8]) -> bool {
     path.starts_with(dir) && (path.len() == dir.len() || path[dir.len()] == b'/')
+}
+
+/// Which of `inodes`, all on `root`'s filesystem, `dir` or an entry below
+/// it is: a walk that follows no symbolic link, enters each directory
+/// once, and does not enter another filesystem, where none of them can
+/// be. An entry removed during the walk is skipped; any other error ends
+/// it, since what it did not read may hold one, and names where. It stops
+/// once it has found them all.
+fn inodes_within(dir: &Path, root: &std::fs::Metadata, inodes: &[u64]) -> Result<Vec<u64>, String> {
+    use std::io::ErrorKind::NotFound;
+    let mut found: Vec<u64> = Vec::new();
+    if inodes.contains(&root.ino()) {
+        found.push(root.ino());
+    }
+    let mut entered = std::collections::HashSet::from([root.ino()]);
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        if found.len() == inodes.len() {
+            break;
+        }
+        let failed = |e: std::io::Error| format!("{}: {e}", next.display());
+        let entries = match std::fs::read_dir(&next) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == NotFound => continue,
+            Err(e) => return Err(failed(e)),
+        };
+        for entry in entries {
+            let (meta, path) = match entry.and_then(|entry| Ok((entry.metadata()?, entry.path()))) {
+                Ok(read) => read,
+                Err(e) if e.kind() == NotFound => continue,
+                Err(e) => return Err(failed(e)),
+            };
+            if meta.dev() != root.dev() {
+                continue;
+            }
+            if inodes.contains(&meta.ino()) && !found.contains(&meta.ino()) {
+                found.push(meta.ino());
+            }
+            if meta.is_dir() && entered.insert(meta.ino()) {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(found)
 }
 
 fn unavailable(backend: &'static str, reason: &'static str, detail: String) -> Snapshot {
@@ -334,6 +475,7 @@ mod platform {
                 total: count_processes(),
                 limits: None,
                 spelling: Some(super::lsof::spell),
+                unnamed: Vec::new(),
             }),
         }
     }
@@ -519,6 +661,7 @@ mod platform {
                 total: Some(total),
                 limits: None,
                 spelling: None,
+                unnamed: Vec::new(),
             }),
         }
     }
@@ -787,6 +930,7 @@ mod platform {
                 total: Some(total),
                 limits: None,
                 spelling: None,
+                unnamed: Vec::new(),
             }),
         }
     }
@@ -1052,6 +1196,7 @@ mod platform {
                 total: Some(total),
                 limits: Some(LIMITS),
                 spelling: None,
+                unnamed: Vec::new(),
             }),
         }
     }
@@ -1127,16 +1272,99 @@ mod platform {
     }
 }
 
+/// What a `/proc/PID/path/NAME` link the illumos kernel could not give
+/// holds. Its readlink is `vnodetopath` (`prreadlink_lookup` in
+/// `fs/proc/prvnops.c`), which checks the path the vnode cached when it was
+/// created or looked up (`v_path`). For a directory whose cached path is
+/// stale it rebuilds one from `..` (`dirtopath`); for any other file it
+/// fails (`vnodetopath_common` in `fs/lookup.c`). A path goes stale when a
+/// folder above the file is renamed. ZFS gives the renamed folder its new
+/// path (`vn_renamepath`, called only by ZFS and the NFS servers), and a
+/// file below it takes the new path once looked up by it
+/// (`vn_updatepath` in `fop_lookup`). tmpfs and UFS keep the folder's old
+/// path, so a lookup changes nothing below it, and the file keeps the old
+/// path until the folder's is rebuilt (`dirtopath`) and the file is looked
+/// up again. A path of `MAXPATHLEN` bytes or more fails too. So a link
+/// that fails can name a file inside any directory on its filesystem,
+/// and residue looks for it there by device and inode (`inodes_within`).
+///
+/// Its device, inode and link count come from `fd/N`, `object/NAME` or the
+/// opened `cwd` (`platform::attributes`). A file whose link count is 0 is
+/// named by no directory, so it is inside no worktree: tmpfs
+/// (`tdirdelete`), ZFS (`zfs_link_destroy`) and UFS (`ufs_dirremove`)
+/// lower it as each name is removed, and their getattr reports it. A
+/// socket, a pipe and a cloned device, which have no file behind them,
+/// report 0 too (`socket_vop_getattr`, `fifo_getattr`, `spec_getattr`);
+/// no descriptor names a filesystem's socket file, which open(2) refuses
+/// (`vn_openat`). A door reports a link count but is on doorfs
+/// (`door_getattr`), a device no worktree has. A regular file, a named
+/// FIFO and a device file report their filesystem's. A directory open by
+/// descriptor reports a link count of 1 (`prgetattr`), so a removed one
+/// is looked for too, and found nowhere. `prgetattr` leaves the device
+/// and inode the file's own.
+#[cfg(any(target_os = "illumos", test))]
+mod unnamed {
+    /// What a process holds through a `path` entry whose link procfs could
+    /// not read.
+    #[derive(Debug, PartialEq)]
+    pub enum Held {
+        /// Nothing inside a directory: a file no directory names, or one
+        /// closed or unmapped since the listing, or a process that exited.
+        Nothing,
+        /// A file with this `st_dev` and `st_ino`.
+        File(u64, u64),
+        /// A file whose device and inode residue could not read either.
+        Unreadable,
+    }
+
+    /// Which `/proc/PID` entry gives the attributes of what the `path`
+    /// entry NAME names: `cwd`, a descriptor number, or a mapped object
+    /// (`a.out` among them), the names `pr_readdir_pathdir` lists.
+    #[derive(Debug, PartialEq)]
+    pub enum Stand {
+        Cwd,
+        Fd,
+        Object,
+    }
+
+    pub fn stand_in(name: &[u8]) -> Stand {
+        if name == b"cwd" {
+            Stand::Cwd
+        } else if !name.is_empty() && name.iter().all(u8::is_ascii_digit) {
+            Stand::Fd
+        } else {
+            Stand::Object
+        }
+    }
+
+    /// From the file's device, inode and link count, or the error reading
+    /// them.
+    pub fn held(read: std::io::Result<(u64, u64, u64)>) -> Held {
+        match read {
+            Ok((_, _, 0)) => Held::Nothing,
+            Ok((device, inode, _)) => Held::File(device, inode),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Held::Nothing,
+            Err(_) => Held::Unreadable,
+        }
+    }
+}
+
 /// illumos: `/proc/<pid>/path/`, which holds a link for the working
 /// directory (`cwd`), for each open file descriptor and for each mapped
 /// object (`a.out`, the executable), each naming the file's path when the
 /// kernel knows it (proc(5)). Not `/proc/<pid>/cwd`: proc(5) says its
-/// readlink yields a null string.
+/// readlink yields a null string. A link the kernel cannot give is an
+/// unnamed file on the filesystem it is on (`super::unnamed`).
 #[cfg(target_os = "illumos")]
 mod platform {
-    use super::{Seen, Snapshot, Use, unavailable};
+    use super::unnamed::{Held, Stand};
+    use super::{Seen, Snapshot, Unnamed, Use, unavailable};
+    use std::ffi::OsStr;
     use std::fs;
-    use std::os::unix::ffi::OsStringExt;
+    use std::io::{self, ErrorKind};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
 
     const BACKEND: &str = "procfs";
 
@@ -1152,6 +1380,7 @@ mod platform {
             Err(e) => return unavailable(BACKEND, "probe_missing", format!("/proc: {e}")),
         };
         let mut uses = Vec::new();
+        let mut unnamed: Vec<Unnamed> = Vec::new();
         let mut total = 0;
         let mut inspected = 0;
         for item in listing {
@@ -1172,35 +1401,64 @@ mod platform {
                 Ok(command) => command,
                 Err(detail) => return unavailable(BACKEND, "parse_error", detail),
             };
-            let paths = base.join("path");
-            // A process whose working directory has no path here (exited,
-            // not the user's, or not nameable) does not count as inspected.
-            let Some(cwd) = link(&paths.join("cwd")) else {
-                continue;
+            let first = unnamed.len();
+            let mut note = |held: Held| {
+                let file = match held {
+                    Held::Nothing => return,
+                    Held::File(device, inode) => Some((device, inode)),
+                    Held::Unreadable => None,
+                };
+                if !unnamed[first..].iter().any(|u| u.file == file) {
+                    unnamed.push(Unnamed {
+                        pid,
+                        command: command.clone(),
+                        file,
+                    });
+                }
             };
-            inspected += 1;
-            uses.push(Use {
-                pid,
-                command: command.clone(),
-                path: cwd,
-            });
-            let Ok(entries) = fs::read_dir(&paths) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if name == "cwd" || name == "root" {
+            // Only the process's owner, or root, may list `path` (mode 0500,
+            // `prgetnode`); a process that is not the user's or has exited
+            // is skipped. Any other failure leaves its files unread.
+            let entries = match fs::read_dir(base.join("path")) {
+                Ok(entries) => entries,
+                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => {
                     continue;
                 }
-                // A descriptor closed since the listing, a socket or a pipe
-                // has no path; skip it.
+                Err(_) => {
+                    note(Held::Unreadable);
+                    continue;
+                }
+            };
+            let mut cwd = false;
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    // The process exited while residue read the list.
+                    Err(e) if e.kind() == ErrorKind::NotFound => break,
+                    Err(_) => {
+                        note(Held::Unreadable);
+                        break;
+                    }
+                };
+                let name = entry.file_name();
+                if name == "root" {
+                    continue;
+                }
                 if let Some(path) = link(&entry.path()) {
+                    cwd |= name == "cwd";
                     uses.push(Use {
                         pid,
                         command: command.clone(),
                         path,
                     });
+                    continue;
                 }
+                note(super::unnamed::held(attributes(&base, &name)));
+            }
+            // A process whose working directory has no path here does not
+            // count as inspected; what was read of it still counts.
+            if cwd {
+                inspected += 1;
             }
         }
         // residue itself is always one of the processes it may inspect.
@@ -1219,13 +1477,32 @@ mod platform {
                 total: Some(total),
                 limits: None,
                 spelling: None,
+                unnamed,
             }),
         }
     }
 
-    fn link(path: &std::path::Path) -> Option<Vec<u8>> {
+    fn link(path: &Path) -> Option<Vec<u8>> {
         let bytes = fs::read_link(path).ok()?.into_os_string().into_vec();
         (bytes.first() == Some(&b'/')).then_some(bytes)
+    }
+
+    /// The device, inode and link count of the file the `path` entry NAME
+    /// names,
+    /// from the entry procfs gives that file's own attributes in: `fd/N`
+    /// and `object/NAME` (`prgetattr` asks the file itself for PR_FD and
+    /// PR_OBJECT), and for `cwd` the directory itself, opened through
+    /// `/proc/PID/cwd` (`propen` hands back the real directory, while a
+    /// stat of `cwd` gives procfs's own attributes). That open needs read
+    /// access to the directory (`praccess`); without it the file is
+    /// unreadable, which keeps every worktree.
+    fn attributes(base: &Path, name: &OsStr) -> io::Result<(u64, u64, u64)> {
+        let meta = match super::unnamed::stand_in(name.as_bytes()) {
+            Stand::Cwd => fs::File::open(base.join("cwd"))?.metadata()?,
+            Stand::Fd => fs::metadata(base.join("fd").join(name))?,
+            Stand::Object => fs::metadata(base.join("object").join(name))?,
+        };
+        Ok((meta.dev(), meta.ino(), meta.nlink()))
     }
 
     /// The executable's name from `psinfo`, which every user may read. It
@@ -1281,7 +1558,7 @@ mod tests {
     //! probe that reads open files may answer `not_observed`; one that does
     //! not (`limits`) answers `in_use` or `unknown`, never `not_observed`.
 
-    use super::{Evidence, Seen, Snapshot, Use};
+    use super::{Evidence, Seen, Snapshot, Unnamed, Use};
     use std::path::Path;
 
     fn snapshot(limits: Option<&'static str>) -> Snapshot {
@@ -1297,6 +1574,7 @@ mod tests {
                 total: Some(1),
                 limits,
                 spelling: None,
+                unnamed: Vec::new(),
             }),
         }
     }
@@ -1327,6 +1605,168 @@ mod tests {
                 panic!("a use inside the directory must be in_use");
             };
             assert_eq!(procs, vec![(1, "sleep".to_string())]);
+        }
+    }
+
+    /// A snapshot whose only process holds files it could not name: each
+    /// its device and inode, or `None` where residue could not read them.
+    fn unnamed_snapshot(pid: u32, files: &[Option<(u64, u64)>]) -> Snapshot {
+        let mut s = snapshot(None);
+        if let Ok(seen) = &mut s.state {
+            for file in files {
+                seen.unnamed.push(Unnamed {
+                    pid,
+                    command: "sleep".into(),
+                    file: *file,
+                });
+            }
+        }
+        s
+    }
+
+    /// A folder of its own in the system's temporary directory, and in it
+    /// the directory `w` holding `sub/file.txt`, beside `outside.txt`.
+    fn scratch(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let top =
+            std::env::temp_dir().join(format!("residue-activity-{name}-{}", std::process::id()));
+        let dir = top.join("w");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/file.txt"), "x").unwrap();
+        std::fs::write(top.join("outside.txt"), "x").unwrap();
+        (top, dir)
+    }
+
+    /// The device and inode of `path`, as the backend records a file.
+    fn id(path: &Path) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(path).unwrap();
+        Some((meta.dev(), meta.ino()))
+    }
+
+    #[test]
+    fn an_unnamed_file_inside_the_directory_is_its_holders_use() {
+        let (top, dir) = scratch("inside");
+        let file = id(&dir.join("sub/file.txt"));
+        let Evidence::InUse(procs) = unnamed_snapshot(2, &[file]).evidence(&dir) else {
+            panic!("an unnamed file inside the directory must be in_use");
+        };
+        assert_eq!(procs, vec![(2, "sleep".to_string())]);
+        // The directory itself, held open, and one process listed once.
+        let both = unnamed_snapshot(2, &[id(&dir), id(&dir.join("sub"))]);
+        let Evidence::InUse(procs) = both.evidence(&dir) else {
+            panic!("the directory held open must be in_use");
+        };
+        assert_eq!(procs, vec![(2, "sleep".to_string())]);
+        std::fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn an_unnamed_file_elsewhere_is_no_use_until_a_name_of_it_is_inside() {
+        let (top, dir) = scratch("outside");
+        let outside = id(&top.join("outside.txt"));
+        assert_eq!(
+            unnamed_snapshot(2, &[outside]).evidence(&dir).code(),
+            "not_observed"
+        );
+        // On another filesystem it cannot be inside the directory.
+        let (device, inode) = id(&dir.join("sub/file.txt")).unwrap();
+        let other = unnamed_snapshot(2, &[Some((device.wrapping_add(1), inode))]);
+        assert_eq!(other.evidence(&dir).code(), "not_observed");
+        // A second name inside the directory is inside it.
+        std::fs::hard_link(top.join("outside.txt"), dir.join("sub/link.txt")).unwrap();
+        assert_eq!(
+            unnamed_snapshot(2, &[outside]).evidence(&dir).code(),
+            "in_use"
+        );
+        std::fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn an_unnamed_file_residue_cannot_place_is_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+        let (top, dir) = scratch("unread");
+        let Evidence::Unknown(u) = unnamed_snapshot(2, &[None]).evidence(&dir) else {
+            panic!("an unnamed file residue cannot read must be unknown");
+        };
+        assert_eq!(u.reason, "unnamed_file");
+        assert_eq!(
+            u.detail,
+            "test cannot give the path of a file process 2 (sleep) holds, and residue cannot read where that file is, so it cannot show that no process is using it"
+        );
+        // A folder residue cannot read may hold it; root reads any, so the
+        // check is only where the folder is unreadable.
+        let outside = id(&top.join("outside.txt"));
+        let sub = dir.join("sub");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read_dir(&sub).is_err();
+        let evidence = unnamed_snapshot(2, &[outside]).evidence(&dir);
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if unreadable {
+            let Evidence::Unknown(u) = evidence else {
+                panic!("a directory residue cannot read all of must be unknown");
+            };
+            assert_eq!(u.reason, "unnamed_file");
+            assert!(
+                u.detail.contains("could not read all of this directory"),
+                "{}",
+                u.detail
+            );
+        }
+        std::fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn a_use_outranks_an_unnamed_file_and_residues_own_do_not_count() {
+        let (top, dir) = scratch("own");
+        let mut s = unnamed_snapshot(std::process::id(), &[None]);
+        assert_eq!(s.evidence(&dir).code(), "not_observed");
+        if let Ok(seen) = &mut s.state {
+            seen.unnamed[0].pid = 2;
+            seen.uses[0].path = dir.as_os_str().as_encoded_bytes().to_vec();
+        }
+        let Evidence::InUse(procs) = s.evidence(&dir) else {
+            panic!("a use inside the directory must be in_use");
+        };
+        assert_eq!(procs, vec![(1, "sleep".to_string())]);
+        std::fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn a_directory_that_does_not_exist_holds_no_unnamed_file() {
+        let (top, dir) = scratch("gone");
+        let file = id(&dir.join("sub/file.txt"));
+        std::fs::remove_dir_all(&top).unwrap();
+        assert_eq!(
+            unnamed_snapshot(2, &[file]).evidence(&dir).code(),
+            "not_observed"
+        );
+        assert_eq!(
+            unnamed_snapshot(2, &[None]).evidence(&dir).code(),
+            "not_observed"
+        );
+    }
+
+    #[test]
+    fn a_path_entry_is_read_where_procfs_gives_its_files_attributes() {
+        use super::unnamed::{Stand, stand_in};
+        assert_eq!(stand_in(b"cwd"), Stand::Cwd);
+        assert_eq!(stand_in(b"0"), Stand::Fd);
+        assert_eq!(stand_in(b"255"), Stand::Fd);
+        assert_eq!(stand_in(b"a.out"), Stand::Object);
+        assert_eq!(stand_in(b"zfs.65538.4194"), Stand::Object);
+        assert_eq!(stand_in(b""), Stand::Object);
+    }
+
+    #[test]
+    fn an_unlinked_or_closed_file_holds_nothing_and_an_unread_one_may_hold_any() {
+        use super::unnamed::{Held, held};
+        use std::io::{Error, ErrorKind};
+        assert_eq!(held(Ok((7, 9, 1))), Held::File(7, 9));
+        assert_eq!(held(Ok((7, 9, 2))), Held::File(7, 9));
+        assert_eq!(held(Ok((7, 9, 0))), Held::Nothing);
+        assert_eq!(held(Err(Error::from(ErrorKind::NotFound))), Held::Nothing);
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::Other] {
+            assert_eq!(held(Err(Error::from(kind))), Held::Unreadable);
         }
     }
 
@@ -1391,6 +1831,7 @@ mod tests {
                 total: Some(1),
                 limits: None,
                 spelling: None,
+                unnamed: Vec::new(),
             }),
         };
         assert_eq!(s.evidence(Path::new("/w/gone")).code(), "in_use");
@@ -1447,6 +1888,7 @@ mod tests {
                 total: Some(1),
                 limits: None,
                 spelling: Some(super::lsof::spell),
+                unnamed: Vec::new(),
             }),
         }
     }

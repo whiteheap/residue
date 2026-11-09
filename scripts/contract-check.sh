@@ -1708,26 +1708,29 @@ fi
 # CJK and a backslash in the worktree's name (given by `git worktree
 # move`), an emoji in a folder above it, and a process whose only link is
 # an open file in a worktree below a folder named with ï. The last two are
-# not moved, so they test the bytes alone. Each holder is a sleep.
-# `explain` and `remove --yes` must keep the worktree, untouched; once the
-# sleep exits it is idle again, which shows the use was the sleep's. On a
-# partial probe, which reads no open files, the open-file case is kept as
-# unknown (partial_probe) instead.
-held() { # NAME WORKTREE-NAME|w cwd|open [REPO-DIR]
+# not moved, so they test the bytes alone. Then the open file once more,
+# with the worktree moved after the file was opened: illumos may then have
+# no path for the file, and finds it by its inode, or else answers unknown
+# (`unnamed_file`), never idle. Each holder is a sleep. `explain` and `remove --yes` must keep the
+# worktree, untouched; once the sleep exits it is idle again, which shows
+# the use was the sleep's. On a partial probe, which reads no open files,
+# the open-file cases are kept as unknown (partial_probe) instead.
+held() { # NAME WORKTREE-NAME|w cwd|open|open-then-move [REPO-DIR]
     name=$1
     make_repo "${4:-}"
     local dest=$repo/.worktrees/$2 before holder i busy explain_status
-    local verdict=keep state=in_use
-    if [ "$3" = open ] && [ -n "$partial_probe" ]; then verdict=unknown state=unknown; fi
-    if [ "$2" != w ]; then
+    local partial=false unnamed=false
+    case $3 in open*) [ -z "$partial_probe" ] || partial=true ;; esac
+    if [ "$3" = open-then-move ] && [ "$(uname -s)" = SunOS ]; then unnamed=true; fi
+    if [ "$2" != w ] && [ "$3" != open-then-move ]; then
         setup git -C "$repo" worktree move "$wt" "$dest"
         wt=$dest
     fi
     before=$(sums "$wt")
-    if [ "$3" = open ]; then
-        (cd "$work" && exec sleep 300 3<"$wt/sub/file.txt") >/dev/null 2>&1 &
-    else
+    if [ "$3" = cwd ]; then
         (cd "$wt/sub" && exec sleep 300) >/dev/null 2>&1 &
+    else
+        (cd "$work" && exec sleep 300 3<"$wt/sub/file.txt") >/dev/null 2>&1 &
     fi
     holder=$!
     holders="$holders $holder"
@@ -1735,6 +1738,15 @@ held() { # NAME WORKTREE-NAME|w cwd|open [REPO-DIR]
         case $(ps -o comm= -p "$holder" 2>/dev/null) in *sleep) break ;; esac
         sleep 0.1
     done
+    if [ "$3" = open-then-move ]; then
+        setup git -C "$repo" worktree move "$wt" "$dest"
+        wt=$dest
+    fi
+    # The sleep's use, or an answer that cannot show the worktree unused.
+    local kept='def kept:
+        if $partial then .state == "unknown" and .reason == "partial_probe"
+        else (.state == "in_use" and any(.processes[]; .pid == $pid and .command == "sleep"))
+            or ($unnamed and .state == "unknown" and .reason == "unnamed_file") end;'
     run explain --json "$wt"
     busy=$work/$name.busy
     explain_status=$status
@@ -1743,20 +1755,17 @@ held() { # NAME WORKTREE-NAME|w cwd|open [REPO-DIR]
     kill "$holder" 2>/dev/null
     wait "$holder" 2>/dev/null
     if [ "$explain_status" != 0 ]; then fail "explain exit $explain_status, want 0"
-    elif ! jq -e --argjson pid "$holder" --arg verdict "$verdict" --arg state "$state" '
-        .worktree.verdict == $verdict and (.worktree.activity | .state == $state
-            and if $state == "in_use" then any(.processes[]; .pid == $pid and .command == "sleep")
-                else .reason == "partial_probe" end)' "$busy" >/dev/null; then
-        fail "with sleep[$holder] in it, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$busy"), want $verdict and $state"
+    elif ! jq -e --argjson pid "$holder" --argjson partial "$partial" --argjson unnamed "$unnamed" "$kept"'
+        .worktree | .verdict == (if .activity.state == "in_use" then "keep" else "unknown" end)
+            and (.activity | kept)' "$busy" >/dev/null; then
+        fail "with sleep[$holder] using it, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$busy")"
     elif [ "$status" != 3 ]; then fail "remove --yes exit $status, want 3"
     elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
     elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), want refused"
     elif [ "$(failing_checks 0)" != activity ]; then fail "failing checks: $(failing_checks 0), want activity"
-    elif ! jq -e --argjson pid "$holder" --arg state "$state" '
-        .results[0].worktree.activity | .state == $state
-            and if $state == "in_use" then any(.processes[]; .pid == $pid and .command == "sleep")
-                else .reason == "partial_probe" end' "$out" >/dev/null; then
-        fail "remove's activity is $(jq -c '.results[0].worktree.activity' "$out"), want $state"
+    elif ! jq -e --argjson pid "$holder" --argjson partial "$partial" --argjson unnamed "$unnamed" "$kept"'
+        .results[0].worktree.activity | kept' "$out" >/dev/null; then
+        fail "with sleep[$holder] using it, remove's activity is $(jq -c '.results[0].worktree.activity' "$out")"
     elif untouched "$before"; then
         run explain --json "$wt"
         if [ "$status" != 0 ]; then fail "after sleep exited, explain exit $status, want 0"
@@ -1764,7 +1773,12 @@ held() { # NAME WORKTREE-NAME|w cwd|open [REPO-DIR]
             fail "after sleep exited, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$out"), want candidate and not_observed"
         elif [ -n "$partial_probe" ] && ! jq -e '.worktree.activity.state == "unknown" and .worktree.activity.reason == "partial_probe"' "$out" >/dev/null; then
             fail "after sleep exited, explain says $(jq -c '.worktree.activity' "$out"), want unknown (partial_probe)"
-        else ok; fi
+        else
+            ok
+            if [ "$3" = open-then-move ]; then
+                echo "     while the sleep held it: $(jq -c '.worktree.activity | {state, reason}' "$busy")"
+            fi
+        fi
     fi
 }
 held activity-cwd-accented "$(printf 'caf\303\251')" cwd
@@ -1772,6 +1786,7 @@ held activity-cwd-cjk "$(printf '\346\274\242\345\255\227')" cwd
 held activity-cwd-backslash 'back\slash' cwd
 held activity-cwd-emoji-above w cwd "$work/$(printf '\360\237\232\200')-repo"
 held activity-open-file-only w open "$work/$(printf 'na\303\257ve')-repo"
+held activity-open-file-moved moved open-then-move
 
 echo "contract-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]
