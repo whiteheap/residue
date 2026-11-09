@@ -1181,7 +1181,7 @@ fn check_size(r: &mut Report, dir: &Path, usage: std::io::Result<Usage>) {
             "mount_point",
             "mount point",
             format!(
-                "contains a mount point at {}; removal could delete files on another filesystem",
+                "contains a mount point at {}; removal could delete what is mounted there",
                 show(&usage.mount_points)
             ),
         );
@@ -1195,6 +1195,12 @@ fn check_size(r: &mut Report, dir: &Path, usage: std::io::Result<Usage>) {
                 plural(usage.unreadable as usize, "entry", "entries"),
                 usage.first_error.clone().unwrap_or_default()
             ),
+        );
+    } else if let Some(why) = &usage.mounts_unknown {
+        r.unknown(
+            "contents",
+            "mount points unknown",
+            format!("cannot tell whether it holds a mount point: {why}"),
         );
     } else if !blocked {
         r.pass(
@@ -1548,6 +1554,11 @@ fn found_after_move(dir: &Path, usage: &Usage) -> Option<String> {
             first.strip_prefix(&inside).unwrap_or(first)
         ));
     }
+    if let Some(why) = &usage.mounts_unknown {
+        return Some(format!(
+            "cannot tell whether it holds a mount point after residue moved it aside: {why}"
+        ));
+    }
     None
 }
 
@@ -1589,8 +1600,8 @@ impl Fingerprint {
     /// The same measurement taken again at `dir`, the worktree's directory
     /// now (after a move, its new path), with `head` as Git lists it there.
     /// It refuses what `check_size` refuses, which the fingerprint does not
-    /// hold: an entry the walk cannot read, a nested repository or a mount
-    /// point (#106). Each error is the reason, a whole sentence. With it
+    /// hold: an entry the walk cannot read, a nested repository, a mount
+    /// point, or mounts it cannot tell (#106). Each error is the reason, a whole sentence. With it
     /// comes what the walk reached, for the activity check (`wanted` is
     /// `Snapshot::wanted`), when the walk ran.
     pub fn again(

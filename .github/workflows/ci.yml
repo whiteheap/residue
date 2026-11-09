@@ -54,6 +54,12 @@ jobs:
         run: bash scripts/contract-check.sh target/release/residue
       - name: Recovery check
         run: bash scripts/recovery-check.sh target/release/residue
+      # Its mount cases need root: a tmpfs, and a folder of the worktree's
+      # own filesystem bind-mounted inside it, before the plan and after the
+      # move aside (2c, 2e, 2e2). The runner's user may sudo.
+      - name: Recovery check as root
+        if: runner.os == 'Linux'
+        run: sudo bash scripts/recovery-check.sh target/release/residue
 
   # FreeBSD runs in a virtual machine. residue's probe there is the base
   # system's ps and two kernel sysctls, so nothing beyond Rust and Git is
