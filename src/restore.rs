@@ -957,7 +957,7 @@ fn list_text(found: &Found, started: i64, places: &Places) -> String {
     }
     if !found.trash.is_empty() || !found.removed.is_empty() {
         out.push_str(&style.dim(
-            "\nput one back: residue restore NAME  ·  trash purged after --keep-trash (7d), records kept at least --keep-removed (30d)\n",
+            "\nput one back: residue restore NAME  ·  trash purged after --keep-trash (7d) or its own when longer, records kept at least --keep-removed (30d)\n",
         ));
     }
     out
@@ -983,12 +983,18 @@ fn trash_row(item: &trash::Item, now: i64, places: &Places, style: &Style) -> St
                 .allocated
                 .map(|b| format!(" · {}", output::bytes(b)))
                 .unwrap_or_default();
+            // The --keep-trash it was trashed with, which no run shortens.
+            let keep = match &r.keep {
+                Some(Ok(k)) => format!(" · kept at least {}", clean(&k.text)),
+                Some(Err(_)) => " · kept until restored".to_string(),
+                None => String::new(),
+            };
             out.push_str(&format!(
                 "  {}\n    was {}\n    {}\n",
                 style.dim(&branch_label(r.branch.as_deref(), r.head.as_deref())),
                 places.show(&r.original),
                 style.dim(&format!(
-                    "trashed {} ({}){size}{}",
+                    "trashed {} ({}){size}{keep}{}",
                     output::date(r.trashed),
                     output::age(now - r.trashed),
                     if item.holds_only_record() {

@@ -54,8 +54,10 @@ pub struct Record {
     pub allocated: Option<u64>,
     pub reclaimable: Option<u64>,
     /// The `--keep-trash` of the run that trashed it, so no later run
-    /// purges it sooner; `None` in an entry an earlier release made.
-    pub keep: Option<removed::Keep>,
+    /// purges it sooner; `None` in an entry an earlier release made, and
+    /// the line as written when this release cannot read it (damaged, or
+    /// a later release's), which no run purges.
+    pub keep: Option<Result<removed::Keep, String>>,
 }
 
 impl Record {
@@ -84,7 +86,7 @@ impl Record {
         );
         // A release before this one ignores the line, and purges the entry
         // after its own --keep-trash.
-        if let Some(k) = &self.keep {
+        if let Some(Ok(k)) = &self.keep {
             out.extend_from_slice(format!("keep {} {}\n", k.seconds, k.text).as_bytes());
         }
         if let Some(n) = self.allocated {
@@ -129,10 +131,9 @@ impl Record {
                 b"branch" => record.branch = Some(text()),
                 b"head" => record.head = Some(text()),
                 b"trashed" => trashed = Some(number("trashed")?),
-                b"keep" => {
-                    record.keep =
-                        Some(removed::Keep::parse(&text()).ok_or("keep is not SECONDS DURATION")?);
-                }
+                // One this release cannot read keeps the entry readable,
+                // so it can be restored, and never expiring.
+                b"keep" => record.keep = Some(removed::Keep::parse(&text()).ok_or_else(text)),
                 b"allocated" => record.allocated = number("allocated")?.try_into().ok(),
                 b"reclaimable" => record.reclaimable = number("reclaimable")?.try_into().ok(),
                 // Keys a later version adds carry nothing this one needs.
@@ -246,11 +247,13 @@ impl Item {
     /// At least `keep` old, and at least as old as the `--keep-trash` of
     /// the run that trashed it, the longer of the two, as a removal
     /// record's `--keep-removed` (`removed::Item::expired`). An entry
-    /// without one, from 0.0.12 or earlier, has only `keep`.
+    /// without one, from 0.0.12 or earlier, has only `keep`; one whose
+    /// `keep` this release cannot read never expires.
     pub fn expired(&self, now: i64, keep: i64) -> bool {
-        self.record.as_ref().is_ok_and(|r| {
-            let own = r.keep.as_ref().map_or(0, |k| k.seconds);
-            now - r.trashed >= keep.max(own)
+        self.record.as_ref().is_ok_and(|r| match &r.keep {
+            Some(Err(_)) => false,
+            Some(Ok(own)) => now - r.trashed >= keep.max(own.seconds),
+            None => now - r.trashed >= keep,
         })
     }
 }
@@ -769,6 +772,13 @@ pub fn purge(item: &Item, registered: &Entry, holds: &[&Hold]) -> Result<Option<
     Ok(discard(&item.dir).err())
 }
 
+/// The `--keep-trash` a record keeps, when this release can read it.
+fn own_keep(record: Option<&Record>) -> Option<&removed::Keep> {
+    record
+        .and_then(|r| r.keep.as_ref())
+        .and_then(|k| k.as_ref().ok())
+}
+
 pub fn item_json(item: &Item) -> Json {
     let record = item.record.as_ref().ok();
     Json::Obj(vec![
@@ -812,18 +822,15 @@ pub fn item_json(item: &Item) -> Json {
             },
         ),
         // The `--keep-trash` it was trashed with, as a removal record's
-        // `keep`; null for an entry an earlier release made.
+        // `keep`; null for an entry an earlier release made, or one whose
+        // keep line this release cannot read.
         (
             "keep",
-            Json::opt(record.and_then(|r| r.keep.as_ref()), |k| {
-                Json::str(k.text.clone())
-            }),
+            Json::opt(own_keep(record), |k| Json::str(k.text.clone())),
         ),
         (
             "keep_seconds",
-            Json::opt(record.and_then(|r| r.keep.as_ref()), |k| {
-                Json::Int(k.seconds)
-            }),
+            Json::opt(own_keep(record), |k| Json::Int(k.seconds)),
         ),
     ])
 }
@@ -840,9 +847,11 @@ mod tests {
             trashed: 1_000,
             allocated: Some(10),
             reclaimable: Some(8),
-            keep: keep.map(|(seconds, text)| removed::Keep {
-                seconds,
-                text: text.into(),
+            keep: keep.map(|(seconds, text)| {
+                Ok(removed::Keep {
+                    seconds,
+                    text: text.into(),
+                })
             }),
         }
     }
@@ -882,7 +891,7 @@ mod tests {
         let text = String::from_utf8(bytes.clone()).unwrap();
         assert!(text.contains("\nkeep 2592000 30d\n"), "{text}");
         let back = Record::parse(&bytes).unwrap();
-        let keep = back.keep.unwrap();
+        let keep = back.keep.unwrap().unwrap();
         assert_eq!((keep.seconds, keep.text.as_str()), (2_592_000, "30d"));
         // An entry an earlier release made has none, and reads as before.
         let old = Record::parse(&record(None).render(entry)).unwrap();
@@ -892,9 +901,12 @@ mod tests {
                 .unwrap()
                 .contains("keep")
         );
-        // A damaged one is an unreadable record, never purged.
+        // One this release cannot read leaves the record readable, so it
+        // can be restored, and it never expires.
         let damaged = text.replace("keep 2592000 30d", "keep soon");
-        assert!(Record::parse(damaged.as_bytes()).is_err());
+        let read = Record::parse(damaged.as_bytes()).unwrap();
+        assert!(matches!(&read.keep, Some(Err(line)) if line == "soon"));
+        assert!(!item(read).expired(1_000 + 520 * 7 * 86_400, 86_400));
     }
 
     #[test]

@@ -458,16 +458,17 @@ PUnlock ==
             /\ UNCHANGED <<w, g, lk, hist>>
   /\ UNCHANGED <<chk, ctx, ts, rs, pl, faults>>
 
-\* After git::remove_worktree: discard the entry, or lock it again.
+\* After git::remove_worktree: discard the entry, or lock it again. Once
+\* Git deleted W, the purge is done whatever trash::discard finds, and
+\* the record stays: an entry that holds more than its info stays whole,
+\* with a warning (trash::Stays), and so is one already gone. The model's
+\* entry holds only its info.
 PAfter ==
   /\ pc["pg"] = "p_wait"
   /\ g["pg"].step = "none" /\ g["pg"].res # "none"
   /\ IF g["pg"].res = "ok"
-     THEN IF w.entry = "info"
-          THEN /\ w' = [w EXCEPT !.entry = "none"]
-               /\ Go("pg", "done")
-          ELSE /\ Go("pg", "p_settle")   \* discard: the entry directory is gone
-               /\ UNCHANGED w
+     THEN /\ w' = IF w.entry = "info" THEN [w EXCEPT !.entry = "none"] ELSE w
+          /\ Go("pg", "done")
      ELSE /\ Go("pg", "p_relock")
           /\ UNCHANGED w
   /\ UNCHANGED <<g, chk, ctx, ts, rs, lk, pl, faults, hist>>

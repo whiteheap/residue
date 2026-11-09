@@ -27,7 +27,8 @@ Options:
   --yes                    remove: skip the prompt; only once the task is done
   --trash                  remove: into the trash; frees nothing until purged
   --no-trash               remove: delete, even with --idle
-  --keep-trash DURATION    remove: purge trash entries older than this (7d)
+  --keep-trash DURATION    remove: purge trash entries older than this (7d);
+                           new entries keep it, and it cannot shorten their own
   --keep-removed DURATION  remove: keep removal records at least this long (30d)
   --as-of TIME             remove: judge ages at TIME, a plan's generated_at
   --removal-reason REASON  remove: watch-landed or watch-low-disk (set by watch)

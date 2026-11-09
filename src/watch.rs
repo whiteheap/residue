@@ -1466,7 +1466,7 @@ fn remove(
     }
     // What it could not read (`errors`, which failed the run), and the
     // removal records it could not read or forget, the trash entries it
-    // kept because they hold what residue never deletes, and a stats ledger
+    // kept because no purge can act on them, and a stats ledger
     // it could not write (`warnings`, which never do): the log is the only
     // place a service user sees either.
     for (key, kind) in [("errors", ""), ("warnings", "warning: ")] {

@@ -1,5 +1,6 @@
 # One mutant per line: the guard it removes (Mut("NAME") in Removal.tla;
-# A+B removes two, for a guard a rule needs only once another is gone),
+# A+B removes two that each keep the rule alone, and check.sh checks that
+# each alone leaves it holding),
 # the setup (Start, the Faults set, the actors that do not run; After is
 # always {}), the rule that must break, and, when the setup has them, the
 # actors of a release that takes no hold (Old) and the trash restores

@@ -1179,6 +1179,44 @@ else
     skip_partial trash-own-keep
 fi
 
+# 8e. Two expired entries no purge can act on: one that holds its worktree
+# while Git lists that worktree at its old path (a move into the trash that
+# stopped after its rename, or a repository moved since), and one whose
+# keep line this release cannot read. Both stay, with a warning each, and
+# the sweep exits 0. The second is still restorable.
+if [ -z "$partial_probe" ]; then
+    name=trash-kept-unpurgeable
+    make_repo
+    setup git -C "$repo" worktree add -q "$repo/.worktrees/v" -b v
+    run remove --yes --json --trash "$wt" "$repo/.worktrees/v"
+    lost=$(result 0 trash_entry) odd=$(result 1 trash_entry)
+    [ "$status" = 0 ] && [ -d "$lost" ] && [ -d "$odd" ] || { echo "contract-check: setup failed in $name: remove --trash exit $status" >&2; exit 2; }
+    for e in "$lost" "$odd"; do
+        sed 's/^trashed [0-9]* .*/trashed 1767225600 2026-01-01T00:00:00Z/' "$e/info" >"$work/$name.info" && cat "$work/$name.info" >"$e/info" || exit 2
+    done
+    sed 's/^keep .*/keep later/' "$odd/info" >"$work/$name.info" && cat "$work/$name.info" >"$odd/info" || exit 2
+    # Git's record of w points at its old path again; its folder stays in the entry.
+    printf '%s\n' "$wt/.git" >"$repo/.git/worktrees/w/gitdir" || exit 2
+    before=$(sums "$lost/w")
+    want=$(printf 'kept %s\nkept %s\n' "$(basename "$lost")" "$(basename "$odd")" | LC_ALL=C sort | paste -s -d , -)
+    run remove --all --yes --json --idle 30d "$repo"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif [ "$(jq -c .errors "$out")" != "[]" ]; then fail "errors: $(jq -c .errors "$out")"
+    elif [ "$(jq -r '[.purged[] | .result + " " + .entry.entry] | sort | join(",")' "$out")" != "$want" ]; then fail "purged: $(jq -c '[.purged[] | {result, reason, entry: .entry.entry}]' "$out")"
+    elif ! jq -e --arg e "$(basename "$lost")" '[.purged[] | select(.entry.entry == $e) | .reason][0] | contains("Git does not list its worktree here") and contains("worktree repair")' "$out" >/dev/null; then fail "the reason for the entry Git lists elsewhere: $(jq -c '.purged' "$out")"
+    elif ! jq -e --arg e "$(basename "$odd")" '[.purged[] | select(.entry.entry == $e)][0] | (.reason | contains("keep line (later)")) and .entry.error == null and .entry.keep == null' "$out" >/dev/null; then fail "the entry with the odd keep line: $(jq -c '.purged' "$out")"
+    elif [ "$(jq '.warnings | length' "$out")" != 2 ]; then fail "warnings: $(jq -c .warnings "$out"), want 2"
+    elif [ "$(sums "$lost/w")" != "$before" ] || [ ! -d "$odd/v" ]; then fail "an entry changed"
+    else
+        in_dir "$repo" run restore --json "$odd"
+        if [ "$status" != 0 ]; then fail "restore of the entry with the odd keep line: exit $status: $(cat "$err")"
+        elif ! registered "$repo/.worktrees/v"; then fail "v is not back"
+        else ok; fi
+    fi
+else
+    skip_partial trash-kept-unpurgeable
+fi
+
 # 9. Stats: each removal, move into the trash, purge and restore adds a
 # line to the stats ledger, `remove --json` reports what it freed in
 # `stats`, and `residue stats --json` (residue.stats/v1) adds them up. A

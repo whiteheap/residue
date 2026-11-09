@@ -1192,6 +1192,79 @@ pub fn stopped_purges(
     Ok(stopped)
 }
 
+/// Before a purge of the trash worktree at `path` writes its own record:
+/// the records of earlier purges of the same entry that Git still lists
+/// there (`stopped_purges`, each held), which a purge stopped before or
+/// while its Git ran leaves, or one whose re-check failed after something
+/// changed what the record keeps. A record whose worktree still holds all
+/// it keeps (`still_holds`) is forgotten: the purge's own record keeps the
+/// same, so one worktree has one record. Any other stays, and so does the
+/// entry, at `entry`: the error says why and names the restore.
+pub fn settle_before_purge(
+    stopped: Vec<(Item, Hold)>,
+    path: &Path,
+    entry: &Path,
+) -> Result<(), String> {
+    for (item, _held) in stopped {
+        let lacks = item
+            .record
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|record| still_holds(&item, record, path));
+        if let Some(why) = lacks.unwrap_or_else(Some) {
+            return Err(format!(
+                "the removal record {} of an earlier purge of this entry stays, since {why}; `residue restore {}` puts the worktree back",
+                item.name,
+                output::shell(entry)
+            ));
+        }
+        forget(&item).map_err(|e| {
+            format!(
+                "could not forget {}, the removal record of an earlier purge of this entry ({e}), so the entry stays",
+                item.name
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// What the worktree at `path`, still where the record's purge started,
+/// lacks of what the record keeps, or `None`: its HEAD contains the
+/// recorded HEAD, its HEAD reflog names every commit the record's refs
+/// keep, as Git reads it (`unnamed_kept`), and its config.worktree is the
+/// record's copy, when the record has one.
+fn still_holds(item: &Item, record: &Record, path: &Path) -> Result<Option<String>, String> {
+    let short = |c: &str| c[..c.len().min(12)].to_string();
+    let now = git::commit_of(path, "HEAD")?.ok_or("it has no HEAD commit")?;
+    if !git::is_ancestor(path, &record.head, &now)? {
+        return Ok(Some(format!(
+            "the worktree's HEAD {} does not contain the recorded HEAD {}",
+            short(&now),
+            short(&record.head)
+        )));
+    }
+    let missing = unnamed_kept(record, path, &item.command_dir)?.len();
+    if missing > 0 {
+        return Ok(Some(format!(
+            "the worktree's HEAD reflog does not name {missing} of the commits the record keeps"
+        )));
+    }
+    let (config, _) = read_copies(item)?;
+    if let Some(copy) = config.map_err(|e| format!("its copy of config.worktree: {e}"))? {
+        let at = git::identity(path)?.git_dir.join(CONFIG);
+        match fs::read(&at) {
+            Ok(now) if now == copy => {}
+            Ok(_) => {
+                return Ok(Some(
+                    "the worktree's config.worktree differs from the record's copy".into(),
+                ));
+            }
+            Err(e) => return Ok(Some(format!("cannot read {}: {e}", at.display()))),
+        }
+    }
+    Ok(None)
+}
+
 /// The names of the records of purges of the trash worktree at any of
 /// `asides` that are not in `seen`, read now. Once a trash restore has
 /// moved the worktree, a purge record it did not read under its hold

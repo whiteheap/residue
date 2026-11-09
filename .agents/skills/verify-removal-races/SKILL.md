@@ -100,7 +100,7 @@ Run the check for a change to any function in this table, or for one that adds a
 | `RVerify` | `remove.rs` `verify_moved` |
 | `PBCheck`, `PBUnlock`, `PBMove`, `PBStuck` | `remove.rs` `Moved::put_back`, `Moved::stuck` |
 | `RSettle`, `PSettle` | `remove.rs` `settle`, `standing`, `Files` |
-| `PHold`, `PRecord`, `PRecheck`, `PUndo`, `PAfter`, `PRelock` | `remove.rs` `purge`: `hold::take(trash::info)`, `removed::create`, `recheck(path, ours = trash::LOCK)`, and `settle` with `standing` and no `Files` when the re-check fails. A purge in Old re-checks before it writes its record, as 0.0.10 did (`PFirst`) |
+| `PHold`, `PRecord`, `PRecheck`, `PUndo`, `PAfter`, `PRelock` | `remove.rs` `purge`: `hold::take(trash::info)`, `removed::create`, `recheck(path, ours = trash::LOCK)`, and `settle` with `standing` and no `Files` when the re-check fails; after `git::remove_worktree`, `trash::discard`, whose result does not change the outcome once Git deleted the worktree. A purge in Old re-checks before it writes its record, as 0.0.10 did (`PFirst`). Its step between the hold and the record, `removed::settle_before_purge` over `stopped_purges`, acts only on a record an earlier purge left, which no setup has |
 | `PUnlock` | `trash.rs` `purge(item, registered, holds)` |
 | `StartGit` | `git.rs` `remove_worktree(main, path, holds)`, `hold.rs` `pass_to` |
 | `GFind`, `GExists`, `GStatus`, `GTree`, `GGitdir` | Git's `remove_worktree`, run by `git.rs` `remove_worktree` |
@@ -235,7 +235,8 @@ A purge writes its removal record before its re-check, as a removal writes its r
 
 - `remove --trash` moving a worktree into the trash, and clearing empty records or forgetting them after `--keep-removed`.
 - `residue watch`'s decisions, the service, and how the restored mark changes later runs.
-- Two remove runs at once, and `restore --to`.
+- Two remove runs at once, and `restore --to`: so also two purges of one entry at once, and a purge after an earlier one of the same entry stopped, which settles that purge's record first (`removed::settle_before_purge`; `scripts/recovery-check.sh` `purge-reset-at-record` and `purge-stopped-before-recheck` check it on the real code).
+- A trash restore that a purge's activity probe cannot see, such as one another user runs, which a probe that is not root does not list. The re-check then misses the restore's open `.git` (`TrUses`), and only the holds keep the two apart; the `PurgeNoHold+TrashRestoreNoUse` and `TrashRestoreNoHold+TrashRestoreNoUse` mutants are that case.
 - Symbolic links, path canonicalization, and moves across filesystems.
 - The stats ledger and the Mac app.
 - Reftable repositories, and branches others move during a run.
