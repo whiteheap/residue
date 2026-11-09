@@ -17,7 +17,8 @@ Usage:
   residue restore [ENTRY]       List what residue can put back, or put back one
   residue stats                 Show how much disk residue has freed
   residue watch [ROOT...]       Clean up when a branch lands or disk is low
-  residue service install       Run `residue watch` from login
+  residue service install|status|uninstall
+                                Run `residue watch` from login; show it; stop it
 
 Options:
   --json                   Print one JSON document
@@ -48,7 +49,7 @@ Examples:
 
 Never removed: the main checkout; a locked or in-use worktree; one with
                staged, modified, untracked or non-regenerable ignored files
-Kept:          branches and commits
+Kept:          branches, commits and the stash
 Restore:       each deletion writes a removal record first; `residue restore`
                brings the worktree back for 30d, without its ignored files
 Rules:         ~/.config/residue/regenerable, one RULE per line
@@ -178,16 +179,21 @@ fn utf8(value: OsString, what: &str) -> Result<String, String> {
 
 pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
     let mut args = args.into_iter().peekable();
-    let kind = match args.peek().and_then(|a| a.to_str()) {
+    let kind = match args.peek().map(|a| a.to_str()) {
         None => return Ok(Command::Scan(Options::default())),
-        Some("-h" | "--help" | "help") => return Ok(Command::Help),
-        Some("-V" | "--version" | "version") => return Ok(Command::Version),
-        Some(word @ ("scan" | "explain" | "remove" | "restore" | "stats")) => {
+        Some(Some("-h" | "--help" | "help")) => return Ok(Command::Help),
+        Some(Some("-V" | "--version" | "version")) => return Ok(Command::Version),
+        Some(Some(word @ ("scan" | "explain" | "remove" | "restore" | "stats"))) => {
             let word = word.to_string();
             args.next();
             word
         }
-        Some(_) => "scan".to_string(),
+        Some(Some(word)) => {
+            not_a_command(word, |p| std::fs::symlink_metadata(p).is_ok())?;
+            "scan".to_string()
+        }
+        // Not UTF-8, so no command: a PATH to scan.
+        Some(None) => "scan".to_string(),
     };
     let mut options = Options::default();
     let mut paths_only = false;
@@ -399,6 +405,23 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
     }
 }
 
+/// Every command, for the message a mistyped one gets.
+const COMMANDS: &str = "scan, explain, remove, restore, stats, watch, service";
+
+/// `residue WORD` with a WORD that is no command scans WORD as a PATH. A
+/// word no PATH can mean, with no `/`, not an option, and with nothing by
+/// that name here (`exists`), is a mistyped command: a usage error, so
+/// `residue clean` never exits 0 having scanned nothing. `residue -- clean`
+/// still scans `clean`.
+fn not_a_command(word: &str, exists: impl Fn(&str) -> bool) -> Result<(), String> {
+    if word.is_empty() || word.starts_with('-') || word.contains('/') || exists(word) {
+        return Ok(());
+    }
+    Err(format!(
+        "{word} is not a command, and there is no folder named {word} here; commands: {COMMANDS}"
+    ))
+}
+
 /// `--removal-reason`: only the reasons `residue watch` gives; a person's
 /// own `remove` records `remove` or `sweep` by itself.
 fn removal_reason(text: &str) -> Result<Reason, String> {
@@ -428,5 +451,50 @@ fn set_trash(options: &mut Options, value: bool) -> Result<(), String> {
             options.trash = Some(value);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+
+    fn paths(command: Result<Command, String>) -> Vec<PathBuf> {
+        match command {
+            Ok(Command::Scan(options)) => options.paths,
+            Ok(_) => panic!("not a scan"),
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn a_mistyped_command_is_a_usage_error() {
+        let none = |_: &str| false;
+        let err = not_a_command("clean", none).unwrap_err();
+        assert_eq!(
+            err,
+            "clean is not a command, and there is no folder named clean here; commands: scan, explain, remove, restore, stats, watch, service"
+        );
+        // A folder by that name, anything with a slash, an option or an
+        // empty word is scanned as before.
+        assert!(not_a_command("clean", |w| w == "clean").is_ok());
+        for word in [
+            ".", "..", "./clean", "src/app", "/tmp/x", "-x", "--json", "",
+        ] {
+            let exists = |w: &str| w == "." || w == "..";
+            assert!(not_a_command(word, exists).is_ok(), "{word}");
+        }
+    }
+
+    #[test]
+    fn paths_after_the_separator_and_not_utf8_are_scanned() {
+        let os = |w: &[&str]| w.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(paths(parse(os(&["--", "clean"]))), [PathBuf::from("clean")]);
+        let odd = OsString::from(std::ffi::OsStr::from_bytes(b"repo\xff"));
+        assert_eq!(
+            paths(parse(vec![odd.clone(), OsString::from("--json")])),
+            [PathBuf::from(odd)]
+        );
+        assert!(paths(parse(Vec::new())).is_empty());
     }
 }

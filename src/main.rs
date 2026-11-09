@@ -1,6 +1,10 @@
 //! residue: find what coding agents left behind on disk, and remove a Git
 //! worktree only when nothing in it would be lost.
 
+// residue reads processes, file descriptors and filesystems the Unix way.
+#[cfg(not(unix))]
+compile_error!("residue runs on Unix-like systems only; on Windows, use WSL");
+
 mod activity;
 mod cli;
 mod commands;
