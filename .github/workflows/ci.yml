@@ -15,7 +15,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-24.04, ubuntu-24.04-arm]
+        # Ubuntu 24.04 and 26.04, the two supported LTS releases, x86_64 and
+        # arm64. 26.04 brings sudo-rs, Rust coreutils and a newer systemd.
+        os: [macos-latest, ubuntu-24.04, ubuntu-24.04-arm, ubuntu-26.04, ubuntu-26.04-arm]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Toolchain
@@ -42,7 +44,7 @@ jobs:
       - name: Watch smoke test
         run: sh .github/watch-smoke.sh ./target/release/residue
       - name: Service smoke test
-        if: matrix.os != 'ubuntu-24.04-arm'
+        if: ${{ !endsWith(matrix.os, '-arm') }}
         run: sh .github/service-smoke.sh ./target/release/residue
       # The race check: change a worktree while the release binary waits at
       # its prompt, answer yes, and check that residue removes nothing.
