@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **`watch`'s fetch changes only the remote-tracking refs of the remote it fetches.** It now gives Git only that remote's fetch refspecs that store under `refs/remotes/` and not into another remote's `refs/remotes/OTHER/`, so tags, notes, other remotes' refs and every other ref stay as they are, whatever else the remote's refspecs, `fetch.pruneTags` or `remote.NAME.pruneTags` name. With remotes such as `origin` and `origin/fork`, one name inside the other, neither is fetched. Your own `git fetch` is unchanged. A remote with nothing left is not fetched, and `watch` logs what it leaves out once.
+- **For scripts and integrations:** `watch` logs, once until it changes, `fetch of REMOTE in PATH leaves out REFSPEC (remote OTHER's refs)` for a refspec it leaves out, and `not fetching REMOTE in PATH: WHY; its refs stay as they were; next try in about DURATION` for a remote it does not fetch, where WHY is `none of its fetch refspecs stores into refs/remotes/` or `each of its fetch refspecs into refs/remotes/ also stores into another remote's refs: REFSPEC (remote OTHER's refs)`.
+
+### Details
+
+- `git::fetch` reads every remote's config in one `git config --null --get-regexp '^remote\.'` and passes, after the remote's name, each of its refspecs whose destination is under `refs/remotes/` and can name no ref under another remote's `refs/remotes/OTHER/` (with a `*`, when the part before it and `refs/remotes/OTHER/` start the same way, one the other), and each negative one, in their order, with `--refmap=` and `--no-prune-tags`. Git then writes and prunes only those destinations. Git stores nothing through a symbolic ref at a destination and prunes none, so one there that names a local branch moves nothing. The fetch no longer sets `refs/remotes/NAME/HEAD`, which Git does only when no refspec is given; residue reads no such ref. Each fetch of a remote runs one more `git config`. Tests: `git::tests` (which refspecs are kept, both ways round for nested remote names, reading the remotes from Git's config, and when a remote is not fetched) and `.github/watch-smoke.sh` case 12.
+
 ## 0.0.13 (2026-11-09)
 
 Automatic cleanup on macOS and the BSDs no longer stops for good when `watch` runs out of open files, and a worktree with an ignored entry residue could not measure is kept.
