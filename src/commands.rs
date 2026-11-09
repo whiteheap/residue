@@ -84,9 +84,10 @@ pub fn scan(options: &Options) -> u8 {
     };
     let (roots, code_folders) = match scan_roots(&options.paths) {
         Ok(found) => found,
-        Err(message) => {
-            eprintln!("residue: {}", clean(&message));
-            eprintln!("Name the folder that holds your repositories: residue scan ~/path/to/repos");
+        Err(no_roots) => {
+            for line in no_roots.lines() {
+                eprintln!("{line}");
+            }
             return 2;
         }
     };
@@ -423,8 +424,8 @@ pub fn scan(options: &Options) -> u8 {
 /// or, at or above the home folder, the usual code folders in it that exist
 /// (`watch::default_roots`, `true`). Never the home folder itself: the walk
 /// would read Documents, Desktop and Downloads, and macOS asks for
-/// permission for each. `Err`, what failed, when none of them exists.
-fn scan_roots(paths: &[PathBuf]) -> Result<(Vec<PathBuf>, bool), String> {
+/// permission for each. `Err` when there is no folder to scan.
+fn scan_roots(paths: &[PathBuf]) -> Result<(Vec<PathBuf>, bool), NoRoots> {
     if !paths.is_empty() {
         return Ok((paths.to_vec(), false));
     }
@@ -433,11 +434,34 @@ fn scan_roots(paths: &[PathBuf]) -> Result<(Vec<PathBuf>, bool), String> {
     }
     match crate::watch::default_roots() {
         Ok(roots) if !roots.is_empty() => Ok((roots, true)),
-        Ok(_) => Err(
-            "none of the usual code folders exists in your home folder, and residue does not scan all of it"
-                .into(),
-        ),
-        Err(e) => Err(e),
+        Ok(_) => Err(NoRoots::NoCodeFolders),
+        // Its only error: HOME is unset, empty or `/`.
+        Err(_) => Err(NoRoots::NoHome),
+    }
+}
+
+/// Why `scan` with no PATH has no folder to scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoRoots {
+    /// HOME names no home folder, so there are no code folders in it.
+    NoHome,
+    /// None of `watch::DEFAULT_ROOTS` exists in the home folder.
+    NoCodeFolders,
+}
+
+impl NoRoots {
+    /// The lines `scan` prints on stderr before it exits 2. The advice is
+    /// given once, in scan's words.
+    fn lines(self) -> &'static [&'static str] {
+        match self {
+            NoRoots::NoHome => &[
+                "residue: no PATH given, and HOME names no home folder; name the folder that holds your repositories: residue scan PATH",
+            ],
+            NoRoots::NoCodeFolders => &[
+                "residue: none of the usual code folders exists in your home folder, and residue does not scan all of it",
+                "Name the folder that holds your repositories: residue scan ~/path/to/repos",
+            ],
+        }
     }
 }
 
@@ -754,4 +778,23 @@ pub fn explain_text(r: &Report, repo: &Repo, places: &Places, style: &Style) -> 
         );
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With no folder to scan, `scan` gives its advice once, in its own
+    /// words: PATH, never watch's ROOT.
+    #[test]
+    fn no_roots_advises_once_in_scan_terms() {
+        for reason in [NoRoots::NoHome, NoRoots::NoCodeFolders] {
+            let text = reason.lines().join("\n");
+            assert!(text.starts_with("residue: "), "{text}");
+            assert_eq!(text.matches("holds your repositories").count(), 1, "{text}");
+            assert_eq!(text.matches("residue scan ").count(), 1, "{text}");
+            assert!(!text.contains("ROOT"), "{text}");
+        }
+        assert_eq!(NoRoots::NoHome.lines().len(), 1);
+    }
 }

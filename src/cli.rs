@@ -179,6 +179,9 @@ fn utf8(value: OsString, what: &str) -> Result<String, String> {
 
 pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
     let mut args = args.into_iter().peekable();
+    // No command word first: `scan`, whose first PATH `not_a_command`
+    // checks in the loop below, after any options and their values.
+    let mut implied = false;
     let kind = match args.peek().map(|a| a.to_str()) {
         None => return Ok(Command::Scan(Options::default())),
         Some(Some("-h" | "--help" | "help")) => return Ok(Command::Help),
@@ -188,12 +191,11 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
             args.next();
             word
         }
-        Some(Some(word)) => {
-            not_a_command(word, |p| std::fs::symlink_metadata(p).is_ok())?;
+        // An option, a PATH, or a word that is not UTF-8 (so no command).
+        Some(_) => {
+            implied = true;
             "scan".to_string()
         }
-        // Not UTF-8, so no command: a PATH to scan.
-        Some(None) => "scan".to_string(),
     };
     let mut options = Options::default();
     let mut paths_only = false;
@@ -321,6 +323,9 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
                     _ if text.starts_with('-') && text.len() > 1 => {
                         return Err(format!("unknown option {text}"));
                     }
+                    _ if implied && options.paths.is_empty() => {
+                        not_a_command(text, |p| std::fs::symlink_metadata(p).is_ok())?;
+                    }
                     _ => {}
                 }
             }
@@ -408,14 +413,20 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
 /// Every command, for the message a mistyped one gets.
 const COMMANDS: &str = "scan, explain, remove, restore, stats, watch, service";
 
-/// `residue WORD` with a WORD that is no command scans WORD as a PATH. A
-/// word no PATH can mean, with no `/`, not an option, and with nothing by
-/// that name here (`exists`), is a mistyped command: a usage error, so
-/// `residue clean` never exits 0 having scanned nothing. `residue -- clean`
-/// still scans `clean`.
+/// `residue WORD` with a WORD that is no command scans WORD as a PATH, and
+/// so does the first PATH after options (`residue --json WORD`). A word no
+/// PATH can mean, with no `/`, not an option, and with nothing by that name
+/// here (`exists`), is a usage error: a mistyped command, or a command after
+/// an option. So `residue clean` never exits 0 having scanned nothing.
+/// `residue -- clean` still scans `clean`.
 fn not_a_command(word: &str, exists: impl Fn(&str) -> bool) -> Result<(), String> {
     if word.is_empty() || word.starts_with('-') || word.contains('/') || exists(word) {
         return Ok(());
+    }
+    if COMMANDS.split(", ").any(|c| c == word) {
+        return Err(format!(
+            "{word} is a command, and goes first: residue {word} [OPTIONS]"
+        ));
     }
     Err(format!(
         "{word} is not a command, and there is no folder named {word} here; commands: {COMMANDS}"
@@ -484,6 +495,45 @@ mod tests {
             let exists = |w: &str| w == "." || w == "..";
             assert!(not_a_command(word, exists).is_ok(), "{word}");
         }
+    }
+
+    /// With no command first, the first PATH after options is checked the
+    /// same way, and an option's value never is.
+    #[test]
+    fn the_first_path_after_options_is_checked_too() {
+        let os = |w: &[&str]| w.iter().map(OsString::from).collect::<Vec<_>>();
+        let err = |w: &[&str]| match parse(os(w)) {
+            Err(e) => e,
+            Ok(_) => panic!("{w:?} was accepted"),
+        };
+        assert!(err(&["--json", "clean"]).starts_with("clean is not a command"));
+        assert!(err(&["--idle", "2d", "clean"]).starts_with("clean is not a command"));
+        assert_eq!(
+            err(&["--json", "scan"]),
+            "scan is a command, and goes first: residue scan [OPTIONS]"
+        );
+        // A value that is no PATH: `--regenerable`'s RULE is not checked.
+        match parse(os(&["--regenerable", "clean", "--json", "."])) {
+            Ok(Command::Scan(o)) => {
+                assert_eq!(o.paths, [PathBuf::from(".")]);
+                assert_eq!(o.regenerable, ["clean"]);
+            }
+            _ => panic!("--regenerable clean was not taken as its RULE"),
+        }
+        // Only the first PATH, and none after `--`.
+        assert_eq!(
+            paths(parse(os(&["--json", ".", "clean"]))),
+            [PathBuf::from("."), PathBuf::from("clean")]
+        );
+        assert_eq!(
+            paths(parse(os(&["--json", "--", "clean"]))),
+            [PathBuf::from("clean")]
+        );
+        // A command named first checks no PATH.
+        assert_eq!(
+            paths(parse(os(&["scan", "--json", "clean"]))),
+            [PathBuf::from("clean")]
+        );
     }
 
     #[test]
