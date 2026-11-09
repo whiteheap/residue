@@ -119,7 +119,7 @@ All three are signed with the key `1AEA B314 3511 8A1F E575  D36E E155 3632 FC32
 
 ### Release archives and packages
 
-Prebuilt binaries for macOS (Apple silicon and Intel), static Linux (x86_64 and arm64) and FreeBSD (x86_64 and aarch64) are on the releases page too. So is the Mac app, `residue-macos.dmg`, from 0.0.8 on (README, [Mac app](../README.md#mac-app)). Each archive, package and DMG has a SHA-256 checksum in `SHA256SUMS` and a GitHub build-provenance attestation:
+Prebuilt binaries for macOS (Apple silicon and Intel), static Linux (x86_64 and arm64) and FreeBSD (x86_64 and aarch64) are on the releases page too. Releases 0.0.8 to 0.0.10 also carry the Mac app, `residue-macos.dmg`, which now releases from [residue-ui](https://github.com/whiteheap/residue-ui) (README, [Mac app](../README.md#mac-app)). Each archive and package has a SHA-256 checksum in `SHA256SUMS` and a GitHub build-provenance attestation:
 
 ```sh
 gh attestation verify residue_amd64.deb --repo whiteheap/residue-cli
@@ -135,6 +135,6 @@ With Rust 1.85 or later:
 cargo install --locked --git https://github.com/whiteheap/residue-cli --tag v0.0.10 residue
 ```
 
-The last word is the package name. Cargo searches the whole repository for packages, and from 0.0.8 on the repository also holds the Mac app's, so without the name `cargo install` stops with "multiple packages with binaries found".
+The last word is the package name. Cargo searches the whole repository for packages, and from 0.0.8 to 0.0.10 the repository also held the Mac app's, so at those tags `cargo install` without the name stops with "multiple packages with binaries found".
 
 residue needs `git` 2.36 or later on `PATH`.

@@ -9,8 +9,7 @@ repository = "https://github.com/whiteheap/residue-cli"
 readme = "README.md"
 keywords = ["git", "worktree", "disk", "agents", "cli"]
 categories = ["command-line-utilities", "development-tools"]
-# app/ is the Mac app, a crate of its own and never part of this package.
-exclude = [".github/", "app/"]
+exclude = [".github/"]
 
 [dependencies]
 libc = "0.2"

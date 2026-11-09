@@ -321,7 +321,7 @@ The launchd plist, the systemd unit and timer, how to stop them, and the sweep's
 
 ## Mac app
 
-The Mac app is residue in a window. It lists the linked worktrees under your code folders with their size and verdict, shows why each one is kept, moves the ones that can go to the trash, restores them, shows what residue has freed, and turns automatic cleanup on or off. Every check, size and removal comes from the residue binary inside the app, which is this release's own residue, with the same version.
+The Mac app is residue in a window. It lists the linked worktrees under your code folders with their size and verdict, shows why each one is kept, moves the ones that can go to the trash, restores them, shows what residue has freed, and turns automatic cleanup on or off. Every check, size and removal comes from the residue binary inside the app, from the residue-cli release the app was built with.
 
 <p>
 <img src="docs/screenshots/worktrees.png" width="830" alt="The Worktrees screen: a line that says automatic cleanup freed about 70.3 MB, 1 worktree, since the app was last open, with a link to Freed. Below it, 1.3 GB reclaimable, 6 of 11 worktrees can go, about 975 MB freed in the last 7 days. A treemap sizes each worktree by the space removing it frees, grouped by repository: white for can go, gray for kept, hatched for unknown. Below it, each worktree's checks and verdict.">
@@ -333,7 +333,7 @@ The Mac app is residue in a window. It lists the linked worktrees under your cod
 
 Both screenshots show example repositories and a made-up history of removals. The Restore screen, with its trash entries and removal records: [docs/screenshots/restore.png](docs/screenshots/restore.png).
 
-Download [residue-macos.dmg](https://github.com/whiteheap/residue-cli/releases/latest/download/residue-macos.dmg), open it, and drag residue to Applications. Every release from 0.0.8 on has it, and the link always serves the latest one. It needs macOS 13 or later, and runs natively on Apple silicon and Intel.
+Download [residue-macos.dmg](https://residue.whiteheap.com/download/macos), open it, and drag residue to Applications. This is 0.0.10's, the last residue-cli release that has it; from 0.0.11 on, the app releases from [residue-ui](https://github.com/whiteheap/residue-ui/releases). It needs macOS 13 or later, and runs natively on Apple silicon and Intel.
 
 ### First launch
 
@@ -343,7 +343,7 @@ The app is signed ad hoc, not with an Apple Developer ID, and it is not notarize
 2. Open **System Settings > Privacy & Security**, scroll down to **Security**, and click **Open Anyway** next to the message about residue. The button is there for about an hour after you tried to open the app.
 3. macOS asks again: click **Open**, and enter your login password if it asks.
 
-Control-click > Open no longer skips this step: since macOS 15, Apple requires the Privacy & Security setting. Apple's own steps: [Open a Mac app from an unknown developer](https://support.apple.com/guide/mac-help/open-a-mac-app-from-an-unknown-developer-mh40616/mac) and [Safely open apps on your Mac](https://support.apple.com/en-us/102445). The DMG is in the release's `SHA256SUMS` and has a build-provenance attestation, like the archives: `gh attestation verify residue-macos.dmg --repo whiteheap/residue-cli`, or `--repo whiteheap/residue` for 0.0.10 and earlier.
+Control-click > Open no longer skips this step: since macOS 15, Apple requires the Privacy & Security setting. Apple's own steps: [Open a Mac app from an unknown developer](https://support.apple.com/guide/mac-help/open-a-mac-app-from-an-unknown-developer-mh40616/mac) and [Safely open apps on your Mac](https://support.apple.com/en-us/102445). The DMG is in [0.0.10's](https://github.com/whiteheap/residue-cli/releases/tag/v0.0.10) `SHA256SUMS` and has a build-provenance attestation, like the archives: `gh attestation verify residue-macos.dmg --repo whiteheap/residue`, the repository's name when 0.0.10 was built.
 
 ### What the app runs
 
@@ -353,7 +353,7 @@ Control-click > Open no longer skips this step: since macOS 15, Apple requires t
 - **Automatic cleanup** is `residue service install FOLDERS` and `residue service uninstall`: the same `com.whiteheap.residue.watch` service as [Automate cleanup](#automate-cleanup), so the app shows a service you installed from a terminal, and the other way round. It deletes instead of using the trash; the app says so before you turn it on. Saving other folders keeps the service's options as written, including ones the app does not know. Preview runs one pass the way the saved service would, with `--dry-run`, fetching first unless the service sets `--no-fetch`.
 - The service records the binary that installed it, so the app never installs it from the copy inside the app. It uses a `residue` you installed that is at least as new as the app's, such as `/opt/homebrew/bin/residue`, or else a copy at `~/Library/Application Support/com.whiteheap.residue/bin/residue`, which stays when the app moves or is deleted. The Automatic cleanup screen shows which binary the service runs and the command that turns it off from a terminal. Deleting the app leaves the service running.
 
-Building and changing the app: [app/README.md](app/README.md).
+Building and changing the app: [residue-ui](https://github.com/whiteheap/residue-ui).
 
 ## Reference
 
