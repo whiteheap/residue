@@ -832,7 +832,9 @@ fn check_status(
 
 /// Decide one ignored entry: matched by a rule itself, or (for a collapsed
 /// directory a path rule reaches into) by the walk's verdict on its contents.
-/// Either way, an environment file inside that no rule names keeps it.
+/// Either way, an environment file inside that no rule names keeps it, and
+/// an entry the walk did not reach is not judged: a rule alone never makes
+/// it regenerable, since the walk did not look at what it holds.
 fn judge(
     path: String,
     rules: &Rules,
@@ -846,6 +848,20 @@ fn judge(
         .and_then(|u| u.buckets.get(index))
         .filter(|b| b.seen);
     let item = judge_rules(path, rules, bucket, usage, measured);
+    if item.regenerable() {
+        let unreached = match (usage, measured) {
+            (Err(e), _) => Some(format!("could not walk the worktree: {e}")),
+            (Ok(_), None) => Some("the walk did not reach it".to_string()),
+            (Ok(_), Some(_)) => None,
+        };
+        if let Some(note) = unreached {
+            return Ignored {
+                judgement: Judgement::Unknown,
+                note: Some(note),
+                ..item
+            };
+        }
+    }
     match measured.and_then(|b| b.env_file.clone()) {
         Some(env) if item.regenerable() => Ignored {
             judgement: Judgement::Kept,
@@ -1707,10 +1723,13 @@ mod tests {
     //! in the README ("What makes a worktree a candidate"): a stale entry is
     //! stale; any failed check keeps the worktree; otherwise any check
     //! residue could not complete, or no checks at all, makes it unknown;
-    //! only a non-empty set of passing checks makes a candidate.
+    //! only a non-empty set of passing checks makes a candidate. And the
+    //! `ignored` check on a synthetic walk.
 
-    use super::{Check, Report, Status};
-    use crate::git::Entry;
+    use super::{
+        Bucket, BucketUsage, Check, Entry, Judgement, RepoRules, Report, Rules, Status, Usage,
+        check_status, git,
+    };
     use Status::{Block as B, Pass as P, Unknown as U};
     use std::path::PathBuf;
 
@@ -1856,6 +1875,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An ignored directory a rule matches, and the `ignored` check, when
+    /// the walk tied Git's entry to the folder it measured, when it did not,
+    /// and when it could not walk at all.
+    fn ignored_check(measured: Option<BucketUsage>, walked: bool) -> (Judgement, Status, String) {
+        let mut rules = Rules::default();
+        rules.add("build").unwrap();
+        let status = git::Status {
+            ignored: vec![("app/build/".to_string(), PathBuf::from("app/build"))],
+            ..git::Status::default()
+        };
+        let buckets = [Bucket {
+            rel: PathBuf::from("app/build"),
+            expand: false,
+        }];
+        let usage = if walked {
+            Ok(Usage {
+                buckets: vec![measured.unwrap_or_default()],
+                ..Usage::default()
+            })
+        } else {
+            Err(std::io::Error::other("no folder"))
+        };
+        let repo = RepoRules {
+            rules: Rules::default(),
+            values: Vec::new(),
+            problem: None,
+        };
+        let mut r = Report::new(&entry());
+        check_status(&mut r, Ok(status), &repo, &rules, &buckets, &usage);
+        let check = r.checks.iter().find(|c| c.id == "ignored").unwrap();
+        (r.ignored[0].judgement, check.status, check.detail.clone())
+    }
+
+    #[test]
+    fn an_ignored_entry_the_walk_did_not_reach_is_not_judged() {
+        let seen = |env: Option<&str>| BucketUsage {
+            seen: true,
+            files: 2,
+            bytes: 10,
+            holds_file: true,
+            env_file: env.map(str::to_string),
+            ..BucketUsage::default()
+        };
+        let (j, s, _) = ignored_check(Some(seen(None)), true);
+        assert!(
+            j == Judgement::Regenerable && s == P,
+            "measured, nothing kept"
+        );
+        let (j, s, _) = ignored_check(Some(seen(Some("app/build/.env"))), true);
+        assert!(
+            j == Judgement::Kept && s == B,
+            "measured, with an environment file"
+        );
+        let (j, s, detail) = ignored_check(None, true);
+        assert!(j == Judgement::Unknown && s == U, "never reached: {detail}");
+        assert!(
+            detail.contains("app/build/ (the walk did not reach it)"),
+            "{detail}"
+        );
+        let (j, s, detail) = ignored_check(None, false);
+        assert!(j == Judgement::Unknown && s == U, "no walk: {detail}");
+        assert!(
+            detail.contains("could not walk the worktree: no folder"),
+            "{detail}"
+        );
     }
 
     #[test]
