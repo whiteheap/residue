@@ -83,11 +83,15 @@ err=
 status=
 
 # A fixture step that fails stops the run with status 2.
+# A fixture step: on failure, stop with exit 2 and show what it printed,
+# so a run that went wrong in CI can be read from its log.
 setup() {
-    "$@" >/dev/null 2>&1 || {
-        echo "contract-check: setup failed in $name: $*" >&2
-        exit 2
-    }
+    local said st
+    said=$("$@" 2>&1) && return 0
+    st=$?
+    echo "contract-check: setup failed in $name (exit $st): $*" >&2
+    [ -n "$said" ] && head -n 40 <<<"$said" | sed 's/^/    | /' >&2
+    exit 2
 }
 
 fail() {

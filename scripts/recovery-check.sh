@@ -460,11 +460,15 @@ passes=0
 failures=0
 name=
 
+# A fixture step: on failure, stop with exit 2 and show what it printed,
+# so a run that went wrong in CI can be read from its log.
 setup() {
-    "$@" >/dev/null 2>&1 || {
-        echo "recovery-check: setup failed in $name: $*" >&2
-        exit 2
-    }
+    local said st
+    said=$("$@" 2>&1) && return 0
+    st=$?
+    echo "recovery-check: setup failed in $name (exit $st): $*" >&2
+    [ -n "$said" ] && head -n 40 <<<"$said" | sed 's/^/    | /' >&2
+    exit 2
 }
 
 fail() {
