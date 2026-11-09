@@ -54,9 +54,10 @@ jobs:
         run: bash scripts/recovery-check.sh target/release/residue
 
   # FreeBSD runs in a virtual machine. residue's probe there is the base
-  # system's procstat, so nothing beyond Rust and Git is installed, plus bash
-  # for the race check. The smoke tests and the race check run as root and as
-  # an ordinary user, who can inspect only their own processes.
+  # system's ps and a kernel sysctl, so nothing beyond Rust and Git is
+  # installed, plus bash for the race check. The smoke tests and the race
+  # check run as root and as an ordinary user, who can inspect only their own
+  # processes.
   freebsd:
     name: freebsd-14
     runs-on: ubuntu-24.04

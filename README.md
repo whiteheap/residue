@@ -326,7 +326,7 @@ residue deletes directories. Start with `scan` and `explain`, and read the limit
 | --- | --- |
 | macOS | One `lsof` snapshot of the working directories and open files of the processes your user can inspect |
 | Linux | `/proc/*/cwd`, `/proc/*/exe`, `/proc/*/fd` and `/proc/*/maps` of the processes your user can read; `maps` shows a native module in `node_modules` that a process started elsewhere loaded |
-| FreeBSD | One `procstat -f` snapshot from the base system, of working directories and open files |
+| FreeBSD | Each process's working directory, executable and open files, from the kernel (`kern.proc.filedesc`), for the processes your user can inspect |
 | illumos | `/proc/PID/path/`: each process's working directory, open files and mapped objects |
 | NetBSD, OpenBSD, DragonFly | Working directories only, and on NetBSD and DragonFly executables too; not open files |
 

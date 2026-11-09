@@ -13,15 +13,17 @@
 //! machines are outside what a same-user probe can see, and a process can
 //! open the directory a moment later.
 
+use std::borrow::Cow;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 #[derive(Clone)]
 pub struct Unavailable {
     /// Stable reason code: `probe_missing`, `timeout`, `probe_failed`,
-    /// `parse_error`, `unsupported`, or `partial_probe` (the probe found no
+    /// `parse_error`, `unsupported`, `partial_probe` (the probe found no
     /// use but does not read open files, so it cannot show the directory
-    /// is unused).
+    /// is unused), or `unmatchable_path` (the probe prints the paths it
+    /// read escaped, and residue cannot be sure how it prints this one).
     pub reason: &'static str,
     pub detail: String,
 }
@@ -42,7 +44,17 @@ pub struct Seen {
     /// `not_observed`: a process can hold a file open inside it while its
     /// working directory is elsewhere.
     pub limits: Option<&'static str>,
+    /// How the paths in `uses` are written. `None`: byte for byte as the
+    /// kernel names them. `Some(spell)`: escaped, as the backend's tool
+    /// prints them; `spell` writes a directory the same way, so a use is
+    /// matched in that form, or gives `None` for a path whose form residue
+    /// cannot be sure of, whose activity is then `unknown`
+    /// (`unmatchable_path`), never `not_observed`.
+    pub spelling: Option<Spell>,
 }
+
+/// Writes a path the way a backend's tool prints one (`lsof::spell`).
+pub type Spell = fn(&[u8]) -> Option<Cow<'_, [u8]>>;
 
 pub struct Snapshot {
     pub backend: &'static str,
@@ -77,11 +89,28 @@ impl Snapshot {
             Err(unavailable) => return Evidence::Unknown(unavailable.clone()),
         };
         let dir = dir.as_os_str().as_bytes();
+        // The directory as the backend writes the paths it read: a use is
+        // inside it in that form exactly when it is inside it byte for byte.
+        let dir = match seen.spelling {
+            None => Cow::Borrowed(dir),
+            Some(spell) => match spell(dir) {
+                Some(spelled) => spelled,
+                None => {
+                    return Evidence::Unknown(Unavailable {
+                        reason: "unmatchable_path",
+                        detail: format!(
+                            "{} prints a byte of this path in a form residue has not confirmed, so it cannot match a process to it",
+                            self.backend
+                        ),
+                    });
+                }
+            },
+        };
         let me = std::process::id();
         let mut hits: Vec<(u32, String)> = Vec::new();
         for item in &seen.uses {
             if item.pid != me
-                && within(&item.path, dir)
+                && within(&item.path, &dir)
                 && !hits.iter().any(|(p, _)| *p == item.pid)
             {
                 hits.push((item.pid, item.command.clone()));
@@ -142,6 +171,65 @@ fn unavailable(backend: &'static str, reason: &'static str, detail: String) -> S
     }
 }
 
+/// How macOS's lsof prints a name under `LC_ALL=C`, byte by byte:
+/// `safestrprt` and `safepup` in its `misc.c` (Apple's `lsof-76`, lsof
+/// 4.91), which print every name, working directories and open files
+/// alike. In the C locale `MB_CUR_MAX` is 1 and `isprint` holds for 0x20
+/// to 0x7e only, so each byte is printed on its own:
+///
+/// ```text
+/// 0x20-0x7e but `\`   itself          `\`        \\
+/// 0x08 0x09 0x0a      \b \t \n        0x0c 0x0d  \f \r
+/// other 0x01-0x1f     ^ and the byte plus 0x40: 0x01 is ^A, 0x1b is ^[
+/// 0x7f-0xfe           \x and two lowercase hex digits: é (c3 a9) is \xc3\xa9
+/// ```
+///
+/// Each class was also checked against `LC_ALL=C lsof -F n` on macOS 26.3.1
+/// for the working directories of processes in folders named with every
+/// byte the disk accepts. A `/` is printed as itself, so a path inside a
+/// directory is printed inside that directory's form. The form is not
+/// unique: a literal `^A` and the byte 0x01 both print as `^A`, so a match
+/// can name a process in a sibling with such a name, never miss one.
+#[cfg(any(target_os = "macos", test))]
+mod lsof {
+    use std::borrow::Cow;
+
+    /// `dir` as lsof prints it, or `None` when it holds a byte whose form
+    /// was not confirmed: 0xff, which `safepup` prints as `\xff` or `^?`
+    /// depending on whether the compiler's `char` is signed, and which no
+    /// APFS or HFS+ name can hold, or a NUL, which no path can.
+    pub fn spell(dir: &[u8]) -> Option<Cow<'_, [u8]>> {
+        if dir
+            .iter()
+            .all(|&b| (0x20..=0x7e).contains(&b) && b != b'\\')
+        {
+            return Some(Cow::Borrowed(dir));
+        }
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = Vec::with_capacity(dir.len() * 2);
+        for &b in dir {
+            match b {
+                b'\\' => out.extend_from_slice(b"\\\\"),
+                0x20..=0x7e => out.push(b),
+                0x08 => out.extend_from_slice(b"\\b"),
+                b'\t' => out.extend_from_slice(b"\\t"),
+                b'\n' => out.extend_from_slice(b"\\n"),
+                0x0c => out.extend_from_slice(b"\\f"),
+                b'\r' => out.extend_from_slice(b"\\r"),
+                0x01..=0x1f => out.extend_from_slice(&[b'^', b + 0x40]),
+                0x7f..=0xfe => out.extend_from_slice(&[
+                    b'\\',
+                    b'x',
+                    HEX[usize::from(b >> 4)],
+                    HEX[usize::from(b & 0x0f)],
+                ]),
+                0x00 | 0xff => return None,
+            }
+        }
+        Some(Cow::Owned(out))
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
     use super::{Seen, Snapshot, Use, unavailable};
@@ -157,6 +245,8 @@ mod platform {
         // pid, command and name; lsof adds the fd field on its own. lsof
         // lists itself too, so it runs in `/`: in residue's directory, its
         // own row would mark the worktree residue runs in as in use by lsof.
+        // LC_ALL=C: it prints each byte of a name by itself, in the form
+        // `lsof::spell` writes a directory in.
         cmd.args(["-n", "-P", "-F", "pcn"])
             .env("LC_ALL", "C")
             .current_dir("/");
@@ -213,6 +303,8 @@ mod platform {
                     whole = true;
                 }
                 b'c' => command = String::from_utf8_lossy(value).into_owned(),
+                // Kept as lsof prints it, escaped (`lsof::spell`): reading
+                // it back is ambiguous, writing a directory that way is not.
                 b'n' if value.first() == Some(&b'/') => {
                     let Some(p) = pid else {
                         return unavailable(
@@ -241,6 +333,7 @@ mod platform {
                 inspected,
                 total: count_processes(),
                 limits: None,
+                spelling: Some(super::lsof::spell),
             }),
         }
     }
@@ -425,6 +518,7 @@ mod platform {
                 inspected,
                 total: Some(total),
                 limits: None,
+                spelling: None,
             }),
         }
     }
@@ -534,41 +628,62 @@ mod maps {
     }
 }
 
-/// FreeBSD: one `procstat -f` snapshot from the base system. procstat is
-/// built with the running kernel, unlike a packaged lsof, which on FreeBSD
-/// can list a process without resolving its working directory.
+/// FreeBSD: the process list from the base system's `ps`, then each
+/// process's working directory, executable and open files from the kernel,
+/// by the sysctl procstat(1) itself reads (`kern.proc.filedesc.<pid>`,
+/// kinfo_getfile(3)), which names each path byte for byte. procstat is not
+/// run: it prints a name through libxo, which in the C locale rewrites a
+/// character that is not ASCII and leaves out a name that is not UTF-8. A
+/// packaged lsof is not used either: on FreeBSD 14 it listed processes
+/// without resolving their working directories.
 #[cfg(target_os = "freebsd")]
 mod platform {
-    use super::{Seen, Snapshot, Use, unavailable};
+    use super::{Seen, Snapshot, Use, kinfo, unavailable};
     use crate::run::{self, RunError};
-    use std::collections::HashSet;
+    use std::mem::offset_of;
     use std::process::Command;
     use std::time::Duration;
 
-    const BACKEND: &str = "procstat";
+    const BACKEND: &str = "sysctl";
+
+    // `kinfo` reads records by these offsets and codes; the build fails if
+    // they ever differ from `<sys/user.h>` as the libc crate declares it.
+    const _: () = {
+        assert!(offset_of!(libc::kinfo_file, kf_structsize) == kinfo::STRUCTSIZE);
+        assert!(offset_of!(libc::kinfo_file, kf_type) == kinfo::TYPE);
+        assert!(offset_of!(libc::kinfo_file, kf_fd) == kinfo::FD);
+        assert!(offset_of!(libc::kinfo_file, kf_path) == kinfo::PATH);
+        assert!(size_of::<libc::c_int>() == 4);
+        assert!(libc::KF_TYPE_VNODE == kinfo::TYPE_VNODE);
+        assert!(libc::KF_TYPE_FIFO == kinfo::TYPE_FIFO);
+        assert!(libc::KF_FD_TYPE_CWD == kinfo::FD_CWD);
+        // `KINFO_FILE_SIZE` in `<sys/user.h>`, which `RECORD` stands for.
+        #[cfg(target_arch = "x86_64")]
+        assert!(size_of::<libc::kinfo_file>() == 1392);
+    };
+
+    /// The most residue reads of one process's files: a record is 368
+    /// bytes and its path, so this is more than 100,000 open files.
+    const MOST: usize = 64 << 20;
 
     pub fn take() -> Snapshot {
-        let mut cmd = Command::new("/usr/bin/procstat");
-        // -h: no header. -a: every process. -f: its files, working directory
-        // (fd `cwd`) and executable (fd `text`).
-        cmd.args(["-h", "-a", "-f"]).env("LC_ALL", "C");
-        let out = match run::run(&mut cmd, Duration::from_secs(30), 512 << 20) {
+        let mut cmd = Command::new("/bin/ps");
+        // -A: every process. -ww: never cut a line to the terminal width.
+        cmd.args(["-A", "-ww", "-o", "pid=", "-o", "comm="])
+            .env("LC_ALL", "C");
+        let out = match run::run(&mut cmd, Duration::from_secs(30), 64 << 20) {
             Ok(out) => out,
             Err(RunError::NotFound) => {
-                return unavailable(
-                    BACKEND,
-                    "probe_missing",
-                    "/usr/bin/procstat not found".into(),
-                );
+                return unavailable(BACKEND, "probe_missing", "/bin/ps not found".into());
             }
             Err(RunError::Timeout(d)) => {
                 return unavailable(
                     BACKEND,
                     "timeout",
-                    format!("procstat ran longer than {}s", d.as_secs()),
+                    format!("ps ran longer than {}s", d.as_secs()),
                 );
             }
-            Err(e) => return unavailable(BACKEND, "probe_failed", format!("procstat: {e}")),
+            Err(e) => return unavailable(BACKEND, "probe_failed", format!("ps: {e}")),
         };
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -576,140 +691,243 @@ mod platform {
             return unavailable(
                 BACKEND,
                 "probe_failed",
-                format!("procstat exited with {}: {first}", out.status),
+                format!("ps exited with {}: {first}", out.status),
             );
         }
         let mut uses = Vec::new();
-        // Processes whose working directory came back as a path. procstat
-        // prints nothing for a process the user may not inspect, and `-` for
-        // a path the kernel cannot name; neither counts as inspected.
-        let mut inspected: HashSet<u32> = HashSet::new();
+        let mut total = 0;
+        let mut inspected = 0;
+        // Reused for every process, and grown when one has more files.
+        let mut buf = vec![0u8; 64 << 10];
         for line in out.stdout.split(|b| *b == b'\n') {
-            if line.iter().all(u8::is_ascii_whitespace) {
+            let line = line.trim_ascii();
+            if line.is_empty() {
                 continue;
             }
-            let Some(row) = parse(line) else {
+            let split = line
+                .iter()
+                .position(u8::is_ascii_whitespace)
+                .unwrap_or(line.len());
+            let pid = std::str::from_utf8(&line[..split])
+                .ok()
+                .and_then(|p| p.parse::<u32>().ok())
+                .and_then(|p| libc::c_int::try_from(p).ok().map(|c| (p, c)));
+            let Some((pid, mib_pid)) = pid else {
                 return unavailable(
                     BACKEND,
                     "parse_error",
                     format!(
-                        "procstat printed a line residue cannot read: {}",
-                        String::from_utf8_lossy(line).trim()
+                        "ps printed a line residue cannot read: {}",
+                        String::from_utf8_lossy(line)
                     ),
                 );
             };
-            if row.kind != b"v" || row.path.first() != Some(&b'/') {
-                continue;
+            total += 1;
+            let len = match read(mib_pid, &mut buf) {
+                Read::Got(len) => len,
+                // Exited since ps listed it, or the user may not inspect it.
+                Read::Skip => continue,
+                Read::TooLarge => {
+                    return unavailable(
+                        BACKEND,
+                        "probe_failed",
+                        format!(
+                            "process {pid} has more open files than residue reads ({} MiB of them)",
+                            MOST >> 20
+                        ),
+                    );
+                }
+            };
+            let command = String::from_utf8_lossy(line[split..].trim_ascii()).into_owned();
+            // Inspected means the kernel named the process's working
+            // directory; one it cannot name (a path not in its name cache)
+            // comes back empty.
+            let mut cwd = false;
+            for file in kinfo::Files::new(&buf[..len]) {
+                let file = match file {
+                    Ok(file) => file,
+                    Err(what) => {
+                        return unavailable(
+                            BACKEND,
+                            "parse_error",
+                            format!("kern.proc.filedesc for process {pid}: {what}"),
+                        );
+                    }
+                };
+                let named = matches!(file.kind, kinfo::TYPE_VNODE | kinfo::TYPE_FIFO)
+                    && file.path.first() == Some(&b'/');
+                if !named {
+                    continue;
+                }
+                cwd |= file.fd == kinfo::FD_CWD;
+                uses.push(Use {
+                    pid,
+                    command: command.clone(),
+                    path: file.path.to_vec(),
+                });
             }
-            if row.fd == b"cwd" {
-                inspected.insert(row.pid);
+            if cwd {
+                inspected += 1;
             }
-            uses.push(Use {
-                pid: row.pid,
-                command: row.command,
-                path: row.path.to_vec(),
-            });
+        }
+        // residue itself is always one of the processes it may inspect, so
+        // none at all means the sysctl does not work here.
+        if inspected == 0 {
+            return unavailable(
+                BACKEND,
+                "probe_failed",
+                format!("the kernel named the working directory of none of {total} processes"),
+            );
         }
         Snapshot {
             backend: BACKEND,
             state: Ok(Seen {
                 uses,
-                inspected: inspected.len(),
-                total: count_processes(),
+                inspected,
+                total: Some(total),
                 limits: None,
+                spelling: None,
             }),
         }
     }
 
-    struct Row<'a> {
-        pid: u32,
-        command: String,
-        fd: &'a [u8],
-        kind: &'a [u8],
-        path: &'a [u8],
+    enum Read {
+        /// The kernel wrote this many bytes of records into the buffer.
+        Got(usize),
+        Skip,
+        TooLarge,
     }
 
-    /// One line of `procstat -h -f`: PID COMM FD T V FLAGS REF OFFSET PRO
-    /// NAME. COMM can contain spaces, so the FD column is the first one
-    /// followed by the shape of T, V, FLAGS, REF and OFFSET. `None` when no
-    /// column has that shape, so an unexpected format fails the whole probe
-    /// instead of hiding a process.
-    fn parse(line: &[u8]) -> Option<Row<'_>> {
-        let cols = columns(line);
-        let col = |i: usize| &line[cols[i].0..cols[i].1];
-        let pid = std::str::from_utf8(col(0)).ok()?.parse::<u32>().ok()?;
-        for i in 2..cols.len().saturating_sub(5) {
-            let fd = col(i);
-            let fd_ok = (!fd.is_empty() && fd.iter().all(u8::is_ascii_digit))
-                || matches!(
-                    fd,
-                    b"cwd" | b"text" | b"ctty" | b"root" | b"jail" | b"trace"
-                );
-            let flags = col(i + 3);
-            let shaped = fd_ok
-                && col(i + 1).len() == 1
-                && col(i + 2).len() == 1
-                && flags.len() == 8
-                && flags.iter().all(|c| b"rwasfndl-".contains(c))
-                && dash_or_number(col(i + 4))
-                && dash_or_number(col(i + 5));
-            if !shaped {
-                continue;
-            }
-            let kind = col(i + 1);
-            // For a vnode the PRO column is `-` and NAME is the rest of the
-            // line, padded on the right.
-            let path = if kind == b"v" && cols.len() > i + 7 && col(i + 6) == b"-" {
-                line[cols[i + 7].0..].trim_ascii_end()
-            } else {
-                &[]
+    /// The longest record the kernel writes: a whole `kinfo_file`, 1392
+    /// bytes, rounded up to 8 (`export_vnode_to_kinfo`, unpacked).
+    const RECORD: usize = size_of::<libc::kinfo_file>().next_multiple_of(8);
+
+    /// `kern.proc.filedesc.<pid>` into `buf`, grown and asked again while
+    /// the records may not have fit. FreeBSD 13 and later answer ENOMEM
+    /// then. FreeBSD 12 stops at the first record that does not fit and
+    /// answers success (`export_kinfo_to_sb` in its `kern_descrip.c`), so
+    /// an answer that ends less than one record short of the buffer may
+    /// have been cut, and is asked again too.
+    fn read(pid: libc::c_int, buf: &mut Vec<u8>) -> Read {
+        let mib = [
+            libc::CTL_KERN,
+            libc::KERN_PROC,
+            libc::KERN_PROC_FILEDESC,
+            pid,
+        ];
+        loop {
+            let mut len: libc::size_t = buf.len();
+            // SAFETY: `mib` holds 4 ints; `buf` is writable for `len` bytes
+            // and the kernel writes at most `len`; no new value is set.
+            let rc = unsafe {
+                libc::sysctl(
+                    mib.as_ptr(),
+                    4,
+                    buf.as_mut_ptr().cast(),
+                    &mut len,
+                    std::ptr::null(),
+                    0,
+                )
             };
-            return Some(Row {
-                pid,
-                command: String::from_utf8_lossy(&line[cols[1].0..cols[i - 1].1]).into_owned(),
-                fd,
-                kind,
-                path,
-            });
-        }
-        None
-    }
-
-    fn dash_or_number(s: &[u8]) -> bool {
-        s == b"-" || (!s.is_empty() && s.iter().all(u8::is_ascii_digit))
-    }
-
-    /// The byte ranges of the whitespace-separated columns of `line`.
-    fn columns(line: &[u8]) -> Vec<(usize, usize)> {
-        let mut cols = Vec::new();
-        let mut start = None;
-        for (i, b) in line.iter().enumerate() {
-            match (b.is_ascii_whitespace(), start) {
-                (false, None) => start = Some(i),
-                (true, Some(s)) => {
-                    cols.push((s, i));
-                    start = None;
+            if rc == 0 {
+                let len = len.min(buf.len());
+                if buf.len() - len >= RECORD {
+                    return Read::Got(len);
                 }
-                _ => {}
+            } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOMEM) {
+                // Any other error is the process's: ESRCH, it exited; EPERM,
+                // the user may not inspect it.
+                return Read::Skip;
             }
+            if buf.len() >= MOST {
+                return Read::TooLarge;
+            }
+            let grown = (buf.len() * 2).min(MOST);
+            buf.resize(grown, 0);
         }
-        if let Some(s) = start {
-            cols.push((s, line.len()));
-        }
-        cols
+    }
+}
+
+/// The records `kern.proc.filedesc.<pid>` returns on FreeBSD: one packed
+/// `struct kinfo_file` (`<sys/user.h>`) per file, the process's executable,
+/// controlling terminal, working directory, root and jail directories
+/// first, then each descriptor. Packed means each record ends after its
+/// path's NUL, rounded up to 8 bytes, and `kf_structsize` gives its length
+/// (`pack_kinfo` in `sys/kern/kern_descrip.c`). A record of size 0 ends the
+/// list, as in libutil's kinfo_getfile(3), but only where nothing but zero
+/// bytes follows it: the kernel writes no such record, so one with more of
+/// the answer after it means the answer is not what residue reads.
+#[cfg(any(target_os = "freebsd", test))]
+mod kinfo {
+    pub const STRUCTSIZE: usize = 0;
+    pub const TYPE: usize = 4;
+    pub const FD: usize = 8;
+    pub const PATH: usize = 368;
+    pub const TYPE_VNODE: i32 = 1;
+    pub const TYPE_FIFO: i32 = 4;
+    pub const FD_CWD: i32 = -1;
+
+    pub struct File<'a> {
+        pub kind: i32,
+        pub fd: i32,
+        /// Empty when the kernel cannot name the file.
+        pub path: &'a [u8],
     }
 
-    /// The number of running processes, to state how much procstat could see.
-    fn count_processes() -> Option<usize> {
-        let mut cmd = Command::new("/bin/ps");
-        cmd.args(["-A", "-o", "pid="]);
-        let out = run::run(&mut cmd, Duration::from_secs(10), 16 << 20).ok()?;
-        out.status.success().then(|| {
-            out.stdout
-                .split(|b| *b == b'\n')
-                .filter(|l| l.iter().any(u8::is_ascii_digit))
-                .count()
-        })
+    pub struct Files<'a> {
+        rest: &'a [u8],
+    }
+
+    impl<'a> Files<'a> {
+        pub fn new(records: &'a [u8]) -> Self {
+            Files { rest: records }
+        }
+    }
+
+    impl<'a> Iterator for Files<'a> {
+        /// A record, or what is wrong with the answer, which ends the walk.
+        type Item = Result<File<'a>, &'static str>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let rest = self.rest;
+            if rest.is_empty() {
+                return None;
+            }
+            let size = int(rest, STRUCTSIZE).map(usize::try_from);
+            let size = match size {
+                Some(Ok(0)) => {
+                    self.rest = &[];
+                    if rest.iter().all(|b| *b == 0) {
+                        return None;
+                    }
+                    return Some(Err("a record of size 0 is followed by more of the answer"));
+                }
+                Some(Ok(size)) if size > PATH && size <= rest.len() => size,
+                _ => {
+                    self.rest = &[];
+                    return Some(Err("a record's size does not fit the answer"));
+                }
+            };
+            self.rest = &rest[size..];
+            let (Some(kind), Some(fd)) = (int(rest, TYPE), int(rest, FD)) else {
+                return Some(Err("a record is shorter than its fields"));
+            };
+            let name = &rest[PATH..size];
+            let Some(end) = name.iter().position(|b| *b == 0) else {
+                self.rest = &[];
+                return Some(Err("a record's path has no end"));
+            };
+            Some(Ok(File {
+                kind,
+                fd,
+                path: &name[..end],
+            }))
+        }
+    }
+
+    fn int(record: &[u8], at: usize) -> Option<i32> {
+        let bytes = record.get(at..at + 4)?;
+        Some(i32::from_ne_bytes(bytes.try_into().ok()?))
     }
 }
 
@@ -833,6 +1051,7 @@ mod platform {
                 inspected,
                 total: Some(total),
                 limits: Some(LIMITS),
+                spelling: None,
             }),
         }
     }
@@ -999,6 +1218,7 @@ mod platform {
                 inspected,
                 total: Some(total),
                 limits: None,
+                spelling: None,
             }),
         }
     }
@@ -1076,6 +1296,7 @@ mod tests {
                 inspected: 1,
                 total: Some(1),
                 limits,
+                spelling: None,
             }),
         }
     }
@@ -1169,10 +1390,148 @@ mod tests {
                 inspected: 1,
                 total: Some(1),
                 limits: None,
+                spelling: None,
             }),
         };
         assert_eq!(s.evidence(Path::new("/w/gone")).code(), "in_use");
         assert_eq!(s.evidence(Path::new("/w/gon")).code(), "not_observed");
+    }
+
+    #[test]
+    fn lsof_spells_each_byte_as_it_prints_it() {
+        use super::lsof::spell;
+        use std::borrow::Cow;
+        assert!(matches!(spell(b"/w/plain dir"), Some(Cow::Borrowed(_))));
+        let cases: [(&[u8], &[u8]); 6] = [
+            (b"/w/caf\xc3\xa9", b"/w/caf\\xc3\\xa9"),
+            (b"/w/back\\slash", b"/w/back\\\\slash"),
+            (b"/w/\x08\t\n\x0c\r", b"/w/\\b\\t\\n\\f\\r"),
+            (b"/w/\x01\x07\x1b\x1f", b"/w/^A^G^[^_"),
+            (b"/w/\x7f\x80\xfe", b"/w/\\x7f\\x80\\xfe"),
+            (b"/w/\xf0\x9f\x9a\x80", b"/w/\\xf0\\x9f\\x9a\\x80"),
+        ];
+        for (dir, printed) in cases {
+            assert_eq!(spell(dir).as_deref(), Some(printed));
+        }
+        assert_eq!(spell(b"/w/\xff"), None);
+        assert_eq!(spell(b"/w/\0"), None);
+    }
+
+    /// A directory named `A` and every byte from 0x01 to 0x7f but `/`, and its
+    /// name as `LC_ALL=C lsof -F n` printed it on macOS 26.3.1 for a process
+    /// working in it.
+    #[test]
+    fn lsof_spells_every_ascii_byte_as_lsof_printed_it() {
+        let dir: Vec<u8> = b"/w/A"
+            .iter()
+            .copied()
+            .chain((0x01..=0x7f).filter(|b| *b != b'/'))
+            .collect();
+        let printed: &[u8] = b"/w/A^A^B^C^D^E^F^G\\b\\t\\n^K\\f\\r^N^O^P^Q^R^S^T^U^V^W^X^Y^Z^[^\\^]^^^_ !\"#$%&'()*+,-.0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\\x7f";
+        assert_eq!(super::lsof::spell(&dir).as_deref(), Some(printed));
+    }
+
+    fn lsof_snapshot(paths: &[&[u8]]) -> Snapshot {
+        Snapshot {
+            backend: "lsof",
+            state: Ok(Seen {
+                uses: paths
+                    .iter()
+                    .map(|p| Use {
+                        pid: 7,
+                        command: "sleep".into(),
+                        path: p.to_vec(),
+                    })
+                    .collect(),
+                inspected: 1,
+                total: Some(1),
+                limits: None,
+                spelling: Some(super::lsof::spell),
+            }),
+        }
+    }
+
+    fn dir(bytes: &[u8]) -> &Path {
+        use std::os::unix::ffi::OsStrExt;
+        Path::new(std::ffi::OsStr::from_bytes(bytes))
+    }
+
+    #[test]
+    fn an_escaped_use_is_a_use_of_the_directory_it_names() {
+        let s = lsof_snapshot(&[b"/w/caf\\xc3\\xa9/src", b"/w/back\\\\slash"]);
+        assert_eq!(s.evidence(dir(b"/w/caf\xc3\xa9")).code(), "in_use");
+        assert_eq!(s.evidence(dir(b"/w/back\\slash")).code(), "in_use");
+        assert_eq!(s.evidence(dir(b"/w/caf")).code(), "not_observed");
+        assert_eq!(s.evidence(dir(b"/w/back")).code(), "not_observed");
+        assert_eq!(s.evidence(dir(b"/w/caf\xc3\xa9x")).code(), "not_observed");
+    }
+
+    #[test]
+    fn a_directory_lsof_may_print_two_ways_is_unknown() {
+        let s = lsof_snapshot(&[b"/w/busy"]);
+        let Evidence::Unknown(u) = s.evidence(dir(b"/w/\xff")) else {
+            panic!("a path whose printed form is not confirmed must be unknown");
+        };
+        assert_eq!(u.reason, "unmatchable_path");
+    }
+
+    /// Packed `kinfo_file` records as FreeBSD's kernel writes them: size,
+    /// type and fd, then the path at offset 368, NUL-ended and padded to 8.
+    fn kinfo_record(kind: i32, fd: i32, path: &[u8]) -> Vec<u8> {
+        use super::kinfo::{FD, PATH, STRUCTSIZE, TYPE};
+        let size = (PATH + path.len() + 1).next_multiple_of(8);
+        let mut r = vec![0u8; size];
+        let size = i32::try_from(size).unwrap();
+        r[STRUCTSIZE..STRUCTSIZE + 4].copy_from_slice(&size.to_ne_bytes());
+        r[TYPE..TYPE + 4].copy_from_slice(&kind.to_ne_bytes());
+        r[FD..FD + 4].copy_from_slice(&fd.to_ne_bytes());
+        r[PATH..PATH + path.len()].copy_from_slice(path);
+        r
+    }
+
+    #[test]
+    fn kinfo_records_give_each_path_byte_for_byte() {
+        use super::kinfo::{FD_CWD, Files, TYPE_FIFO, TYPE_VNODE};
+        let mut buf = kinfo_record(TYPE_VNODE, -5, b"/bin/sleep");
+        buf.extend(kinfo_record(TYPE_VNODE, FD_CWD, b"/w/caf\xc3\xa9 \xff\\x"));
+        buf.extend(kinfo_record(TYPE_FIFO, 3, b"/w/pipe"));
+        buf.extend(kinfo_record(TYPE_VNODE, 4, b""));
+        let files: Vec<(i32, i32, Vec<u8>)> = Files::new(&buf)
+            .map(|f| f.map(|f| (f.kind, f.fd, f.path.to_vec())))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            files,
+            vec![
+                (TYPE_VNODE, -5, b"/bin/sleep".to_vec()),
+                (TYPE_VNODE, FD_CWD, b"/w/caf\xc3\xa9 \xff\\x".to_vec()),
+                (TYPE_FIFO, 3, b"/w/pipe".to_vec()),
+                (TYPE_VNODE, 4, Vec::new()),
+            ]
+        );
+        // A record of size 0 ends the list when only zero bytes follow it,
+        // and is an error when a record does: the walk never skips one.
+        let mut ended = buf.clone();
+        ended.extend([0u8; 16]);
+        assert_eq!(Files::new(&ended).count(), 4);
+        assert!(Files::new(&ended).all(|f| f.is_ok()));
+        ended.extend(kinfo_record(TYPE_VNODE, 5, b"/w/after"));
+        let last = Files::new(&ended).last().map(|f| f.is_err());
+        assert_eq!(last, Some(true));
+        assert_eq!(Files::new(&ended).count(), 5);
+    }
+
+    #[test]
+    fn a_kinfo_answer_cut_short_is_an_error() {
+        use super::kinfo::{Files, TYPE_VNODE};
+        let whole = kinfo_record(TYPE_VNODE, 0, b"/w/a");
+        let last = |buf: &[u8]| Files::new(buf).last().map(|f| f.is_err());
+        assert_eq!(last(&whole), Some(false));
+        assert_eq!(last(&whole[..whole.len() - 8]), Some(true));
+        assert_eq!(last(&whole[..2]), Some(true));
+        let mut no_end = whole.clone();
+        no_end[super::kinfo::PATH..].fill(b'a');
+        assert_eq!(last(&no_end), Some(true));
     }
 
     #[test]

@@ -45,7 +45,19 @@ case $work in
 */residue-contract.??????) ;;
 *) echo "contract-check: unexpected scratch directory $work" >&2; exit 2 ;;
 esac
-trap 'rm -rf -- "$work"' EXIT
+# Each sleep a scenario starts to hold a worktree is listed in $holders, so
+# an early exit stops it too. Only a holder still running as a job of this
+# shell is signalled: once bash has reaped one, by `wait` or on its own, its
+# PID may already belong to another process.
+holders=
+stop_holders() {
+    local pid running
+    running=" $(jobs -pr | tr '\n' ' ') "
+    for pid in $holders; do
+        case $running in *" $pid "*) kill "$pid" 2>/dev/null ;; esac
+    done
+}
+trap 'stop_holders; rm -rf -- "$work"' EXIT
 
 # A controlled environment for residue and Git.
 export HOME=$work/home XDG_CONFIG_HOME=$work/home/.config XDG_STATE_HOME=$work/home/.local/state
@@ -128,8 +140,10 @@ sums() {
     (cd "$1" && find . -type f ! -path ./.git -print | LC_ALL=C sort | while read -r f; do printf '%s ' "$f"; cksum <"$f"; done)
 }
 
+# -z and -F: Git quotes a path with a backslash or a control character in
+# the list without -z, and the path is matched as text, not a pattern.
 registered() { # PATH
-    git -C "$repo" worktree list --porcelain | grep -qx "worktree $(cd "$1" 2>/dev/null && pwd -P)"
+    git -C "$repo" worktree list --porcelain -z | tr '\0' '\n' | grep -qxF "worktree $(cd "$1" 2>/dev/null && pwd -P)"
 }
 
 # Run the rest of the arguments in DIR, then go back: `in_dir DIR run ...`
@@ -1348,6 +1362,7 @@ if [ "$(uname -s)" = Linux ]; then
     mapped=$wt_real/node_modules/libmapped.so
     (cd "$work" && LD_PRELOAD=$mapped exec sleep 300) >/dev/null 2>&1 &
     holder=$!
+    holders="$holders $holder"
     for ((i = 0; i < 100; i++)); do
         grep -qF "$mapped" "/proc/$holder/maps" 2>/dev/null && break
         sleep 0.1
@@ -1687,6 +1702,76 @@ else
         else ok; fi
     fi
 fi
+
+# 16. A process inside a worktree keeps it in use whatever bytes its path
+# holds, though a probe may print such a name escaped (lsof on macOS): é,
+# CJK and a backslash in the worktree's name (given by `git worktree
+# move`), an emoji in a folder above it, and a process whose only link is
+# an open file in a worktree below a folder named with ï. The last two are
+# not moved, so they test the bytes alone. Each holder is a sleep.
+# `explain` and `remove --yes` must keep the worktree, untouched; once the
+# sleep exits it is idle again, which shows the use was the sleep's. On a
+# partial probe, which reads no open files, the open-file case is kept as
+# unknown (partial_probe) instead.
+held() { # NAME WORKTREE-NAME|w cwd|open [REPO-DIR]
+    name=$1
+    make_repo "${4:-}"
+    local dest=$repo/.worktrees/$2 before holder i busy explain_status
+    local verdict=keep state=in_use
+    if [ "$3" = open ] && [ -n "$partial_probe" ]; then verdict=unknown state=unknown; fi
+    if [ "$2" != w ]; then
+        setup git -C "$repo" worktree move "$wt" "$dest"
+        wt=$dest
+    fi
+    before=$(sums "$wt")
+    if [ "$3" = open ]; then
+        (cd "$work" && exec sleep 300 3<"$wt/sub/file.txt") >/dev/null 2>&1 &
+    else
+        (cd "$wt/sub" && exec sleep 300) >/dev/null 2>&1 &
+    fi
+    holder=$!
+    holders="$holders $holder"
+    for ((i = 0; i < 100; i++)); do
+        case $(ps -o comm= -p "$holder" 2>/dev/null) in *sleep) break ;; esac
+        sleep 0.1
+    done
+    run explain --json "$wt"
+    busy=$work/$name.busy
+    explain_status=$status
+    mv "$out" "$busy" || exit 2
+    run remove --yes --json --no-trash "$wt"
+    kill "$holder" 2>/dev/null
+    wait "$holder" 2>/dev/null
+    if [ "$explain_status" != 0 ]; then fail "explain exit $explain_status, want 0"
+    elif ! jq -e --argjson pid "$holder" --arg verdict "$verdict" --arg state "$state" '
+        .worktree.verdict == $verdict and (.worktree.activity | .state == $state
+            and if $state == "in_use" then any(.processes[]; .pid == $pid and .command == "sleep")
+                else .reason == "partial_probe" end)' "$busy" >/dev/null; then
+        fail "with sleep[$holder] in it, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$busy"), want $verdict and $state"
+    elif [ "$status" != 3 ]; then fail "remove --yes exit $status, want 3"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), want refused"
+    elif [ "$(failing_checks 0)" != activity ]; then fail "failing checks: $(failing_checks 0), want activity"
+    elif ! jq -e --argjson pid "$holder" --arg state "$state" '
+        .results[0].worktree.activity | .state == $state
+            and if $state == "in_use" then any(.processes[]; .pid == $pid and .command == "sleep")
+                else .reason == "partial_probe" end' "$out" >/dev/null; then
+        fail "remove's activity is $(jq -c '.results[0].worktree.activity' "$out"), want $state"
+    elif untouched "$before"; then
+        run explain --json "$wt"
+        if [ "$status" != 0 ]; then fail "after sleep exited, explain exit $status, want 0"
+        elif [ -z "$partial_probe" ] && ! jq -e '.worktree.activity.state == "not_observed" and .worktree.verdict == "candidate"' "$out" >/dev/null; then
+            fail "after sleep exited, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$out"), want candidate and not_observed"
+        elif [ -n "$partial_probe" ] && ! jq -e '.worktree.activity.state == "unknown" and .worktree.activity.reason == "partial_probe"' "$out" >/dev/null; then
+            fail "after sleep exited, explain says $(jq -c '.worktree.activity' "$out"), want unknown (partial_probe)"
+        else ok; fi
+    fi
+}
+held activity-cwd-accented "$(printf 'caf\303\251')" cwd
+held activity-cwd-cjk "$(printf '\346\274\242\345\255\227')" cwd
+held activity-cwd-backslash 'back\slash' cwd
+held activity-cwd-emoji-above w cwd "$work/$(printf '\360\237\232\200')-repo"
+held activity-open-file-only w open "$work/$(printf 'na\303\257ve')-repo"
 
 echo "contract-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]
