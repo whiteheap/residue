@@ -13,13 +13,22 @@ pub use imp::BACKEND;
 
 pub struct Events {
     imp: imp::Events,
+    room: usize,
 }
 
 impl Events {
     pub fn new() -> io::Result<Events> {
         Ok(Events {
             imp: imp::Events::new()?,
+            room: imp::room(),
         })
+    }
+
+    /// How many paths this backend can watch at once while the process
+    /// still starts the Git and residue it runs: kqueue holds an open file
+    /// for each watched path, inotify none.
+    pub fn room(&self) -> usize {
+        self.room
     }
 
     /// Report changes to `path`: entries added, removed or renamed in a
@@ -67,6 +76,12 @@ mod imp {
     use std::time::Duration;
 
     pub const BACKEND: &str = "inotify";
+
+    /// An inotify watch holds no open file; `fs.inotify.max_user_watches`
+    /// bounds them, and a watch past it fails on its own.
+    pub fn room() -> usize {
+        usize::MAX
+    }
 
     fn millis(timeout: Duration) -> libc::c_int {
         timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int
@@ -163,6 +178,39 @@ mod imp {
     use std::time::Duration;
 
     pub const BACKEND: &str = "kqueue";
+
+    /// Open files kept free for everything but the watches: the Git and
+    /// residue a pass starts, each with its pipes, the log and the locks.
+    const RESERVE: u64 = 128;
+    /// The most the soft limit is raised to: `OPEN_MAX`, above which
+    /// macOS's setrlimit(2) refuses `RLIMIT_NOFILE`.
+    const RAISE_TO: u64 = 10_240;
+
+    /// Each watched path holds an open file, and launchd starts a service
+    /// with a soft limit of 256 open files, so a watch of every folder
+    /// below `refs/remotes` could leave none for the Git and residue a pass
+    /// starts ("Too many open files"). This raises the soft limit toward
+    /// the hard one, then leaves `RESERVE` of it free.
+    pub fn room() -> usize {
+        // SAFETY: an all-zero rlimit is valid output space for getrlimit.
+        let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+        // SAFETY: reads this process's limit into `lim`.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+            return 0;
+        }
+        let want = (lim.rlim_max as u64).min(RAISE_TO);
+        if (lim.rlim_cur as u64) < want {
+            let raised = libc::rlimit {
+                rlim_cur: want as _,
+                rlim_max: lim.rlim_max,
+            };
+            // SAFETY: sets this process's soft limit, at most its hard one.
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+                lim.rlim_cur = raised.rlim_cur;
+            }
+        }
+        usize::try_from((lim.rlim_cur as u64).saturating_sub(RESERVE)).unwrap_or(usize::MAX)
+    }
 
     #[cfg(target_os = "macos")]
     const OPEN_FLAGS: libc::c_int = libc::O_EVTONLY | libc::O_CLOEXEC;
@@ -288,6 +336,10 @@ mod imp {
 
     pub const BACKEND: &str = "none";
 
+    pub fn room() -> usize {
+        usize::MAX
+    }
+
     pub struct Events;
 
     impl Events {
@@ -307,5 +359,32 @@ mod imp {
             std::thread::sleep(timeout);
             Ok(false)
         }
+    }
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )
+))]
+mod tests {
+    #[test]
+    fn kqueue_watches_leave_open_files_for_what_a_pass_starts() {
+        let room = super::imp::room();
+        // SAFETY: an all-zero rlimit is valid output space for getrlimit.
+        let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+        // SAFETY: reads this process's limit into `lim`.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+        let (soft, hard) = (lim.rlim_cur as u64, lim.rlim_max as u64);
+        assert!(
+            soft >= hard.min(10_240),
+            "the soft limit {soft} was not raised toward {hard}"
+        );
+        assert_eq!(room as u64, soft - 128);
     }
 }

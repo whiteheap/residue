@@ -60,7 +60,7 @@ These are the reasons people trust the tool. Do not weaken them without an expli
 | `src/output.rs`, `src/json.rs` | Terminal text and JSON documents |
 | `src/run.rs` | Child processes with a deadline and an output cap, and `run::spawn`, the one place a child starts, under a lock that keeps a child from inheriting another's pipes on macOS. `clippy.toml` refuses `Command::spawn`, `output` and `status` anywhere else (#114) |
 | `src/watch.rs` | `residue watch`: when to remove (branch landed, disk low), by running `scan --json` and `remove --yes --idle --no-trash`; when to fetch (`Fetcher`); the default roots |
-| `src/events.rs` | Waiting for file changes: inotify on Linux, kqueue on macOS and the BSDs |
+| `src/events.rs` | Waiting for file changes: inotify on Linux, kqueue on macOS and the BSDs. kqueue holds an open file per watched path, so `Events::room` raises the soft open-file limit and keeps 128 of it free for the children a pass starts |
 | `src/jsonread.rs` | Reading back residue's own JSON documents, for `watch` |
 | `src/service.rs` | `residue service`: the launchd agent and the systemd user service that run `watch`, reading an installed one back (`status`, kept roots), the fingerprint `install --expect` compares and the lock install and uninstall take, and the line `scan` ends with at a terminal while no `watch` runs (`hint`) |
 | `scripts/race-check.sh` | The race check: changes a worktree while the release binary's prompt waits, under a pseudo-terminal |

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **A running `watch` on macOS and the BSDs no longer runs out of open files.** kqueue holds an open file for each folder `watch` watches, and launchd starts a service with a limit of 256. With many branch folders under `refs/remotes`, the watches took them all, and every pass after that failed with `could not start: Too many open files`, so automatic cleanup stopped and removed nothing. `watch` now raises its limit on open files and keeps 128 of it free for the Git and residue each pass starts.
+
+### Details
+
+- `Events::room` (kqueue): the soft `RLIMIT_NOFILE` is raised toward the hard limit, at most 10,240 (`OPEN_MAX` on macOS), and the watches stop 128 below it, as well as at `MAX_WATCHES`. inotify watches hold no open file and are unchanged. Tests: `events::tests` and `.github/watch-smoke.sh` scenario 11, a running watch under `ulimit -n 256` with 302 folders to watch, which removes a worktree whose upstream is pruned.
+
 ## 0.0.12 (2026-11-09)
 
 Launch hardening: residue keeps more worktrees that are in use or hold what it cannot rebuild, stops on a mistyped command or an old Git before anything runs, replaces only the service you looked at, and comes with a skill for coding agents.

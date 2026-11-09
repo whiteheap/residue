@@ -1563,11 +1563,14 @@ fn arm(events: &mut Events, snap: &Snapshot, state: &mut State) {
         log(&format!("cannot reset the change watches: {e}"));
         return;
     }
+    // kqueue holds an open file for each path, so its watches also stay
+    // below the open-file limit (`Events::room`).
+    let most = MAX_WATCHES.min(events.room());
     let mut add = |events: &mut Events, path: &Path| {
-        if events.len() >= MAX_WATCHES {
+        if events.len() >= most {
             if !state.watch_limit_logged {
                 log(&format!(
-                    "watching {MAX_WATCHES} paths, the limit; changes in the rest are seen on the next timer"
+                    "watching {most} paths, the limit; changes in the rest are seen on the next timer"
                 ));
                 state.watch_limit_logged = true;
             }
