@@ -2112,30 +2112,29 @@ fn purge(
     // An earlier purge of this entry that stopped before or while its Git
     // ran, or whose re-check failed, left a record. One whose worktree
     // still holds all it keeps is forgotten, so this purge's record is the
-    // only one; any other keeps the entry. They speak to a restore, which
-    // reads them the same way; here a later remove run tries again.
-    let earlier = git::worktrees(&p.item.command_dir).and_then(|listed| {
-        removed::stopped_purges(
-            &p.item.common_dir,
-            &p.item.command_dir,
-            &path,
-            &trashed.original,
-            trashed.trashed,
-            &listed,
-        )
-    });
-    match earlier {
+    // only one; any other keeps the entry, and is named. A record a process
+    // holds, or one whose run may still delete the worktree, skips it until
+    // that ends; one no readable record explains keeps it, never forgotten.
+    let listed = match git::worktrees(&p.item.command_dir) {
+        Ok(listed) => listed,
+        Err(e) => return Outcome::Failed(e),
+    };
+    match removed::stopped_purges(
+        &p.item.common_dir,
+        &p.item.command_dir,
+        &path,
+        &trashed.original,
+        trashed.trashed,
+        &listed,
+    ) {
         Ok(stopped) => {
-            if let Err(why) = removed::settle_before_purge(stopped, &path, &p.item.dir) {
+            if let Err((why, record)) = removed::settle_before_purge(stopped, &path, &p.item.dir) {
+                *kept_record = Some(record);
                 return Outcome::Kept(why);
             }
         }
-        Err(e) => {
-            return Outcome::Skipped(e.replace(
-                "run this restore again",
-                "a later remove run tries the purge again",
-            ));
-        }
+        Err(unsettled) if unsettled.passes() => return Outcome::Skipped(unsettled.purge_text()),
+        Err(unsettled) => return Outcome::Kept(unsettled.purge_text()),
     }
     // A purge deletes too, so it records first, as a removal does, from
     // the plan's HEAD and branch, which the re-check then compares.

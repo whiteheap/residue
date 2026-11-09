@@ -221,10 +221,13 @@ while read -r mutant start faults off rule old late; do
       alone=ok
       for part in ${mutant//+/ }; do
         single=$(tlc "$start" "$faults" "$off" "{}" "$old" "$late" "{\"$part\"}" "$rule" 2>"$work/last")
-        if [ "${single%% *}" != holds ]; then
-          echo "mutant $mutant: $part alone already breaks $rule ($single), so the pair shows nothing"
-          failed=1 alone=no
-        fi
+        case $single in
+          holds*) ;;
+          "breaks $rule"*)
+            echo "mutant $mutant: $part alone already breaks $rule ($single), so the pair shows nothing"
+            failed=1 alone=no ;;
+          *) echo "mutant $mutant, $part alone: $single (output: $(cat "$work/last"))" >&2; exit 2 ;;
+        esac
       done
       [ "$alone" = ok ] || continue
       echo "mutant $mutant: each alone leaves $rule holding"

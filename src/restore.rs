@@ -686,7 +686,8 @@ fn settle_trash(
         &trashed.original,
         trashed.trashed,
         listed,
-    )?;
+    )
+    .map_err(|unsettled| unsettled.restore_text())?;
     // What such a purge left that cannot be moved back, its record brings
     // back (`removed::restore`).
     if let Some((record, _)) = stopped.first() {

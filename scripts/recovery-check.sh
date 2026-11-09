@@ -2368,9 +2368,10 @@ listed_freed() {
 # --- 4u. HEAD moved back while a purge writes its removal record ----------
 # The re-check finds HEAD changed, and the record stays, since w no longer
 # holds the commit it keeps; the purge names it. The next purge finds that
-# record, which w still does not hold, and keeps the entry instead of
-# writing a second record for the same worktree: one record, nothing
-# counted as freed, w still in the trash.
+# record, which w still does not hold, and keeps the entry, naming that
+# record in removal_record, until it is restored, instead of writing a
+# second record for the same worktree: one record, nothing counted as
+# freed, w still in the trash.
 name=purge-reset-at-record
 make_repo
 rm -f "$XDG_STATE_HOME/residue/ledger.jsonl" "$HOME/Library/Application Support/residue/ledger.jsonl"
@@ -2391,7 +2392,8 @@ elif [ "$first" != 3 ] || [ "$(jq -r '.purged[0].result' "$out")" != skipped ]; 
 elif ! jq -r '.purged[0].reason' "$out" | grep -qF 'HEAD changed'; then fail "the first purge's reason: $(jq -r '.purged[0].reason' "$out")"
 elif [ -z "$kept_at" ] || [ ! -f "$kept_at/info" ]; then fail "the first purge does not name the record that stays: removal_record ${kept_at:-null}"
 elif [ "$again" != 0 ] || [ "$(jq -r '.purged[0].result' "$out2")" != kept ]; then fail "the next purge: exit $again, $(jq -r '.purged[0].result' "$out2"), want 0, kept: $(jq -r '.purged[0].reason' "$out2")"
-elif ! jq -r '.purged[0].reason' "$out2" | grep -qF "$(basename "$kept_at")"; then fail "the next purge does not name the earlier record: $(jq -r '.purged[0].reason' "$out2")"
+elif ! jq -r '.purged[0].reason' "$out2" | grep -qF "$(basename "$kept_at")" || ! jq -r '.purged[0].reason' "$out2" | grep -qF 'until you restore it'; then fail "the next purge does not name the earlier record, or say it stays until restored: $(jq -r '.purged[0].reason' "$out2")"
+elif [ "$(jq -r '.purged[0].removal_record // empty' "$out2")" != "$kept_at" ]; then fail "the next purge's removal_record is $(jq -r '.purged[0].removal_record' "$out2"), want $kept_at"
 elif [ "$(records)" != "1 records, 1 refs" ]; then fail "removal records: $(records), want 1 records, 1 refs"
 elif [ "$(listed_freed)" != "1 records, 0 freed" ]; then fail "restore and stats: $(listed_freed), want 1 records, 0 freed"
 elif [ "$(record "$entry/w")" != "registered, locked residue: in trash" ]; then fail "w in the trash: $(record "$entry/w")"

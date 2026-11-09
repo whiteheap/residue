@@ -247,7 +247,7 @@ impl Item {
     /// At least `keep` old, and at least as old as the `--keep-trash` of
     /// the run that trashed it, the longer of the two, as a removal
     /// record's `--keep-removed` (`removed::Item::expired`). An entry
-    /// without one, from 0.0.12 or earlier, has only `keep`; one whose
+    /// without one, from 0.0.13 or earlier, has only `keep`; one whose
     /// `keep` this release cannot read never expires.
     pub fn expired(&self, now: i64, keep: i64) -> bool {
         self.record.as_ref().is_ok_and(|r| match &r.keep {

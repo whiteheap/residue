@@ -1217,6 +1217,37 @@ else
     skip_partial trash-kept-unpurgeable
 fi
 
+# 8f. An expired entry beside a damaged removal record named for its
+# worktree, which may be an earlier purge's: residue cannot tell, so the
+# purge keeps the entry, with a warning naming the record, and never
+# forgets that record. Two sweeps, each exit 0.
+if [ -z "$partial_probe" ]; then
+    name=trash-damaged-purge-record
+    make_repo
+    run remove --yes --json --trash "$wt"
+    entry=$(result 0 trash_entry)
+    [ "$status" = 0 ] && [ -d "$entry" ] || { echo "contract-check: setup failed in $name: remove --trash exit $status" >&2; exit 2; }
+    sed 's/^trashed [0-9]* .*/trashed 1767225600 2026-01-01T00:00:00Z/' "$entry/info" >"$work/$name.info" && cat "$work/$name.info" >"$entry/info" || exit 2
+    damaged=$repo/.git/residue-removed/w-20260601T000000Z
+    mkdir -p "$damaged" && printf 'not a record\n' >"$damaged/info" || exit 2
+    wrong=
+    for round in 1 2; do
+        run remove --all --yes --json --idle 30d "$repo"
+        if [ "$status" != 0 ]; then wrong+=" sweep $round: exit $status, want 0;"
+        elif [ "$(jq -r '[.purged[] | .result] | join(",")' "$out")" != kept ]; then wrong+=" sweep $round purged: $(jq -c '[.purged[] | {result, reason}]' "$out");"
+        elif ! jq -e '.purged[0].reason | contains("w-20260601T000000Z") and contains("cannot read")' "$out" >/dev/null; then wrong+=" sweep $round reason: $(jq -c '.purged[0].reason' "$out");"
+        elif ! jq -e '[.warnings[] | select(contains("kept the trash entry") and contains("w-20260601T000000Z"))] | length == 1' "$out" >/dev/null; then wrong+=" sweep $round warnings: $(jq -c .warnings "$out");"
+        elif [ "$(jq -c .errors "$out")" != "[]" ]; then wrong+=" sweep $round errors: $(jq -c .errors "$out");"
+        fi
+    done
+    if [ -n "$wrong" ]; then fail "$wrong"
+    elif [ "$(cat "$damaged/info" 2>/dev/null)" != "not a record" ]; then fail "the damaged record changed"
+    elif ! registered "$entry/w"; then fail "the trashed worktree is gone"
+    else ok; fi
+else
+    skip_partial trash-damaged-purge-record
+fi
+
 # 9. Stats: each removal, move into the trash, purge and restore adds a
 # line to the stats ledger, `remove --json` reports what it freed in
 # `stats`, and `residue stats --json` (residue.stats/v1) adds them up. A

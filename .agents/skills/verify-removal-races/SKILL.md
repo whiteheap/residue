@@ -100,14 +100,14 @@ Run the check for a change to any function in this table, or for one that adds a
 | `RVerify` | `remove.rs` `verify_moved` |
 | `PBCheck`, `PBUnlock`, `PBMove`, `PBStuck` | `remove.rs` `Moved::put_back`, `Moved::stuck` |
 | `RSettle`, `PSettle` | `remove.rs` `settle`, `standing`, `Files` |
-| `PHold`, `PRecord`, `PRecheck`, `PUndo`, `PAfter`, `PRelock` | `remove.rs` `purge`: `hold::take(trash::info)`, `removed::create`, `recheck(path, ours = trash::LOCK)`, and `settle` with `standing` and no `Files` when the re-check fails; after `git::remove_worktree`, `trash::discard`, whose result does not change the outcome once Git deleted the worktree. A purge in Old re-checks before it writes its record, as 0.0.10 did (`PFirst`). Its step between the hold and the record, `removed::settle_before_purge` over `stopped_purges`, acts only on a record an earlier purge left, which no setup has |
+| `PHold`, `PRecord`, `PRecheck`, `PUndo`, `PAfter`, `PRelock` | `remove.rs` `purge`: `hold::take(trash::info)`, `removed::create`, `recheck(path, ours = trash::LOCK)`, and `settle` with `standing` and no `Files` when the re-check fails; after `git::remove_worktree`, `trash::discard`, whose result does not change the outcome once Git deleted the worktree. A purge in Old re-checks before it writes its record, as 0.0.10 did (`PFirst`). Its step between the hold and the record, `removed::settle_before_purge` over `stopped_purges` (said through `Unsettled::purge_text`), acts only on a record an earlier purge left, which no setup has |
 | `PUnlock` | `trash.rs` `purge(item, registered, holds)` |
 | `StartGit` | `git.rs` `remove_worktree(main, path, holds)`, `hold.rs` `pass_to` |
 | `GFind`, `GExists`, `GStatus`, `GTree`, `GGitdir` | Git's `remove_worktree`, run by `git.rs` `remove_worktree` |
 | `GitTimeout` | `git.rs` `REMOVE_TIMEOUT` and `run.rs` `stop` |
 | `Kill`, `Orphan` | No code: residue stopped with its Git child, or alone (`run.rs` `stop` on watch's 30-minute deadline for its `residue remove` kills that PID alone); the kernel frees a hold once every process that has it has exited |
 | `TList`, `SList` | `restore.rs` `gather`, `choose` |
-| `THold`, `TOpen`, `TLock`, `TRead`, `TLift` | `trash.rs` `take`; `restore.rs` `restore_trash`: `keep_open`, `git::worktrees`, `git::lock_worktree(trash::LOCK)` when Git lists it unlocked, `lift`, `removed::stopped_purges` and its `refuse_unheld`: `unheld`, `process::removing`, `process::started` |
+| `THold`, `TOpen`, `TLock`, `TRead`, `TLift` | `trash.rs` `take`; `restore.rs` `restore_trash`: `keep_open`, `git::worktrees`, `git::lock_worktree(trash::LOCK)` when Git lists it unlocked, `lift`, `removed::stopped_purges` and its `unheld_refusal`: `unheld`, `process::removing`, `process::started`, said through `Unsettled::restore_text` |
 | `TCheck`, `TUnlock`, `TMove`, `TRelock` | `restore.rs` `restore_trash`'s refusal when a stopped purge left no files or files Git cannot use (`holds_worktree`, `remove::unusable`); `trash.rs` `restore(item, to, listed, held)`: `holds_worktree`, `was_locked` |
 | `TDiscard` | `trash.rs` `discard` |
 | `TForget` | `removed.rs` `after_trash_restore`, `finish`; `restore.rs` `settle_trash`: `removed::raced_purges` after the move |
