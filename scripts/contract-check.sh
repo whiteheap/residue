@@ -1710,8 +1710,8 @@ fi
 # an open file in a worktree below a folder named with ï. The last two are
 # not moved, so they test the bytes alone. Then the open file once more,
 # with the worktree moved after the file was opened: illumos may then have
-# no path for the file (`unnamed_file`), and the answer is unknown, never
-# idle. Each holder is a sleep. `explain` and `remove --yes` must keep the
+# no path for the file, and finds it by its inode, or else answers unknown
+# (`unnamed_file`), never idle. Each holder is a sleep. `explain` and `remove --yes` must keep the
 # worktree, untouched; once the sleep exits it is idle again, which shows
 # the use was the sleep's. On a partial probe, which reads no open files,
 # the open-file cases are kept as unknown (partial_probe) instead.
