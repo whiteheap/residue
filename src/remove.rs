@@ -32,7 +32,7 @@ use crate::commands::{self, Target, VERSION, fail, locate};
 use crate::discover::{self, Repo};
 use crate::git::{self, Entry};
 use crate::hold::{self, Taken};
-use crate::inspect::{self, Fingerprint, Report, Verdict};
+use crate::inspect::{self, Fingerprint, Kept, Report, Verdict};
 use crate::json::Json;
 use crate::output::{self, Places, Style, clean};
 use crate::policy::Policy;
@@ -562,10 +562,19 @@ pub fn remove(options: &Options) -> u8 {
     };
 
     let snapshot = Snapshot::take();
-    let jobs: Vec<(&Entry, &Path)> = items
+    // What each repository keeps like a main checkout, read once for each.
+    let mut kept: std::collections::HashMap<&Path, Kept> = std::collections::HashMap::new();
+    for t in items.iter().filter_map(|i| i.target.as_ref()) {
+        kept.entry(t.repo.common_dir.as_path())
+            .or_insert_with(|| Kept::of(&t.repo.main, &t.repo.common_dir));
+    }
+    let jobs: Vec<inspect::Job> = items
         .iter()
         .filter_map(|i| i.target.as_ref())
-        .map(|t| (&t.entry, t.repo.common_dir.as_path()))
+        .map(|t| {
+            let common = t.repo.common_dir.as_path();
+            (&t.entry, common, &kept[common])
+        })
         .collect();
     let mut reports = inspect::all(&jobs, &snapshot, &policy).into_iter();
     for item in &mut items {
@@ -616,11 +625,13 @@ pub fn remove(options: &Options) -> u8 {
         .filter(|p| judge(p))
         .filter_map(|p| p.item.registered.as_ref().map(as_judged))
         .collect();
-    let purge_jobs: Vec<(&Entry, &Path)> = purges
+    // A trash entry was already removed from its path: nothing keeps it like
+    // a main checkout, so it is purged as before.
+    let purge_jobs: Vec<inspect::Job> = purges
         .iter()
         .filter(|p| judge(p))
         .zip(&judged)
-        .map(|(p, e)| (e, p.item.common_dir.as_path()))
+        .map(|(p, e)| (e, p.item.common_dir.as_path(), &Kept::Nothing))
         .collect();
     let mut purge_reports = inspect::all(&purge_jobs, &snapshot, &purge_policy).into_iter();
     for p in &mut purges {
@@ -1261,7 +1272,11 @@ fn recheck(
     }
     compare_entry(&before.entry, &judged, since)?;
     let snapshot = Snapshot::take();
-    let now = inspect::worktree(&judged, common_dir, &snapshot, policy);
+    // The fresh list says what keeps a worktree like a main checkout now.
+    let kept = fresh
+        .first()
+        .map_or(Kept::Nothing, |main| Kept::of(main, common_dir));
+    let now = inspect::worktree(&judged, common_dir, &kept, &snapshot, policy);
     if now.verdict != Verdict::Candidate {
         let reasons: Vec<String> = now.blocking().map(|c| c.short.clone()).collect();
         return Err(Outcome::Skipped(format!(

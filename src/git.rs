@@ -1334,6 +1334,26 @@ pub fn commit_of(dir: &Path, name: &str) -> Result<Option<String>, String> {
     }
 }
 
+/// The branch HEAD names in the repository at `dir` (`refs/heads/main`), or
+/// `None` when HEAD is detached: `symbolic-ref -q` exits 1 for that, and
+/// anything else is an error. It reads HEAD as Git does, so it works for a
+/// repository that keeps its refs in reftable too.
+pub fn head_branch(dir: &Path) -> Result<Option<String>, String> {
+    let exit = git_exit(dir, &["symbolic-ref", "-q", "HEAD"])?;
+    match exit.code {
+        Some(0) => {
+            let name = String::from_utf8_lossy(&exit.stdout).trim().to_string();
+            if name.is_empty() {
+                Err("git symbolic-ref HEAD printed nothing".into())
+            } else {
+                Ok(Some(name))
+            }
+        }
+        Some(1) => Ok(None),
+        _ => Err(format!("git symbolic-ref HEAD failed: {}", exit.stderr)),
+    }
+}
+
 /// The ref `full` exists, whatever it points at.
 pub fn ref_exists(dir: &Path, full: &str) -> Result<bool, String> {
     let exit = git_exit(dir, &["show-ref", "--verify", "--quiet", full])?;

@@ -1647,5 +1647,46 @@ if [ "$status" != 0 ]; then fail "exit $status, want 0"
 elif [ "$(jq -r '.as_of == .generated_at' "$out")" != true ]; then fail "as_of $(jq -r .as_of "$out"), generated_at $(jq -r .generated_at "$out")"
 elif untouched "$before"; then ok; fi
 
+# 15. A bare repository with a linked worktree per branch, the layout
+# `git clone --bare` and then `git worktree add` makes. The worktree on the
+# branch the bare repository's HEAD names is its main checkout in all but
+# name: scan, explain and remove keep it (`head` blocks, saying why). A
+# worktree on another branch there is a candidate as anywhere else.
+name=bare-head-branch
+base=$work/$name
+setup git init -q "$base/src"
+echo hello >"$base/src/README.md"
+setup git -C "$base/src" add .
+setup git -C "$base/src" commit -qm init
+setup git clone -q --bare "$base/src" "$base/repo.git"
+setup git -C "$base/repo.git" worktree add -q "$base/main" main
+setup git -C "$base/repo.git" worktree add -q "$base/feat" -b feat
+head_detail="on main, the branch the bare repository's HEAD names; kept like a main checkout"
+bare_head() { # the main worktree's head check in a scan or explain document: STATUS DETAIL
+    jq -r --arg p "$(cd "$base/main" && pwd -P)" '
+        [.. | objects | select(.path? == $p and has("checks")) | .checks[] | select(.id == "head") | .status + " " + .detail] | first // empty
+    ' "$out"
+}
+# One refusal makes the run exit 3; on a partial probe feat is kept too.
+if [ -z "$partial_probe" ]; then want_feat=removed; else want_feat=refused; fi
+run scan --json "$base"
+if [ "$status" != 0 ]; then fail "scan exit $status, want 0"
+elif [ "$(bare_head)" != "block $head_detail" ]; then fail "scan's head check for main: $(bare_head)"
+else
+    run explain --json "$base/main"
+    if [ "$status" != 0 ]; then fail "explain exit $status, want 0"
+    elif [ "$(bare_head)" != "block $head_detail" ]; then fail "explain's head check: $(bare_head)"
+    else
+        run remove --yes --json "$base/main" "$base/feat"
+        if [ "$status" != 3 ]; then fail "remove exit $status, want 3"
+        elif ! json_ok 2; then fail "stdout is not one valid remove document with 2 results"
+        elif [ "$(result 0 result),$(result 1 result)" != "refused,$want_feat" ]; then fail "results $(result 0 result),$(result 1 result), want refused,$want_feat"
+        elif [ "$(failing_checks 0)" != "$(want_failing head)" ]; then fail "main's failing checks: $(failing_checks 0), want $(want_failing head)"
+        elif [ ! -f "$base/main/README.md" ]; then fail "main's files are gone"
+        elif [ -z "$partial_probe" ] && [ -e "$base/feat" ]; then fail "feat is still on disk"
+        else ok; fi
+    fi
+fi
+
 echo "contract-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]
