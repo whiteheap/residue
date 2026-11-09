@@ -506,14 +506,27 @@ struct Mode {
     /// child is the run with `--removal-reason`.
     by: By,
     started: i64,
+    /// `--as-of TIME`, or the start when TIME is later: every age this run
+    /// judges is measured at it, so a run confirming another run's plan
+    /// purges and forgets only what had expired when that plan was made.
+    as_of: Option<i64>,
+}
+
+impl Mode {
+    /// When this run measures ages: `--as-of`, otherwise its start.
+    fn ages_at(&self) -> i64 {
+        self.as_of.unwrap_or(self.started)
+    }
 }
 
 pub fn remove(options: &Options) -> u8 {
     let started = output::now();
-    let policy = match commands::prepare(options) {
+    let as_of = options.as_of.map(|t| t.min(started));
+    let mut policy = match commands::prepare(options) {
         Ok(p) => p,
         Err(e) => return fail(&e),
     };
+    policy.idle_at = as_of;
     let mode = Mode {
         trash: options.trash(),
         keep: options.keep_trash(),
@@ -536,6 +549,7 @@ pub fn remove(options: &Options) -> u8 {
             (None, false) => By::Remove,
         },
         started,
+        as_of,
     };
     let places = Places::new();
     let style = Style::stdout();
@@ -580,7 +594,7 @@ pub fn remove(options: &Options) -> u8 {
     // --keep-trash without saying so.
     let mut purge_policy = policy.clone();
     purge_policy.idle = None;
-    let mut purges = expired(&repos, &mode.keep, started, &mut errors);
+    let mut purges = expired(&repos, &mode.keep, mode.as_of, mode.ages_at(), &mut errors);
     // Problems with removal records: warnings, on stderr and in JSON
     // `warnings`, but never `errors` and never the exit status. A record
     // is about a worktree already gone, and a run that removed its PATHs
@@ -589,7 +603,13 @@ pub fn remove(options: &Options) -> u8 {
     let mut warnings: Vec<String> = Vec::new();
     // What the plan keeps because its filesystem gives no hold is in the
     // plan's "kept" lists and `kept` in the JSON, never also a warning.
-    let mut forgets = expired_records(&repos, &mode.keep_removed, started, &mut warnings);
+    let mut forgets = expired_records(
+        &repos,
+        &mode.keep_removed,
+        mode.as_of,
+        mode.ages_at(),
+        &mut warnings,
+    );
     let judge = |p: &Purge| p.item.registered.is_some() && p.outcome.is_none();
     let judged: Vec<Entry> = purges
         .iter()
@@ -632,8 +652,9 @@ pub fn remove(options: &Options) -> u8 {
         print!(
             "{}{}",
             style.dim(&format!(
-                "{} · activity: {}\n",
+                "{}{} · activity: {}\n",
                 commands::header(mode.started),
+                ages_text(&mode),
                 clean(&snapshot.scope())
             )),
             plan_text(&items, &purges, &forgets, &errors, &mode, &places, &style)
@@ -857,10 +878,15 @@ fn repos_of(items: &[Item]) -> Vec<Repo> {
 /// restore` is how it goes back. An unreadable record is never forgotten
 /// either, since residue cannot tell which refs are its own; it goes into
 /// `warnings`. One whose filesystem gives no hold is kept from the plan on
-/// (`removed::unforgettable`).
+/// (`removed::unforgettable`). Under `--as-of`, ages are measured at `now`,
+/// that time, and a record is forgotten only when its directory and Git's
+/// list of the repository's worktrees last changed before it: a removal
+/// still running then, whose record read as interrupted, waits for a later
+/// run.
 fn expired_records(
     repos: &[Repo],
     keep: &Span,
+    as_of: Option<i64>,
     now: i64,
     warnings: &mut Vec<String>,
 ) -> Vec<Forget> {
@@ -870,15 +896,19 @@ fn expired_records(
         item,
     };
     for repo in repos {
+        let listed = as_of.is_none() || before(as_of, worktrees_changed(&repo.common_dir));
         match removed::of_repo(repo) {
             Ok(list) => {
                 for item in list {
+                    let settled = listed && before(as_of, item.modified);
                     match &item.record {
-                        Err(_) if item.clearable(now) => out.push(forget(item)),
+                        Err(_) if item.clearable(now) && settled => out.push(forget(item)),
                         Err(_) if item.incomplete => {}
                         Err(e) => warnings.push(format!("removal record: {e}")),
                         Ok(_) if item.interrupted() => {}
-                        Ok(_) if item.expired(now, keep.seconds) => out.push(forget(item)),
+                        Ok(_) if item.expired(now, keep.seconds) && settled => {
+                            out.push(forget(item));
+                        }
                         Ok(_) => {}
                     }
                 }
@@ -893,15 +923,25 @@ fn expired_records(
 /// and entries that hold only their record an hour after they were made
 /// (`trash::Item::clearable`), which any purge clears. A younger one may
 /// be another run's, between writing `info` and moving the worktree in,
-/// so it is left alone, as is one with no `info` yet.
-fn expired(repos: &[Repo], keep: &Span, now: i64, errors: &mut Vec<String>) -> Vec<Purge> {
+/// so it is left alone, as is one with no `info` yet. Under `--as-of`,
+/// ages are measured at `now`, that time, and an entry is purged only when
+/// its directory last changed before it: one whose `info` or worktree
+/// arrived later waits for a later run.
+fn expired(
+    repos: &[Repo],
+    keep: &Span,
+    as_of: Option<i64>,
+    now: i64,
+    errors: &mut Vec<String>,
+) -> Vec<Purge> {
     let mut out = Vec::new();
     for repo in repos {
         match trash::list(&repo.common_dir, &repo.command_dir(), &repo.trash) {
             Ok(list) => {
                 for item in list {
+                    let settled = before(as_of, item.modified);
                     match &item.record {
-                        _ if item.clearable(now) => out.push(Purge {
+                        _ if item.clearable(now) && settled => out.push(Purge {
                             item,
                             report: None,
                             outcome: None,
@@ -909,7 +949,7 @@ fn expired(repos: &[Repo], keep: &Span, now: i64, errors: &mut Vec<String>) -> V
                         Err(_) if item.incomplete && item.bare => {}
                         Err(e) => errors.push(format!("trash entry {}: {e}", item.dir.display())),
                         Ok(_) if item.is_empty_record() => {}
-                        Ok(_) if item.age(now).is_some_and(|a| a >= keep.seconds) => {
+                        Ok(_) if item.age(now).is_some_and(|a| a >= keep.seconds) && settled => {
                             let outcome = if item.registered.is_none() {
                                 Some(Outcome::Failed(
                                     "Git no longer lists it as a worktree, so residue cannot remove it with git worktree remove".into(),
@@ -938,6 +978,26 @@ fn expired(repos: &[Repo], keep: &Span, now: i64, errors: &mut Vec<String>) -> V
         }
     }
     out
+}
+
+/// Without `--as-of`, true. With it, whether `changed`, a modification time
+/// in whole seconds, is before TIME, so the change was there when a plan
+/// made at TIME read it. An unknown time is not.
+fn before(as_of: Option<i64>, changed: Option<i64>) -> bool {
+    as_of.is_none_or(|t| changed.is_some_and(|m| m < t))
+}
+
+/// When Git's list of a repository's worktrees last changed: the time of
+/// `worktrees/` in its common directory, or of the common directory once
+/// Git removed `worktrees/` with the last linked worktree.
+fn worktrees_changed(common_dir: &Path) -> Option<i64> {
+    match fs::metadata(common_dir.join("worktrees")) {
+        Ok(m) => Some(m.mtime()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            fs::metadata(common_dir).ok().map(|m| m.mtime())
+        }
+        Err(_) => None,
+    }
 }
 
 /// The worktree PATHs named on the command line, each resolved to one
@@ -2019,7 +2079,7 @@ fn plan_text(
             ))
         ));
         for &i in &purgeable {
-            out.push_str(&purge_summary(&purges[i], places, style));
+            out.push_str(&purge_summary(&purges[i], mode.ages_at(), places, style));
         }
     }
     let (pending, kept): (Vec<&Forget>, Vec<&Forget>) =
@@ -2037,7 +2097,7 @@ fn plan_text(
             &style.dim("  after this, `residue restore` cannot bring these back; branches stay\n"),
         );
         for f in pending {
-            out.push_str(&forget_summary(&f.item, places, style));
+            out.push_str(&forget_summary(&f.item, mode.ages_at(), places, style));
         }
     }
     if !kept.is_empty() {
@@ -2117,8 +2177,9 @@ fn refusal(r: &Report) -> String {
     format!("{}: {}", r.verdict.code(), reasons.join(" · "))
 }
 
-fn purge_summary(p: &Purge, places: &Places, style: &Style) -> String {
-    let now = output::now();
+/// One trash entry the plan purges, its age at `now`, when the run measures
+/// ages (`Mode::ages_at`), as the header says.
+fn purge_summary(p: &Purge, now: i64, places: &Places, style: &Style) -> String {
     let Ok(r) = &p.item.record else {
         return format!(
             "  {}\n    {}\n",
@@ -2242,9 +2303,8 @@ fn forget_line(item: &removed::Item, outcome: &Outcome, places: &Places) -> Stri
     }
 }
 
-/// One removal record the plan forgets.
-fn forget_summary(item: &removed::Item, places: &Places, style: &Style) -> String {
-    let now = output::now();
+/// One removal record the plan forgets, its age at `now`, as for a purge.
+fn forget_summary(item: &removed::Item, now: i64, places: &Places, style: &Style) -> String {
     let Ok(r) = &item.record else {
         return String::new();
     };
@@ -2409,5 +2469,17 @@ fn json(
                     .collect(),
             ),
         ),
+        // Added after the others, so every field before it keeps its place.
+        ("as_of", Json::str(output::rfc3339(mode.ages_at()))),
     ])
+}
+
+/// ` · ages as of 14:01:07 +02:00` in the header when `--as-of` set a time
+/// before the run's start; empty otherwise.
+fn ages_text(mode: &Mode) -> String {
+    match mode.as_of {
+        Some(t) if t < mode.started - 86_400 => format!(" · ages as of {}", output::date(t)),
+        Some(t) if t < mode.started => format!(" · ages as of {}", output::clock(t)),
+        _ => String::new(),
+    }
 }

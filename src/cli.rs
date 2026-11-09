@@ -28,6 +28,7 @@ Options:
   --no-trash               remove: delete, even with --idle
   --keep-trash DURATION    remove: purge trash entries older than this (7d)
   --keep-removed DURATION  remove: keep removal records at least this long (30d)
+  --as-of TIME             remove: judge ages at TIME, a plan's generated_at
   --removal-reason REASON  remove: watch-landed or watch-low-disk (set by watch)
   --only-if-upstream-gone  remove: only if local refs show the upstream gone
   --to PATH                restore: put the worktree at PATH
@@ -120,6 +121,10 @@ pub struct Options {
     pub trash: Option<bool>,
     pub keep_trash: Option<Span>,
     pub keep_removed: Option<Span>,
+    /// `remove --as-of TIME`, in Unix seconds: the time every age the run
+    /// judges is measured at, such as the `generated_at` of the plan a
+    /// person confirmed.
+    pub as_of: Option<i64>,
     pub regenerable: Vec<String>,
     /// `--only-if-upstream-gone`: remove only worktrees whose branch has an
     /// upstream that the local refs show as gone, checked at the plan, right
@@ -263,6 +268,17 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
                         )?);
                         continue;
                     }
+                    "--as-of" => {
+                        let value = args
+                            .next()
+                            .ok_or("--as-of needs a TIME, such as 2026-11-09T12:00:00Z")?;
+                        options.as_of = Some(as_of(&utf8(value, "--as-of TIME")?)?);
+                        continue;
+                    }
+                    _ if text.starts_with("--as-of=") => {
+                        options.as_of = Some(as_of(&text["--as-of=".len()..])?);
+                        continue;
+                    }
                     "--removal-reason" => {
                         let value = args
                             .next()
@@ -338,6 +354,9 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
         if options.removal_reason.is_some() {
             return Err("--removal-reason applies only to `residue remove`".into());
         }
+        if options.as_of.is_some() {
+            return Err("--as-of applies only to `residue remove`".into());
+        }
     }
     if options.to.is_some() && kind != "restore" {
         return Err("--to applies only to `residue restore ENTRY`".into());
@@ -390,6 +409,16 @@ fn removal_reason(text: &str) -> Result<Reason, String> {
             "--removal-reason {text:?}: use watch-landed or watch-low-disk"
         )),
     }
+}
+
+/// `--as-of`: an RFC 3339 time with whole seconds, as `generated_at`
+/// gives it, or with a `+HH:MM` offset.
+fn as_of(text: &str) -> Result<i64, String> {
+    crate::output::parse_rfc3339(text).ok_or_else(|| {
+        format!(
+            "--as-of {text:?}: use a time as generated_at gives it, such as 2026-11-09T12:00:00Z"
+        )
+    })
 }
 
 fn set_trash(options: &mut Options, value: bool) -> Result<(), String> {

@@ -227,17 +227,15 @@ fn utc_offset(tm: &libc::tm, _seconds: i64) -> i64 {
 }
 
 /// illumos and Solaris have no `tm_gmtoff`. Read the local civil time as if
-/// it were UTC (Howard Hinnant's days-from-civil); its distance from the real
-/// instant is the offset.
+/// it were UTC ([`days_from_civil`]); its distance from the real instant is
+/// the offset.
 #[cfg(any(target_os = "illumos", target_os = "solaris"))]
 fn utc_offset(tm: &libc::tm, seconds: i64) -> i64 {
-    let month = i64::from(tm.tm_mon) + 1;
-    let year = i64::from(tm.tm_year) + 1_900 - i64::from(month <= 2);
-    let era = year.div_euclid(400);
-    let yoe = year - era * 400;
-    let doy = (153 * ((month + 9) % 12) + 2) / 5 + i64::from(tm.tm_mday) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
+    let days = days_from_civil(
+        i64::from(tm.tm_year) + 1_900,
+        i64::from(tm.tm_mon) + 1,
+        i64::from(tm.tm_mday),
+    );
     let local = days * 86_400
         + i64::from(tm.tm_hour) * 3_600
         + i64::from(tm.tm_min) * 60
@@ -307,8 +305,57 @@ pub fn unstamp(text: &str) -> Option<i64> {
             .iter()
             .fold(0, |n, d| n * 10 + i64::from(d - b'0'))
     };
-    let (year, month, day) = (num(0, 4), num(4, 6), num(6, 8));
-    let (hour, minute, second) = (num(9, 11), num(11, 13), num(13, 15));
+    from_civil(
+        (num(0, 4), num(4, 6), num(6, 8)),
+        (num(9, 11), num(11, 13), num(13, 15)),
+    )
+}
+
+/// Unix seconds from an RFC 3339 time with whole seconds and `Z` or a
+/// `+HH:MM` offset, such as [`rfc3339`] writes: `2026-11-06T21:04:05Z`.
+/// `None` for anything else, including a date that does not exist.
+pub fn parse_rfc3339(text: &str) -> Option<i64> {
+    let b = text.as_bytes();
+    let separators = [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':')];
+    if b.len() < 20 || separators.iter().any(|&(i, c)| b[i] != c) {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<i64> {
+        let digits = text.get(from..to)?;
+        if digits.bytes().all(|d| d.is_ascii_digit()) {
+            digits.parse().ok()
+        } else {
+            None
+        }
+    };
+    let date = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let time = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    let offset = match text.get(19..)? {
+        "Z" => 0,
+        zone if zone.len() == 6 && zone.as_bytes()[3] == b':' => {
+            let sign = match zone.as_bytes()[0] {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            let (h, m) = (num(20, 22)?, num(23, 25)?);
+            if h > 23 || m > 59 {
+                return None;
+            }
+            sign * (h * 3_600 + m * 60)
+        }
+        _ => return None,
+    };
+    Some(from_civil(date, time)? - offset)
+}
+
+/// Unix seconds from a UTC date and time of day, or `None` when either does
+/// not exist, such as 02-29 in 2026 or 24:00:00: the one check [`unstamp`]
+/// and [`parse_rfc3339`] share.
+fn from_civil(
+    (year, month, day): (i64, i64, i64),
+    (hour, minute, second): (i64, i64, i64),
+) -> Option<i64> {
     if !(1..=12).contains(&month)
         || !(1..=31).contains(&day)
         || hour > 23
@@ -317,14 +364,25 @@ pub fn unstamp(text: &str) -> Option<i64> {
     {
         return None;
     }
-    // Howard Hinnant's days-from-civil, the inverse of `civil`.
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = year.div_euclid(400);
-    let yoe = year - era * 400;
+    let days = days_from_civil(year, month, day);
+    // A day the month does not have, such as 02-30, comes back as another.
+    let (y, m, d, _) = civil(days * 86_400);
+    if (y, m, d) != (year, month, day) {
+        return None;
+    }
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date, month 1 to 12
+/// (Howard Hinnant's days-from-civil, the inverse of [`civil`]). It does
+/// not check the date: 02-30 counts as 03-02.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
     let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+    era * 146_097 + doe - 719_468
 }
 
 /// `20261107T040000Z`: UTC, for names that sort by time.
@@ -901,4 +959,57 @@ pub fn idle_json(policy: &Policy) -> Json {
 /// effective list: these, then its repository's Git config rules.
 pub fn policy_sources_json(policy: &Policy) -> Json {
     Json::Arr(policy.sources.iter().map(rule_source_json).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rfc3339_reads_back_what_it_writes() {
+        for t in [0, 951_782_400, 1_767_225_600, 1_778_330_645, 4_102_444_799] {
+            assert_eq!(parse_rfc3339(&rfc3339(t)), Some(t), "{}", rfc3339(t));
+        }
+    }
+
+    #[test]
+    fn rfc3339_takes_an_offset() {
+        assert_eq!(
+            parse_rfc3339("2026-11-09T14:03:12+02:00"),
+            parse_rfc3339("2026-11-09T12:03:12Z")
+        );
+        assert_eq!(
+            parse_rfc3339("2026-11-09T06:33:12-05:30"),
+            parse_rfc3339("2026-11-09T12:03:12Z")
+        );
+        assert_eq!(parse_rfc3339("2024-02-29T00:00:00Z"), Some(1_709_164_800));
+    }
+
+    #[test]
+    fn rfc3339_refuses_what_it_does_not_write() {
+        for text in [
+            "",
+            "yesterday",
+            "2026-11-09",
+            "2026-11-09 12:03:12Z",
+            "2026-11-09T12:03:12",
+            "2026-11-09T12:03:12.5Z",
+            "2026-11-09T12:03:12z",
+            "2026-11-09T12:03:12+0200",
+            "2026-11-09T12:03:12+24:00",
+            "2026-13-01T00:00:00Z",
+            "2026-00-01T00:00:00Z",
+            "2026-02-29T00:00:00Z",
+            "2026-11-31T00:00:00Z",
+            "2026-11-00T00:00:00Z",
+            "2026-11-09T24:00:00Z",
+            "2026-11-09T12:60:00Z",
+            "2026-11-09T12:03:60Z",
+            "+026-11-09T12:03:12Z",
+            "2026-11-09T12:03:12Zx",
+            "2026-11-09T12:03:1\u{e9}Z",
+        ] {
+            assert_eq!(parse_rfc3339(text), None, "{text}");
+        }
+    }
 }
