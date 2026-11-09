@@ -780,8 +780,8 @@ fi
 # --- 1d. A removal record residue cannot probe ------------------------------
 # As 1b, while the held Git keeps the hold on the removal record. With the
 # record's `info` read-only (mode 0444), scan must still find it held, by
-# an open for reading; on illumos, where flock(2) needs a file open for
-# writing, it cannot tell, and says so. With `info` unreadable (mode 0000),
+# an open for reading: flock(2) on one works on every local filesystem
+# this runs on, illumos's included. With `info` unreadable (mode 0000),
 # scan cannot tell whether the removal still runs: it must give no
 # recovery line and say why, and still so once that Git has exited.
 # Read-only again, scan gives the move back.
@@ -818,12 +818,8 @@ else
         (cd "$repo" && "$bin" restore --json w >"$work/$name.out-again" 2>"$work/$name.err-again")
         again=$?
         undecided='.[0].removal_running == null and .[0].recovery == ""'
-        if [ "$(uname -s)" = SunOS ]; then
-            ro_busy=$undecided ro_free=$undecided
-        else
-            ro_busy='.[0].removal_running == true and .[0].recovery == ""'
-            ro_free='.[0].removal_running == false and .[0].recovery == $move'
-        fi
+        ro_busy='.[0].removal_running == true and .[0].recovery == ""'
+        ro_free='.[0].removal_running == false and .[0].recovery == $move'
         if [ -z "$aside" ] || [ -z "$info" ]; then fail "no moved-aside directory or removal record at the barrier"
         elif [ "$ended" != 0 ]; then fail "the held git worktree remove did not exit"
         elif ! jq -e "$ro_busy" <<<"$ro_held" >/dev/null; then fail "with info read-only while its Git runs, scan says: $ro_held"

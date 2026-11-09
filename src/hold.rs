@@ -10,9 +10,10 @@
 //! before it checks: neither acts while another run, or a Git it started,
 //! may still delete or move the worktree. PIDs are reused; a hold is not.
 //!
-//! `info` is opened for writing as well as reading because illumos makes
-//! flock(2) a write lock, which needs a file open for writing. Nothing is
-//! written to it.
+//! `info` is opened for writing as well as reading when residue may write
+//! it, because NFS on Linux emulates flock(2) with fcntl(2) locks, and an
+//! exclusive one needs a file open for writing (`take`). Nothing is written
+//! to it.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -41,10 +42,10 @@ pub enum Taken {
 /// Take the hold on the entry whose `info` is at `info`, without waiting.
 /// An `info` residue may not write (mode 0444) is opened for reading:
 /// flock(2) holds a file open either way on the local filesystems of macOS,
-/// Linux and the BSDs. Where it needs one open for writing (illumos, and
-/// NFS on Linux, which emulates it with fcntl(2) locks), that lock fails,
-/// and the error names the open that was refused. Every error is an error,
-/// never a free hold.
+/// Linux, the BSDs and illumos, whose `F_FLOCK` checks no open mode. Where
+/// it needs one open for writing (NFS on Linux, which emulates it with
+/// fcntl(2) locks), that lock fails, and the error names the open that was
+/// refused. Every error is an error, never a free hold.
 pub fn take(info: &Path) -> Result<Taken, String> {
     let (file, refused) = match OpenOptions::new().read(true).write(true).open(info) {
         Ok(f) => (f, None),
