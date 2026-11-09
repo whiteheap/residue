@@ -1335,7 +1335,10 @@ setup git -C "$wt" reset -q --hard HEAD~1
 : >"$work/mode"
 setup "$bin" remove --yes --json "$wt"
 echo hold-in-w >"$work/mode"
-(cd "$repo" && PATH="$work/bin:$PATH" "$bin" restore --json w >"$work/$name.out" 2>"$work/$name.err") &
+# exec, so that $! is the restore itself: bash 3.2 and 5.3 both fork the
+# last command of `(cd ... && cmd)`, and a kill of the subshell alone left
+# the restore running on, still holding its record.
+(cd "$repo" && PATH="$work/bin:$PATH" exec "$bin" restore --json w >"$work/$name.out" 2>"$work/$name.err") &
 pid=$!
 started+=("$pid")
 if ! await "$work/at-in-w"; then
@@ -1345,8 +1348,8 @@ else
     cp "$work/at-in-w" "$work/held"
     kill -KILL "$pid"
     finish "$pid"
-    touch "$work/abort-in-w" "$work/go-in-w"
-    kill -TERM "$(cat "$work/held")" 2>/dev/null
+    end_held in-w
+    ended=$?
     rm -f "$work/held"
     : >"$work/mode"
     # A ledger without the removal's own line, so what seeding adds shows.
@@ -1364,7 +1367,9 @@ else
     checkout=$(jq -r '.restore.checkout' "$work/$name.out-again" 2>/dev/null)
     "$bin" scan --json "$repo" >"$work/$name.scan-after" 2>/dev/null
     marker_after=$(jq -r --arg p "$(cd "$wt" && pwd -P)" '.repositories[].worktrees[] | select(.path == $p) | .restored.from // empty' "$work/$name.scan-after")
-    if [ "$(record "$wt")" != registered ]; then fail "at its path Git has: $(record "$wt")"
+    if [ "$ended" != 0 ]; then fail "the held Git command in w did not exit"
+    elif [ -s "$work/$name.out" ]; then fail "the killed restore ran on and finished: $(cat "$work/$name.out")"
+    elif [ "$(record "$wt")" != registered ]; then fail "at its path Git has: $(record "$wt")"
     elif [ "$(git -C "$wt" rev-parse HEAD)" != "$w_sha" ]; then fail "w is not at its recorded HEAD"
     elif [ "$held_records" != "1 records, 2 refs" ]; then fail "after the kill: $held_records, want 1 records, 2 refs"
     elif [ "$marker" != null ]; then fail "after the kill w has a restored marker: $marker"
