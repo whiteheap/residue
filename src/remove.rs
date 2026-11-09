@@ -2079,7 +2079,7 @@ fn plan_text(
             ))
         ));
         for &i in &purgeable {
-            out.push_str(&purge_summary(&purges[i], places, style));
+            out.push_str(&purge_summary(&purges[i], mode.ages_at(), places, style));
         }
     }
     let (pending, kept): (Vec<&Forget>, Vec<&Forget>) =
@@ -2097,7 +2097,7 @@ fn plan_text(
             &style.dim("  after this, `residue restore` cannot bring these back; branches stay\n"),
         );
         for f in pending {
-            out.push_str(&forget_summary(&f.item, places, style));
+            out.push_str(&forget_summary(&f.item, mode.ages_at(), places, style));
         }
     }
     if !kept.is_empty() {
@@ -2177,8 +2177,9 @@ fn refusal(r: &Report) -> String {
     format!("{}: {}", r.verdict.code(), reasons.join(" · "))
 }
 
-fn purge_summary(p: &Purge, places: &Places, style: &Style) -> String {
-    let now = output::now();
+/// One trash entry the plan purges, its age at `now`, when the run measures
+/// ages (`Mode::ages_at`), as the header says.
+fn purge_summary(p: &Purge, now: i64, places: &Places, style: &Style) -> String {
     let Ok(r) = &p.item.record else {
         return format!(
             "  {}\n    {}\n",
@@ -2302,9 +2303,8 @@ fn forget_line(item: &removed::Item, outcome: &Outcome, places: &Places) -> Stri
     }
 }
 
-/// One removal record the plan forgets.
-fn forget_summary(item: &removed::Item, places: &Places, style: &Style) -> String {
-    let now = output::now();
+/// One removal record the plan forgets, its age at `now`, as for a purge.
+fn forget_summary(item: &removed::Item, now: i64, places: &Places, style: &Style) -> String {
     let Ok(r) = &item.record else {
         return String::new();
     };
