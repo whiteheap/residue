@@ -105,7 +105,7 @@ jobs:
           brew install whiteheap/tap/residue
           \`\`\`
 
-          Either one; every other way is in [docs/installation.md](https://github.com/whiteheap/residue-cli/blob/main/docs/installation.md). Or download the file for your machine below. The packages and the FreeBSD archives arrive within half an hour of the release.
+          Either one; every other way is in [docs/installation.md](https://github.com/whiteheap/residue-cli/blob/main/docs/installation.md). The script also turns on automatic cleanup, which deletes worktrees without asking; \`residue restore\` brings each back for 30 days. To install without it, run \`curl -fsSL https://residue.whiteheap.com/install.sh | sh -s -- --no-service\`. Homebrew installs without it. Or download the file for your machine below. The packages and the FreeBSD archives arrive within half an hour of the release.
 
           | Machine | File |
           | --- | --- |
