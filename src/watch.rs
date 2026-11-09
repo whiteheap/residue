@@ -434,11 +434,16 @@ pub fn main(args: &[OsString]) -> u8 {
             return 2;
         }
     };
-    // Every pass runs `residue scan`, which refuses an old Git: refuse it
-    // here, once, before the lock, instead of failing every pass.
-    if let Err(message) = git::require_version() {
-        log(&message);
-        return 1;
+    // Every pass runs `residue scan`, which refuses an old Git. `--once`
+    // stops here with exit 1. A running watch does not: the service
+    // manager would start it again every minute, forever. It waits for a
+    // newer Git below (`wait_for_git`), once it holds its lock.
+    let too_old = git::require_version().err();
+    if let Some(message) = &too_old {
+        if opts.once {
+            log(message);
+            return 1;
+        }
     }
     if let Err(message) = opts.use_default_roots("residue watch") {
         eprintln!("residue watch: {}", output::clean(&message));
@@ -459,6 +464,19 @@ pub fn main(args: &[OsString]) -> u8 {
             return 1;
         }
     };
+    if let Some(message) = too_old {
+        let ready = wait_for_git(
+            message,
+            FREE_CHECK,
+            git::require_version,
+            std::thread::sleep,
+            || exit_for_upgrade(&binary),
+            log,
+        );
+        if !ready {
+            return 1;
+        }
+    }
     // One line of labels and values; `residue watch --help` explains each.
     log(&format!(
         "watching {} ({}{}) · removes: landed and unchanged {}, or below {}% free and unchanged {} · removal records: {} · fetch: {}{} · residue {}",
@@ -498,10 +516,7 @@ pub fn main(args: &[OsString]) -> u8 {
     let mut rescans_in_a_row = 0;
     loop {
         // Between passes, never during one: no child is running here.
-        if let Some(why) = binary.replaced() {
-            log(&format!(
-                "{why}; exiting so the service manager starts the new one"
-            ));
+        if exit_for_upgrade(&binary) {
             return 1;
         }
         let mut snap = match scan(&exe, &opts) {
@@ -589,7 +604,7 @@ fn nothing_to_remove(
     let disk = match lowest {
         None => "free space unknown".to_string(),
         Some((pct, _)) if pct >= opts.min_free => format!(
-            "{} {pct:.0}% free (removes below {}%)",
+            "{} {pct:.1}% free (removes below {}%)",
             if filesystems.len() == 1 {
                 "the disk is"
             } else {
@@ -624,6 +639,60 @@ fn failed(error: ScanError, once: bool) -> Option<u8> {
             }
             std::thread::sleep(FREE_CHECK);
             None
+        }
+    }
+}
+
+/// Whether to exit so the service manager starts a new release: the
+/// service's path names another binary (`Binary::replaced`), logged. Called
+/// only where no child runs: between passes, and while `wait_for_git` waits.
+fn exit_for_upgrade(binary: &Binary) -> bool {
+    match binary.replaced() {
+        Some(why) => {
+            log(&format!(
+                "{why}; exiting so the service manager starts the new one"
+            ));
+            true
+        }
+        None => false,
+    }
+}
+
+/// A running watch whose Git `version` refused (`first`, why): log that
+/// once, then check again every `every` until it passes, and log that.
+/// `true` to start watching; `false` to exit 1 for an upgrade of residue
+/// (`upgraded`, checked before each pause), which a newer Git may come
+/// with. A different refusal (Git gone from PATH) is logged when it
+/// changes, never on every check. `every` is `FREE_CHECK`: one `git
+/// --version` per five minutes, and only while Git is too old.
+fn wait_for_git(
+    first: String,
+    every: Duration,
+    mut version: impl FnMut() -> Result<(u32, u32), String>,
+    mut pause: impl FnMut(Duration),
+    mut upgraded: impl FnMut() -> bool,
+    mut say: impl FnMut(&str),
+) -> bool {
+    say(&format!(
+        "{first}; checking again every {} minutes",
+        every.as_secs() / 60
+    ));
+    let mut last = first;
+    loop {
+        if upgraded() {
+            return false;
+        }
+        pause(every);
+        match version() {
+            Ok((major, minor)) => {
+                say(&format!("git {major}.{minor} is new enough now; starting"));
+                return true;
+            }
+            Err(message) if message != last => {
+                say(&message);
+                last = message;
+            }
+            Err(_) => {}
         }
     }
 }
@@ -713,55 +782,100 @@ const UNSEEN_FOR: i64 = 24 * 60 * 60;
 /// `UNSEEN_FOR`, for the log.
 const UNSEEN_FOR_TEXT: &str = "24h";
 
-/// One low-disk removal on a filesystem: when, the free space the pass
-/// read before it, and the bytes the scan measured for what went.
+/// What one low-disk removal freed that free space has not shown yet: when
+/// it ran, and the bytes still to show.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Freed {
     at: i64,
-    free_before: u64,
     bytes: u64,
+}
+
+/// One filesystem's low-disk removals whose bytes free space has not shown
+/// yet, oldest first, and the free space of the last reading they are
+/// counted from.
+#[derive(Debug, Default)]
+struct Pending {
+    free: u64,
+    freed: Vec<Freed>,
+}
+
+impl Pending {
+    /// A new reading of free space. What it gained since the last one
+    /// showed up: it is taken off the oldest removal first. A drop is new
+    /// files, and leaves what waits as it was.
+    fn read(&mut self, free: u64) {
+        let mut gained = free.saturating_sub(self.free);
+        self.free = free;
+        for f in &mut self.freed {
+            let shown = gained.min(f.bytes);
+            f.bytes -= shown;
+            gained -= shown;
+        }
+        self.freed.retain(|f| f.bytes > 0);
+    }
+
+    fn total(&self) -> u64 {
+        self.freed.iter().map(|f| f.bytes).sum()
+    }
 }
 
 /// What low-disk removals freed, by filesystem, that free space may not show
 /// yet. In memory only, like `watch`'s timers: a restarted watch judges free
 /// space alone. Its moves are `removed`, `waiting` (which also forgets the
 /// removals older than `UNSEEN_FOR`) and `clear`; nothing else changes it.
+/// It only ever lowers what a pass removes: what it holds is at most what
+/// the removals measured, and a pass subtracts it from what it needs.
 #[derive(Default)]
 struct Unseen {
-    by_dev: HashMap<u64, Vec<Freed>>,
+    by_dev: HashMap<u64, Pending>,
 }
 
 impl Unseen {
-    /// A low-disk pass on `dev` removed `bytes` at `at`, when `free_before`
-    /// was free.
-    fn removed(&mut self, dev: u64, at: i64, free_before: u64, bytes: u64) {
-        if bytes == 0 {
-            return;
+    /// A low-disk pass on `dev` removed worktrees the scan measured at
+    /// `bytes`, at `at`: free space read `before` the removals and again
+    /// `after` them, right as they finished. Only what `after` does not
+    /// show is recorded, counted from `after`; nothing when it all showed.
+    /// A gain beyond `bytes` showed for an earlier removal.
+    fn removed(&mut self, dev: u64, at: i64, before: u64, after: u64, bytes: u64) {
+        let pending = self.by_dev.entry(dev).or_default();
+        pending.read(before);
+        let shown = after.saturating_sub(before).min(bytes);
+        pending.free = before + shown;
+        pending.read(after);
+        if bytes > shown {
+            pending.freed.push(Freed {
+                at,
+                bytes: bytes - shown,
+            });
         }
-        self.by_dev.entry(dev).or_default().push(Freed {
-            at,
-            free_before,
-            bytes,
-        });
+        if pending.freed.is_empty() {
+            self.by_dev.remove(&dev);
+        }
     }
 
     /// The bytes still to show up on `dev`, with `free` free at `now`: what
-    /// the removals of the last `UNSEEN_FOR` freed, less what free space has
-    /// gained since the first of them, never below zero. It only ever
-    /// lowers what a pass removes: free space that dropped since (new files)
-    /// leaves the gap that drop made, and a pass still removes for it.
+    /// the removals of the last `UNSEEN_FOR` freed that no reading since
+    /// has shown. Each reading counts only what free space gained since the
+    /// one before, so a gain is never taken off twice. Readings come with
+    /// each removal and each low-disk pass, five minutes apart or more, and
+    /// show only the net change between two of them. So it cannot tell
+    /// space that showed up and was used again between two readings (a
+    /// build that wrote as much as a snapshot let go) from space that never
+    /// showed: it keeps waiting for that, until `UNSEEN_FOR` passes or free
+    /// space is above `--min-free` (`clear`). And space anything else freed
+    /// between two readings counts as shown, so the pass removes more, as
+    /// it would without this.
     fn waiting(&mut self, dev: u64, free: u64, now: i64) -> u64 {
-        let Some(list) = self.by_dev.get_mut(&dev) else {
+        let Some(pending) = self.by_dev.get_mut(&dev) else {
             return 0;
         };
-        list.retain(|f| now - f.at < UNSEEN_FOR);
-        let Some(first) = list.first().copied() else {
+        pending.freed.retain(|f| now - f.at < UNSEEN_FOR);
+        pending.read(free);
+        if pending.freed.is_empty() {
             self.by_dev.remove(&dev);
             return 0;
-        };
-        let freed: u64 = list.iter().map(|f| f.bytes).sum();
-        let shown = free.saturating_sub(first.free_before);
-        freed.saturating_sub(shown)
+        }
+        pending.total()
     }
 
     /// Free space on `dev` is above `--min-free` again: what was waiting
@@ -1104,9 +1218,29 @@ fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> Acted 
             },
         );
         acted.removed += gone.count;
-        state.unseen.removed(dev, now, free, gone.bytes);
+        // Read free space again at once, so only what it does not show
+        // yet waits. Unread, nothing is recorded: the next pass judges free
+        // space alone.
+        if gone.bytes > 0 {
+            if let Some(after) = free_on(dev, Path::new(&sample)) {
+                state.unseen.removed(dev, now, free, after, gone.bytes);
+            }
+        }
     }
     acted
+}
+
+/// Free bytes on the filesystem `dev`, read through `path` or, when a
+/// removal took `path`, the nearest folder above it that exists, if that
+/// is still on `dev`.
+fn free_on(dev: u64, path: &Path) -> Option<u64> {
+    let (meta, at) = path
+        .ancestors()
+        .find_map(|p| std::fs::metadata(p).ok().map(|m| (m, p)))?;
+    if meta.dev() != dev {
+        return None;
+    }
+    space(at).map(|(free, _)| free)
 }
 
 /// `; 3 commits on no remote-tracking ref stay on branch fix`, as the plan
@@ -1897,31 +2031,142 @@ mod tests {
         const G: u64 = 1 << 30;
         let mut unseen = Unseen::default();
         assert_eq!(unseen.waiting(1, 10 * G, 0), 0);
-        unseen.removed(1, 100, 10 * G, 0);
-        assert_eq!(
-            unseen.waiting(1, 10 * G, 100),
-            0,
-            "nothing removed, nothing waits"
-        );
-        unseen.removed(1, 100, 10 * G, 4 * G);
-        // A snapshot holds it all, then half shows up, then all of it.
+        unseen.removed(1, 100, 10 * G, 10 * G, 0);
+        assert!(unseen.by_dev.is_empty(), "nothing removed, nothing waits");
+        // A snapshot holds it all, then half shows up.
+        unseen.removed(1, 100, 10 * G, 10 * G, 4 * G);
         assert_eq!(unseen.waiting(1, 10 * G, 200), 4 * G);
         assert_eq!(unseen.waiting(1, 12 * G, 300), 2 * G);
-        assert_eq!(unseen.waiting(1, 14 * G, 400), 0);
-        // New files filled the disk meanwhile: what waits is still at most
-        // what was removed, so the pass still removes for the new gap.
-        assert_eq!(unseen.waiting(1, 6 * G, 500), 4 * G);
-        // A second removal adds to it; another filesystem has its own.
-        unseen.removed(1, 600, 6 * G, 3 * G);
-        assert_eq!(unseen.waiting(1, 6 * G, 700), 7 * G);
-        assert_eq!(unseen.waiting(2, 6 * G, 700), 0);
-        // Past UNSEEN_FOR the first no longer counts, then neither does.
-        assert_eq!(unseen.waiting(1, 6 * G, 100 + UNSEEN_FOR), 3 * G);
-        assert_eq!(unseen.waiting(1, 6 * G, 600 + UNSEEN_FOR), 0);
+        // New files: a drop leaves what waits as it was, so the pass still
+        // removes for the gap they made.
+        assert_eq!(unseen.waiting(1, 6 * G, 400), 2 * G);
+        // The rest shows: nothing waits, and a later drop brings none back.
+        assert_eq!(unseen.waiting(1, 8 * G, 500), 0);
         assert!(unseen.by_dev.is_empty());
-        unseen.removed(1, 0, G, G);
+        assert_eq!(unseen.waiting(1, 4 * G, 550), 0);
+        // Two removals: the second's own gain is taken off it alone, and a
+        // later gain off the oldest first. Another filesystem has its own.
+        unseen.removed(1, 600, 8 * G, 8 * G, 3 * G);
+        unseen.removed(1, 700, 8 * G, 9 * G, 2 * G);
+        assert_eq!(unseen.waiting(1, 9 * G, 800), 4 * G);
+        assert_eq!(unseen.waiting(2, 9 * G, 800), 0);
+        assert_eq!(unseen.waiting(1, 11 * G, 900), 2 * G);
+        // Past UNSEEN_FOR the first no longer counts, then neither does.
+        assert_eq!(unseen.waiting(1, 11 * G, 600 + UNSEEN_FOR), G);
+        assert_eq!(unseen.waiting(1, 11 * G, 700 + UNSEEN_FOR), 0);
+        assert!(unseen.by_dev.is_empty());
+        unseen.removed(1, 0, G, G, G);
+        assert_eq!(unseen.waiting(1, G, 1), G);
         unseen.clear(1);
         assert_eq!(unseen.waiting(1, G, 1), 0);
+    }
+
+    /// What the reading right after a removal shows is never recorded, and
+    /// never taken off twice; what is recorded is at most what went.
+    #[test]
+    fn unseen_records_only_what_the_reading_after_does_not_show() {
+        // The review's case: 1000 GB, --min-free 10, so the target is
+        // 150 GB. A pass reads 90 GB free and removes 60 GB, which shows at
+        // once; a build writes 60 GB before the next pass. Nothing waits,
+        // so that pass removes for the whole gap again instead of waiting
+        // 24 hours with the disk at 9%.
+        const G: u64 = 1_000_000_000;
+        let target = 150 * G;
+        let mut unseen = Unseen::default();
+        unseen.removed(1, 0, 90 * G, 150 * G, 60 * G);
+        assert!(unseen.by_dev.is_empty());
+        let free = 90 * G;
+        let need = target - free - unseen.waiting(1, free, 300);
+        assert_eq!(need, 60 * G);
+        // A snapshot holds the 60 GB instead: the next pass waits for it.
+        unseen.removed(1, 0, 90 * G, 90 * G, 60 * G);
+        assert_eq!(target - free - unseen.waiting(1, free, 300), 0);
+        unseen.clear(1);
+        // Part shows at once: the rest waits, counted from that reading,
+        // so a later reading takes off only what it gained since.
+        unseen.removed(1, 0, 90 * G, 110 * G, 60 * G);
+        assert_eq!(unseen.waiting(1, 110 * G, 300), 40 * G);
+        assert_eq!(unseen.waiting(1, 120 * G, 600), 30 * G);
+        unseen.clear(1);
+        // A gain past what went showed for an earlier removal.
+        unseen.removed(1, 0, 100 * G, 100 * G, 20 * G);
+        unseen.removed(1, 300, 100 * G, 150 * G, 30 * G);
+        assert!(unseen.by_dev.is_empty());
+        // Free space fell while the removal ran: what waits is still at
+        // most what went.
+        unseen.removed(1, 0, 50 * G, 40 * G, 10 * G);
+        assert_eq!(unseen.waiting(1, 40 * G, 300), 10 * G);
+    }
+
+    /// A running watch on an old Git says so once, checks again at each
+    /// interval, says once that it starts, and exits for an upgrade of
+    /// residue meanwhile.
+    #[test]
+    fn a_running_watch_waits_for_a_newer_git() {
+        let old = "git 2.34 is too old; residue needs git 2.36 or later".to_string();
+        let mut said: Vec<String> = Vec::new();
+        let mut pauses = Vec::new();
+        let mut answers = vec![
+            Err(old.clone()),
+            Err(old.clone()),
+            Err("git is not installed or not on PATH".to_string()),
+            Ok((2, 50)),
+        ]
+        .into_iter();
+        let ready = wait_for_git(
+            old.clone(),
+            FREE_CHECK,
+            || answers.next().unwrap(),
+            |d| pauses.push(d),
+            || false,
+            |m| said.push(m.to_string()),
+        );
+        assert!(ready);
+        assert_eq!(pauses, vec![FREE_CHECK; 4]);
+        assert_eq!(
+            said,
+            [
+                "git 2.34 is too old; residue needs git 2.36 or later; checking again every 5 minutes",
+                "git is not installed or not on PATH",
+                "git 2.50 is new enough now; starting",
+            ]
+        );
+        // An upgrade is checked before each pause, and ends the wait.
+        let mut checks = 0;
+        let mut pauses = 0;
+        let ready = wait_for_git(
+            old.clone(),
+            FREE_CHECK,
+            || Err(old.clone()),
+            |_| pauses += 1,
+            || {
+                checks += 1;
+                checks == 3
+            },
+            |_| {},
+        );
+        assert!(!ready);
+        assert_eq!((checks, pauses), (3, 2));
+    }
+
+    /// `exit_for_upgrade`, which both the loop and `wait_for_git` use, sees
+    /// the service's path name another file.
+    #[test]
+    fn exit_for_upgrade_sees_a_replaced_binary() {
+        let dir = std::env::temp_dir().join(format!("residue-upgrade-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("residue");
+        std::fs::write(&path, "old").unwrap();
+        let binary = Binary {
+            running: identity(&path).ok(),
+            path: path.clone(),
+        };
+        assert!(!exit_for_upgrade(&binary));
+        let new = dir.join("residue.new");
+        std::fs::write(&new, "new").unwrap();
+        std::fs::rename(&new, &path).unwrap();
+        assert!(exit_for_upgrade(&binary));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1944,7 +2189,7 @@ mod tests {
         let fs = [(1, "/r/b".to_string(), 48, 100)];
         assert_eq!(
             nothing_to_remove(&opts, &snap, &fs),
-            "nothing to remove now: 1 worktree's branch landed, but a check keeps it, and the disk is 48% free (removes below 10%)"
+            "nothing to remove now: 1 worktree's branch landed, but a check keeps it, and the disk is 48.0% free (removes below 10%)"
         );
         let snap = Snapshot {
             repos: Vec::new(),

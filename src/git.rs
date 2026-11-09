@@ -328,7 +328,9 @@ pub fn git_exit(dir: &Path, args: &[&str]) -> Result<Exit, String> {
     exec(dir, &args, QUERY_TIMEOUT)
 }
 
-pub fn require_version() -> Result<(), String> {
+/// The Git on PATH, `(major, minor)`, when it is `MIN_VERSION` or later;
+/// otherwise why not, one line.
+pub fn require_version() -> Result<(u32, u32), String> {
     let out = git(Path::new("."), &["--version"])?;
     let text = String::from_utf8_lossy(&out);
     let version = text
@@ -348,7 +350,7 @@ pub fn require_version() -> Result<(), String> {
             MIN_VERSION.0, MIN_VERSION.1
         ));
     }
-    Ok(())
+    Ok((major, minor))
 }
 
 fn path_from(bytes: &[u8]) -> PathBuf {
