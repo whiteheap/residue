@@ -1,0 +1,14 @@
+name: Question
+description: Ask how residue works or how to use it.
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The README's [Common questions](https://github.com/whiteheap/residue-cli#common-questions) may already answer it.
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+    validations:
+      required: true

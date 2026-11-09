@@ -61,16 +61,7 @@ What it checks:
 - Every command that changes the machine is printed (`+ ...`) before it runs.
 - The whole script is functions called on its last line, so a download cut short runs nothing.
 
-To undo it, the summary prints the commands for the channel it used. In short:
-
-```sh
-residue service uninstall
-brew uninstall residue                    # Homebrew
-sudo apt-get remove residue               # apt; then remove /etc/apt/sources.list.d/residue.list and /etc/apt/keyrings/residue.gpg
-sudo dnf remove residue                   # dnf; then remove /etc/yum.repos.d/residue.repo and /etc/pki/rpm-gpg/RPM-GPG-KEY-residue
-sudo pacman -R residue                    # pacman; then remove the [residue] section from /etc/pacman.conf
-rm ~/.local/bin/residue                   # archive, or the --prefix you chose
-```
+To undo it, the summary prints the commands for the channel it used; [Uninstall](#uninstall) has them all.
 
 ## Install by hand
 
@@ -88,6 +79,7 @@ On Linux, add residue's signed package repository once, and your normal upgrades
 
 #### Debian and Ubuntu
 
+The package needs Git 2.36 or later: Debian 12 and Ubuntu 24.04 ship it. Ubuntu 22.04 ships Git 2.34, so add a newer Git there first with `sudo add-apt-repository ppa:git-core/ppa`.
 
 ```sh
 sudo install -d -m 0755 /etc/apt/keyrings
@@ -107,7 +99,6 @@ sudo dnf install residue
 
 #### Arch Linux, Omarchy and other Arch-based systems
 
-
 ```sh
 curl -fsSL https://whiteheap.github.io/residue/residue-signing-key.asc | sudo pacman-key --add -
 sudo pacman-key --lsign-key 1AEAB31435118A1FE575D36EE1553632FC32554A
@@ -115,7 +106,7 @@ printf '\n[residue]\nServer = https://whiteheap.github.io/residue/arch/$arch\n' 
 sudo pacman -Syu residue
 ```
 
-All three are signed with the key `1AEA B314 3511 8A1F E575  D36E E155 3632 FC32 554A`. Each package installs `/usr/bin/residue` and pulls in Git if it is missing. To install one release without adding a repository, every release also carries `residue_amd64.deb`, `residue.x86_64.rpm` and `residue-x86_64.pkg.tar.zst` (and their arm64 builds) on the [releases page](https://github.com/whiteheap/residue-cli/releases/latest).
+All three are signed with the key `1AEA B314 3511 8A1F E575  D36E E155 3632 FC32 554A`. Each package installs `/usr/bin/residue` and pulls in Git if it is missing. To install one release without adding a repository, every release also carries `residue_amd64.deb`, `residue.x86_64.rpm` and `residue-x86_64.pkg.tar.zst`, and for arm64 `residue_arm64.deb`, `residue.aarch64.rpm` and `residue-aarch64.pkg.tar.zst`, on the [releases page](https://github.com/whiteheap/residue-cli/releases/latest).
 
 ### Release archives and packages
 
@@ -125,7 +116,9 @@ Prebuilt binaries for macOS (Apple silicon and Intel), static Linux (x86_64 and 
 gh attestation verify residue_amd64.deb --repo whiteheap/residue-cli
 ```
 
-For 0.0.10 and earlier, built before the rename, use `--repo whiteheap/residue`.
+For 0.0.10 and earlier, built before the rename, use `--repo whiteheap/residue`. The FreeBSD archives and the packages are attested by the packages workflow on `main`, at the release's commit, so check them with `--repo`, not with `--source-ref` set to the tag.
+
+The macOS binaries need macOS 11 or later on Apple silicon and 10.12 or later on Intel, and the FreeBSD ones FreeBSD 14. The Linux binaries are static (musl) and need no libc. On a Mac, a binary from an archive your browser downloaded is blocked the first time it runs, because it is not notarized: run `xattr -d com.apple.quarantine residue` on it, or download the archive with `curl`, which does not mark it.
 
 ### From source
 
@@ -135,6 +128,58 @@ With Rust 1.85 or later:
 cargo install --locked --git https://github.com/whiteheap/residue-cli --tag v0.0.11 residue
 ```
 
-The last word is the package name. Cargo searches the whole repository for packages, and from 0.0.8 to 0.0.10 the repository also held the Mac app's, so at those tags `cargo install` without the name stops with "multiple packages with binaries found".
+The last word is the package name. Cargo searches the whole repository for packages, and from 0.0.8 to 0.0.10 the repository also held the Mac app's, so at those tags `cargo install` without the name stops with "multiple packages with binaries found". residue is not on crates.io, so `cargo install residue` does not install it.
 
 residue needs `git` 2.36 or later on `PATH`.
+
+## Windows and WSL
+
+Windows is not supported: residue builds only for Unix-like systems, and the install script stops in Git Bash. Under WSL 2, install it inside WSL as on Linux; that is untested. The probe there sees Linux processes only, so a Windows program working in a repository, through `\\wsl$` or under `/mnt/c`, is not seen: keep repositories you use from Windows programs locked, or out of residue's folders. Automatic cleanup needs systemd, which WSL starts when `/etc/wsl.conf` has `systemd=true` under `[boot]`.
+
+## Uninstall
+
+Turn the service off before you remove the package. Removed first, the service goes on starting a binary that is gone, about once a minute.
+
+```sh
+residue service uninstall
+brew uninstall residue                    # Homebrew
+sudo apt-get remove residue               # apt; then remove /etc/apt/sources.list.d/residue.list and /etc/apt/keyrings/residue.gpg
+sudo dnf remove residue                   # dnf; then remove /etc/yum.repos.d/residue.repo and /etc/pki/rpm-gpg/RPM-GPG-KEY-residue
+sudo pacman -R residue                    # pacman; then remove the [residue] section from /etc/pacman.conf
+rm ~/.local/bin/residue                   # archive, or the --prefix you chose
+```
+
+If residue is already gone, stop the service by hand. On macOS:
+
+```sh
+launchctl bootout gui/$(id -u)/com.whiteheap.residue.watch
+rm ~/Library/LaunchAgents/com.whiteheap.residue.watch.plist
+```
+
+On Linux:
+
+```sh
+systemctl --user disable --now residue-watch.service
+rm ~/.config/systemd/user/residue-watch.service
+systemctl --user daemon-reload
+```
+
+### Remove everything
+
+residue leaves a trash, removal records and refs in each repository it removed from, and a ledger, logs and rules in your home folder. First run `residue restore` in each repository and put back what you want: a trash entry is a whole worktree, locked, that keeps its disk until it is purged, and a removal record is what brings a deleted worktree back. Then, in each repository, from the main checkout:
+
+```sh
+for wt in .git/residue-trash/*/*/; do git worktree unlock "$wt" && git worktree remove "$wt"; done
+git for-each-ref --format='delete %(refname)' refs/residue/ | git update-ref --stdin   # a commit only these refs held is lost at the next git gc
+rm -rf .git/residue-trash .git/residue-removed
+git config --unset-all residue.regenerable                                              # the rules you added, if any
+```
+
+Once per user, with `--global` for rules you added there:
+
+```sh
+rm -rf ~/.config/residue ~/.local/state/residue ~/Library/Application\ Support/residue ~/Library/Logs/residue
+git config --global --unset-all residue.regenerable
+```
+
+Your branches, commits and stashes stay.

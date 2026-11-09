@@ -4,7 +4,7 @@ residue deletes directories. Every change is judged by one question: could it ma
 
 ## Report a bug
 
-Open an issue with:
+Open a [bug report](https://github.com/whiteheap/residue-cli/issues/new?template=bug_report.yml) with:
 
 - `residue --version`, your operating system and version, and `git --version`
 - the command you ran and what you expected

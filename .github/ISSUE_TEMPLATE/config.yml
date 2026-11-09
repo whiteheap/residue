@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: residue removed work you want back
+    url: https://github.com/whiteheap/residue-cli/security/advisories/new
+    about: Or it would. Report it privately, as SECURITY.md describes. Do not open a public issue.
+  - name: The Mac app
+    url: https://github.com/whiteheap/residue-ui/issues
+    about: Issues with residue in a window go to residue-ui.

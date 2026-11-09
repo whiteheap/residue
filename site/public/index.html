@@ -102,7 +102,7 @@
             </div>
             <a class="install-source" href="/install.sh">read the script</a>
           </div>
-          <p class="install-note">Installs residue, and on macOS and Linux turns on automatic cleanup · or Homebrew: <code>brew install whiteheap/tap/residue</code> · <a href="#mac-app">the Mac&nbsp;app</a> · <a href="https://github.com/whiteheap/residue-cli#install">other ways to install</a></p>
+          <p class="install-note">Installs residue, and on macOS and Linux turns on <a href="#automatic-title">automatic cleanup</a>, which deletes worktrees that pass every check, without asking · install only: <code>curl -fsSL https://residue.whiteheap.com/install.sh | sh -s -- --no-service</code> · or Homebrew: <code>brew install whiteheap/tap/residue</code> · <a href="#mac-app">the Mac&nbsp;app</a> · <a href="https://github.com/whiteheap/residue-cli#install">other ways to install</a></p>
         </div>
       </section>
 
@@ -127,7 +127,7 @@
       <section class="section split wrap" aria-labelledby="kept-title">
         <h2 id="kept-title" class="label">what it keeps</h2>
         <div class="flow">
-          <p class="lead">residue deletes only what you can get back.</p>
+          <p class="lead">residue deletes only what its checks show you can get back.</p>
           <ul class="points">
             <li><strong>Committed files and rebuildable output.</strong> A worktree goes only when every tracked file is committed and every ignored entry matches a regenerable rule, such as <code>node_modules/</code>. A check residue cannot finish keeps it.</li>
             <li><strong>Branches, commits and the stash stay.</strong> residue never deletes a branch, never kills a process, and never lifts a lock it did not set. Lock a worktree to keep it.</li>
@@ -145,7 +145,7 @@
         <div class="flow">
           <p>residue needs Git 2.36 or later on <code>PATH</code>. Debian, Ubuntu, Fedora, Arch, prebuilt binaries and building from source are in <a href="https://github.com/whiteheap/residue-cli#install">the other ways to install</a>, and downloads are on <a href="https://github.com/whiteheap/residue-cli/releases/latest">the latest release</a>.</p>
           <pre tabindex="0"><code>residue scan ~/src/app</code></pre>
-          <p>Replace the example path <code>~/src/app</code> with your repository's path. <code>scan</code> only reads: it lists each linked worktree with its size, its verdict and the reason, and every directory is still there afterwards.</p>
+          <p>Replace the example path <code>~/src/app</code> with your repository's path. <code>scan</code> deletes nothing: it lists each linked worktree with its size, its verdict and the reason, and every directory is still there afterwards.</p>
           <pre tabindex="0"><code>residue explain PATH</code></pre>
           <p>Replace <code>PATH</code> with a linked worktree's path to see every check, and why it passed or failed.</p>
         </div>
@@ -157,7 +157,7 @@
           <p class="lead">residue in a window.</p>
           <p>The Mac app lists the linked worktrees under your code folders with their size and verdict, moves the ones that can go to the trash, restores them, and turns automatic cleanup on or off. Every check and removal comes from the residue inside it, nothing moves until you confirm, and automatic cleanup deletes without the trash. macOS 13 or later, on Apple silicon and Intel.</p>
           <p><a class="button button-secondary" href="/download/macos"><svg aria-hidden="true" viewBox="0 0 256 256" fill="currentColor"><path d="M224,144v64a8,8,0,0,1-8,8H40a8,8,0,0,1-8-8V144a8,8,0,0,1,16,0v56H208V144a8,8,0,0,1,16,0Zm-101.66,5.66a8,8,0,0,0,11.32,0l40-40a8,8,0,0,0-11.32-11.32L136,124.69V32a8,8,0,0,0-16,0v92.69L93.66,98.34a8,8,0,0,0-11.32,11.32Z"/></svg>Download for macOS</a></p>
-          <p>It is not notarized yet, so macOS blocks it the first time you open it: <a href="https://github.com/whiteheap/residue-ui#first-launch">First launch</a> has the steps.</p>
+          <p>It is not notarized yet, so macOS blocks it the first time you open it. Then open <strong>System Settings &gt; Privacy &amp; Security</strong> and click <strong>Open Anyway</strong>. <a href="https://github.com/whiteheap/residue-ui#first-launch">First launch</a> has every step.</p>
           <p><a href="https://github.com/whiteheap/residue-ui#install">Install</a> · <a href="https://github.com/whiteheap/residue-ui#screens">Screens</a> · <a href="https://github.com/whiteheap/residue-ui#uninstall">Uninstall</a> · <a href="https://github.com/whiteheap/residue-ui/releases/latest">Release notes and checksums</a></p>
         </div>
       </section>
@@ -189,9 +189,12 @@
           <p class="lead">residue is a standalone command, or a login service that runs that command. It does not create worktrees and it does not merge branches.</p>
           <ul class="points">
             <li><a href="https://code.claude.com/docs/en/worktrees"><strong>Claude Code</strong></a>, when you only want the worktrees that tool created, swept and locked by that tool.</li>
+            <li><a href="https://learn.chatgpt.com/docs/environments/git-worktrees"><strong>Codex app</strong></a>, when you want the worktrees Codex manages kept to the newest 15, with a snapshot saved before each one is deleted.</li>
+            <li><a href="https://cursor.com/docs/configuration/worktrees"><strong>Cursor</strong></a>, when you want the worktrees on the machine kept to the newest 25, the oldest removed first.</li>
             <li><a href="https://worktrunk.dev"><strong>Worktrunk</strong></a>, when you want to create, switch, merge, and remove worktrees, and stop processes tied to one.</li>
             <li><strong>residue</strong>, when you want linked worktrees from any tool removed only when every check passes, with Git doing the delete and a trash on a sweep.</li>
           </ul>
+          <p>Codex and Cursor decide by age and count. residue decides by what is in a worktree, whichever tool made it, and never deletes a branch.</p>
           <p><a href="https://github.com/whiteheap/residue-cli#where-it-fits">Where it fits</a></p>
         </div>
       </section>

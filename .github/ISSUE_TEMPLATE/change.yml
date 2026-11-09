@@ -1,0 +1,16 @@
+name: Propose a change
+description: A feature, a new regenerable name, or something slow.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: change
+    attributes:
+      label: What should change, and why
+      description: For something slow, add the measurement and the command that repeats it.
+    validations:
+      required: true
+  - type: textarea
+    id: risk
+    attributes:
+      label: Could it make residue remove something a person would want back?
+      description: Every change is judged by this question. Say what you checked.
