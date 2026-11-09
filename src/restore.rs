@@ -8,8 +8,9 @@
 //! worktree is marked (`removed::MARKER`), so `residue watch` never removes
 //! it again because its work landed.
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use crate::cli::Options;
@@ -495,39 +496,88 @@ struct Done {
 fn restore_trash(found: &Found, i: usize, to: Option<&Path>) -> Result<Done, String> {
     let item = &found.trash[i];
     let from = item.worktree.clone().unwrap_or_default();
-    let trashed = item.record.as_ref().map_err(|e| e.clone())?;
+    // A damaged entry: nothing to move back by.
+    item.record.as_ref().map_err(|e| e.clone())?;
     let held = trash::take(item)?;
     let _using = keep_open(item)?;
     let main = &item.command_dir;
     let listed = git::worktrees(main)?;
     let unlocked = in_trash(&listed, &from).is_some_and(|e| e.locked.is_none());
     if !unlocked {
-        return settle_trash(found, i, to, &from, trashed, &held, &listed);
+        return settle_trash(found, i, to, &from, &held, &listed, false);
     }
     git::lock_worktree(main, &from, trash::LOCK).map_err(|e| {
         format!("residue could not lock it in the trash before it reads what else acts on it ({e}), so it changed nothing")
     })?;
     git::worktrees(main)
-        .and_then(|listed| settle_trash(found, i, to, &from, trashed, &held, &listed))
+        .and_then(|listed| settle_trash(found, i, to, &from, &held, &listed, true))
         .map_err(|e| lift(main, &from, e))
 }
 
 /// The trash worktree's `.git`, open for reading, which the activity probe
 /// of every release sees as a use of the worktree. None when the entry
 /// holds no `.git` there: the restore then refuses later, as Git can no
-/// longer use what is left.
+/// longer use what is left. Only a regular file is opened, without
+/// following a symbolic link and without waiting (`O_NONBLOCK`), so
+/// neither a FIFO nor a link into a hung mount stops the restore while it
+/// holds the entry; anything else is a refusal, since the restore never
+/// goes on without that open file.
 fn keep_open(item: &trash::Item) -> Result<Option<File>, String> {
     let Some(worktree) = item.worktree.as_ref().filter(|_| item.holds_worktree()) else {
         return Ok(None);
     };
     let dot_git = worktree.join(".git");
-    match File::open(&dot_git) {
-        Ok(file) => Ok(Some(file)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!(
-            "cannot open {} ({e}), which residue keeps open while it restores so that no purge starts meanwhile; residue changed nothing",
-            dot_git.display()
+    let refuse = |why: String| {
+        Err(format!(
+            "{why}; residue keeps it open while it restores so that no purge starts meanwhile, so it changed nothing"
+        ))
+    };
+    match fs::symlink_metadata(&dot_git) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return refuse(format!("cannot read {} ({e})", dot_git.display())),
+        Ok(meta) if !meta.file_type().is_file() => {
+            return refuse(format!(
+                "{} is {}, not the regular file Git writes there",
+                dot_git.display(),
+                kind(&meta.file_type())
+            ));
+        }
+        Ok(_) => {}
+    }
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(&dot_git)
+    {
+        Ok(file) => file,
+        Err(e) => return refuse(format!("cannot open {} ({e})", dot_git.display())),
+    };
+    // What it opened, should the name have changed since the check.
+    match file.metadata() {
+        Ok(meta) if meta.file_type().is_file() => Ok(Some(file)),
+        Ok(meta) => refuse(format!(
+            "{} is {}, not the regular file Git writes there",
+            dot_git.display(),
+            kind(&meta.file_type())
         )),
+        Err(e) => refuse(format!("cannot read {} ({e})", dot_git.display())),
+    }
+}
+
+/// What a file that is not a regular file is, as a phrase.
+fn kind(file_type: &fs::FileType) -> &'static str {
+    if file_type.is_symlink() {
+        "a symbolic link"
+    } else if file_type.is_dir() {
+        "a directory"
+    } else if file_type.is_fifo() {
+        "a FIFO"
+    } else if file_type.is_socket() {
+        "a socket"
+    } else if file_type.is_block_device() || file_type.is_char_device() {
+        "a device"
+    } else {
+        "of a kind Git does not write"
     }
 }
 
@@ -555,18 +605,54 @@ fn lift(main: &Path, from: &Path, why: String) -> String {
     }
 }
 
+/// Why a trash restore stopped at Git's unlock or move, `error`: what it
+/// changed, the lock it `lifted` and could not put back, if any; and,
+/// from the removal records read again (`raced`), each that a purge by a
+/// release taking no hold wrote meanwhile, which now keeps the worktree.
+fn git_failed(
+    error: &str,
+    lifted: Option<(String, String)>,
+    raced: Result<Vec<String>, String>,
+) -> String {
+    let changed = match lifted {
+        None => "this restore changed nothing".to_string(),
+        Some((lock, why)) => format!(
+            "this restore lifted the lock `{}` and could not put it back ({why})",
+            output::clean(&lock)
+        ),
+    };
+    let records = match raced {
+        Ok(names) => names
+            .iter()
+            .map(|name| {
+                format!(
+                    "; a purge by a residue release that takes no hold wrote the removal record {} meanwhile, which keeps the worktree's HEAD and reflog: once that purge has ended, `residue restore {}` recreates it",
+                    output::clean(name),
+                    output::word(name)
+                )
+            })
+            .collect(),
+        Err(e) => format!(
+            "; residue could not read the removal records again ({e}), so it cannot tell whether a purge by a residue release that takes no hold ran meanwhile: `residue restore` lists any record it left"
+        ),
+    };
+    format!("{error}; {changed}{records}")
+}
+
 /// [`restore_trash`] once the entry is held and Git's list read since:
-/// `from` is its worktree, `trashed` its record.
+/// `from` is its worktree. `ours`: this restore locked it in the trash,
+/// and lifts that lock again if it refuses.
 fn settle_trash(
     found: &Found,
     i: usize,
     to: Option<&Path>,
     from: &Path,
-    trashed: &trash::Record,
     held: &Hold,
     listed: &[git::Entry],
+    ours: bool,
 ) -> Result<Done, String> {
     let item = &found.trash[i];
+    let trashed = item.record.as_ref().map_err(|e| e.clone())?;
     // A purge writes its record before it deletes, so without one nothing
     // of the worktree is gone.
     let stopped = removed::stopped_purges(
@@ -581,7 +667,7 @@ fn settle_trash(
     // back (`removed::restore`).
     if let Some((record, _)) = stopped.first() {
         let registered = in_trash(listed, from);
-        let name = output::clean(&record.name);
+        let name = output::word(&record.name);
         let left = if !item.holds_worktree() {
             Some(format!(
                 "Git deleted its files; its removal record keeps its HEAD and reflog: `residue restore {name}` recreates it"
@@ -607,7 +693,7 @@ fn settle_trash(
     if let (true, false, Some(record)) = (stopped.is_empty(), item.holds_worktree(), purged) {
         return Err(format!(
             "a purge of it deleted its files; its removal record keeps its HEAD and reflog: `residue restore {}` recreates it",
-            output::clean(&record.name)
+            output::word(&record.name)
         ));
     }
     // Where its purges' records name it, read while it is still there.
@@ -615,27 +701,48 @@ fn settle_trash(
         .into_iter()
         .flatten()
         .collect();
-    let (path, note) = trash::restore(item, to, listed, held)?;
-    let mut notes: Vec<String> = note.into_iter().collect();
     // A purge of a release that takes no hold may have raced this restore:
     // its record says so, and it stays.
     let seen: Vec<String> = stopped.iter().map(|(r, _)| r.name.clone()).collect();
+    let (path, note) = match trash::restore(item, to, listed, held) {
+        Ok(back) => back,
+        Err(trash::NotBack::Refused(e)) => return Err(e),
+        Err(trash::NotBack::Git { error, lifted }) => {
+            let raced = removed::raced_purges(&item.common_dir, &item.command_dir, &asides, &seen);
+            return Err(git_failed(&error, lifted.filter(|_| !ours), raced));
+        }
+    };
+    let mut notes: Vec<String> = note.into_iter().collect();
     let raced = removed::raced_purges(&item.common_dir, &item.command_dir, &asides, &seen);
     if !stopped.is_empty() || !raced.as_ref().is_ok_and(Vec::is_empty) {
         notes.push(removed::PURGE_STOPPED.into());
     }
-    match raced {
-        Ok(raced) => notes.extend(raced.iter().map(|name| {
-            let name = output::clean(name);
+    let identity = git::identity(&path);
+    // Such a purge's Git may have deleted the Git directory after its
+    // delete of the files failed: their restore would refuse at the path
+    // they still take, and no `git worktree lock` works there.
+    let unusable = identity.is_err() && raced.as_ref().is_ok_and(|r| !r.is_empty());
+    match (raced, &identity) {
+        (Ok(raced), Err(e)) if unusable => notes.extend(raced.iter().map(|name| {
             format!(
-                "a purge by a residue release that takes no hold wrote the removal record {name} while this restore ran; it keeps the worktree's HEAD and reflog, and once that purge has ended, `residue restore {name}` puts back what the worktree lacks of them and drops the record"
+                "a purge by a residue release that takes no hold wrote the removal record {} while this restore ran, and Git can no longer use the worktree ({e}): its files stay at {}; `residue restore {} --to NEWPATH` recreates it from that record",
+                output::clean(name),
+                path.display(),
+                output::word(name)
             )
         })),
-        Err(e) => notes.push(format!(
+        (Ok(raced), _) => notes.extend(raced.iter().map(|name| {
+            format!(
+                "a purge by a residue release that takes no hold wrote the removal record {} while this restore ran; it keeps the worktree's HEAD and reflog, and once that purge has ended, `residue restore {}` puts back what the worktree lacks of them and drops the record",
+                output::clean(name),
+                output::word(name)
+            )
+        })),
+        (Err(e), _) => notes.push(format!(
             "residue could not read the removal records again ({e}), so it cannot tell whether a purge by a residue release that takes no hold ran meanwhile; `residue restore` lists any record it left"
         )),
     }
-    match git::identity(&path) {
+    match identity {
         Ok(id) => {
             if let Err(e) = removed::mark(&id.git_dir, &format!("trash entry {}", item.name)) {
                 notes.push(format!(
@@ -643,6 +750,7 @@ fn settle_trash(
                 ));
             }
         }
+        Err(_) if unusable => {}
         Err(e) => notes.push(format!(
             "could not find its Git directory to mark it as restored ({e}); `residue watch` may remove it once its upstream is gone: lock it with `git worktree lock` to keep it"
         )),

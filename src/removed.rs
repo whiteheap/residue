@@ -497,8 +497,10 @@ const NAMED_SLACK: i64 = 86_400;
 /// takes no hold (`unheld`).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Unheld {
-    /// The run that wrote the record, this PID, still runs.
-    Writer(u32),
+    /// The run that wrote the record, this PID, still runs; `true` when
+    /// nothing else here shows that its removal may still run, so the PID
+    /// alone keeps it, and a PID may be reused.
+    Writer(u32, bool),
     /// A `git worktree remove` of the worktree runs, as the one a run
     /// started still does after that run is killed alone.
     Git(u32),
@@ -514,7 +516,9 @@ pub enum Unheld {
 /// wrote it still runs (`writes`); a `git worktree remove` of the
 /// worktree runs (`process::removing`); the activity probe (`snapshot`,
 /// or one taken now) sees a process using the worktree or its Git
-/// directory. `Ok(None)` for a record with its `hold` line, whose hold
+/// directory. A running writer comes first, and the rest is still asked,
+/// so that `Unheld::Writer` says whether its PID alone keeps the worktree.
+/// `Ok(None)` for a record with its `hold` line, whose hold
 /// shows all of that. `Err` when residue cannot tell: another user wrote
 /// the record and residue, not root, cannot see that user's processes
 /// (`foreign`), it cannot read the arguments of processes, or the probe
@@ -536,9 +540,21 @@ pub fn unheld(
     let writer = record
         .writer()
         .filter(|&pid| pid != me && crate::remove::running(pid) && writes(pid, record));
-    if let Some(pid) = writer {
-        return Ok(Some(Unheld::Writer(pid)));
+    let others = unheld_others(item, record, registered, snapshot);
+    match writer {
+        Some(pid) => Ok(Some(Unheld::Writer(pid, matches!(others, Ok(None))))),
+        None => others,
     }
+}
+
+/// [`unheld`] after the writer: a `git worktree remove` of the worktree,
+/// then the activity probe.
+fn unheld_others(
+    item: &Item,
+    record: &Record,
+    registered: &Entry,
+    snapshot: Option<&Snapshot>,
+) -> Result<Option<Unheld>, String> {
     let mut paths = vec![record.aside.clone(), registered.path.clone()];
     paths.extend(git::canonical(&record.aside).ok());
     paths.sort();
@@ -608,13 +624,15 @@ fn foreign(info: &Path) -> Result<(), String> {
     if owner == me {
         return Ok(());
     }
-    let (who, how) = if owner == 0 {
-        ("root".to_string(), ", such as with sudo")
+    // No `sudo` hint: a run as another user, root included, leaves files
+    // that user owns, such as the restored marker, in this Git directory.
+    let who = if owner == 0 {
+        "root".to_string()
     } else {
-        (format!("uid {owner}"), "")
+        format!("uid {owner}")
     };
     Err(format!(
-        "{who} wrote it, and residue runs as uid {me}, so it cannot see that user's processes; run residue as that user{how}"
+        "{who} wrote it, and residue runs as uid {me}, so it cannot see that user's processes; run residue as that user"
     ))
 }
 
@@ -671,7 +689,13 @@ fn refuse_unheld(
         });
     Err(match found {
         Ok(None) => return Ok(()),
-        Ok(Some(Unheld::Writer(pid))) => format!(
+        // A PID may be reused: when it alone keeps the worktree, the move
+        // back by hand is named for when it is not residue.
+        Ok(Some(Unheld::Writer(pid, true))) => format!(
+            "{release} wrote {what}, takes no hold, and its process {pid} still runs, so it may still be deleting the worktree; run this restore again once it ends; if `ps -p {pid}` shows it is not residue, this moves it back: {}",
+            move_back_line(&item.command_dir, registered, &record.original)
+        ),
+        Ok(Some(Unheld::Writer(pid, false))) => format!(
             "{release} wrote {what}, takes no hold, and its process {pid} still runs, so it may still be deleting the worktree; run this restore again once it ends; `ps -p {pid}` shows what it is"
         ),
         Ok(Some(Unheld::Git(pid))) => format!(
@@ -702,7 +726,23 @@ pub fn move_back_line(main: &Path, registered: &Entry, original: &Path) -> Strin
     } else {
         String::new()
     };
-    format!("{unlock}{git} move {path} {}", output::shell(original))
+    format!(
+        "{}{unlock}{git} move {path} {}",
+        output::vacant(original),
+        output::shell(original)
+    )
+}
+
+/// The command that recreates by hand, at its original path, the worktree
+/// of `record`, which Git no longer lists: `git worktree add` of its
+/// branch, or of its HEAD detached.
+fn recreate_line(main: &Path, record: &Record) -> String {
+    let add = format!("git -C {} worktree add", output::shell(main));
+    let path = output::shell(&record.original);
+    match record.short_branch() {
+        Some(branch) => format!("{add} {path} {}", output::word(branch)),
+        None => format!("{add} --detach {path} {}", output::word(&record.head)),
+    }
 }
 
 /// What a restore says when a run holds a record: `info` is its file.
@@ -1449,6 +1489,86 @@ fn reflog_only(reflog: Option<&[u8]>, worktree: &Path, main: &Path) -> Result<Ve
     git::independent(main, &lost)
 }
 
+/// What clearing Git's record of a worktree no removal record names drops
+/// besides the record: its HEAD, its HEAD reflog and its private refs, and
+/// with them, at the next `git gc`, every commit only they reach
+/// (`output::clear_line`).
+pub struct Drops {
+    /// Git's name for the worktree, its directory under `COMMON/worktrees`,
+    /// when residue found it.
+    pub id: Option<String>,
+    /// The fewest commits that reach every commit only the worktree
+    /// reaches, each with its abbreviation; or why residue cannot tell.
+    pub keep: Result<Vec<(String, String)>, String>,
+}
+
+/// [`Drops`] for the worktree Git lists as `entry` in `repo`. What stays
+/// after its record goes is every ref outside `refs/residue/` (whose
+/// records expire), the main worktree's HEAD, and the HEAD of each other
+/// linked worktree whose directory is there and that Git does not mark
+/// prunable: a stale one, or one residue moved aside, may be cleared too.
+/// Its HEAD reflog is the bytes of `logs/HEAD` in a files repository;
+/// otherwise Git says which commits it names (`git_head_reflog`).
+pub fn drops(repo: &crate::discover::Repo, entry: &Entry) -> Drops {
+    let common_dir = &repo.common_dir;
+    let Some(git_dir) = git_dir_of(common_dir, &[&entry.path]) else {
+        return Drops {
+            id: None,
+            keep: Err(format!(
+                "no Git directory in {} names it",
+                common_dir.join("worktrees").display()
+            )),
+        };
+    };
+    let id = git_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
+    let heads: Vec<&str> = std::iter::once(&repo.main)
+        .chain(&repo.linked)
+        .filter(|e| e.path != entry.path && e.prunable.is_none())
+        .filter(|e| fs::symlink_metadata(&e.path).is_ok())
+        .filter_map(|e| e.head.as_deref())
+        .filter(|h| is_object_id(h))
+        .collect();
+    let keep = only_reached_by(common_dir, &git_dir, entry, &heads);
+    Drops { id, keep }
+}
+
+fn only_reached_by(
+    common_dir: &Path,
+    git_dir: &Path,
+    entry: &Entry,
+    heads: &[&str],
+) -> Result<Vec<(String, String)>, String> {
+    let reftable = git::is_reftable(common_dir)?;
+    let reflog = if reftable {
+        None
+    } else {
+        read_if_present(Some(git_dir.join("logs").join("HEAD")))
+            .map_err(|e| format!("cannot read its HEAD reflog: {e}"))?
+    };
+    let mut named = match reflog {
+        Some(bytes) => reflog_ids(&bytes),
+        None => git_head_reflog(git_dir, common_dir)?,
+    };
+    if entry.branch.is_none() {
+        named.extend(entry.head.iter().map(|h| h.to_ascii_lowercase()));
+    }
+    named.extend(git::private_ref_commits(git_dir)?);
+    let mut seen = HashSet::new();
+    let named: Vec<&str> = named
+        .iter()
+        .filter(|id| is_object_id(id) && id.bytes().any(|b| b != b'0'))
+        .filter(|id| seen.insert(id.as_str()))
+        .map(String::as_str)
+        .collect();
+    let lost = git::unreached_but_by(common_dir, &named, heads)?;
+    git::independent(common_dir, &lost)?
+        .into_iter()
+        .map(|id| git::abbrev(common_dir, &id).map(|short| (id, short)))
+        .collect()
+}
+
 /// The commits Git reads the HEAD reflog of the worktree at `worktree` as
 /// naming, once each: each entry's new value and the oldest entry's old
 /// value. Git reads no other old value on its own, and one after a gap in
@@ -1599,23 +1719,54 @@ pub fn forget(item: &Item) -> Result<(), String> {
     }
 }
 
+/// What [`forget_expired`] did.
+pub enum Forgot {
+    /// The record is gone, forgotten by this run or since the listing.
+    Yes,
+    /// A run holds it now, a restore, so it stays until the next run.
+    Busy,
+    /// It stays on every run, and why: its filesystem gives no hold
+    /// (`unforgettable`).
+    Kept(String),
+}
+
 /// Forget a record a remove run found expired, holding it first: a run
-/// that holds it now, a restore, is using it, so it stays (`Ok(false)`).
-/// One forgotten since the listing is gone, as this run wanted. An entry
-/// with no `info` has nothing to hold.
-pub fn forget_expired(item: &Item) -> Result<bool, String> {
+/// that holds it now, a restore, is using it, so it stays. One forgotten
+/// since the listing is gone, as this run wanted. An entry with no `info`
+/// has nothing to hold.
+pub fn forget_expired(item: &Item) -> Result<Forgot, String> {
     if item.incomplete {
-        return forget(item).map(|()| true);
+        return forget(item).map(|()| Forgot::Yes);
     }
     match hold::take(&item.dir.join(INFO))? {
-        Taken::Held(_hold) => forget(item).map(|()| true),
-        Taken::Busy => Ok(false),
-        Taken::Gone => Ok(true),
-        Taken::Unsupported(why) => Err(format!(
-            "{why}, so residue cannot tell whether a restore uses it, and keeps it"
-        )),
+        Taken::Held(_hold) => forget(item).map(|()| Forgot::Yes),
+        Taken::Busy => Ok(Forgot::Busy),
+        Taken::Gone => Ok(Forgot::Yes),
+        Taken::Unsupported(why) => Ok(Forgot::Kept(kept_unheld(item, &why))),
     }
 }
+
+/// Why the record of `item` stays on every run, when its filesystem gives
+/// no hold: the plan says so, by an instant hold as `scan` takes, so the
+/// plan, the prompt, the run and its JSON agree. `None` otherwise, a
+/// failed open included, which the forget itself then reports.
+pub fn unforgettable(item: &Item) -> Option<String> {
+    if item.incomplete {
+        return None;
+    }
+    match hold::take(&item.dir.join(INFO)) {
+        Ok(Taken::Unsupported(why)) => Some(kept_unheld(item, &why)),
+        _ => None,
+    }
+}
+
+fn kept_unheld(item: &Item, why: &str) -> String {
+    format!(
+        "{why}, so residue cannot tell whether a restore uses it, and keeps it, with the commits it keeps; `residue restore {}` names the steps that bring its worktree back by hand",
+        output::word(&item.name)
+    )
+}
+
 // ---------------------------------------------------------------- restore
 
 /// How `restore` brought a worktree back.
@@ -1675,8 +1826,9 @@ fn whereabouts(entry: &Entry, main: &Entry, trash_root: &Path) -> String {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         format!(
-            "in the trash entry {name} (`residue restore {name}` puts it back)",
-            name = output::clean(&name)
+            "in the trash entry {} (`residue restore {}` puts it back)",
+            output::clean(&name),
+            output::word(&name)
         )
     } else if crate::remove::original_of(&path).is_some() {
         format!(
@@ -1711,25 +1863,45 @@ fn take(item: &Item) -> Result<Hold, String> {
         Taken::Unsupported(why) => Err(unsupported_note(
             &why,
             match (&item.record, &item.registered) {
-                (Ok(record), Some(registered)) => Some(move_back_line(
+                (Ok(record), Some(registered)) => Some(Manual::MoveBack(move_back_line(
                     &item.command_dir,
                     registered,
                     &record.original,
-                )),
+                ))),
+                // Its worktree is gone, and residue cannot forget the
+                // record there either (`forget_expired`), so its refs stay.
+                (Ok(record), None) => {
+                    Some(Manual::Recreate(recreate_line(&item.command_dir, record)))
+                }
                 _ => None,
             },
         )),
     }
 }
 
+/// What a restore where the filesystem gives no hold names to do by hand.
+pub enum Manual {
+    /// The line that moves the worktree, which Git still lists, back.
+    MoveBack(String),
+    /// The line that recreates the worktree of a record Git no longer
+    /// lists, whose refs still keep its commits.
+    Recreate(String),
+}
+
 /// What a restore says where the filesystem gives no hold: it changed
-/// nothing, and `manual`, when there is one, moves the worktree back by
-/// hand. That filesystem has only entries a release that takes no hold
-/// made, and only its runs, or a hand, may still act on them.
-pub fn unsupported_note(why: &str, manual: Option<String>) -> String {
-    let manual = manual.map_or(String::new(), |line| {
-        format!("; once no residue run acts on it, this moves the worktree back by hand: {line}")
-    });
+/// nothing, and `manual`, when there is one, says what to do by hand.
+/// That filesystem has only entries a release that takes no hold made,
+/// and only its runs, or a hand, may still act on them.
+pub fn unsupported_note(why: &str, manual: Option<Manual>) -> String {
+    let manual = match manual {
+        None => String::new(),
+        Some(Manual::MoveBack(line)) => format!(
+            "; once no residue run acts on it, this moves the worktree back by hand: {line}"
+        ),
+        Some(Manual::Recreate(line)) => format!(
+            "; once no residue run acts on it, this recreates the worktree by hand: {line}; the record still keeps its commits, and residue cannot forget it there either"
+        ),
+    };
     format!("{why}, so residue cannot hold it against another run, and changed nothing{manual}")
 }
 
@@ -2286,7 +2458,7 @@ fn move_back(
             .unwrap_or_default();
         return Err(format!(
             "its purge from the trash did not finish, so it is still in the trash; `residue restore {}` puts it back",
-            output::clean(&entry)
+            output::word(&entry)
         ));
     }
     let Some(left) = crate::remove::Leftover::of(registered, main) else {

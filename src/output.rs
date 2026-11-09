@@ -10,7 +10,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::activity::{Evidence, Snapshot};
 use crate::fsinfo::{Space, Usage};
-use crate::git::Entry;
 use crate::inspect::{LastChange, Report, Status, Verdict};
 use crate::json::Json;
 use crate::policy::{Policy, RuleSource};
@@ -345,26 +344,29 @@ pub fn stamp(seconds: i64) -> String {
 /// worktree. Only then the line that clears Git's record of that one
 /// worktree, `git -C MAIN worktree remove PATH`, never `git worktree
 /// prune`, which acts on every unlocked worktree whose directory is
-/// missing, this one or not, and what it drops with it (`head_note`).
-/// Git marks a worktree prunable also when its directory is there without
-/// its `.git` file, and refuses to remove that one, so the note says to
-/// delete the directory first.
+/// missing, this one or not, after a branch for each commit only it
+/// reaches (`clear_line`). Git marks a worktree prunable also when its
+/// directory is there without its `.git` file, and refuses to remove that
+/// one, so the note says to delete the directory first.
 pub fn stale_note(r: &Report, main: &Path) -> String {
     let why = clean(r.stale_reason.as_deref().unwrap_or("stale"));
-    let clear = format!(
-        "`git -C {} worktree remove {}`",
+    let remove = format!(
+        "git -C {} worktree remove {}",
         shell(main),
         shell(&r.entry.path)
     );
-    let head = head_note(main, &r.entry);
-    match std::fs::symlink_metadata(&r.entry.path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => format!(
-            "{why}; {}; otherwise {clear} clears Git's record of it, which drops its HEAD and reflog: {head}",
-            missing_note(main)
+    let clear = clear_line(main, &remove, r.entry.locked.as_deref(), r.drops.as_ref());
+    let gone = matches!(
+        std::fs::symlink_metadata(&r.entry.path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    );
+    match (gone, clear) {
+        (true, Ok(line)) => format!("{why}; {}; otherwise {line}", missing_note(main)),
+        (true, Err(none)) => format!("{why}; {}; {none}", missing_note(main)),
+        (false, Ok(line)) => format!(
+            "{why}; its directory is still there: copy out what you need, delete it, then {line}"
         ),
-        _ => format!(
-            "{why}; its directory is still there: copy out what you need, delete it, then {clear} clears Git's record of it, which drops its HEAD and reflog: {head}"
-        ),
+        (false, Err(none)) => format!("{why}; its directory is still there; {none}"),
     }
 }
 
@@ -376,34 +378,85 @@ pub fn missing_note(main: &Path) -> String {
     )
 }
 
-/// The HEAD of the worktree Git lists as `entry`, which `git worktree
-/// remove` drops with its Git directory, and how to keep it first: a
-/// branch at it, unless the worktree is on one.
-pub fn head_note(main: &Path, entry: &Entry) -> String {
-    match (entry.head.as_deref(), entry.short_branch()) {
-        (None, _) => "Git cannot read its HEAD".into(),
-        (Some(_), Some(branch)) => format!(
-            "its HEAD commit, {}, stays on its branch {}",
-            entry.short_head().unwrap_or_default(),
-            clean(branch)
-        ),
-        (Some(head), None) => format!(
-            "its HEAD commit, {}, is on no branch, and `git -C {} branch {} {}` keeps it",
-            entry.short_head().unwrap_or_default(),
-            shell(main),
-            keep_branch(&entry.path),
-            clean(head)
-        ),
+/// The line that clears Git's record of a worktree no removal record
+/// names, `remove`, and what it does: first a `git branch` for each
+/// commit only that worktree reaches (`removed::Drops`), all joined with
+/// `&&`, so the remove runs only once every branch is made. `Err` says why
+/// residue names no such line: someone locked the worktree, as people do
+/// one on a disk not always mounted, so Git keeps its record (`locked`,
+/// the lock unless `remove` lifts it); or residue could not tell which
+/// commits only it reaches, and then names where Git lists them.
+pub fn clear_line(
+    main: &Path,
+    remove: &str,
+    locked: Option<&str>,
+    drops: Option<&crate::removed::Drops>,
+) -> Result<String, String> {
+    if let Some(reason) = locked {
+        let reason = if reason.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", clean(reason))
+        };
+        return Err(format!(
+            "it is locked{reason}, so Git keeps its record and its HEAD, and residue names no line that clears them"
+        ));
     }
+    let id = drops.and_then(|d| d.id.as_deref());
+    let keep = match drops.map(|d| &d.keep) {
+        Some(Ok(keep)) => keep,
+        failed => {
+            let why = match failed {
+                Some(Err(e)) => clean(e),
+                _ => "not read".into(),
+            };
+            let reflog = format!("worktrees/{}/HEAD", id.unwrap_or("NAME"));
+            return Err(format!(
+                "residue cannot tell which commits only it reaches ({why}), so it names no line that clears Git's record of it, which drops its HEAD and reflog; `git -C {} reflog show {}` lists the commits its HEAD reflog names",
+                shell(main),
+                word(&reflog)
+            ));
+        }
+    };
+    if keep.is_empty() {
+        return Ok(format!(
+            "`{}` clears Git's record of it, with its HEAD and reflog, whose commits other refs keep",
+            clean(remove)
+        ));
+    }
+    let name = id.map(keep_name).filter(|n| !n.is_empty());
+    let mut line: Vec<String> = keep
+        .iter()
+        .map(|(full, short)| {
+            let branch = match &name {
+                Some(name) => format!("keep-{name}-{short}"),
+                None => format!("keep-{short}"),
+            };
+            format!(
+                "git -C {} branch {} {}",
+                shell(main),
+                word(&branch),
+                word(full)
+            )
+        })
+        .collect();
+    line.push(remove.to_string());
+    let what = if keep.len() == 1 {
+        "the commit only it reaches on a branch".to_string()
+    } else {
+        format!("the {} commits only it reaches on branches", keep.len())
+    };
+    Ok(format!(
+        "`{}` keeps {what}, then clears Git's record of it, with its HEAD and reflog",
+        clean(&line.join(" && "))
+    ))
 }
 
-/// `keep-NAME`, NAME the worktree's directory name in the characters a
-/// branch name takes in any shell.
-fn keep_branch(path: &Path) -> String {
-    let name: String = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
+/// Git's name for a worktree in the characters a branch name takes in any
+/// shell: each other one becomes `-`, and none leads or ends it. Git
+/// makes the name unique among the repository's worktrees (`wt`, `wt1`).
+fn keep_name(id: &str) -> String {
+    let name: String = id
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' {
@@ -413,16 +466,27 @@ fn keep_branch(path: &Path) -> String {
             }
         })
         .collect();
-    match name.trim_matches('-') {
-        "" => "keep-worktree".into(),
-        name => format!("keep-{name}"),
-    }
+    name.trim_matches('-').to_string()
 }
 
-/// A path as a shell word: unchanged when it holds only characters no
-/// shell treats specially, otherwise in single quotes.
+/// `test ! -e PATH && test ! -L PATH && `, to lead a line that moves a
+/// worktree to PATH by hand: `git worktree move` into a directory that
+/// is there moves the worktree inside it, so the line stops unless
+/// nothing is at PATH, a dangling symbolic link included.
+pub fn vacant(path: &Path) -> String {
+    let path = shell(path);
+    format!("test ! -e {path} && test ! -L {path} && ")
+}
+
+/// A path as a shell word ([`word`]).
 pub fn shell(path: &Path) -> String {
-    let text = clean(&path.to_string_lossy());
+    word(&path.to_string_lossy())
+}
+
+/// Text as a shell word: unchanged when it holds only characters no shell
+/// treats specially, otherwise in single quotes.
+pub fn word(text: &str) -> String {
+    let text = clean(text);
     let plain = !text.is_empty()
         && text
             .bytes()

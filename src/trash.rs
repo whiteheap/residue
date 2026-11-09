@@ -438,14 +438,34 @@ pub fn take(item: &Item) -> Result<Hold, String> {
         Taken::Unsupported(why) => Err(removed::unsupported_note(
             &why,
             match (&item.record, &item.registered) {
-                (Ok(record), Some(registered)) => Some(removed::move_back_line(
-                    &item.command_dir,
-                    registered,
-                    &record.original,
-                )),
+                (Ok(record), Some(registered)) => {
+                    Some(removed::Manual::MoveBack(removed::move_back_line(
+                        &item.command_dir,
+                        registered,
+                        &record.original,
+                    )))
+                }
                 _ => None,
             },
         )),
+    }
+}
+
+/// Why [`restore`] did not move the worktree back.
+pub enum NotBack {
+    /// A check refused, before Git changed anything.
+    Refused(String),
+    /// Git's unlock or move failed, `error`. `lifted` is the lock it lifted
+    /// first and could not put back, with why: its reason, then Git's error.
+    Git {
+        error: String,
+        lifted: Option<(String, String)>,
+    },
+}
+
+impl From<String> for NotBack {
+    fn from(why: String) -> NotBack {
+        NotBack::Refused(why)
     }
 }
 
@@ -460,7 +480,38 @@ pub fn restore(
     to: Option<&Path>,
     listed: &[Entry],
     _held: &Hold,
-) -> Result<(PathBuf, Option<String>), String> {
+) -> Result<(PathBuf, Option<String>), NotBack> {
+    let (worktree, registered, dest) = restorable(item, to, listed)?;
+    let main = &item.command_dir;
+    let lock = registered.locked.as_deref();
+    if lock.is_some() {
+        git::unlock_worktree(main, worktree).map_err(|error| NotBack::Git {
+            error,
+            lifted: None,
+        })?;
+    }
+    if let Err(error) = git::move_worktree(main, worktree, dest) {
+        let lifted = match lock {
+            Some(reason) => git::lock_worktree(main, worktree, LOCK)
+                .err()
+                .map(|relock| (reason.to_string(), relock)),
+            None => None,
+        };
+        return Err(NotBack::Git { error, lifted });
+    }
+    let note = discard(&item.dir)
+        .err()
+        .map(|e| format!("could not remove the trash record ({e}); the next remove run clears it"));
+    Ok((dest.to_path_buf(), note))
+}
+
+/// What [`restore`] checks before Git changes anything: the entry's
+/// worktree, Git's entry for it, and where it goes.
+fn restorable<'a>(
+    item: &'a Item,
+    to: Option<&'a Path>,
+    listed: &'a [Entry],
+) -> Result<(&'a Path, &'a Entry, &'a Path), String> {
     let record = item.record.as_ref().map_err(|e| e.clone())?;
     let worktree = item
         .worktree
@@ -516,25 +567,8 @@ pub fn restore(
             parent.display()
         ));
     }
-    let main = &item.command_dir;
-    let was_locked = registered.locked.is_some();
-    if was_locked {
-        git::unlock_worktree(main, worktree)?;
-    }
-    if let Err(e) = git::move_worktree(main, worktree, dest) {
-        if was_locked {
-            if let Err(relock) = git::lock_worktree(main, worktree, LOCK) {
-                return Err(format!("{e}; and could not lock it again: {relock}"));
-            }
-        }
-        return Err(e);
-    }
-    let note = discard(&item.dir)
-        .err()
-        .map(|e| format!("could not remove the trash record ({e}); the next remove run clears it"));
-    Ok((dest.to_path_buf(), note))
+    Ok((worktree, registered, dest))
 }
-
 /// Delete one entry's worktree with `git worktree remove` (no `--force`)
 /// and drop the entry. The caller holds the entry and has re-checked it
 /// since: `registered` is Git's entry for it from that check, so the lock

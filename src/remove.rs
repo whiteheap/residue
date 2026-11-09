@@ -36,7 +36,7 @@ use crate::inspect::{self, Fingerprint, Report, Verdict};
 use crate::json::Json;
 use crate::output::{self, Places, Style, clean};
 use crate::policy::Policy;
-use crate::removed::{self, Activity, By, Reason, Unheld};
+use crate::removed::{self, Activity, By, Forgot, Reason, Unheld};
 use crate::stats;
 use crate::trash;
 
@@ -99,6 +99,8 @@ pub fn running(pid: u32) -> bool {
 pub struct Leftover {
     pub path: PathBuf,
     pub original: PathBuf,
+    /// Where its Git commands run.
+    pub main: PathBuf,
     pub pid: u32,
     /// A process with that PID still runs, so the removal may be in
     /// progress. PIDs are reused, so this is a hint, not proof.
@@ -142,9 +144,13 @@ pub struct Leftover {
     /// and Git can use it: what a refusal names once residue cannot tell
     /// whether its removal still runs. Empty otherwise.
     pub move_back: String,
-    /// What `clear` drops with Git's record, its HEAD, and how to keep it
-    /// (`output::head_note`), for when no removal record keeps it.
-    pub head: String,
+    /// Someone else's lock on it, which `clear` does not lift; Git keeps
+    /// its record while it holds.
+    pub locked: Option<String>,
+    /// What `clear` drops with Git's record when no removal record keeps
+    /// it (`removed::drops`), read only where the text shows it
+    /// (`drops_shown`); with none, the text names no line that clears it.
+    pub drops: Option<removed::Drops>,
     /// What to try before `clear` when its directory is gone
     /// (`output::missing_note`).
     pub missing: String,
@@ -157,7 +163,8 @@ impl Leftover {
         let unusable = unusable(entry);
         let git = format!("git -C {} worktree", output::shell(main));
         let path = output::shell(&entry.path);
-        let unlock = if entry.locked.as_deref() == Some(REMOVING) {
+        let ours = entry.locked.as_deref() == Some(REMOVING);
+        let unlock = if ours {
             format!("{git} unlock {path} && ")
         } else {
             String::new()
@@ -165,13 +172,14 @@ impl Leftover {
         // Gone: only a removal record that names it makes `clear` safe to
         // give as the line (`with_records`).
         let recovery = if unusable.is_none() && present {
-            format!("{unlock}{git} move {path} {}", output::shell(&original))
+            recovery(main, &entry.path, &original, ours)
         } else {
             String::new()
         };
         Some(Leftover {
             path: entry.path.clone(),
             original,
+            main: main.to_path_buf(),
             pid,
             running: running(pid),
             present,
@@ -186,7 +194,8 @@ impl Leftover {
             },
             recovery,
             clear: format!("{unlock}{git} remove {path}"),
-            head: output::head_note(main, entry),
+            locked: entry.locked.clone().filter(|l| l != REMOVING),
+            drops: None,
             missing: output::missing_note(main),
         })
     }
@@ -230,6 +239,12 @@ impl Leftover {
         self
     }
 
+    /// The text names a line that clears Git's record of it with no
+    /// removal record to keep what that drops (`drops`).
+    pub fn drops_shown(&self) -> bool {
+        self.record.is_none() && (self.unusable.is_some() || !self.present) && self.busy().is_none()
+    }
+
     /// Why no line is safe while something may still act on it.
     fn busy(&self) -> Option<String> {
         let again = "run residue scan again once it ends";
@@ -245,7 +260,15 @@ impl Leftover {
                     "a residue run, or the `git worktree remove` it started, still holds its removal record, so it may still be deleting it; {again}"
                 )),
             },
-            Ok(Activity::Unheld(Unheld::Writer(pid))) => Some(format!(
+            // A PID may be reused: when it alone keeps it, the move back by
+            // hand is named for when it is not residue.
+            Ok(Activity::Unheld(Unheld::Writer(pid, true))) if !self.move_back.is_empty() => {
+                Some(format!(
+                    "process {pid}, the residue run that removed it, is from a release that takes no hold and still runs, so it may still be deleting it; {again}; if `ps -p {pid}` shows it is not residue, this moves it back: {}",
+                    clean(&self.move_back)
+                ))
+            }
+            Ok(Activity::Unheld(Unheld::Writer(pid, _))) => Some(format!(
                 "process {pid}, the residue run that removed it, is from a release that takes no hold and still runs, so it may still be deleting it; {again}; `ps -p {pid}` shows what it is"
             )),
             Ok(Activity::Unheld(Unheld::Git(pid))) => Some(format!(
@@ -277,16 +300,27 @@ impl Leftover {
         if let Some(why) = self.busy() {
             return format!("{head}    {why}\n");
         }
+        let clear = || {
+            output::clear_line(
+                &self.main,
+                &self.clear,
+                self.locked.as_deref(),
+                self.drops.as_ref(),
+            )
+        };
         let line = match (&self.unusable, &self.record) {
             (Some(why), Some(_)) => format!(
                 "Git can no longer use it ({why}); restore says what to clear, then recreates it: {}",
                 clean(&self.recovery)
             ),
-            (Some(why), None) => format!(
-                "Git can no longer use it ({why}), and no removal record names it; copy out what you need, delete it, then `{}` clears Git's record of it, which drops its HEAD and reflog: {}",
-                clean(&self.clear),
-                self.head
-            ),
+            (Some(why), None) => match clear() {
+                Ok(line) => format!(
+                    "Git can no longer use it ({why}), and no removal record names it; copy out what you need, delete it, then {line}"
+                ),
+                Err(none) => format!(
+                    "Git can no longer use it ({why}), and no removal record names it; {none}"
+                ),
+            },
             (None, _) if self.present => format!("put it back: {}", clean(&self.recovery)),
             // Gone may be only moved, or on a disk not mounted now: those
             // come first, since clearing Git's record then leaves the
@@ -296,12 +330,10 @@ impl Leftover {
                 self.missing,
                 clean(&self.clear)
             ),
-            (None, None) => format!(
-                "its directory is gone; {}; otherwise `{}` clears Git's record of it, which drops its HEAD and reflog: {}",
-                self.missing,
-                clean(&self.clear),
-                self.head
-            ),
+            (None, None) => match clear() {
+                Ok(line) => format!("its directory is gone; {}; otherwise {line}", self.missing),
+                Err(none) => format!("its directory is gone; {}; {none}", self.missing),
+            },
         };
         // A record with its hold line, free now, shows that its removal has
         // stopped, whatever process has that PID now.
@@ -370,7 +402,8 @@ pub fn unusable(entry: &Entry) -> Option<String> {
 pub const LEFTOVER_TITLE: &str =
     "interrupted removals (moved aside, then stopped; part may already be deleted):";
 
-/// The one line that puts a moved worktree back by hand.
+/// The one line that puts a moved worktree back by hand, which stops
+/// while something is at `original` (`output::vacant`).
 pub fn recovery(main: &Path, moved: &Path, original: &Path, locked: bool) -> String {
     let git = format!("git -C {} worktree", output::shell(main));
     let unlock = if locked {
@@ -379,7 +412,8 @@ pub fn recovery(main: &Path, moved: &Path, original: &Path, locked: bool) -> Str
         String::new()
     };
     format!(
-        "{unlock}{git} move {} {}",
+        "{}{unlock}{git} move {} {}",
+        output::vacant(original),
         output::shell(moved),
         output::shell(original)
     )
@@ -544,19 +578,38 @@ pub fn remove(options: &Options) -> u8 {
     // in its repository.
     let mut warnings: Vec<String> = Vec::new();
     let mut forgets = expired_records(&repos, &mode.keep_removed, started, &mut warnings);
+    // What the plan keeps because its filesystem gives no hold, said once.
+    for p in &purges {
+        if let Some(Outcome::Kept(why)) = &p.outcome {
+            warnings.push(format!(
+                "kept the trash entry {}: {why}",
+                p.item.dir.display()
+            ));
+        }
+    }
+    for f in &forgets {
+        if let Some(Outcome::Kept(why)) = &f.outcome {
+            warnings.push(format!(
+                "kept the removal record {}: {why}",
+                f.item.dir.display()
+            ));
+        }
+    }
+    let judge = |p: &Purge| p.item.registered.is_some() && p.outcome.is_none();
     let judged: Vec<Entry> = purges
         .iter()
+        .filter(|p| judge(p))
         .filter_map(|p| p.item.registered.as_ref().map(as_judged))
         .collect();
     let purge_jobs: Vec<(&Entry, &Path)> = purges
         .iter()
-        .filter(|p| p.item.registered.is_some())
+        .filter(|p| judge(p))
         .zip(&judged)
         .map(|(p, e)| (e, p.item.common_dir.as_path()))
         .collect();
     let mut purge_reports = inspect::all(&purge_jobs, &snapshot, &purge_policy).into_iter();
     for p in &mut purges {
-        if p.item.registered.is_some() {
+        if judge(p) {
             let report = purge_reports.next();
             if report
                 .as_ref()
@@ -574,6 +627,10 @@ pub fn remove(options: &Options) -> u8 {
     let purgeable: Vec<usize> = (0..purges.len())
         .filter(|&i| purges[i].outcome.is_none())
         .collect();
+    // Those the plan kept already are not asked about or acted on.
+    let forgettable: Vec<usize> = (0..forgets.len())
+        .filter(|&i| forgets[i].outcome.is_none())
+        .collect();
     if !options.json {
         // The header names the one activity snapshot every check of the plan
         // used, as `scan` and `explain` do.
@@ -589,8 +646,9 @@ pub fn remove(options: &Options) -> u8 {
     }
 
     let mut declined: Option<String> = None;
-    if (!ready.is_empty() || !purgeable.is_empty() || !forgets.is_empty()) && !options.yes {
-        declined = match confirm(ready.len(), purgeable.len(), forgets.len(), mode.trash) {
+    let pending = !ready.is_empty() || !purgeable.is_empty() || !forgettable.is_empty();
+    if pending && !options.yes {
+        declined = match confirm(ready.len(), purgeable.len(), forgettable.len(), mode.trash) {
             Ok(true) => None,
             Ok(false) => Some("not confirmed".to_string()),
             Err(e) => Some(e),
@@ -602,8 +660,8 @@ pub fn remove(options: &Options) -> u8 {
             for &i in &purgeable {
                 purges[i].outcome = Some(Outcome::Skipped(why.clone()));
             }
-            for f in &mut forgets {
-                f.outcome = Some(Outcome::Skipped(why.clone()));
+            for &i in &forgettable {
+                forgets[i].outcome = Some(Outcome::Skipped(why.clone()));
             }
         }
     }
@@ -611,8 +669,7 @@ pub fn remove(options: &Options) -> u8 {
     // The stats ledger takes in the removal records and trash entries of
     // these repositories it lacks, before this run forgets any. Nothing it
     // does changes what the run removes.
-    let acting =
-        declined.is_none() && (!ready.is_empty() || !purgeable.is_empty() || !forgets.is_empty());
+    let acting = declined.is_none() && pending;
     let seeded = acting.then(|| stats::seed_repos(&repos));
 
     for &i in &ready {
@@ -641,16 +698,25 @@ pub fn remove(options: &Options) -> u8 {
         }
         purges[i].outcome = Some(outcome);
     }
-    for f in &mut forgets {
+    for &i in &forgettable {
+        let f = &mut forgets[i];
         if f.outcome.is_some() {
             continue;
         }
         let outcome = match removed::forget_expired(&f.item) {
-            Ok(true) => Outcome::Removed(None),
-            Ok(false) => Outcome::Skipped(
+            Ok(Forgot::Yes) => Outcome::Removed(None),
+            Ok(Forgot::Busy) => Outcome::Skipped(
                 "another residue run, a restore, holds it now, so it stays until the next run"
                     .into(),
             ),
+            // As the plan's, should its filesystem have changed since.
+            Ok(Forgot::Kept(why)) => {
+                warnings.push(format!(
+                    "kept the removal record {}: {why}",
+                    f.item.dir.display()
+                ));
+                Outcome::Kept(why)
+            }
             Err(e) => {
                 warnings.push(format!(
                     "could not forget the removal record {}: {e}",
@@ -707,7 +773,7 @@ pub fn remove(options: &Options) -> u8 {
         println!("{NO_TERMINAL_TEXT}");
     } else if let Some(why) = declined {
         println!("nothing removed: {}", clean(&why));
-    } else if ready.is_empty() && purgeable.is_empty() && forgets.is_empty() && options.all {
+    } else if !pending && options.all {
         println!("nothing to remove");
     } else if let Some(line) = run.text(&mode.keep.text) {
         println!("{line}");
@@ -795,7 +861,8 @@ fn repos_of(items: &[Item]) -> Vec<Repo> {
 /// removal is never forgotten: its worktree is still there, and `residue
 /// restore` is how it goes back. An unreadable record is never forgotten
 /// either, since residue cannot tell which refs are its own; it goes into
-/// `warnings`.
+/// `warnings`. One whose filesystem gives no hold is kept from the plan on
+/// (`removed::unforgettable`).
 fn expired_records(
     repos: &[Repo],
     keep: &Span,
@@ -803,24 +870,20 @@ fn expired_records(
     warnings: &mut Vec<String>,
 ) -> Vec<Forget> {
     let mut out = Vec::new();
+    let forget = |item: removed::Item| Forget {
+        outcome: removed::unforgettable(&item).map(Outcome::Kept),
+        item,
+    };
     for repo in repos {
         match removed::of_repo(repo) {
             Ok(list) => {
                 for item in list {
                     match &item.record {
-                        Err(_) if item.clearable(now) => out.push(Forget {
-                            item,
-                            outcome: None,
-                        }),
+                        Err(_) if item.clearable(now) => out.push(forget(item)),
                         Err(_) if item.incomplete => {}
                         Err(e) => warnings.push(format!("removal record: {e}")),
                         Ok(_) if item.interrupted() => {}
-                        Ok(_) if item.expired(now, keep.seconds) => {
-                            out.push(Forget {
-                                item,
-                                outcome: None,
-                            });
-                        }
+                        Ok(_) if item.expired(now, keep.seconds) => out.push(forget(item)),
                         Ok(_) => {}
                     }
                 }
@@ -857,7 +920,14 @@ fn expired(repos: &[Repo], keep: &Span, now: i64, errors: &mut Vec<String>) -> V
                                     "Git no longer lists it as a worktree, so residue cannot remove it with git worktree remove".into(),
                                 ))
                             } else {
-                                None
+                                // Kept from the plan on, as `purge` keeps
+                                // it, so the prompt does not count it.
+                                match hold::take(&trash::info(&item.dir)) {
+                                    Ok(Taken::Unsupported(why)) => {
+                                        Some(Outcome::Kept(unpurgeable(&why, &item.dir)))
+                                    }
+                                    _ => None,
+                                }
                             };
                             out.push(Purge {
                                 item,
@@ -1747,6 +1817,16 @@ fn verify_moved(
 /// Hold one expired trash entry, re-check it, then delete it with `git
 /// worktree remove`. The hold comes first, so no restore moves the
 /// worktree between the check and the deletion, nor while Git deletes.
+/// Why a trash entry whose filesystem gives no flock(2) lock stays, on
+/// every run, which does not fail for it. Only an older release made it
+/// there, and this run cannot keep a restore away while it deletes.
+fn unpurgeable(why: &str, dir: &Path) -> String {
+    format!(
+        "{why}, so residue cannot hold it against a restore while it purges; `residue restore {}` names the steps to move it back by hand",
+        output::shell(dir)
+    )
+}
+
 fn purge(p: &Purge, policy: &Policy, mode: &Mode) -> Outcome {
     // One that holds only its record has no worktree to delete or restore,
     // and may have no `info` to hold; the hour since it was made keeps it
@@ -1772,12 +1852,7 @@ fn purge(p: &Purge, policy: &Policy, mode: &Mode) -> Outcome {
         // Only an older release made it there, and this run cannot keep a
         // restore away while it deletes: it stays, every run, and the run
         // does not fail for it (a warning says so).
-        Ok(Taken::Unsupported(why)) => {
-            return Outcome::Kept(format!(
-                "{why}, so residue cannot hold it against a restore while it purges; `residue restore {}` names the steps to move it back by hand",
-                output::shell(&p.item.dir)
-            ));
-        }
+        Ok(Taken::Unsupported(why)) => return Outcome::Kept(unpurgeable(&why, &p.item.dir)),
         Err(e) => return Outcome::Failed(e),
     };
     let (Some(worktree), Some(before), Ok(trashed)) = (&p.item.worktree, &p.report, &p.item.record)
@@ -1932,20 +2007,39 @@ fn plan_text(
             out.push_str(&purge_summary(&purges[i], places, style));
         }
     }
-    if !forgets.is_empty() {
+    let (pending, kept): (Vec<&Forget>, Vec<&Forget>) =
+        forgets.iter().partition(|f| f.outcome.is_none());
+    if !pending.is_empty() {
         out.push_str(&format!(
             "\n{}\n",
             style.bold(&format!(
                 "will forget removal records ({}), older than {} (--keep-removed):",
-                forgets.len(),
+                pending.len(),
                 mode.keep_removed.text
             ))
         ));
         out.push_str(
             &style.dim("  after this, `residue restore` cannot bring these back; branches stay\n"),
         );
-        for f in forgets {
+        for f in pending {
             out.push_str(&forget_summary(&f.item, places, style));
+        }
+    }
+    if !kept.is_empty() {
+        out.push_str(&format!(
+            "\n{}\n",
+            style.bold(&format!("kept removal records ({}):", kept.len()))
+        ));
+        for f in kept {
+            let why = match &f.outcome {
+                Some(Outcome::Kept(why)) => clean(why),
+                _ => String::new(),
+            };
+            out.push_str(&format!(
+                "  {}  {}\n",
+                style.bold(&clean(&f.item.name)),
+                style.dim(&why)
+            ));
         }
     }
     let refused: Vec<&Item> = items.iter().filter(|i| i.outcome.is_some()).collect();
@@ -1978,7 +2072,7 @@ fn plan_text(
         ));
         for p in kept {
             let why = match (&p.outcome, &p.report) {
-                (Some(Outcome::Failed(e)), _) => clean(e),
+                (Some(Outcome::Failed(e) | Outcome::Kept(e)), _) => clean(e),
                 (_, Some(r)) => refusal(r),
                 _ => String::new(),
             };
@@ -2123,7 +2217,10 @@ fn forget_line(item: &removed::Item, outcome: &Outcome, places: &Places) -> Stri
         .unwrap_or_default();
     match outcome {
         Outcome::Removed(_) => format!("forgot the removal record {name}{was}"),
-        Outcome::Skipped(why) | Outcome::Failed(why) | Outcome::Invalid(why) => {
+        Outcome::Skipped(why)
+        | Outcome::Kept(why)
+        | Outcome::Failed(why)
+        | Outcome::Invalid(why) => {
             format!("kept the removal record {name}{was}: {}", clean(why))
         }
         _ => format!("kept the removal record {name}{was}"),
