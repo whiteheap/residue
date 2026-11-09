@@ -380,12 +380,17 @@ start_service() {
     service="on already, left as it is, with its own folders. To restart it on this version, run \`$bin service install\` with them"
     return 0
   fi
-  # The service would stop at every pass on an older Git, and the archive
-  # brings no Git of its own.
-  if ! git_ok; then
+  # The service would stop at every pass on an older Git. The apt, dnf and
+  # pacman packages depend on a new enough one, so a dry run through them has
+  # none to check yet; Homebrew's formula and the archive bring none.
+  if { [ "$dry_run" = 0 ] || [ "$channel" = brew ] || [ "$channel" = archive ]; } && ! git_ok; then
     if [ -n "$git_v" ]; then git_found="git here is $git_v"
     elif has git; then git_found="\`git --version\` does not say which Git this is"
     else git_found="no git is on PATH"
+    fi
+    if [ "$dry_run" = 1 ]; then
+      service="would not be turned on: residue needs Git $GIT_NEEDS or later, and $git_found"
+      return 0
     fi
     service="NOT turned on: residue needs Git $GIT_NEEDS or later, and $git_found. Install a newer Git, then run: $turn_on"
     failed=1
