@@ -191,7 +191,7 @@ residue runs every check below on every linked worktree. A worktree is a **candi
 | `head` | HEAD is detached and no branch, tag or remote-tracking ref contains it, or the worktree is on the branch a bare repository's HEAD names |
 | `layout` | It has submodules or is a sparse checkout |
 | `nested_repo` | It contains a `.git` entry in any case, other than its own `.git` link: another repository or checkout, or files Git does not list |
-| `mount_point` | It contains a mount point: another filesystem, or a folder mounted a second time, such as a bind mount ([how residue tells](docs/platforms-and-testing.md#mount-points)) |
+| `mount_point` | It contains a mount point: another filesystem, or a folder or file mounted a second time, such as a bind mount ([how residue tells](docs/platforms-and-testing.md#mount-points)) |
 | `contents` | residue could not read some of its entries, or one changed while it read them |
 
 Some facts never block, and residue reports each one separately instead of calling a worktree "safe": commits that are on the branch but on no remote-tracking ref, whether the branch's upstream is gone, the last change and what made it, and size. `scan` and `explain` do not fetch, so "local-only" means local-only as of the last fetch.

@@ -1265,18 +1265,19 @@ else
     elif common_ok; then ok "$(jq -r '.results[0].reason' "$work/$name.out")"; fi
 fi
 
-# --- 2e, 2e2. A folder outside the worktree, mounted inside it -------------
+# --- 2e, 2e2, 2e3. A folder or file outside the worktree, mounted inside it
 # A mount of a folder from the worktree's own filesystem keeps its device,
 # and Git's remove deletes through it into that folder. 2e mounts one at an
 # ignored path before the plan: residue must keep the worktree for
 # mount_point. 2e2 mounts it after the move aside, over a folder with the
 # same files, sizes and times, so the fingerprint cannot tell: the check
 # after the move must refuse and put w back. In both, the folder's file
-# must survive.
-planted_at() { # where the mount is now: at its path, or where a removal moved w
-    local d
-    for d in "$wt/node_modules/mnt" "$repo"/.worktrees/.w.residue-removing-*/node_modules/mnt; do
-        [ -d "$d" ] && { echo "$d"; return; }
+# must survive. 2e3 mounts a file over an ignored file before the plan,
+# where the system can (FreeBSD's nullfs from 14): mount_point keeps it.
+planted_at() { # [REL]: where the mount is now, at its path or where a removal moved w
+    local d rel=${1:-node_modules/mnt}
+    for d in "$wt/$rel" "$repo"/.worktrees/.w.residue-removing-*/"$rel"; do
+        [ -e "$d" ] && { echo "$d"; return; }
     done
 }
 name=bind-mount
@@ -1305,6 +1306,39 @@ else
     elif [ "$(records)" != "0 records, 0 refs" ]; then fail "removal records: $(records), want 0 records, 0 refs"
     elif [ "$(sums "$wt")" != "$w_sum" ]; then fail "w's files changed"
     elif common_ok; then ok "$(jq -r '.worktree.checks[] | select(.id == "mount_point") | .detail' "$work/$name.out-explain")"; fi
+fi
+
+name=bind-mount-file
+if [ -z "$bind_how" ]; then
+    echo "skip $name: $bind_skip"
+else
+    make_repo
+    from=$work/$name-outside.js
+    echo kept >"$from" && echo x >"$wt/node_modules/mnt.js" || exit 2
+    w_sum=$(sums "$wt") || exit 2
+    echo "$wt/node_modules/mnt.js" >"$work/mounted-at"
+    if ! bind_mount "$from" "$wt/node_modules/mnt.js" 2>"$work/$name.err-mount"; then
+        rm -f "$work/mounted-at"
+        echo "skip $name: $bind_how does not mount a file over a file here: $(head -c 200 "$work/$name.err-mount")"
+    else
+        : >"$work/mode"
+        "$bin" explain --json "$wt" >"$work/$name.out-explain" 2>"$work/$name.err-explain"
+        start "" remove --yes --json "$wt"
+        finish "$pid"
+        kept=$(cat "$from" 2>/dev/null)
+        unmount_planted "$(planted_at node_modules/mnt.js)"
+        unmounted=$?
+        block=$(jq -r '.worktree.checks[] | select(.id == "mount_point") | .status' "$work/$name.out-explain")
+        if [ "$kept" != kept ]; then fail "the file mounted inside w changed: '$kept'; residue: $(outcome)"
+        elif [ "$block" != block ]; then fail "explain: mount_point is '$block', want block"
+        elif [ "$status" != 3 ]; then fail "exit $status, want 3"
+        elif [ "$(jq -r '.results[0].result' "$work/$name.out")" != refused ]; then fail "result $(outcome), want refused"
+        elif [ "$unmounted" != 0 ]; then fail "the mount did not go within 10 s"
+        elif [ "$(record "$wt")" != registered ] || [ -n "$(asides)" ]; then fail "w moved: $(record "$wt"), aside: $(asides)"
+        elif [ "$(records)" != "0 records, 0 refs" ]; then fail "removal records: $(records), want 0 records, 0 refs"
+        elif [ "$(sums "$wt")" != "$w_sum" ]; then fail "w's files changed"
+        elif common_ok; then ok "$(jq -r '.worktree.checks[] | select(.id == "mount_point") | .detail' "$work/$name.out-explain")"; fi
+    fi
 fi
 
 name=bind-mount-after-move
