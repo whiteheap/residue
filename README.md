@@ -241,7 +241,7 @@ residue restore               # list the trash of the repositories at or under t
 residue restore fix-login     # put one back
 ```
 
-A trashed worktree stays whole in its repository's `.git/residue-trash/`, locked with the reason `residue: in trash`. Git still lists it, and its branch stays checked out there, so `git switch` to that branch in another worktree refuses until you restore the worktree or the purge removes it. The trash frees no disk: every `remove` run purges the entries older than `--keep-trash` (default `7d`) in the repositories it covers, after the same checks, and lists them in its plan before you confirm. residue refuses to trash a worktree on another filesystem than its repository, because the move would be a copy. [The trash](docs/removal.md#the-trash) has where it lives, how restore puts an entry back, and the purge.
+A trashed worktree stays whole in its repository's `.git/residue-trash/`, locked with the reason `residue: in trash`. Git still lists it, and its branch stays checked out there, so `git switch` to that branch in another worktree refuses until you restore the worktree or the purge removes it. The trash frees no disk: every `remove` run purges the entries older than `--keep-trash` (default `7d`) in the repositories it covers, after the same checks, and lists them in its plan before you confirm. Each entry keeps the `--keep-trash` it was trashed with, and no run purges it sooner. residue refuses to trash a worktree on another filesystem than its repository, because the move would be a copy. [The trash](docs/removal.md#the-trash) has where it lives, how restore puts an entry back, and the purge.
 
 ### Restore a removed worktree
 
@@ -393,7 +393,7 @@ In short: CI runs the scripts listed there on every push, on macOS, Ubuntu 24.04
 <a id="exit-status"></a>
 <a id="for-coding-agents"></a>
 
-Exit codes and the `results[].result` values are in the [reference](docs/reference.md#exit-status). `residue remove --yes --json "$WORKTREE"`, run from outside the worktree, is there too: exit 0 means removed or trashed, exit 3 means it is still there, and diagnostics stay on stderr. The [residue skill](skills/residue/SKILL.md) gives Claude Code, Codex and other agents these steps: `npx skills add whiteheap/residue-cli --skill residue -g`. `residue --help` lists every command and option.
+Exit codes and the `results[].result` values are in the [reference](docs/reference.md#exit-status). `residue remove --yes --json "$WORKTREE"`, run from outside the worktree, is there too: exit 0 means removed or trashed, exit 3 means it is still there or an expired trash entry of its repository could not be purged (`results[].result` says which), and diagnostics stay on stderr. The [residue skill](skills/residue/SKILL.md) gives Claude Code, Codex and other agents these steps: `npx skills add whiteheap/residue-cli --skill residue -g`. `residue --help` lists every command and option.
 
 Ignored does not mean disposable. An untracked file that is not ignored always keeps the worktree. residue never takes a regenerable rule from a file committed in the repository, or from `git -c`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`, or `GIT_CONFIG`. The built-in names, the path grammar, and where a rule is stored are in the [reference](docs/reference.md#the-regenerable-list).
 

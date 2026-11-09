@@ -377,49 +377,66 @@ RSettle ==
 ----------------------------------------------------------------------------
 (* pg: remove.rs purge, then trash.rs purge                                *)
 
+\* What follows the hold: this release writes its record first, then
+\* re-checks, so writing the record does not widen the time between the
+\* check and the deletion. A release that takes no hold (0.0.10) re-checked
+\* first.
+PFirst == IF "pg" \in Old THEN "p_recheck" ELSE "p_record"
+
 \* hold::take on the entry's info, before anything else: Busy (another
 \* purge, its Git, or a restore holds it) or Gone (purged or restored since
 \* the plan) skips the entry. A purge in Old takes no hold.
 PHold ==
   /\ pc["pg"] = "p_hold"
   /\ IF Mut("PurgeNoHold") \/ "pg" \in Old
-     THEN /\ Go("pg", "p_recheck") /\ UNCHANGED lk
+     THEN /\ Go("pg", PFirst) /\ UNCHANGED lk
      ELSE IF w.entry # "info" \/ Held("T")
      THEN /\ Go("pg", "done") /\ UNCHANGED lk
      ELSE /\ lk' = [lk EXCEPT !["T"] = @ \cup {"pg"}]
-          /\ Go("pg", "p_recheck")
+          /\ Go("pg", PFirst)
   /\ UNCHANGED <<w, g, chk, ctx, ts, rs, pl, faults, hist>>
 
 \* recheck(path, ours = LOCK): residue's own trash lock counts as none,
 \* and a process the probe sees in W, a trash restore's open .git among
 \* them (TrUses), stops it. The lock it read is the one trash::purge lifts.
+\* In this release it comes after the record, and a failure settles the
+\* record (PUndo); in Old it comes before, and a failure ends the purge.
 PRecheck ==
   /\ pc["pg"] = "p_recheck"
   /\ IF Mut("PurgeNoRecheck")
        \/ (Listed("trash") /\ w.gitdir = "ok" /\ DotGit
            /\ w.lock \in {"trash", "none"} /\ Clean /\ ~TrUses /\ w.tree = "whole")
-     THEN /\ Go("pg", "p_record")
+     THEN /\ Go("pg", IF "pg" \in Old THEN "p_record" ELSE "p_unlock")
           /\ chk' = IF Mut("PurgeNoRecheck") THEN chk
                     ELSE [chk EXCEPT !["pg"] = [path |-> "trash", clean |-> Clean]]
           /\ pl' = IF Mut("PurgeNoRecheck") THEN pl
                    ELSE [pl EXCEPT !.lock = w.lock,
                                    !.early = pc["tr"] \in {"t_list", "t_hold", "t_open"}]
-     ELSE /\ Go("pg", "done")
+     ELSE /\ Go("pg", IF "pg" \in Old THEN "done" ELSE "p_undo")
           /\ UNCHANGED <<chk, pl>>
   /\ UNCHANGED <<w, g, ctx, ts, rs, lk, faults, hist>>
 
 \* removed::create, with Reason::TrashPurge and the trash path as aside,
-\* held as rm's is.
+\* held as rm's is. A failure deletes nothing and ends the purge.
 PRecord ==
   /\ pc["pg"] = "p_record"
   /\ \/ /\ w' = [w EXCEPT !.records = @ \cup {"pg"}]
         /\ lk' = IF "pg" \in Old THEN lk ELSE [lk EXCEPT !["pg"] = {"pg"}]
         /\ pl' = [pl EXCEPT !.after = pc["tr"] \notin
                     {"t_list", "t_hold", "t_open", "t_lock", "t_read"}]
-        /\ Go("pg", "p_unlock")
+        /\ Go("pg", IF "pg" \in Old THEN "p_unlock" ELSE "p_recheck")
      \/ /\ Go("pg", "done")
         /\ UNCHANGED <<w, lk, pl>>
   /\ UNCHANGED <<g, chk, ctx, ts, rs, faults, hist>>
+
+\* settle(&written, standing([path], no files), entry) after a re-check
+\* that failed: Git has not run, so the checkout and the Git directory
+\* count, not the files.
+PUndo ==
+  /\ pc["pg"] = "p_undo"
+  /\ Settle("pg", {"trash"}, FALSE)
+  /\ Go("pg", "done")
+  /\ UNCHANGED <<g, chk, ctx, ts, rs, lk, pl, faults>>
 
 \* trash::purge: the re-check read residue's lock, so it unlocks; read no
 \* lock, so it does not; read another's, so it refuses. Then
@@ -937,7 +954,8 @@ Finished ==
 Next ==
   \/ RRecheck \/ RMove \/ RLock \/ RRecord \/ RVerify \/ RUnlock \/ RAfter
   \/ PBCheck \/ PBUnlock \/ PBMove \/ PBStuck \/ RSettle
-  \/ PHold \/ PRecheck \/ PRecord \/ PUnlock \/ PAfter \/ PRelock \/ PSettle
+  \/ PHold \/ PRecheck \/ PRecord \/ PUndo \/ PUnlock \/ PAfter \/ PRelock
+  \/ PSettle
   \/ \E a \in D : GFind(a) \/ GExists(a) \/ GStatus(a) \/ GTree(a)
                   \/ GGitdir(a) \/ GitTimeout(a)
   \/ \E a \in Actors : Kill(a) \/ Orphan(a)

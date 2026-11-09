@@ -191,6 +191,20 @@ pub struct Keep {
     pub text: String,
 }
 
+impl Keep {
+    /// The value of a `keep` line, `SECONDS TEXT` with SECONDS above zero;
+    /// `None` for anything else. A trash entry's `info` keeps it the same
+    /// way.
+    pub fn parse(value: &str) -> Option<Keep> {
+        let (seconds, shown) = value.split_once(' ').filter(|(_, s)| !s.is_empty())?;
+        let seconds = seconds.parse::<i64>().ok().filter(|s| *s > 0)?;
+        Some(Keep {
+            seconds,
+            text: shown.to_string(),
+        })
+    }
+}
+
 /// An ignored entry the deletion took, as the plan measured it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Gone {
@@ -404,18 +418,7 @@ impl Record {
                 b"by" => record.by = Some(text()),
                 b"removed" => removed = Some(number("removed")?),
                 b"keep" => {
-                    let t = text();
-                    let keep = t
-                        .split_once(' ')
-                        .filter(|(_, shown)| !shown.is_empty())
-                        .and_then(|(seconds, shown)| {
-                            let seconds = seconds.parse::<i64>().ok().filter(|s| *s > 0)?;
-                            Some(Keep {
-                                seconds,
-                                text: shown.to_string(),
-                            })
-                        });
-                    record.keep = Some(keep.ok_or("keep is not SECONDS DURATION")?);
+                    record.keep = Some(Keep::parse(&text()).ok_or("keep is not SECONDS DURATION")?);
                 }
                 b"allocated" => record.allocated = number("allocated")?.try_into().ok(),
                 b"reclaimable" => record.reclaimable = number("reclaimable")?.try_into().ok(),
@@ -2169,9 +2172,7 @@ fn clear_purged(
     if entry_hold.is_none() {
         return Ok(None);
     }
-    Ok(crate::trash::discard(entry)
-        .err()
-        .map(|e| format!("its trash entry stays ({e}); the next remove run clears it")))
+    Ok(crate::trash::discard(entry).err().map(|stays| stays.note()))
 }
 
 /// After `residue restore ENTRY` moved a trash entry's worktree to `path`:

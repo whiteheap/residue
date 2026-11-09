@@ -457,8 +457,10 @@ enum Outcome {
     Trashed(PathBuf),
     Refused,
     /// A trash entry left alone on purpose, which does not fail the run:
-    /// why. Only one on a filesystem with no flock(2), which a run of this
-    /// release cannot hold (`Taken::Unsupported`).
+    /// why. One on a filesystem with no flock(2), which a run of this
+    /// release cannot hold (`Taken::Unsupported`), and one no purge can
+    /// clear, which holds what residue never deletes
+    /// (`trash::Item::stranded`).
     Kept(String),
     Skipped(String),
     Failed(String),
@@ -623,13 +625,21 @@ pub fn remove(options: &Options) -> u8 {
     // --keep-trash without saying so.
     let mut purge_policy = policy.clone();
     purge_policy.idle = None;
-    let mut purges = expired(&repos, &mode.keep, mode.as_of, mode.ages_at(), &mut errors);
     // Problems with removal records: warnings, on stderr and in JSON
     // `warnings`, but never `errors` and never the exit status. A record
     // is about a worktree already gone, and a run that removed its PATHs
     // did what it was asked; otherwise one bad record would fail every run
-    // in its repository.
+    // in its repository. So is a trash entry no purge can clear, which
+    // holds what residue never deletes (`trash::Item::stranded`).
     let mut warnings: Vec<String> = Vec::new();
+    let mut purges = expired(
+        &repos,
+        &mode.keep,
+        mode.as_of,
+        mode.ages_at(),
+        &mut errors,
+        &mut warnings,
+    );
     // What the plan keeps because its filesystem gives no hold is in the
     // plan's "kept" lists and `kept` in the JSON, never also a warning.
     let mut forgets = expired_records(
@@ -645,13 +655,28 @@ pub fn remove(options: &Options) -> u8 {
         .filter(|p| judge(p))
         .filter_map(|p| p.item.registered.as_ref().map(as_judged))
         .collect();
-    // A trash entry was already removed from its path: nothing keeps it like
-    // a main checkout, so it is purged as before.
+    // A trash entry is judged as its re-check judges it: one on the branch
+    // a bare repository's HEAD names is kept like a main checkout. Each
+    // purge comes from one of `repos` (`expired`); one that did not would
+    // be kept, since any branch may then be the kept one.
+    let mut purge_kept: std::collections::HashMap<&Path, Kept> = std::collections::HashMap::new();
+    for p in purges.iter().filter(|p| judge(p)) {
+        let common = p.item.common_dir.as_path();
+        purge_kept.entry(common).or_insert_with(|| {
+            repos.iter().find(|r| r.common_dir == common).map_or_else(
+                || Kept::Unreadable("internal: no repository for this trash entry".into()),
+                |r| Kept::of(&r.main, &r.common_dir),
+            )
+        });
+    }
     let purge_jobs: Vec<inspect::Job> = purges
         .iter()
         .filter(|p| judge(p))
         .zip(&judged)
-        .map(|(p, e)| (e, p.item.common_dir.as_path(), &Kept::Nothing))
+        .map(|(p, e)| {
+            let common = p.item.common_dir.as_path();
+            (e, common, &purge_kept[common])
+        })
         .collect();
     let mut purge_reports = inspect::all(&purge_jobs, &snapshot, &purge_policy).into_iter();
     for p in &mut purges {
@@ -733,7 +758,7 @@ pub fn remove(options: &Options) -> u8 {
         if purges[i].outcome.is_some() {
             continue;
         }
-        let outcome = purge(&purges[i], &purge_policy, &mode);
+        let outcome = purge(&purges[i], &purge_policy, &mode, &mut warnings);
         if !options.json {
             println!("{}", purge_line(&purges[i], &outcome, &places));
         }
@@ -951,19 +976,24 @@ fn expired_records(
 }
 
 /// The trash entries of these repositories that are at least `keep` old,
-/// and entries that hold only their record an hour after they were made
-/// (`trash::Item::clearable`), which any purge clears. A younger one may
-/// be another run's, between writing `info` and moving the worktree in,
-/// so it is left alone, as is one with no `info` yet. Under `--as-of`,
-/// ages are measured at `now`, that time, and an entry is purged only when
-/// its directory last changed before it: one whose `info` or worktree
-/// arrived later waits for a later run.
+/// or as old as the `--keep-trash` they were trashed with when that is
+/// longer, and entries that hold only their record an hour after they
+/// were made (`trash::Item::clearable`), which any purge clears. A younger
+/// one may be another run's, between writing `info` and moving the
+/// worktree in, so it is left alone, as is one with no `info` yet. Under
+/// `--as-of`, ages are measured at `now`, that time, and an entry is
+/// purged only when its directory last changed before it: one whose
+/// `info` or worktree arrived later waits for a later run. An entry no
+/// purge can clear, as it holds something residue never deletes, is kept
+/// with a warning and fails no run (`trash::Item::stranded`): otherwise it
+/// would fail every run in its repository.
 fn expired(
     repos: &[Repo],
     keep: &Span,
     as_of: Option<i64>,
     now: i64,
     errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
 ) -> Vec<Purge> {
     let mut out = Vec::new();
     for repo in repos {
@@ -971,6 +1001,18 @@ fn expired(
             Ok(list) => {
                 for item in list {
                     let settled = before(as_of, item.modified);
+                    if let Some(why) = item.stranded(now) {
+                        warnings.push(format!(
+                            "kept the trash entry {}: {why}",
+                            item.dir.display()
+                        ));
+                        out.push(Purge {
+                            item,
+                            report: None,
+                            outcome: Some(Outcome::Kept(why)),
+                        });
+                        continue;
+                    }
                     match &item.record {
                         _ if item.clearable(now) && settled => out.push(Purge {
                             item,
@@ -980,7 +1022,7 @@ fn expired(
                         Err(_) if item.incomplete && item.bare => {}
                         Err(e) => errors.push(format!("trash entry {}: {e}", item.dir.display())),
                         Ok(_) if item.is_empty_record() => {}
-                        Ok(_) if item.age(now).is_some_and(|a| a >= keep.seconds) && settled => {
+                        Ok(_) if item.expired(now, keep.seconds) && settled => {
                             let outcome = if item.registered.is_none() {
                                 Some(Outcome::Failed(
                                     "Git no longer lists it as a worktree, so residue cannot remove it with git worktree remove".into(),
@@ -1416,6 +1458,10 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
             trashed: output::now(),
             allocated: before.usage.as_ref().map(|u| u.allocated),
             reclaimable: before.usage.as_ref().map(|u| u.reclaimable),
+            keep: Some(removed::Keep {
+                seconds: mode.keep.seconds,
+                text: mode.keep.text.clone(),
+            }),
         };
         let (entry, hold) = match trash::create(&target.repo.common_dir, &record) {
             Ok(e) => e,
@@ -1969,17 +2015,24 @@ fn unpurgeable(why: &str, dir: &Path) -> String {
     )
 }
 
-/// Hold one expired trash entry, re-check it, then delete it with `git
-/// worktree remove`. The hold comes first, so no restore moves the
-/// worktree between the check and the deletion, nor while Git deletes.
-fn purge(p: &Purge, policy: &Policy, mode: &Mode) -> Outcome {
+/// Hold one expired trash entry, write its removal record, re-check it,
+/// then delete it with `git worktree remove`. The hold comes first, so no
+/// restore moves the worktree between the check and the deletion, nor
+/// while Git deletes. The record comes before the re-check, as a
+/// removal's comes before its last check (`execute`), so writing and
+/// syncing it does not widen the time between that check and the
+/// deletion; a re-check that fails undoes it. A note on an entry the
+/// purge leaves goes into `warnings`.
+fn purge(p: &Purge, policy: &Policy, mode: &Mode, warnings: &mut Vec<String>) -> Outcome {
     // One that holds only its record has no worktree to delete or restore,
     // and may have no `info` to hold; the hour since it was made keeps it
     // from being a run's still moving a worktree in (`trash::Item`).
     if p.item.holds_only_record() {
         return match trash::discard(&p.item.dir) {
             Ok(()) => Outcome::Removed(None),
-            Err(e) => Outcome::Failed(e),
+            // Something arrived beside the record since the plan.
+            Err(trash::Stays::Holds(_, names)) => Outcome::Kept(trash::beside(&names)),
+            Err(trash::Stays::Failed(e)) => Outcome::Failed(e),
         };
     }
     let held = match hold::take(&trash::info(&p.item.dir)) {
@@ -2013,23 +2066,12 @@ fn purge(p: &Purge, policy: &Policy, mode: &Mode) -> Outcome {
         }
     };
     let path = git::canonical(worktree).unwrap_or_else(|_| worktree.clone());
-    let listed = match recheck(
-        &path,
-        &p.item.common_dir,
-        before,
-        policy,
-        mode.since,
-        Some(trash::LOCK),
-        /* only_if_upstream_gone */ false,
-    ) {
-        Ok(l) => l,
-        Err(outcome) => return outcome,
-    };
-    // A purge deletes too, so it records first, as a removal does.
+    // A purge deletes too, so it records first, as a removal does, from
+    // the plan's HEAD and branch, which the re-check then compares.
     let record = removal_record(
         &trashed.original,
         &path,
-        &listed,
+        &before.entry,
         before,
         Reason::TrashPurge,
         mode.by,
@@ -2048,9 +2090,38 @@ fn purge(p: &Purge, policy: &Policy, mode: &Mode) -> Outcome {
             ));
         }
     };
+    // Git deleted nothing yet, so a re-check that fails undoes the record
+    // while the worktree is whole; it stays in the trash, locked as it was.
+    let listed = match recheck(
+        &path,
+        &p.item.common_dir,
+        before,
+        policy,
+        mode.since,
+        Some(trash::LOCK),
+        /* only_if_upstream_gone */ false,
+    ) {
+        Ok(l) => l,
+        Err(outcome) => {
+            return settle(
+                &written,
+                standing(&written, &p.item.command_dir, &[&path], None),
+                Some(&p.item.dir),
+                outcome,
+            );
+        }
+    };
     // The lock lifted is the one the re-check read, under the hold.
     match trash::purge(&p.item, &listed, &[&held, written.hold()]) {
-        Ok(()) => Outcome::Removed(Some(written.dir)),
+        Ok(None) => Outcome::Removed(Some(written.dir)),
+        Ok(Some(stays)) => {
+            warnings.push(format!(
+                "purged {} from the trash, but {}",
+                p.item.name,
+                stays.note()
+            ));
+            Outcome::Removed(Some(written.dir))
+        }
         // Its files count whether or not Git ran: the re-check found them
         // as the plan did a moment ago, so a difference keeps the record.
         Err(e) => {
@@ -2407,8 +2478,9 @@ fn reason_json(outcome: &Option<Outcome>) -> Json {
 
 /// What a remove run lists apart from its results: `errors`, what it
 /// could not read, each of which makes it exit 3, and `warnings`, the
-/// removal records it could not read or forget, which never change the
-/// exit status.
+/// removal records it could not read or forget and the trash entries it
+/// keeps because they hold what residue never deletes, which never change
+/// the exit status.
 struct Problems<'a> {
     errors: &'a [String],
     warnings: &'a [String],

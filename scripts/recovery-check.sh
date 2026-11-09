@@ -73,6 +73,10 @@
 #                  of the entry's worktree: after it read the removal
 #                  records, right before it moves the worktree back (4m,
 #                  4q)
+#   plant-at-record
+#                  at a purge's `update-ref`, which writes its removal
+#                  record's refs, add a file to the trashed worktree's
+#                  ignored node_modules/ (4t)
 #   hold-purge     stop a purge at `worktree remove` of its trash entry,
 #                  after it wrote its removal record (4d, 4l)
 #   stop-purge     at the same point, delete an ignored file and the
@@ -439,7 +443,17 @@ case " \$* " in
     case \$mode in *hold-add*) [ -e "\$work/at-add" ] || hold add ;; esac
     ;;
 *" update-ref "*)
-    case \$mode in *hold-update-ref*) [ -e "\$work/at-update-ref" ] || hold update-ref ;; esac
+    case \$mode in
+    *hold-update-ref*) [ -e "\$work/at-update-ref" ] || hold update-ref ;;
+    *plant-at-record*)
+        # While a purge writes its removal record's refs: a new file in
+        # the ignored node_modules/ of the worktree named in plant-in.
+        if [ ! -e "\$work/touched" ]; then
+            echo new >"\$(cat "\$work/plant-in")/node_modules/b.js" || exit 1
+            : >"\$work/touched"
+        fi
+        ;;
+    esac
     ;;
 *" worktree list "*)
     case \$mode in
@@ -671,7 +685,7 @@ if [ -n "$partial_probe" ]; then
         opened-before-move restore-to-other-fs stale-no-index leftover-dotgit-kept restore-forget-race forget-restore-race \
         forget-before-restore-reads restore-forget-race-reftable stale-names-repair gone-aside-no-record \
         stale-keeps-reflog stale-keeps-reflog-reftable stale-keeps-same-name stale-locked-no-remove move-back-guard \
-        restore-raced-git-dir restore-move-stops-after-rename noflock-recreate noflock-kept; do
+        restore-raced-git-dir restore-move-stops-after-rename purge-change-at-record noflock-recreate noflock-kept; do
         skip_partial "$scenario"
     done
     echo "recovery-check: $passes passed, $failures failed"
@@ -2285,6 +2299,35 @@ elif ! grep -qF "Git moved its files to " "$err" || ! grep -qF " worktree repair
 elif [ -z "$followed" ] || [ -n "$follow_failed" ]; then fail "the lines it names failed: ${follow_failed:-none named}"
 elif [ "$(record "$dest")" != registered ] || [ "$(sums "$dest")" != "$w_sum" ]; then fail "w is not back whole at the new path: $(record "$dest")"
 elif common_ok; then ok "the restore says Git moved the files and names the repair, which brings w back"; fi
+
+# --- 4t. A change while a purge writes its removal record -----------------
+# The purge writes its record before its re-check, as a removal writes its
+# record before its last check, so writing and syncing it is not part of
+# the time between that check and Git's delete. A file added to the
+# trashed w's ignored node_modules/ while the record is written is seen by
+# the re-check: the purge is skipped, naming node_modules/, its record is
+# undone, and w stays in the trash, whole and locked, with that file.
+name=purge-change-at-record
+make_repo
+: >"$work/mode"
+setup "$bin" remove --yes --json --trash "$wt"
+entry=$(find "$repo/.git/residue-trash" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+tinfo=$entry/info
+sed 's/^trashed [0-9]* .*/trashed 1767225600 2026-01-01T00:00:00Z/' "$tinfo" >"$work/$name.info" && cat "$work/$name.info" >"$tinfo" || exit 2
+echo "$entry/w" >"$work/plant-in"
+echo plant-at-record >"$work/mode"
+start "" remove --all --yes --json --idle 30d "$repo"
+finish "$pid"
+: >"$work/mode"
+out=$work/$name.out
+if [ ! -e "$work/touched" ]; then fail "the purge never wrote its record's refs (exit $status)"
+elif [ "$status" != 3 ]; then fail "exit $status, want 3"
+elif [ "$(jq -r '.purged[0].result' "$out")" != skipped ]; then fail "the purge's result is $(jq -r '.purged[0].result' "$out"), want skipped: $(jq -r '.purged[0].reason' "$out")"
+elif ! jq -r '.purged[0].reason' "$out" | grep -qF 'node_modules/'; then fail "the reason does not name node_modules/: $(jq -r '.purged[0].reason' "$out")"
+elif [ "$(cat "$entry/w/node_modules/b.js" 2>/dev/null)" != new ]; then fail "the file added while the record was written is gone"
+elif [ "$(record "$entry/w")" != "registered, locked residue: in trash" ]; then fail "w in the trash: $(record "$entry/w")"
+elif [ "$(records)" != "0 records, 0 refs" ]; then fail "removal records: $(records), want 0 records, 0 refs"
+elif common_ok; then ok "a file added while the purge wrote its record keeps w in the trash, and the record is undone"; fi
 
 # --- 5. git worktree remove fails part way ----------------------------------
 # Git deletes the checkout, then its own directory for the worktree, each

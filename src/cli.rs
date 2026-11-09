@@ -53,7 +53,8 @@ Kept:          branches, commits and the stash
 Restore:       each deletion writes a removal record first; `residue restore`
                brings the worktree back for 30d, without its ignored files
 Rules:         ~/.config/residue/regenerable, one RULE per line
-Exit status:   0 ok, 1 error, 2 usage, 3 remove refused or skipped a path
+Exit status:   0 ok, 1 error, 2 usage, 3 remove refused or skipped a path,
+               or could not purge an expired trash entry
 Details:       https://github.com/whiteheap/residue-cli#readme
 ";
 

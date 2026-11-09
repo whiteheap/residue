@@ -324,12 +324,13 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 /// repository has no main checkout: every checkout is a linked worktree,
 /// and the one on the branch its HEAD names is the one a person works in,
 /// so residue keeps it (the `head` check). Read once per repository from
-/// Git's list of its worktrees, whose first entry is the main one.
+/// Git's list of its worktrees, whose first entry is the main one. A trash
+/// purge's plan and its re-check read it too, so an entry on that branch
+/// stays in the trash.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Kept {
     /// A repository with a main checkout, a bare one whose HEAD is
-    /// detached. The trash purge passes it too: an entry in the trash is
-    /// purged as before.
+    /// detached.
     Nothing,
     /// A bare repository whose HEAD names this branch (`refs/heads/main`).
     Branch(String),

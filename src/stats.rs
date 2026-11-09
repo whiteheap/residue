@@ -1536,6 +1536,7 @@ mod tests {
                 trashed: 50,
                 allocated: Some(10),
                 reclaimable: Some(8),
+                keep: None,
             }),
             worktree: Some(PathBuf::from(format!(
                 "/src/app/.git/residue-trash/{name}/old"
@@ -1545,6 +1546,7 @@ mod tests {
             incomplete: false,
             bare: false,
             modified: Some(50),
+            extra: Some(Vec::new()),
         }
     }
 

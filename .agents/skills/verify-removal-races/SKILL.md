@@ -68,11 +68,11 @@ The faults: a kill of residue with its Git child (Ctrl-C), the 30-minute Git tim
 | Remove orphan | rm, rr, user | orphaning kill | 3,722 |
 | Remove unraced | rm, user | kill, orphaning kill | 743 |
 | Remove after | rm, then rr, user | kill, timeout | 3,479 |
-| Trash no-faults | pg, tr, rr, user | none | 48,509 |
-| Trash faults | pg, tr, rr, user | kill, timeout | 241,272 |
-| Trash orphan | pg, tr, rr, user | orphaning kill | 83,465 |
-| Trash unraced | pg, rr, user | kill, orphaning kill | 10,848 |
-| Trash after | pg, then tr and rr, user | kill, timeout | 52,660 |
+| Trash no-faults | pg, tr, rr, user | none | 52,993 |
+| Trash faults | pg, tr, rr, user | kill, timeout | 260,428 |
+| Trash orphan | pg, tr, rr, user | orphaning kill | 89,567 |
+| Trash unraced | pg, rr, user | kill, orphaning kill | 11,112 |
+| Trash after | pg, then tr and rr, user | kill, timeout | 54,202 |
 | Remove old | rm of a release that takes no hold, rr, user | kill, timeout | 10,591 |
 | Trash old | pg of a release that takes no hold, tr, rr, user | kill, timeout | 496,086 |
 | Remove old-orphan | rm of a release that takes no hold, rr, user | orphaning kill | 5,312 |
@@ -100,7 +100,7 @@ Run the check for a change to any function in this table, or for one that adds a
 | `RVerify` | `remove.rs` `verify_moved` |
 | `PBCheck`, `PBUnlock`, `PBMove`, `PBStuck` | `remove.rs` `Moved::put_back`, `Moved::stuck` |
 | `RSettle`, `PSettle` | `remove.rs` `settle`, `standing`, `Files` |
-| `PHold`, `PRecheck`, `PRecord`, `PAfter`, `PRelock` | `remove.rs` `purge`: `hold::take(trash::info)`, `recheck(path, ours = trash::LOCK)`, `removed::create` |
+| `PHold`, `PRecord`, `PRecheck`, `PUndo`, `PAfter`, `PRelock` | `remove.rs` `purge`: `hold::take(trash::info)`, `removed::create`, `recheck(path, ours = trash::LOCK)`, and `settle` with `standing` and no `Files` when the re-check fails. A purge in Old re-checks before it writes its record, as 0.0.10 did (`PFirst`) |
 | `PUnlock` | `trash.rs` `purge(item, registered, holds)` |
 | `StartGit` | `git.rs` `remove_worktree(main, path, holds)`, `hold.rs` `pass_to` |
 | `GFind`, `GExists`, `GStatus`, `GTree`, `GGitdir` | Git's `remove_worktree`, run by `git.rs` `remove_worktree` |
@@ -132,7 +132,7 @@ In check.sh's output:
 - `mutant NAME: NOT caught` means the model no longer depends on that guard of the code.
 - `no control` means the mutant's rule already breaks in its setup without the mutant, so the line shows nothing.
 
-Each mutant in `model/mutants` removes one guard the code has, to show that a rule depends on it:
+Each mutant in `model/mutants` removes one guard the code has, to show that a rule depends on it. `A+B` removes two, for a guard a rule needs only once another is gone:
 
 | Mutant | The guard it removes | Rule that breaks |
 | --- | --- | --- |
@@ -144,8 +144,8 @@ Each mutant in `model/mutants` removes one guard the code has, to show that a ru
 | `StandingIgnoresFiles` | `standing`'s comparison of the files with the plan's once Git ran (`Files`) | `RecordDroppedOnlyWhenWhole` |
 | `MoveBackNoNote` | `move_back`'s "part of it is gone" note | `RestoreTellsTheTruth` |
 | `PutBackAlwaysUnlocks` | `Moved::put_back(locked)`: unlock only a lock residue set | `OnlyOwnLocksLifted` |
-| `PurgeNoHold` | the purge's `hold::take` on the entry | `NotDeletedOnceBack` |
-| `TrashRestoreNoHold` | `trash::take` in `restore_trash` | `NotDeletedOnceBack` |
+| `PurgeNoHold+TrashRestoreNoUse` | the purge's `hold::take` on the entry, and the trash restore's open `.git` | `NotDeletedOnceBack` |
+| `TrashRestoreNoHold+TrashRestoreNoUse` | `trash::take` in `restore_trash`, and its open `.git` | `NotDeletedOnceBack` |
 | `RestoreNoHold` | `removed.rs` `take` in `restore` | `NotDeletedOnceBack` |
 | `GitNoHold` | `hold::pass_to` in `git::remove_worktree`: Git inherits the holds | `NotDeletedOnceBack` |
 | `TrashRestoreStale` | `trash::restore` reading the lock from Git's list under the hold, not the listing's | `OnlyOwnLocksLifted` |
@@ -228,6 +228,8 @@ The review of #147 added the old setups, `SClear`, and `TCheck`'s refusal. When 
 Its second review added the old-orphan setups. For a record without a `hold` line, a restore now also refuses while a `git worktree remove` of the worktree runs, or while the activity probe sees a process using the worktree or its Git directory, and it applies these refusals only while Git still lists the worktree where the record's deletion started. Every rule holds in both.
 
 Its third review added the trash restore's open `.git`, its lock of a worktree Git lists unlocked, its second read of the records once the worktree has moved, and the note of a record restore whose purge's worktree is already back, each with a mutant. In the old setups the trash restore now races the purge throughout, outside the window `LatePurge` names. Every rule holds in all fourteen setups.
+
+A purge writes its removal record before its re-check, as a removal writes its record before its last check, so writing and syncing the record does not lengthen the time between that check and Git's delete. The model has no clock, so no rule shows that time; what it shows is that the new order breaks no rule, that a re-check that fails after the record settles the record as a removal does (`PUndo`), and that the entry's holds are no longer the only guard against a trash restore: a restore that a missing hold lets in either finds the purge's record held and refuses, or opened the worktree's `.git` before that record, which the re-check then sees as a use. So `PurgeNoHold` and `TrashRestoreNoHold` are each checked with `TrashRestoreNoUse` too, and both holds stay in the code. A purge by a release that takes no hold keeps its old order in the model (`PFirst`).
 
 ## Not covered
 

@@ -991,8 +991,10 @@ fn trash_row(item: &trash::Item, now: i64, places: &Places, style: &Style) -> St
                     "trashed {} ({}){size}{}",
                     output::date(r.trashed),
                     output::age(now - r.trashed),
-                    if item.is_empty_record() {
+                    if item.holds_only_record() {
                         " · holds no worktree; the next purge clears it"
+                    } else if item.is_empty_record() {
+                        " · holds no worktree, but more than its record, so it stays"
                     } else {
                         " · still on disk; restore moves it back"
                     }
