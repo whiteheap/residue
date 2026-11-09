@@ -353,10 +353,16 @@ case " \$* " in
         *residue-removing-*hold-move* | */residue-trash/*hold-move*) hold "move-\$PPID" ;;
         *residue-removing-*open-before-move*)
             # After every check, a process opens a file at the top of the
-            # worktree, which it then holds under the hidden name.
+            # worktree, which it then holds under the hidden name. The
+            # wrapper opens it itself, before the move runs, and the sleep
+            # inherits it: opened in the background, it could come after
+            # the move, find no file there, and hold nothing.
             if [ ! -e "\$work/opener" ]; then
-                sleep 300 3<"\$second/README.md" >/dev/null 2>&1 &
+                exec 3<"\$second/README.md" || exit 1
+                # A copy on 4: some shells (ksh93) close 3 at an exec.
+                sleep 300 4<&3 >/dev/null 2>&1 &
                 echo \$! >"\$work/opener"
+                exec 3<&-
             fi
             ;;
         esac
