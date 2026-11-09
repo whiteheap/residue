@@ -5,7 +5,7 @@ description: Remove the Git worktree this session created, once its task is done
 
 # Remove a finished worktree with residue
 
-residue removes a linked Git worktree only when nothing in it would be lost. A change not committed, an untracked file, an ignored file no regenerable rule matches (an ignored `.env` always counts), a lock, or a process inside keeps it. Git does the delete, with `git worktree remove`, never `--force`. The branch and its commits stay.
+residue removes a linked Git worktree only when nothing in it would be lost. A change not committed, an untracked file, an ignored file that is not regenerable, such as a `.env`, even inside `build/`, a lock, or a process inside keeps it. Git does the delete, with `git worktree remove`, never `--force`. The branch and its commits stay.
 
 A pass is not a guarantee. A paused session often has no process in its worktree, so residue cannot see that it is still in use. That is why the steps below are for the worktree this session created, and for no other.
 
