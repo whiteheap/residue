@@ -76,6 +76,8 @@ For every repository on the machine, put one rule per line in `~/.config/residue
 
 ## For coding agents
 
+The [residue skill](../skills/residue/SKILL.md) gives Claude Code, Codex and other coding agents the steps below, and what to do when residue keeps the worktree. Install it for every project with `npx skills add whiteheap/residue-cli --skill residue -g`, or copy `skills/residue` into `~/.claude/skills/` for Claude Code or `~/.agents/skills/` for Codex.
+
 To clean up at the end of a task, run this from outside the worktree:
 
 ```sh
