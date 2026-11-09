@@ -4,7 +4,7 @@ residue deletes directories. Every change is judged by one question: could it ma
 
 ## Report a bug
 
-Open an issue with:
+Open a [bug report](https://github.com/whiteheap/residue-cli/issues/new?template=bug_report.yml) with:
 
 - `residue --version`, your operating system and version, and `git --version`
 - the command you ran and what you expected
@@ -14,7 +14,9 @@ If residue removed, or would remove, a worktree holding uncommitted, untracked o
 
 ## Propose a change
 
-Open an issue before you start on anything larger than a small fix, so we can agree on the behavior first.
+Open an issue before you start on anything larger than a small fix, so we can agree on the behavior first. Include a sketch of the change, such as a diagram, a mockup or a before and after.
+
+A step that each contributor or each release repeats by hand belongs in a script, a check or a workflow in this repository. When a step failed or a mistake got through, the change that fixes it also adds what catches it next time.
 
 [AGENTS.md](AGENTS.md#invariants) lists the invariants: deletion only through `git worktree remove` without `--force`, an `unknown` check blocks like a failed one, three activity states, a fresh re-check before every removal and again after the move aside, and one dependency. A change that weakens one of them needs an explicit decision recorded in [CHANGELOG.md](CHANGELOG.md), so raise it in an issue first.
 

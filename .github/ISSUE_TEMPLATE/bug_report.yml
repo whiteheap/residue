@@ -1,0 +1,34 @@
+name: Bug report
+description: residue did something you did not expect.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If residue removed, or would remove, a worktree holding work you want back, a worktree in use, or anything outside the worktree, do not open a public issue. [Report it privately](https://github.com/whiteheap/residue-cli/security/advisories/new), as [SECURITY.md](https://github.com/whiteheap/residue-cli/blob/main/SECURITY.md) describes.
+  - type: input
+    id: version
+    attributes:
+      label: residue --version
+      placeholder: residue 0.0.11
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and version, and git --version
+      placeholder: macOS 26.3.1, git version 2.50.1
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: The command you ran, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: explain
+    attributes:
+      label: residue explain --json PATH
+      description: For the worktree involved. Remove any paths or branch names you don't want public.
+      render: json
