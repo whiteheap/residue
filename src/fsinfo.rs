@@ -132,6 +132,10 @@ pub struct BucketUsage {
     /// Part of the entry was not read: an unreadable entry or a mount point
     /// is at or below it.
     pub incomplete: bool,
+    /// The first environment file (`policy::env_file`) strictly inside the
+    /// entry, outside `.git` entries and package folders, that no rule names
+    /// itself, relative to the worktree root.
+    pub env_file: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -163,14 +167,19 @@ struct Place {
     covered: bool,
     /// The entry is, or is inside, an entry named `.git` below the bucket.
     in_git: bool,
+    /// The entry is, or is inside, a package folder (`policy::PACKAGE_DIRS`).
+    in_package: bool,
 }
 
 /// Measures the worktree at `root`, which must be canonical
 /// (`git::canonical`): the walk refuses a symbolic link anywhere on it.
+/// `matches` is the rule matcher (`Rules::matches`), and `named` says
+/// whether a rule names a file itself (`Rules::names_file`).
 pub fn measure(
     root: &Path,
     buckets: &[Bucket],
     matches: &dyn Fn(&str) -> bool,
+    named: &dyn Fn(&str) -> bool,
 ) -> io::Result<Usage> {
     let (top, opened) = open_root(root)?;
     let device = top.dev();
@@ -203,6 +212,7 @@ pub fn measure(
             bucket: None,
             covered: false,
             in_git: false,
+            in_package: false,
         },
     });
     let mut stack: Vec<Pending> = Vec::new();
@@ -328,11 +338,29 @@ pub fn measure(
                 }
                 if meta.is_file() && !here.in_git {
                     usage.buckets[i].holds_file = true;
+                    // Strictly inside the bucket: the bucket entry itself
+                    // is judged by the rules alone, as before.
+                    if place.bucket.is_some()
+                        && !here.in_package
+                        && usage.buckets[i].env_file.is_none()
+                        && path.file_name().is_some_and(crate::policy::env_file)
+                        && !relative(&path, root).is_some_and(|rel| named(&rel))
+                        && !git_spelling(&path, root).is_some_and(|rel| named(&rel))
+                    {
+                        usage.buckets[i].env_file = Some(display(&path, root));
+                    }
                 }
                 if !meta.is_dir() && first {
                     usage.buckets[i].files += 1;
                     usage.buckets[i].bytes += meta.len();
                 }
+            }
+            if meta.is_dir()
+                && path
+                    .file_name()
+                    .is_some_and(|n| crate::policy::PACKAGE_DIRS.iter().any(|p| n == *p))
+            {
+                here.in_package = true;
             }
             if meta.is_dir() {
                 match leaf(&path) {
@@ -1319,8 +1347,8 @@ mod tests {
     //! entry.
 
     use super::{
-        HELD, Parent, Pending, Place, REOPENED, Reopened, Step, lstat_at, measure, open_listed,
-        open_root,
+        Bucket, HELD, Parent, Pending, Place, REOPENED, Reopened, Step, lstat_at, measure,
+        open_listed, open_root,
     };
     use std::ffi::CString;
     use std::fs;
@@ -1350,6 +1378,7 @@ mod tests {
         bucket: None,
         covered: false,
         in_git: false,
+        in_package: false,
     };
 
     /// The folder at `dir`, opened as the walk opens a worktree.
@@ -1473,7 +1502,7 @@ mod tests {
 
         // A worktree path with a symbolic link on it is refused whole.
         symlink(&w, root.join("link")).unwrap();
-        let Err(e) = measure(&root.join("link"), &[], &|_| false) else {
+        let Err(e) = measure(&root.join("link"), &[], &|_| false, &|_| false) else {
             panic!("the walk opened a worktree through a symbolic link");
         };
         assert!(e.to_string().contains("symbolic link"), "{e}");
@@ -1481,7 +1510,7 @@ mod tests {
         // The walk itself reads the link as one entry and nothing behind it.
         fs::remove_file(w.join("a")).unwrap();
         symlink(&elsewhere, w.join("a")).unwrap();
-        let usage = measure(&w, &[], &|_| false).unwrap();
+        let usage = measure(&w, &[], &|_| false, &|_| false).unwrap();
         assert_eq!(usage.entries, 2, "w and the link");
         assert!(usage.nested_repos.is_empty());
         assert_eq!(usage.unreadable, 0);
@@ -1526,7 +1555,7 @@ mod tests {
         }
         let mut repos = Vec::new();
         let entries = count(&w, &mut repos);
-        let usage = measure(&w, &[], &|_| false).unwrap();
+        let usage = measure(&w, &[], &|_| false, &|_| false).unwrap();
         assert_eq!(usage.unreadable, 0, "{:?}", usage.first_error);
         assert_eq!(usage.entries, entries);
         let mut found = usage.nested_repos.clone();
@@ -1603,7 +1632,7 @@ mod tests {
         let w = root.join("w");
         fs::create_dir_all(w.join("a")).unwrap();
         fs::set_permissions(&w, fs::Permissions::from_mode(0o311)).unwrap();
-        let usage = measure(&w, &[], &|_| false);
+        let usage = measure(&w, &[], &|_| false, &|_| false);
         fs::set_permissions(&w, fs::Permissions::from_mode(0o755)).unwrap();
         let usage = usage.unwrap();
         // SAFETY: geteuid only returns this process's effective user.
@@ -1614,6 +1643,62 @@ mod tests {
             assert!(error.starts_with(&format!("{}: ", w.display())), "{error}");
             assert!(usage.newest_mtime.is_some());
         }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// An environment file strictly inside an ignored entry is found, except
+    /// in a package folder or a `.git` entry, when a rule names it itself,
+    /// or when it is the entry, which the rules judge alone.
+    #[test]
+    fn an_environment_file_inside_an_ignored_folder_is_found() {
+        let root = scratch("env");
+        let w = root.join("w");
+        let files = [
+            "build/sub/.env.local",
+            "build/sub/.env.production",
+            "dist/.env.example",
+            "node_modules/pkg/.env",
+            "out/.venv/lib/.env",
+            "named/.env",
+            "copy/.git/.env",
+            ".env",
+        ];
+        for file in files {
+            let path = w.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "SECRET=1").unwrap();
+        }
+        let buckets: Vec<Bucket> = [
+            "build",
+            "dist",
+            "node_modules",
+            "out",
+            "named",
+            "copy",
+            ".env",
+        ]
+        .iter()
+        .map(|rel| Bucket {
+            rel: PathBuf::from(rel),
+            expand: false,
+        })
+        .collect();
+        let usage = measure(&w, &buckets, &|_| true, &|rel| rel == "named/.env").unwrap();
+        let found: Vec<Option<&str>> = usage
+            .buckets
+            .iter()
+            .map(|b| b.env_file.as_deref())
+            .collect();
+        let first = found[0].unwrap_or_default();
+        assert!(
+            first == "build/sub/.env.local" || first == "build/sub/.env.production",
+            "{found:?}"
+        );
+        assert_eq!(
+            found[1..],
+            [None, None, None, None, None, None],
+            "{found:?}"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 }

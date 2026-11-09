@@ -23,11 +23,44 @@
 //! `GIT_CONFIG`): every subprocess inherits it, so it must not widen what
 //! residue deletes. residue reports those values instead of using them.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use crate::cli::Span;
+
+/// Folders a package manager fills from a registry. An environment file in
+/// one came with a package, and the next install puts it back, so it does
+/// not keep its worktree the way one in `build/` does ([`env_file`]).
+pub const PACKAGE_DIRS: &[&str] = &[
+    "node_modules",
+    ".pnpm-store",
+    "bower_components",
+    ".venv",
+    "venv",
+    ".tox",
+    ".nox",
+];
+
+/// `.env` and `.env.NAME`, in any case: where a project keeps its secrets
+/// and local settings, which no build or install recreates. A rule that
+/// matches the folder around one does not cover it, so it keeps its
+/// worktree until a rule names the file itself (`Rules::names_file`). The
+/// templates `.env.example`, `.env.sample`, `.env.template` and `.env.dist`
+/// are not, since a repository usually tracks them.
+pub fn env_file(name: &OsStr) -> bool {
+    let name = name.as_bytes().to_ascii_lowercase();
+    if name == b".env" {
+        return true;
+    }
+    let Some(rest) = name.strip_prefix(b".env.") else {
+        return false;
+    };
+    let last = rest.rsplit(|&b| b == b'.').next().unwrap_or(rest);
+    !rest.is_empty() && !matches!(last, b"example" | b"sample" | b"template" | b"dist")
+}
 
 pub const DEFAULTS: &[&str] = &[
     // JavaScript and TypeScript
@@ -126,19 +159,37 @@ impl Rules {
     /// prints it, with or without a trailing slash for a directory.
     pub fn matches(&self, entry: &str) -> bool {
         let trimmed = entry.trim_end_matches('/');
-        let name = trimmed.rsplit('/').next().unwrap_or(trimmed);
-        if self.names.iter().any(|n| n == name)
-            || self
-                .suffixes
-                .iter()
-                .any(|s| name.len() > s.len() && name.ends_with(s.as_str()))
-        {
+        if self.name_matches(trimmed) {
             return true;
         }
         let parts: Vec<&str> = trimmed.split('/').collect();
         self.paths
             .iter()
             .any(|rule| rule.len() <= parts.len() && prefix_matches(rule, &parts))
+    }
+
+    /// True when a rule names the file at `entry` itself: a name or `*.ext`
+    /// rule that matches its name, or a path rule exactly as long as its
+    /// path. A rule that matches a folder above it does not count, so
+    /// `build` covers `build/` but does not name `build/.env`.
+    pub fn names_file(&self, entry: &str) -> bool {
+        if self.name_matches(entry) {
+            return true;
+        }
+        let parts: Vec<&str> = entry.split('/').collect();
+        self.paths
+            .iter()
+            .any(|rule| rule.len() == parts.len() && prefix_matches(rule, &parts))
+    }
+
+    /// A name or `*.ext` rule matches the last component of `entry`.
+    fn name_matches(&self, entry: &str) -> bool {
+        let name = entry.rsplit('/').next().unwrap_or(entry);
+        self.names.iter().any(|n| n == name)
+            || self
+                .suffixes
+                .iter()
+                .any(|s| name.len() > s.len() && name.ends_with(s.as_str()))
     }
 
     /// True when a path rule names something strictly below the directory
@@ -305,4 +356,69 @@ pub fn config_path() -> Option<PathBuf> {
                 .map(|h| PathBuf::from(h).join(".config"))
         })?;
     Some(base.join("residue").join("regenerable"))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Which names are environment files, and when a rule names a file
+    //! itself rather than a folder above it.
+
+    use super::{Rules, env_file};
+    use std::ffi::OsStr;
+
+    #[test]
+    fn env_files_are_dotenv_and_its_variants_but_not_its_templates() {
+        for name in [
+            ".env",
+            ".ENV",
+            ".env.local",
+            ".env.production",
+            ".env.development.local",
+        ] {
+            assert!(env_file(OsStr::new(name)), "{name} is an environment file");
+        }
+        for name in [
+            ".env.example",
+            ".env.sample",
+            ".env.template",
+            ".env.dist",
+            ".env.local.example",
+            ".env.",
+            ".envrc",
+            "env",
+            ".environment",
+            "prod.env",
+        ] {
+            assert!(
+                !env_file(OsStr::new(name)),
+                "{name} is not an environment file"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rule_names_a_file_by_its_name_or_its_whole_path_only() {
+        let mut rules = Rules::default();
+        for rule in ["build", "*.local", "dist/.env", "out/*"] {
+            rules.add(rule).unwrap();
+        }
+        assert!(rules.matches("build/"), "the folder rule covers build/");
+        assert!(
+            !rules.names_file("build/.env"),
+            "a folder rule names no file in it"
+        );
+        assert!(rules.names_file("build/.env.local"), "*.local names it");
+        assert!(rules.names_file("dist/.env"), "the whole path");
+        assert!(
+            !rules.names_file("dist/.env/x"),
+            "a path rule shorter than the path"
+        );
+        assert!(!rules.names_file("dist/sub/.env"), "another path");
+        assert!(rules.names_file("out/.env"), "* matches within its segment");
+        assert!(
+            !rules.names_file("out/sub/.env"),
+            "* stays within one segment"
+        );
+        assert!(!Rules::default().names_file(".env"), "no rule");
+    }
 }
