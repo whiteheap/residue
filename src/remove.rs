@@ -36,7 +36,7 @@ use crate::inspect::{self, Fingerprint, Report, Verdict};
 use crate::json::Json;
 use crate::output::{self, Places, Style, clean};
 use crate::policy::Policy;
-use crate::removed::{self, By, Reason};
+use crate::removed::{self, Activity, By, Reason};
 use crate::stats;
 use crate::trash;
 
@@ -104,18 +104,26 @@ pub struct Leftover {
     /// cannot (`unusable`): Git then refuses to move it back or remove it.
     pub unusable: Option<String>,
     /// The removal record that names it, which `residue restore` takes
-    /// (`with_record`).
+    /// (`with_records`).
     pub record: Option<PathBuf>,
-    /// A run, or the `git worktree remove` it started, holds that record
-    /// now: the removal may still be deleting it, or a restore moving it
-    /// back. `Err` when residue could not tell; `Ok(false)` with no record.
-    pub removal_running: Result<bool, String>,
+    /// What may still act on it, from that record (`removed::Activity`):
+    /// a run, its Git, or a program Git started holds the record, or the
+    /// record comes from a release that takes no hold and its run still
+    /// runs. Either way the removal may still be deleting it, or a restore
+    /// moving it back. `Err` when residue could not tell, which includes a
+    /// record that may name it and cannot be read; `Ok(Idle)` with no
+    /// record.
+    pub activity: Result<removed::Activity, String>,
+    /// That record has its `hold` line, so its hold, not `running`, shows
+    /// whether its removal still runs.
+    pub held_record: bool,
     /// The one line that recovers it: moves it back, clears Git's record
     /// when the directory is gone, or, when Git can no longer use it, the
     /// `residue restore` of its record, which says what to clear first.
     /// Empty when Git can no longer use it and no record names it, since no
-    /// one command brings it back, and while its removal runs, since any
-    /// move then lets Git delete it where it lands. Never a deletion.
+    /// one command brings it back, and unless residue could tell that its
+    /// removal has stopped, since any move then lets Git delete it where it
+    /// lands. Never a deletion.
     pub recovery: String,
 }
 
@@ -146,34 +154,76 @@ impl Leftover {
             present,
             unusable,
             record: None,
-            removal_running: Ok(false),
+            activity: Ok(Activity::Idle),
+            held_record: false,
             recovery,
         })
     }
 
-    /// The removal record that names it, if one does. When Git can no
-    /// longer use it, the record's restore is the only line that works.
-    /// While a run holds the record, no line is safe.
-    pub fn with_record(mut self, dir: Option<PathBuf>) -> Leftover {
-        if let Some(dir) = &dir {
-            self.removal_running = removed::held(dir);
-            if self.removal_running == Ok(true) {
-                self.recovery = String::new();
-            } else if self.unusable.is_some() {
+    /// The removal record that names it, among the repository's `records`.
+    /// When Git can no longer use it, the record's restore is the only line
+    /// that works. Unless residue can tell that no run acts on the record
+    /// (`Activity::Idle`), no line is safe, so there is none; that includes
+    /// a record that may name it and cannot be read.
+    pub fn with_records(mut self, records: &[removed::Item]) -> Leftover {
+        let named = records
+            .iter()
+            .find(|i| i.record.as_ref().is_ok_and(|r| r.aside == self.path));
+        if let Some(item) = named {
+            self.activity = item.activity();
+            self.held_record = item.record.as_ref().is_ok_and(|r| r.hold);
+            self.record = Some(item.dir.clone());
+        } else if let Some(item) = records
+            .iter()
+            .find(|i| i.may_be_unreadable_for(&self.original))
+        {
+            let e = item.record.as_ref().err().map_or("", String::as_str);
+            self.activity = Err(format!(
+                "a removal record that may name it cannot be read: {e}"
+            ));
+        }
+        match (&self.activity, &self.record) {
+            (Ok(Activity::Idle), Some(dir)) if self.unusable.is_some() => {
                 self.recovery = format!("residue restore {}", output::shell(dir));
             }
+            (Ok(Activity::Idle), _) => {}
+            _ => self.recovery = String::new(),
         }
-        self.record = dir;
         self
     }
 
+    /// Why no line is safe while something may still act on it.
+    fn busy(&self) -> Option<String> {
+        let again = "run residue scan again once it ends";
+        match &self.activity {
+            Ok(Activity::Idle) => None,
+            Ok(Activity::Held) => match &self.record {
+                Some(dir) if !self.running => Some(format!(
+                    "residue run {} has exited, but a process still holds its removal record: the `git worktree remove` it started, a program that Git started, or another residue run (`lsof {}` names it), so Git may still be deleting it; {again}",
+                    self.pid,
+                    output::shell(&removed::info_of(dir))
+                )),
+                _ => Some(format!(
+                    "a residue run, or the `git worktree remove` it started, still holds its removal record, so it may still be deleting it; {again}"
+                )),
+            },
+            Ok(Activity::Unheld(pid)) => Some(format!(
+                "process {pid}, the residue run that removed it, is from a release that takes no hold and still runs, so it may still be deleting it; {again}; `ps -p {pid}` shows what it is"
+            )),
+            Err(e) => Some(format!(
+                "residue could not tell whether its removal still runs ({e}), so it names no line to recover it; fix that, then run residue scan again"
+            )),
+        }
+    }
+
     pub fn text(&self, places: &Places, style: &Style) -> String {
-        if self.removal_running == Ok(true) {
-            return format!(
-                "  {}  {}\n    a residue run, or the `git worktree remove` it started, still holds its removal record, so it may still be deleting it; run residue scan again once it ends\n",
-                places.show(&self.path),
-                style.dim(&format!("was {}", places.show(&self.original))),
-            );
+        let head = format!(
+            "  {}  {}\n",
+            places.show(&self.path),
+            style.dim(&format!("was {}", places.show(&self.original))),
+        );
+        if let Some(why) = self.busy() {
+            return format!("{head}    {why}\n");
         }
         let line = match (&self.unusable, &self.record) {
             (Some(why), Some(_)) => format!(
@@ -189,7 +239,9 @@ impl Leftover {
                 clean(&self.recovery)
             ),
         };
-        let line = if self.running {
+        // A record with its hold line, free now, shows that its removal has
+        // stopped, whatever process has that PID now.
+        let line = if self.running && !self.held_record {
             format!(
                 "process {} still runs, so residue may still be removing it; if it is not residue, {line}",
                 self.pid
@@ -197,18 +249,7 @@ impl Leftover {
         } else {
             line
         };
-        let line = match &self.removal_running {
-            Err(e) => format!(
-                "residue could not tell whether its removal still runs ({e}); if none does, {line}"
-            ),
-            Ok(_) => line,
-        };
-        let mut out = format!(
-            "  {}  {}\n    {}\n",
-            places.show(&self.path),
-            style.dim(&format!("was {}", places.show(&self.original))),
-            line
-        );
+        let mut out = format!("{head}    {line}\n");
         // A run that stopped after writing its removal record: restore
         // moves it back, with the same checks.
         if let (None, Some(dir)) = (&self.unusable, &self.record) {
@@ -225,8 +266,8 @@ impl Leftover {
             ("pid_running", Json::Bool(self.running)),
             (
                 "removal_running",
-                match &self.removal_running {
-                    Ok(running) => Json::Bool(*running),
+                match &self.activity {
+                    Ok(activity) => Json::Bool(*activity != Activity::Idle),
                     Err(_) => Json::Null,
                 },
             ),
@@ -529,8 +570,12 @@ pub fn remove(options: &Options) -> u8 {
         if f.outcome.is_some() {
             continue;
         }
-        let outcome = match removed::forget(&f.item) {
-            Ok(()) => Outcome::Removed(None),
+        let outcome = match removed::forget_expired(&f.item) {
+            Ok(true) => Outcome::Removed(None),
+            Ok(false) => Outcome::Skipped(
+                "another residue run, a restore, holds it now, so it stays until the next run"
+                    .into(),
+            ),
             Err(e) => {
                 warnings.push(format!(
                     "could not forget the removal record {}: {e}",
@@ -1232,13 +1277,24 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
     };
     // Git deleted nothing yet, so only the checkout and the Git directory
     // count: a check that failed on an edit of the user's puts it back.
+    let both = [original, dest.as_path()];
     if let Err(why) = check() {
         let outcome = moved.put_back(true, &why);
-        return settle(&written, &main, &[original, &dest], None, None, outcome);
+        return settle(
+            &written,
+            standing(&written, &main, &both, None),
+            None,
+            outcome,
+        );
     }
     if let Err(e) = git::unlock_worktree(&main, &dest) {
         let outcome = moved.put_back(true, &format!("could not unlock it: {e}"));
-        return settle(&written, &main, &[original, &dest], None, None, outcome);
+        return settle(
+            &written,
+            standing(&written, &main, &both, None),
+            None,
+            outcome,
+        );
     }
     // Git inherits the record's hold, so a restore waits for it even if
     // this process is killed alone.
@@ -1249,7 +1305,9 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
     // HEAD, its reflog. Then it stays where it is, since Git may not move
     // it, and the record is how it comes back: `residue restore` moves it
     // back and puts back what its Git directory lost. Its files count too:
-    // Git may have been stopped partway through them.
+    // Git may have been stopped partway through them. This one reading
+    // decides: the settle of a worktree left lacking uses it, so a later
+    // reading cannot drop the record of one that stays aside.
     let files = Files {
         planned,
         policy,
@@ -1257,22 +1315,23 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
     };
     let at_dest = standing(&written, &main, &[&dest], Some(&files));
     if let Standing::Lacking(..) = at_dest {
-        return settle(
-            &written,
-            &main,
-            &[&dest],
-            Some(&files),
-            None,
-            Outcome::Failed(e),
-        );
+        return settle(&written, at_dest, None, Outcome::Failed(e));
     }
+    let measured_whole = matches!(at_dest, Standing::Whole(_));
     let outcome = match moved.put_back(false, &e) {
         Outcome::Skipped(why) => Outcome::Failed(why),
         other => other,
     };
-    // Measured whole just now, and the move back changes no file.
-    let measure = (!matches!(at_dest, Standing::Whole)).then_some(&files);
-    settle(&written, &main, &[original, &dest], measure, None, outcome)
+    // The move back changed where it is, so where it stands is read again;
+    // measured whole just now, its files need no second measure, since the
+    // move changes none.
+    let measure = (!measured_whole).then_some(&files);
+    settle(
+        &written,
+        standing(&written, &main, &both, measure),
+        None,
+        outcome,
+    )
 }
 
 /// What the removal record keeps of a worktree about to be deleted at
@@ -1319,6 +1378,7 @@ fn removal_record(
             .collect(),
         pid: Some(std::process::id()),
         version: Some(VERSION.to_string()),
+        hold: true,
         // `removed::create` finds them, right before it writes the record.
         kept: Vec::new(),
     }
@@ -1333,9 +1393,9 @@ fn checkout_present(path: &Path) -> bool {
 /// What is left of a worktree whose deletion did not complete, as far as
 /// its removal record is concerned.
 enum Standing<'a> {
-    /// Git lists it at one of the paths, with its checkout and everything
-    /// the record keeps: nothing of it is gone.
-    Whole,
+    /// Git lists it at this path, with its checkout and everything the
+    /// record keeps: nothing of it is gone.
+    Whole(&'a Path),
     /// Git lists it at this path, but this part of it is gone.
     Lacking(&'a Path, String),
     /// Git no longer lists it at any of the paths.
@@ -1411,11 +1471,11 @@ fn standing<'a>(
             return Standing::Lacking(at, why);
         }
         let Some(files) = files else {
-            return Standing::Whole;
+            return Standing::Whole(at);
         };
         return match files.planned.again(at, entry.head.clone(), files.policy) {
             Ok(now) => match files.planned.changed(&now, files.since) {
-                None => Standing::Whole,
+                None => Standing::Whole(at),
                 Some(why) => Standing::Lacking(at, format!("part of its files may be gone: {why}")),
             },
             Err(e) => Standing::Lacking(
@@ -1427,24 +1487,29 @@ fn standing<'a>(
     unsure.unwrap_or(Standing::Unlisted)
 }
 
-/// After a deletion that did not complete: when nothing of the worktree
-/// is gone (`standing`, with `files` once Git ran), its removal record is
-/// dropped. Otherwise the record stays, and the outcome says so: it is how
-/// the worktree comes back. `entry` is the trash entry a purge's worktree
-/// is still in, whose restore brings it back while Git lists it there.
-/// The run holds the record, and a purge the entry, so no restore moved
-/// the worktree meanwhile.
+/// After a deletion that did not complete, from one reading of where the
+/// worktree stands (`standing`, with `files` once Git ran): when nothing
+/// of it is gone and it is at a path that is its own (its original path,
+/// or a purge's trash entry), its removal record is dropped. Otherwise the
+/// record stays, and the outcome says so: it is how the worktree comes
+/// back. One left whole under the hidden name keeps its record too, so
+/// that `residue restore` and `residue scan` still find it. `entry` is the
+/// trash entry a purge's worktree is still in, whose restore brings it
+/// back while Git lists it there. The run holds the record, and a purge
+/// the entry, so no restore moved the worktree meanwhile.
 fn settle(
     written: &removed::Written,
-    main: &Path,
-    paths: &[&Path],
-    files: Option<&Files>,
+    standing: Standing,
     entry: Option<&Path>,
     outcome: Outcome,
 ) -> Outcome {
     let restore = output::shell(&written.dir);
-    let note = match standing(written, main, paths, files) {
-        Standing::Whole => match written.undo() {
+    let note = match standing {
+        Standing::Whole(at) if original_of(at).is_some() => format!(
+            "it is whole at {}, and its removal record stays: residue restore {restore} moves it back",
+            at.display()
+        ),
+        Standing::Whole(_) => match written.undo() {
             Ok(()) => return outcome,
             Err(e) => format!("its removal record stays ({e})"),
         },
@@ -1461,9 +1526,22 @@ fn settle(
         ),
     };
     match outcome {
-        Outcome::Skipped(why) => Outcome::Skipped(format!("{why}; {note}")),
-        Outcome::Failed(why) => Outcome::Failed(format!("{why}; {note}")),
+        Outcome::Skipped(why) => Outcome::Skipped(with_note(why, &note)),
+        Outcome::Failed(why) => Outcome::Failed(with_note(why, &note)),
         other => other,
+    }
+}
+
+/// Where the line that recovers a worktree residue could not move back
+/// starts in an outcome (`Moved::stuck`).
+const RECOVER_WITH: &str = ". Recover with: ";
+
+/// `why` with `note` added. The line that recovers the worktree stays last,
+/// so a copy of it to the end runs nothing else.
+fn with_note(why: String, note: &str) -> String {
+    match why.rsplit_once(RECOVER_WITH) {
+        Some((head, line)) => format!("{head}; {note}{RECOVER_WITH}{line}"),
+        None => format!("{why}; {note}"),
     }
 }
 
@@ -1514,7 +1592,7 @@ impl Moved<'_> {
     fn stuck(&self, locked: bool, why: &str, cause: &str) -> Outcome {
         let relocked = git::lock_worktree(self.main, self.dest, self.reason).is_ok();
         Outcome::Failed(format!(
-            "{why}; residue could not move it back to {} ({cause}). It is at {}. Recover with: {}",
+            "{why}; residue could not move it back to {} ({cause}). It is at {}{RECOVER_WITH}{}",
             self.original.display(),
             self.dest.display(),
             recovery(self.main, self.dest, self.original, locked || relocked)
@@ -1671,18 +1749,15 @@ fn purge(p: &Purge, policy: &Policy, mode: &Mode) -> Outcome {
         Ok(()) => Outcome::Removed(Some(written.dir)),
         // Its files count whether or not Git ran: the re-check found them
         // as the plan did a moment ago, so a difference keeps the record.
-        Err(e) => settle(
-            &written,
-            &p.item.command_dir,
-            &[&path],
-            Some(&Files {
+        Err(e) => {
+            let files = Files {
                 planned,
                 policy,
                 since: mode.since,
-            }),
-            Some(&p.item.dir),
-            Outcome::Failed(e),
-        ),
+            };
+            let at = standing(&written, &p.item.command_dir, &[&path], Some(&files));
+            settle(&written, at, Some(&p.item.dir), Outcome::Failed(e))
+        }
     }
 }
 

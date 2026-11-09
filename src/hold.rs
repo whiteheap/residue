@@ -39,13 +39,33 @@ pub enum Taken {
 }
 
 /// Take the hold on the entry whose `info` is at `info`, without waiting.
+/// An `info` residue may not write (mode 0444) is opened for reading:
+/// flock(2) holds a file open either way on the local filesystems of macOS,
+/// Linux and the BSDs. Where it needs one open for writing (illumos, and
+/// NFS on Linux, which emulates it with fcntl(2) locks), that lock fails,
+/// and the error names the open that was refused. Every error is an error,
+/// never a free hold.
 pub fn take(info: &Path) -> Result<Taken, String> {
-    let file = match OpenOptions::new().read(true).write(true).open(info) {
-        Ok(f) => f,
+    let (file, refused) = match OpenOptions::new().read(true).write(true).open(info) {
+        Ok(f) => (f, None),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Taken::Gone),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            match OpenOptions::new().read(true).open(info) {
+                Ok(f) => (f, Some(e)),
+                Err(again) if again.kind() == io::ErrorKind::NotFound => return Ok(Taken::Gone),
+                Err(again) => return Err(format!("cannot open {}: {again}", info.display())),
+            }
+        }
         Err(e) => return Err(format!("cannot open {}: {e}", info.display())),
     };
-    if !lock(&file).map_err(|e| format!("cannot lock {}: {e}", info.display()))? {
+    let locked = lock(&file).map_err(|e| match &refused {
+        Some(w) => format!(
+            "cannot lock {} open for reading ({e}), and cannot open it for writing ({w})",
+            info.display()
+        ),
+        None => format!("cannot lock {}: {e}", info.display()),
+    })?;
+    if !locked {
         return Ok(Taken::Busy);
     }
     // A run that discarded the entry between the open and the lock left

@@ -95,6 +95,9 @@ const CONFIG: &str = "config.worktree";
 /// when it had one and the repository kept its refs in files, the only
 /// backend whose reflog Git reads from that file.
 const REFLOG: &str = "HEAD.reflog";
+/// The value of a record's `hold` line: its writer holds `info` with
+/// flock(2) (`hold`).
+const HOLD: &str = "flock";
 /// What a restore that recreates a worktree says in a repository that
 /// keeps its refs in reftable, where Git reads no `logs/HEAD` file to put
 /// the old entries in.
@@ -245,6 +248,11 @@ pub struct Record {
     /// The residue process that wrote it.
     pub pid: Option<u32>,
     pub version: Option<String>,
+    /// Its writer holds `info` while it, or the Git it starts, acts on the
+    /// worktree (the `hold flock` line, `hold`). A record without it comes
+    /// from a release that takes no hold, 0.0.10 and earlier, whose run
+    /// only its PID shows (`Record::unheld_writer`).
+    pub hold: bool,
     /// The fewest commits that reach every commit only the worktree's own
     /// reflog held; the Nth has the ref `refs/residue/reflog/ENTRY/N`.
     pub kept: Vec<String>,
@@ -335,6 +343,9 @@ impl Record {
         if let Some(v) = &self.version {
             line("version", v.as_bytes());
         }
+        if self.hold {
+            line("hold", HOLD.as_bytes());
+        }
         for k in &self.kept {
             line("kept", k.as_bytes());
         }
@@ -357,6 +368,7 @@ impl Record {
             gone: Vec::new(),
             pid: None,
             version: None,
+            hold: false,
             kept: Vec::new(),
         };
         let (mut original, mut aside, mut removed) = (None, None, None);
@@ -418,6 +430,9 @@ impl Record {
                 }
                 b"pid" => record.pid = text().parse().ok(),
                 b"version" => record.version = Some(text()),
+                // Another kind of hold, from a later release, is one this
+                // release cannot see, so only its PID counts.
+                b"hold" => record.hold = text() == HOLD,
                 b"kept" => {
                     let commit = text();
                     if !is_object_id(&commit) {
@@ -452,6 +467,49 @@ impl Record {
         self.branch
             .as_deref()
             .map(|b| b.strip_prefix("refs/heads/").unwrap_or(b))
+    }
+
+    /// The PID of the run that wrote this record when its release takes no
+    /// hold (no `hold` line) and that PID still runs: the run, or its Git,
+    /// may still be deleting the worktree, and a free hold shows nothing.
+    /// PIDs are reused, so it may be another process.
+    pub fn unheld_writer(&self) -> Option<u32> {
+        if self.hold {
+            return None;
+        }
+        self.pid
+            .filter(|&pid| pid != std::process::id() && crate::remove::running(pid))
+    }
+}
+
+/// A restore's refusal while the run that wrote `record`, from a release
+/// that takes no hold, still runs (`Record::unheld_writer`).
+fn unheld_refusal(record: &Record, what: &str) -> Option<String> {
+    let pid = record.unheld_writer()?;
+    let release = record
+        .version
+        .as_deref()
+        .map_or("an older residue".to_string(), |v| {
+            format!("residue {}", output::clean(v))
+        });
+    Some(format!(
+        "{release} wrote {what}, takes no hold, and its process {pid} still runs, so it may still be deleting the worktree; run this restore again once it ends; `ps -p {pid}` shows what it is"
+    ))
+}
+
+/// What a restore says when a run holds a record: `info` is its file.
+/// Once the run that wrote it has exited, what holds it is its Git, a
+/// program that Git started, or another run that restores or forgets the
+/// record, and `lsof` names it.
+fn busy_note(record: Option<&Record>, info: &Path, what: &str) -> String {
+    let lsof = format!("`lsof {}` names it", output::shell(info));
+    match record.and_then(|r| r.pid) {
+        Some(pid) if !crate::remove::running(pid) => format!(
+            "the residue run that wrote {what} (process {pid}) has exited, but another process still holds it ({lsof}): the `git worktree remove` it started, or a program that Git started, may still be deleting the worktree, or another residue run is restoring or forgetting the record; run this restore again once that process ends"
+        ),
+        _ => format!(
+            "a residue run, or the `git worktree remove` it started, still holds {what} ({lsof}): it may still be deleting the worktree, or restoring or forgetting the record; run this restore again once it ends"
+        ),
     }
 }
 
@@ -570,6 +628,19 @@ impl Item {
         self.registered.is_some()
     }
 
+    /// A record with an `info` residue cannot read, whose name it could
+    /// have been given for a worktree at `original` (`create` names it
+    /// after the worktree's directory): residue cannot tell whether it
+    /// names that worktree, or whether a run holds it.
+    pub fn may_be_unreadable_for(&self, original: &Path) -> bool {
+        self.record.is_err()
+            && !self.incomplete
+            && self
+                .name
+                .strip_prefix(&entry_base(original))
+                .is_some_and(|rest| rest.starts_with('-'))
+    }
+
     /// A run with `--keep-removed` of `keep` seconds forgets this record:
     /// it is at least that old and at least as old as the `--keep-removed`
     /// of the removal that wrote it, so no run forgets a record before the
@@ -621,22 +692,33 @@ pub fn of_repo(repo: &crate::discover::Repo) -> Result<Vec<Item>, String> {
     list(&repo.common_dir, &repo.command_dir(), &listed, &repo.linked)
 }
 
-/// The records of purges of the trash worktree at `aside` that Git still
-/// lists there, read now, each held. `listed` is every worktree Git lists
-/// for the repository now. A purge holds the trash entry while it, or its
-/// Git, runs, so to a restore that holds the entry each one is a purge that
-/// stopped partway. A record another run holds refuses the restore: that
-/// run may be restoring or forgetting it now.
+/// The records of purges of the trash worktree at `aside`, which came from
+/// `original`, that Git still lists there, read now, each held. `listed`
+/// is every worktree Git lists for the repository now. A purge holds the
+/// trash entry while it, or its Git, runs, so to a restore that holds the
+/// entry each one is a purge that stopped partway. The restore refuses,
+/// having changed nothing, while one may not have stopped: another run
+/// holds it, or it comes from a release that takes no hold and the run
+/// that wrote it still runs (`unheld_refusal`). It refuses too while a
+/// record that may be one cannot be read.
 pub fn stopped_purges(
     common_dir: &Path,
     command_dir: &Path,
     aside: &Path,
+    original: &Path,
     listed: &[Entry],
 ) -> Result<Vec<(Item, Hold)>, String> {
     let listed: Vec<&Entry> = listed.iter().collect();
     let aside_now = git::canonical(aside).ok();
     let mut stopped = Vec::new();
     for item in list(common_dir, command_dir, &listed, &[])? {
+        if item.may_be_unreadable_for(original) {
+            let e = item.record.as_ref().err().map_or("", String::as_str);
+            return Err(format!(
+                "residue cannot read the removal record {} ({e}), so it cannot tell whether a purge of this entry stopped partway, or still runs; residue changed nothing",
+                item.name
+            ));
+        }
         let ours = item.interrupted()
             && item
                 .record
@@ -645,14 +727,21 @@ pub fn stopped_purges(
         if !ours {
             continue;
         }
-        match hold::take(&item.dir.join(INFO))? {
-            Taken::Held(hold) => stopped.push((item, hold)),
-            Taken::Busy => {
-                return Err(format!(
-                    "another residue run holds {}, the removal record of a purge of this entry that stopped partway, so residue changed nothing; run this restore again once it ends",
-                    item.name
-                ));
+        let info = item.dir.join(INFO);
+        let what = format!("{}, the removal record of a purge of this entry", item.name);
+        match hold::take(&info)? {
+            Taken::Held(hold) => {
+                if let Some(why) = item
+                    .record
+                    .as_ref()
+                    .ok()
+                    .and_then(|r| unheld_refusal(r, &what))
+                {
+                    return Err(why);
+                }
+                stopped.push((item, hold));
             }
+            Taken::Busy => return Err(busy_note(item.record.as_ref().ok(), &info, &what)),
             // Forgotten since the listing: nothing of it is left to settle.
             Taken::Gone => {}
         }
@@ -790,6 +879,8 @@ pub struct Written {
     /// path, device and inode, so [`Written::is_its_git_dir`] can tell it
     /// from a directory Git made again under the same name.
     git_dir_id: Option<(PathBuf, u64, u64)>,
+    /// That directory had an index.
+    index: bool,
     config: Option<Vec<u8>>,
     reflog: Option<Vec<u8>>,
     /// The hold on its `info`, taken before `info` was in place.
@@ -827,8 +918,11 @@ impl Written {
     /// What the worktree Git still lists, with `head` as its HEAD, lacks
     /// of what this record keeps: `None` when its HEAD contains the
     /// recorded HEAD, its HEAD reflog still begins with the one the record
-    /// copied (so it names every commit the record's refs keep), and its
-    /// `config.worktree` is the one the record copied. A `git worktree
+    /// copied (so it names every commit the record's refs keep), its index
+    /// is there if it was, and its `config.worktree` is the one the record
+    /// copied. The record holds no copy of the index, but a worktree that
+    /// lost it is not whole: it stays aside, and its restore says how to
+    /// write the index again (`index_note`). A `git worktree
     /// remove` that failed part way may have deleted any of them, in the
     /// order the filesystem lists them, while Git still lists the worktree.
     pub fn lacks(&self, head: Option<&str>) -> Option<String> {
@@ -860,6 +954,15 @@ impl Written {
             (Some(saved), Ok(Some(now))) if now.starts_with(saved) => {}
             (Some(_), Ok(_)) => return Some("part of its HEAD reflog is gone".to_string()),
             (_, Err(e)) => return Some(format!("residue could not read its HEAD reflog ({e})")),
+        }
+        if self.index {
+            match fs::symlink_metadata(git_dir.join("index")) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    return Some("its index is gone".to_string());
+                }
+                Err(e) => return Some(format!("residue could not check its index ({e})")),
+            }
         }
         match now(Path::new(CONFIG)) {
             Ok(now) if now == self.config => None,
@@ -971,6 +1074,7 @@ pub fn create(
             command_dir: command_dir.to_path_buf(),
             git_dir: git_dir.map(Path::to_path_buf),
             git_dir_id: git_dir.and_then(dir_id),
+            index: git_dir.is_some_and(|d| fs::symlink_metadata(d.join("index")).is_ok()),
             config,
             reflog,
             hold,
@@ -1186,6 +1290,21 @@ pub fn forget(item: &Item) -> Result<(), String> {
         Err(e) => Err(e.clone()),
     }
 }
+
+/// Forget a record a remove run found expired, holding it first: a run
+/// that holds it now, a restore, is using it, so it stays (`Ok(false)`).
+/// One forgotten since the listing is gone, as this run wanted. An entry
+/// with no `info` has nothing to hold.
+pub fn forget_expired(item: &Item) -> Result<bool, String> {
+    if item.incomplete {
+        return forget(item).map(|()| true);
+    }
+    match hold::take(&item.dir.join(INFO))? {
+        Taken::Held(_hold) => forget(item).map(|()| true),
+        Taken::Busy => Ok(false),
+        Taken::Gone => Ok(true),
+    }
+}
 // ---------------------------------------------------------------- restore
 
 /// How `restore` brought a worktree back.
@@ -1265,21 +1384,54 @@ const TAKEN: &str = "another residue run forgot or restored this removal record 
 
 /// Take the hold on a record before a restore acts on it. Held, it means
 /// that no removal, no `git worktree remove` one started and no other
-/// restore is acting on the record or its worktree.
+/// restore is acting on the record or its worktree, unless the record
+/// comes from a release that takes no hold and its run still runs, which
+/// refuses too (`unheld_refusal`).
 fn take(item: &Item) -> Result<Hold, String> {
-    match hold::take(&item.dir.join(INFO))? {
-        Taken::Held(hold) => Ok(hold),
-        Taken::Busy => Err(
-            "a residue run, or the `git worktree remove` it started, still holds this removal record, so it may still be deleting the worktree; run this restore again once it ends".into(),
-        ),
+    let info = item.dir.join(INFO);
+    let record = item.record.as_ref().ok();
+    match hold::take(&info)? {
+        Taken::Held(hold) => match record.and_then(|r| unheld_refusal(r, "this removal record")) {
+            Some(why) => Err(why),
+            None => Ok(hold),
+        },
+        Taken::Busy => Err(busy_note(record, &info, "this removal record")),
         Taken::Gone => Err(TAKEN.into()),
     }
 }
 
-/// Whether a run, or the `git worktree remove` it started, holds the
-/// record in the entry `dir` now (`hold::held`).
-pub fn held(dir: &Path) -> Result<bool, String> {
-    hold::held(&dir.join(INFO))
+/// What may still act on a record's worktree now, as far as residue can
+/// tell (`Item::activity`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Activity {
+    /// No run holds the record, and its writer takes a hold or has exited.
+    Idle,
+    /// A run, its Git, or a program that Git started holds it.
+    Held,
+    /// No one holds it, but it comes from a release that takes no hold,
+    /// and the run that wrote it, this PID, still runs.
+    Unheld(u32),
+}
+
+impl Item {
+    /// Whether a run may still act on this record's worktree now. It takes
+    /// the hold and lets go of it at once (`hold::held`).
+    pub fn activity(&self) -> Result<Activity, String> {
+        if hold::held(&self.dir.join(INFO))? {
+            return Ok(Activity::Held);
+        }
+        Ok(self
+            .record
+            .as_ref()
+            .ok()
+            .and_then(Record::unheld_writer)
+            .map_or(Activity::Idle, Activity::Unheld))
+    }
+}
+
+/// The `info` of the record entry `dir`.
+pub fn info_of(dir: &Path) -> PathBuf {
+    dir.join(INFO)
 }
 
 /// Bring back the worktree one record describes, at `to` or where it was,
@@ -1295,7 +1447,7 @@ pub fn held(dir: &Path) -> Result<bool, String> {
 /// restore.
 pub fn restore(item: &Item, to: Option<&Path>) -> Result<Restored, String> {
     let record = item.record.as_ref().map_err(|e| e.clone())?;
-    let _hold = take(item)?;
+    let hold = take(item)?;
     let listed = git::worktrees(&item.command_dir)?;
     let registered = listed
         .iter()
@@ -1304,6 +1456,9 @@ pub fn restore(item: &Item, to: Option<&Path>) -> Result<Restored, String> {
                 || git::canonical(&e.path).ok().as_deref() == Some(record.aside.as_path())
         })
         .cloned();
+    let purged = registered
+        .as_ref()
+        .is_some_and(|e| purged_to_git_dir(item, record, e));
     let standing = match registered {
         Some(_) => Back::No,
         None => is_back(record, &listed, &item.command_dir),
@@ -1331,12 +1486,94 @@ pub fn restore(item: &Item, to: Option<&Path>) -> Result<Restored, String> {
     let copies = read_copies(item)?;
     let mut restored = match &registered {
         _ if back => already_back(record, &listed)?,
+        Some(registered) if purged => {
+            let note = clear_purged(item, registered, &hold)?;
+            // Read again: the list before named the trash worktree, on
+            // the branch the recreated one checks out.
+            let mut restored = recreate(item, record, dest, &git::worktrees(&item.command_dir)?)?;
+            restored.notes.extend(note);
+            restored
+        }
         Some(registered) => move_back(item, record, registered, dest)?,
         None => recreate(item, record, dest, &listed)?,
     };
-    let recreated = registered.is_none() && !back;
+    let recreated = (registered.is_none() || purged) && !back;
     finish(item, record, &mut restored, &copies, recreated, back);
     Ok(restored)
+}
+
+/// A purge of a trash worktree that stopped once Git had deleted its
+/// files: Git still lists it in the trash entry, whose directory is there,
+/// but nothing is at its path, so the trash restore has nothing to move
+/// back, and this record is how it comes back.
+fn purged_to_git_dir(item: &Item, record: &Record, registered: &Entry) -> bool {
+    let trash = crate::trash::root(&item.common_dir);
+    (record.aside.starts_with(&trash) || registered.path.starts_with(&trash))
+        && registered.path.parent().is_some_and(Path::is_dir)
+        && fs::symlink_metadata(&registered.path)
+            .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+}
+
+/// Clear what Git keeps of the trash worktree a purge stopped deleting
+/// (`purged_to_git_dir`), so that the restore can recreate it: under the
+/// record's hold, `record_hold`, and its trash entry's, `git worktree
+/// remove` finds no files at its path and deletes only its own directory
+/// for it, as the purge's Git would have; then the entry, which holds only
+/// its `info`, goes. A lock residue's trash put on it is lifted first, and
+/// put back if Git refuses; anyone else's keeps it. Returns a note when
+/// the entry stays.
+fn clear_purged(
+    item: &Item,
+    registered: &Entry,
+    record_hold: &Hold,
+) -> Result<Option<String>, String> {
+    let main = &item.command_dir;
+    let entry = registered
+        .path
+        .parent()
+        .ok_or("the trash worktree has no entry")?;
+    let info = crate::trash::info(entry);
+    let entry_hold = match hold::take(&info)? {
+        Taken::Held(h) => Some(h),
+        Taken::Busy => {
+            return Err(format!(
+                "a residue run, or the `git worktree remove` it started, is purging or restoring its trash entry now (`lsof {}` names it); run this restore again once it ends",
+                output::shell(&info)
+            ));
+        }
+        Taken::Gone => None,
+    };
+    let ours = crate::trash::locked_by_residue(registered);
+    match registered.locked.as_deref() {
+        None => {}
+        Some(_) if ours => git::unlock_worktree(main, &registered.path)?,
+        Some(reason) => {
+            return Err(format!(
+                "Git still lists it in the trash, locked by someone else ({reason}); residue leaves that lock alone"
+            ));
+        }
+    }
+    let mut holds = vec![record_hold];
+    holds.extend(entry_hold.as_ref());
+    if let Err(e) = git::remove_worktree(main, &registered.path, &holds) {
+        let relocked = match ours {
+            true => git::lock_worktree(main, &registered.path, crate::trash::LOCK)
+                .err()
+                .map_or(String::new(), |r| {
+                    format!("; and could not lock it again: {r}")
+                }),
+            false => String::new(),
+        };
+        return Err(format!(
+            "its purge from the trash stopped after Git deleted its files, and residue could not clear what Git kept of it: {e}{relocked}"
+        ));
+    }
+    if entry_hold.is_none() {
+        return Ok(None);
+    }
+    Ok(crate::trash::discard(entry)
+        .err()
+        .map(|e| format!("its trash entry stays ({e}); the next remove run clears it")))
 }
 
 /// After `residue restore ENTRY` moved a trash entry's worktree to `path`:
@@ -1351,9 +1588,18 @@ pub fn after_trash_restore(item: &Item, path: &Path) -> Vec<String> {
     };
     let copies = match read_copies(item) {
         Ok(copies) => copies,
-        // Another run forgot or restored it: nothing is left to do.
-        Err(_) if fs::symlink_metadata(item.dir.join(INFO)).is_err() => return Vec::new(),
-        Err(e) => return vec![e],
+        Err(e) => {
+            return match fs::symlink_metadata(item.dir.join(INFO)) {
+                // Its `info` is gone: deleted by hand, or forgotten by a
+                // residue that takes no hold. Nothing of it is left to put
+                // back.
+                Err(gone) if gone.kind() == io::ErrorKind::NotFound => Vec::new(),
+                _ => vec![format!(
+                    "the removal record {} stays, since residue could not read its copies ({e})",
+                    item.name
+                )],
+            };
+        }
     };
     let mut restored = Restored {
         path: path.to_path_buf(),
@@ -1394,6 +1640,9 @@ fn finish(
                 restored.notes.push(format!(
                     "could not mark it as restored ({e}); `residue watch` may remove it again once its upstream is gone: lock it with `git worktree lock` to keep it"
                 ));
+            }
+            if !recreated {
+                restored.notes.extend(index_note(&id.git_dir));
             }
             // Git reads a `logs/HEAD` file only while the repository keeps
             // its refs in files. How it keeps them now decides, not how it
@@ -1454,6 +1703,20 @@ fn finish(
                 "could not drop the removal record ({e}); a remove run forgets it after --keep-removed"
             ));
         }
+    }
+}
+
+/// What a restore says of a worktree it put back whose Git directory has
+/// no index: a removal that stopped partway can delete it, and then `git
+/// status` lists every tracked file as deleted, and `git restore .`, which
+/// copies from the index, brings none back.
+fn index_note(git_dir: &Path) -> Option<String> {
+    match fs::symlink_metadata(git_dir.join("index")) {
+        Ok(_) => None,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Some(
+            "it has no index, which a removal stopped partway can delete: run `git reset` in it first, which writes the index again from HEAD and changes no file".into(),
+        ),
+        Err(e) => Some(format!("residue could not check its index ({e})")),
     }
 }
 
@@ -1656,6 +1919,15 @@ fn move_back(
     let aside = &record.aside;
     let main = &item.command_dir;
     if aside.starts_with(crate::trash::root(&item.common_dir)) {
+        // A purge that stopped deleting it, part of which Git can no
+        // longer use: the trash restore cannot move that, and once it is
+        // deleted this restore recreates it (`purged_to_git_dir`).
+        if let Some(why) = crate::remove::unusable(registered) {
+            return Err(format!(
+                "its purge from the trash stopped partway, and Git can no longer use what is left of it ({why}); the record keeps its HEAD and reflog: delete {}, then run this restore again, which recreates it",
+                registered.path.display()
+            ));
+        }
         let entry = aside
             .parent()
             .and_then(Path::file_name)
@@ -1675,10 +1947,11 @@ fn move_back(
     // Read under the record's hold, which no removal or Git holds now: only
     // the user locks or unlocks it meanwhile, and never residue's own lock.
     let ours = registered.locked.as_deref() == Some(crate::remove::REMOVING);
-    if left.running {
+    if left.running && !record.hold {
         // The hold shows that the removal that wrote this record, and its
-        // Git, have ended. A residue run of 0.0.10 or earlier holds none,
-        // so the PID in the aside's name still counts.
+        // Git, have ended. A record with no `hold` line and no PID comes
+        // from a release older than both, so the PID in the aside's name
+        // is all that shows its run (`take` checks the record's).
         // Git refuses to move a worktree it can no longer use, so there is
         // no command to run while that process may be removing it. PIDs are
         // reused, so the process may be another one that never exits.
@@ -2139,6 +2412,7 @@ mod tests {
             ],
             pid: Some(42),
             version: Some("0.0.7".into()),
+            hold: true,
             kept: vec![
                 "1f607062a2d10dfb8bc578c32a96c976609da819".into(),
                 "2f607062a2d10dfb8bc578c32a96c976609da819".into(),

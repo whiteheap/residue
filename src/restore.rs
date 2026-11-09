@@ -484,11 +484,40 @@ const PURGE_STOPPED: &str = "if its purge had started deleting, part of it is go
 fn restore_trash(found: &Found, i: usize, to: Option<&Path>) -> Result<Done, String> {
     let item = &found.trash[i];
     let from = item.worktree.clone().unwrap_or_default();
+    let trashed = item.record.as_ref().map_err(|e| e.clone())?;
     let held = trash::take(item)?;
     let listed = git::worktrees(&item.command_dir)?;
     // A purge writes its record before it deletes, so without one nothing
     // of the worktree is gone.
-    let stopped = removed::stopped_purges(&item.common_dir, &item.command_dir, &from, &listed)?;
+    let stopped = removed::stopped_purges(
+        &item.common_dir,
+        &item.command_dir,
+        &from,
+        &trashed.original,
+        &listed,
+    )?;
+    // What such a purge left that cannot be moved back, its record brings
+    // back (`removed::restore`).
+    if let Some((record, _)) = stopped.first() {
+        let registered = listed.iter().find(|e| {
+            e.path == from || git::canonical(&e.path).ok().as_deref() == Some(from.as_path())
+        });
+        let name = output::clean(&record.name);
+        let left = if !item.holds_worktree() {
+            Some(format!(
+                "Git deleted its files; its removal record keeps its HEAD and reflog: `residue restore {name}` recreates it"
+            ))
+        } else {
+            registered.and_then(crate::remove::unusable).map(|why| {
+                format!(
+                    "Git can no longer use what is left of it ({why}); its removal record keeps its HEAD and reflog: `residue restore {name}` says what to clear, then recreates it"
+                )
+            })
+        };
+        if let Some(left) = left {
+            return Err(format!("a purge of it stopped partway and {left}"));
+        }
+    }
     let (path, note) = trash::restore(item, to, &listed, &held)?;
     let mut notes: Vec<String> = note.into_iter().collect();
     if !stopped.is_empty() {

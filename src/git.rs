@@ -949,7 +949,10 @@ fn config_values(exit: Exit, what: &str) -> Result<Vec<Vec<u8>>, String> {
 /// `git worktree remove` without `--force`. Git inherits `holds`, the
 /// entries that name the worktree, and keeps them held while it deletes,
 /// also after residue has exited (`hold::pass_to`). fsmonitor and hooks are
-/// off, so no process Git starts outlives it holding them.
+/// off, but every program Git starts inherits them too, the `git status`
+/// it runs first and that one's filter drivers among them, and one that
+/// outlives Git keeps them held: a restore then refuses, and says to look
+/// with `lsof`. A timeout kills Git, not its children.
 pub fn remove_worktree(main: &Path, worktree: &Path, holds: &[&Hold]) -> Result<(), String> {
     let args = [
         OsStr::new("worktree"),

@@ -10,3 +10,5 @@
 # worktree remove` residue starts inherits its run's holds, standing()
 # compares the files with the plan's once Git ran, and a trash restore
 # settles the records of a purge that stopped partway, with a note.
+# The old setups (#147) add a remove run or purge of a release that takes
+# no hold: a restore refuses while the PID its record names runs.

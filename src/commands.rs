@@ -113,14 +113,8 @@ pub fn scan(options: &Options) -> u8 {
             .interrupted
             .iter()
             .filter_map(|e| Leftover::of(e, &repo.command_dir()))
-            .map(|l| {
-                // A run that stopped after writing its removal record.
-                let record = records
-                    .iter()
-                    .find(|i| i.record.as_ref().is_ok_and(|r| r.aside == l.path))
-                    .map(|i| i.dir.clone());
-                l.with_record(record)
-            })
+            // A run that stopped after writing its removal record.
+            .map(|l| l.with_records(&records))
             .collect();
         grouped.push(Group {
             repo,

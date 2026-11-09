@@ -3,9 +3,10 @@
 #
 #   bash .agents/skills/verify-removal-races/check.sh
 #
-# Checks model/Removal.tla in the ten setups below (a removal or a purge;
-# no fault, a kill, a Git timeout, or residue killed alone; and with the
-# races between them left out), then runs each mutant in
+# Checks model/Removal.tla in the twelve setups below (a removal or a
+# purge; no fault, a kill, a Git timeout, or residue killed alone; with
+# the races between them left out; and a removal or a purge by a release
+# that takes no hold), then runs each mutant in
 # model/mutants, a model with one guard of the code removed, which must
 # fail its rule. The result must match model/expected: every rule holds
 # except the known breaks listed there, each with its shortest path.
@@ -102,8 +103,8 @@ rules="TypeOK NotDeletedOnceBack OnlyCheckedStateDeleted ReflogCommitsKept Resto
 # One TLC run. Prints "holds N" (N distinct states, all of them checked),
 # "breaks RULE: ACTION ACTION ...", or "error: ...", and on standard error
 # the path of TLC's output.
-tlc() { # START FAULTS OFF AFTER BROKEN RULES...
-  local start=$1 faults=$2 off=$3 after=$4 broken=$5; shift 5
+tlc() { # START FAULTS OFF AFTER OLD LATE BROKEN RULES...
+  local start=$1 faults=$2 off=$3 after=$4 old=$5 late=$6 broken=$7; shift 7
   local dir; dir=$(mktemp -d "$work/run.XXXXXX")
   cp "$model/Removal.tla" "$dir/"
   {
@@ -113,6 +114,8 @@ tlc() { # START FAULTS OFF AFTER BROKEN RULES...
     echo "  Faults = $faults"
     echo "  Off = $off"
     echo "  After = $after"
+    echo "  Old = $old"
+    echo "  Late = $late"
     echo "  Broken = $broken"
     echo "INVARIANTS"
     for r in "$@"; do echo "  $r"; done
@@ -151,25 +154,30 @@ start_time=$(date +%s)
 # timeout, and "after" lets the restores list only once the remove run or
 # purge has stopped. "faults" is at most one kill of residue with its Git
 # child (Ctrl-C) or one Git timeout; "orphan" is at most one kill of
-# residue alone, which leaves its Git child running.
+# residue alone, which leaves its Git child running. "old" runs the remove
+# run or purge as a release that takes no hold (OLD), and the trash
+# restore lists only once that purge has written its record or stopped
+# (LATE).
 #
-# Each entry: NAME KIND START FAULTS OFF AFTER.
-for setup in "Remove no-faults orig {} {} {}" \
-             "Remove faults orig {\"kill\",\"timeout\"} {} {}" \
-             "Remove orphan orig {\"orphan\"} {} {}" \
-             "Remove unraced orig {\"kill\",\"orphan\"} {\"rr\"} {}" \
-             "Remove after orig {\"kill\",\"timeout\"} {} {\"rr\"}" \
-             "Trash no-faults trash {} {} {}" \
-             "Trash faults trash {\"kill\",\"timeout\"} {} {}" \
-             "Trash orphan trash {\"orphan\"} {} {}" \
-             "Trash unraced trash {\"kill\",\"orphan\"} {\"tr\"} {}" \
-             "Trash after trash {\"kill\",\"timeout\"} {} {\"tr\",\"rr\"}"; do
-  read -r name kind start faults off after <<< "$setup"
+# Each entry: NAME KIND START FAULTS OFF AFTER OLD LATE.
+for setup in "Remove no-faults orig {} {} {} {} {}" \
+             "Remove faults orig {\"kill\",\"timeout\"} {} {} {} {}" \
+             "Remove orphan orig {\"orphan\"} {} {} {} {}" \
+             "Remove unraced orig {\"kill\",\"orphan\"} {\"rr\"} {} {} {}" \
+             "Remove after orig {\"kill\",\"timeout\"} {} {\"rr\"} {} {}" \
+             "Trash no-faults trash {} {} {} {} {}" \
+             "Trash faults trash {\"kill\",\"timeout\"} {} {} {} {}" \
+             "Trash orphan trash {\"orphan\"} {} {} {} {}" \
+             "Trash unraced trash {\"kill\",\"orphan\"} {\"tr\"} {} {} {}" \
+             "Trash after trash {\"kill\",\"timeout\"} {} {\"tr\",\"rr\"} {} {}" \
+             "Remove old orig {\"kill\",\"timeout\"} {} {} {\"rm\"} {}" \
+             "Trash old trash {\"kill\",\"timeout\"} {} {} {\"pg\"} {\"tr\"}"; do
+  read -r name kind start faults off after old late <<< "$setup"
   label="$name $kind"
   left=$rules
   while :; do
     # shellcheck disable=SC2086
-    result=$(tlc "$start" "$faults" "$off" "$after" "{}" $left 2>"$work/last")
+    result=$(tlc "$start" "$faults" "$off" "$after" "$old" "$late" "{}" $left 2>"$work/last")
     case $result in
       holds*)
         if [ "$left" = "$rules" ]; then
@@ -193,15 +201,16 @@ done
 
 # Each mutant must break the rule it names in a setup where the code, with
 # no guard removed, holds that rule.
-while read -r mutant start faults off rule; do
+while read -r mutant start faults off rule old late; do
   case $mutant in ''|\#*) continue ;; esac
-  control=$(tlc "$start" "$faults" "$off" "{}" "{}" "$rule" 2>"$work/last")
+  old=${old:-\{\}} late=${late:-\{\}}
+  control=$(tlc "$start" "$faults" "$off" "{}" "$old" "$late" "{}" "$rule" 2>"$work/last")
   if [ "${control%% *}" != holds ]; then
-    echo "mutant $mutant: no control, $rule does not hold with Start $start, Faults $faults, Off $off: $control"
+    echo "mutant $mutant: no control, $rule does not hold with Start $start, Faults $faults, Off $off, Old $old, Late $late: $control"
     failed=1
     continue
   fi
-  result=$(tlc "$start" "$faults" "$off" "{}" "{\"$mutant\"}" "$rule" 2>"$work/last")
+  result=$(tlc "$start" "$faults" "$off" "{}" "$old" "$late" "{\"$mutant\"}" "$rule" 2>"$work/last")
   case $result in
     "breaks $rule"*) echo "mutant $mutant: caught by $rule" ;;
     holds*) echo "mutant $mutant: NOT caught, $rule still holds"; failed=1 ;;
