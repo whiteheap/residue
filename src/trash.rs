@@ -435,6 +435,17 @@ pub fn take(item: &Item) -> Result<Hold, String> {
         Taken::Gone => Err(
             "another residue run purged or restored this trash entry after this restore listed it, so residue changed nothing; `residue restore` lists what is left".into(),
         ),
+        Taken::Unsupported(why) => Err(removed::unsupported_note(
+            &why,
+            match (&item.record, &item.registered) {
+                (Ok(record), Some(registered)) => Some(removed::move_back_line(
+                    &item.command_dir,
+                    registered,
+                    &record.original,
+                )),
+                _ => None,
+            },
+        )),
     }
 }
 

@@ -157,9 +157,9 @@ start_time=$(date +%s)
 # child (Ctrl-C) or one Git timeout; "orphan" is at most one kill of
 # residue alone, which leaves its Git child running. "old" runs the remove
 # run or purge as a release that takes no hold (OLD), and the trash
-# restore lists only once that purge has written its record or stopped
-# (LATE); "old-orphan" may kill that run alone, so its Git goes on with no
-# hold to show it.
+# restore is one such a purge does not race in the narrow window that
+# LatePurge in model/Removal.tla names (LATE); "old-orphan" may kill that
+# run alone, so its Git goes on with no hold to show it.
 #
 # Each entry: NAME KIND START FAULTS OFF AFTER OLD LATE.
 for setup in "Remove no-faults orig {} {} {} {} {}" \

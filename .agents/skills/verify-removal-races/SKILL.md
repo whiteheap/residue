@@ -15,7 +15,7 @@ It is a TLA+ model of the code, `model/Removal.tla`, checked with TLC. TLC does 
 bash .agents/skills/verify-removal-races/check.sh
 ```
 
-It takes about a minute and exits 0 when the result matches `model/expected`: every rule holds except any known break it lists, each with its shortest path, and every mutant is caught. At the sync commit it lists none. It exits 1 when the result differs, and 2 when the tools cannot be set up or TLC fails.
+It takes about two minutes and exits 0 when the result matches `model/expected`: every rule holds except any known break it lists, each with its shortest path, and every mutant is caught. At the sync commit it lists none. It exits 1 when the result differs, and 2 when the tools cannot be set up or TLC fails.
 
 The first run downloads TLC and a Java runtime into `~/.cache/residue-tla` (or `$RESIDUE_TLA_TOOLS`) and checks each against its pinned SHA-256. It needs bash, curl, tar, and `shasum` or `sha256sum`. To use your own, set `TLA2TOOLS` to a tla2tools.jar and `JAVA` to a java binary (11 or later); the run says when either is not the pinned one.
 
@@ -55,7 +55,7 @@ One repository, one worktree W, and these actors, each step one action of the mo
 - Git's `git worktree remove`, as the four steps of `remove_worktree` in Git 2.50's `builtin/worktree.c`: look the worktree up, `git status` in it, delete its files by path, delete its Git directory by id.
 - The user: edits W, starts a process in it, or runs `git worktree lock` on it, once each.
 - The holds (`src/hold.rs`): the purge holds the trash entry's `info`, each writer holds its removal record's `info` from the moment it is in place, and each `git worktree remove` residue starts inherits its run's holds. A restore takes the hold first and refuses while another process has it; so does a purge.
-- In the "old" and "old-orphan" setups, the remove run or the purge is one of a release that takes no hold, 0.0.10 and earlier (`Old`): it holds nothing, its Git inherits nothing, and its record has no `hold` line. While Git still lists the worktree where that record's deletion started, a restore refuses while the PID the record names runs, or while a `git worktree remove` of the worktree does, found by its arguments (`removed::unheld`). Its other steps are this release's.
+- In the "old" and "old-orphan" setups, the remove run or the purge is one of a release that takes no hold, 0.0.10 and earlier (`Old`): it holds nothing, its Git inherits nothing, and its record has no `hold` line. While Git still lists the worktree where that record's deletion started, a restore refuses while the PID the record names runs, or while a `git worktree remove` of the worktree does, found by its arguments (`removed::unheld`). Its other steps are this release's. A trash restore keeps such a purge off the worktree three ways: from just after it takes the entry's hold it keeps the worktree's `.git` open, which that purge's re-check sees as a use (`TOpen`); when Git lists the worktree unlocked, it locks it with residue's trash lock before it reads the records, and lifts that lock if it then refuses (`TLock`, `TLift`); and once the worktree has moved, it reads the records again and names a purge's record that came meanwhile (`TForget`).
 
 The faults: a kill of residue with its Git child (Ctrl-C), the 30-minute Git timeout, or an orphaning kill of residue alone, which leaves its Git child deleting. A kill during Git's delete of its own directory leaves it whole, without its `logs/`, or without HEAD or commondir too, by readdir order. Git 2.50.1 moves a worktree whose Git directory lacks `logs/` or `index`, and refuses one that lacks HEAD, commondir or gitdir: probed on 2026-11-09 on macOS by deleting each by hand from a scratch worktree's Git directory before `git worktree move`.
 
@@ -66,17 +66,17 @@ The faults: a kill of residue with its Git child (Ctrl-C), the 30-minute Git tim
 | Remove orphan | rm, rr, user | orphaning kill | 3,722 |
 | Remove unraced | rm, user | kill, orphaning kill | 743 |
 | Remove after | rm, then rr, user | kill, timeout | 3,479 |
-| Trash no-faults | pg, tr, rr, user | none | 21,111 |
-| Trash faults | pg, tr, rr, user | kill, timeout | 90,704 |
-| Trash orphan | pg, tr, rr, user | orphaning kill | 34,617 |
-| Trash unraced | pg, rr, user | kill, orphaning kill | 6,036 |
-| Trash after | pg, then tr and rr, user | kill, timeout | 16,801 |
+| Trash no-faults | pg, tr, rr, user | none | 48,509 |
+| Trash faults | pg, tr, rr, user | kill, timeout | 241,272 |
+| Trash orphan | pg, tr, rr, user | orphaning kill | 83,465 |
+| Trash unraced | pg, rr, user | kill, orphaning kill | 10,848 |
+| Trash after | pg, then tr and rr, user | kill, timeout | 52,660 |
 | Remove old | rm of a release that takes no hold, rr, user | kill, timeout | 10,591 |
-| Trash old | pg of a release that takes no hold, tr once its record is in place, rr, user | kill, timeout | 105,529 |
+| Trash old | pg of a release that takes no hold, tr, rr, user | kill, timeout | 496,086 |
 | Remove old-orphan | rm of a release that takes no hold, rr, user | orphaning kill | 5,312 |
-| Trash old-orphan | pg of a release that takes no hold, tr once its record is in place, rr, user | orphaning kill | 45,603 |
+| Trash old-orphan | pg of a release that takes no hold, tr, rr, user | orphaning kill | 215,556 |
 
-TLC stops at a rule's first break and reports the shortest path, so check.sh checks the other rules again without it. A rule that breaks in a setup is therefore not checked further there: a new way to break it shows only if it is shorter. Two kinds of setup leave the races out, so a rule a race breaks is still checked in the rest. Unraced switches off the restore and the Git timeout. After lets a restore start only once the remove run or purge has stopped, the usual way to recover. Old and old-orphan check what a restore of this release can tell of a run that takes no hold: its record's PID, and a `git worktree remove` of the worktree. In old-orphan that run may be killed alone, so its Git goes on with no hold to show it. In both, the trash restore lists only once that purge has written its record or stopped (`Late`); "Not covered" lists what that leaves out. At the sync commit every rule holds in all fourteen.
+TLC stops at a rule's first break and reports the shortest path, so check.sh checks the other rules again without it. A rule that breaks in a setup is therefore not checked further there: a new way to break it shows only if it is shorter. Two kinds of setup leave the races out, so a rule a race breaks is still checked in the rest. Unraced switches off the restore and the Git timeout. After lets a restore start only once the remove run or purge has stopped, the usual way to recover. Old and old-orphan check what a restore of this release can tell of a run that takes no hold: its record's PID, and a `git worktree remove` of the worktree. In old-orphan that run may be killed alone, so its Git goes on with no hold to show it. In "Trash old" and "Trash old-orphan" the trash restore races that purge throughout, except in the narrow window `LatePurge` names (`Late`); "Not covered" lists what that leaves out. At the sync commit every rule holds in all fourteen.
 
 Assumptions:
 
@@ -105,17 +105,17 @@ Run the check for a change to any function in this table, or for one that adds a
 | `GitTimeout` | `git.rs` `REMOVE_TIMEOUT` and `run.rs` `stop` |
 | `Kill`, `Orphan` | No code: residue stopped with its Git child, or alone (`run.rs` `stop` on watch's 30-minute deadline for its `residue remove` kills that PID alone); the kernel frees a hold once every process that has it has exited |
 | `TList`, `SList` | `restore.rs` `gather`, `choose` |
-| `THold`, `TRead` | `trash.rs` `take`; `restore.rs` `restore_trash`: `git::worktrees`, `removed::stopped_purges` and its `refuse_unheld`: `unheld`, `process::removing`, `process::started` |
+| `THold`, `TOpen`, `TLock`, `TRead`, `TLift` | `trash.rs` `take`; `restore.rs` `restore_trash`: `keep_open`, `git::worktrees`, `git::lock_worktree(trash::LOCK)` when Git lists it unlocked, `lift`, `removed::stopped_purges` and its `refuse_unheld`: `unheld`, `process::removing`, `process::started` |
 | `TCheck`, `TUnlock`, `TMove`, `TRelock` | `restore.rs` `restore_trash`'s refusal when a stopped purge left no files or files Git cannot use (`holds_worktree`, `remove::unusable`); `trash.rs` `restore(item, to, listed, held)`: `holds_worktree`, `was_locked` |
 | `TDiscard` | `trash.rs` `discard` |
-| `TForget` | `removed.rs` `after_trash_restore`, `finish` |
+| `TForget` | `removed.rs` `after_trash_restore`, `finish`; `restore.rs` `settle_trash`: `removed::raced_purges` after the move |
 | `SHold`, `SRead` | `removed.rs` `take`; `restore`: `git::worktrees`, `refuse_unheld` when Git lists the record's aside (`unheld`, `process::removing`, `process::started`), `Item::interrupted`, `is_back` |
 | `SDest`, `SAfter` | `removed.rs` `restore`, `finish`, `reflog_if_lost`, `holds`, `forget` |
 | `SCopies` | `removed.rs` `read_copies` |
 | `SMoveBack`, `SUnlock`, `SMove`, `SRelock` | `removed.rs` `restore`'s `purged_to_git_dir`, `move_back`; `remove.rs` `Leftover::of` |
 | `SClear` | `removed.rs` `clear_purged`: the entry's hold, `trash::locked_by_residue`, `git::unlock_worktree`, `git::remove_worktree`, `trash::discard` |
 | `SRecreate` | `removed.rs` `recreate` |
-| `TReport`, `SReport` | `restore.rs` `command`, the `restored ...` line and its notes, `PURGE_STOPPED` |
+| `TReport`, `SReport` | `restore.rs` `command`, the `restored ...` line and its notes, `removed::PURGE_STOPPED`, also for a purge's record whose worktree is already back (`removed.rs` `restore`) |
 
 Sync commit: the commit that fixed #135 to #139 (#147). The model was last confirmed to describe the code there, on 2026-11-09. Of the commits after `0ad6ec7`, only `083816d` (#150) changed the code above before it: `watch` exits between passes for an upgrade, when no child runs, and starts and stops a remove run as before. Move it forward only after you confirm, for each covered function a change touched, that the model still describes it. `git log --format='%h %s' 0ad6ec7.. -- src/hold.rs src/process.rs src/remove.rs src/trash.rs src/removed.rs src/restore.rs src/git.rs src/run.rs src/watch.rs` lists the changes; read each one after that fix.
 
@@ -155,6 +155,10 @@ Each mutant in `model/mutants` removes one guard the code has, to show that a ru
 | `RestoreNoOldPid` | `restore`'s refusal while the run that wrote a record without a hold runs (`unheld`, `Unheld::Writer`), in the "Trash old" and "Remove old" setups | `NotDeletedOnceBack` |
 | `TrashRestoreNoOldGit` | `stopped_purges`' refusal while a `git worktree remove` of the worktree runs for a record without a hold (`unheld`, `Unheld::Git`), in the "Trash old-orphan" setup | `NotDeletedOnceBack` |
 | `RestoreNoOldGit` | `restore`'s refusal while a `git worktree remove` of the worktree runs for a record without a hold (`unheld`, `Unheld::Git`), in the "Remove old-orphan" and "Trash old-orphan" setups | `NotDeletedOnceBack` |
+| `TrashRestoreNoUse` | `restore_trash`'s `keep_open`: the worktree's `.git` open from just after the hold, which the re-check of a purge that takes no hold sees as a use, in the "Trash old" setup | `NotDeletedOnceBack` |
+| `TrashRestoreNoLock` | `restore_trash`'s lock of a worktree Git lists unlocked, before it reads the records, in the "Trash old" setup | `NotDeletedOnceBack` |
+| `TrashRestoreNoReread` | `settle_trash`'s second read of the records once the worktree has moved (`raced_purges`), and its `PURGE_STOPPED` note, in the "Trash old" setup | `RestoreTellsTheTruth` |
+| `BackPurgeNoNote` | `removed.rs` `restore`'s `PURGE_STOPPED` note for a purge's record whose worktree is already back, in the "Trash old" setup | `RestoreTellsTheTruth` |
 
 Both refusals apply only while Git still lists the worktree where the record's deletion started. Once it lists it nowhere, that deletion is over, so a restore of a finished removal no longer refuses for a process that reused the record's PID; dropping that condition breaks no rule, it only makes a restore refuse longer. The model also leaves out the activity probe's part (`Unheld::Using`), a process seen using the worktree or its Git directory, which refuses too.
 
@@ -221,6 +225,8 @@ The review of #147 added the old setups, `SClear`, and `TCheck`'s refusal. When 
 
 Its second review added the old-orphan setups. For a record without a `hold` line, a restore now also refuses while a `git worktree remove` of the worktree runs, or while the activity probe sees a process using the worktree or its Git directory, and it applies these refusals only while Git still lists the worktree where the record's deletion started. Every rule holds in both.
 
+Its third review added the trash restore's open `.git`, its lock of a worktree Git lists unlocked, its second read of the records once the worktree has moved, and the note of a record restore whose purge's worktree is already back, each with a mutant. In the old setups the trash restore now races the purge throughout, outside the window `LatePurge` names. Every rule holds in all fourteen setups.
+
 ## Not covered
 
 - `remove --trash` moving a worktree into the trash, and clearing empty records or forgetting them after `--keep-removed`.
@@ -232,10 +238,10 @@ Its second review added the old-orphan setups. For a record without a `hold` lin
 - Disk errors, except `removed::create` failing.
 - Two faults in one run.
 - `residue scan`, whose `removal_running` takes a record's hold for an instant: a restore in that instant refuses as busy and says to run it again.
-- Of a release that takes no hold, 0.0.10 and earlier: its restores, and a purge of its that writes its record after a restore of this release listed the records. After an upgrade, automatic cleanup runs the new release on its own ([After an upgrade](../../../docs/automation.md#after-an-upgrade)), so such a purge needs a run of that release still going.
+- Of a release that takes no hold, 0.0.10 and earlier: its restores; a purge whose activity probe cannot see the trash restore's open files; and the steps `LatePurge` in the model leaves out, for a purge whose re-check came before a trash restore of this release opened the worktree's `.git` and whose record comes after that restore read the records. After an upgrade, automatic cleanup runs the new release on its own ([After an upgrade](../../../docs/automation.md#after-an-upgrade)), so such a purge needs a run of that release still going.
 - Whether a refusal ends. The rules say what must never happen, not that a restore can finish; two restores that each send the user to the other break none of them.
-- A program that Git starts keeping a hold after Git exits, and a process that reused a record's PID while Git still lists the worktree where that record's deletion started: each only makes a restore refuse longer. On macOS, Linux, FreeBSD and illumos residue reads a process's start time and skips one that started more than ten minutes after the record was written; on NetBSD, OpenBSD and DragonFly it cannot, and `ps -p PID` shows what the process is.
-- A filesystem with no flock(2): residue writes no removal record or trash entry there and takes no hold, so it removes and restores nothing, and the model takes the holds as given.
+- A program that Git starts keeping a hold after Git exits, a process that reused a record's PID while Git still lists the worktree where that record's deletion started, and a record another user wrote, which a restore not run as root refuses because it cannot see that user's processes: each only makes a restore refuse longer. residue counts a live process with the record's PID as its writer while that process's arguments hold `remove`. Where it cannot read them, on macOS, Linux, FreeBSD and illumos it skips one that started more than ten minutes after the record was written; on NetBSD, OpenBSD and DragonFly it cannot, and `ps -p PID` shows what the process is.
+- A filesystem with no flock(2): residue writes no removal record or trash entry there and takes no hold, so it removes and restores nothing. A purge skips a trash entry an earlier release made there, and its restore refuses and names the Git commands that move it back by hand. The model takes the holds as given.
 
 ## Credit
 

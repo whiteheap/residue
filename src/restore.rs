@@ -8,12 +8,15 @@
 //! worktree is marked (`removed::MARKER`), so `residue watch` never removes
 //! it again because its work landed.
 
+use std::fs::File;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use crate::cli::Options;
 use crate::commands::{VERSION, fail, header};
 use crate::discover;
 use crate::git;
+use crate::hold::Hold;
 use crate::json::Json;
 use crate::output::{self, Places, Style, clean};
 use crate::removed::{self, How};
@@ -475,33 +478,109 @@ struct Done {
     notes: Vec<String>,
 }
 
-/// A trash restore's note when a purge of the entry stopped partway, as
-/// `removed.rs` `move_back` says it for a removal.
-const PURGE_STOPPED: &str = "if its purge had started deleting, part of it is gone: `git status` in it lists tracked files that are missing, and `git restore .` brings them back; ignored output comes back from the project's install";
-
 /// Hold the entry, read where it stands now, move it back, then settle the
 /// records of any purge of it that stopped partway.
+///
+/// A purge of a release that takes no hold may act on the entry meanwhile,
+/// so the restore keeps it from starting one. From its hold until it
+/// returns, it keeps the worktree's `.git` open, so the re-check of a
+/// purge of any release, whose activity probe then finds it in use,
+/// skips the entry. And a trash worktree Git lists unlocked is locked,
+/// with residue's own lock, before the records of purges are read, and
+/// that lock is lifted again if the restore refuses: such a purge unlocks
+/// only a lock its plan saw, and Git's remove refuses a locked worktree.
+/// Once the worktree is moved, the records are read again, and a purge
+/// record that came meanwhile stays and is named in the notes. What the
+/// removal model leaves out here is its `Late`.
 fn restore_trash(found: &Found, i: usize, to: Option<&Path>) -> Result<Done, String> {
     let item = &found.trash[i];
     let from = item.worktree.clone().unwrap_or_default();
     let trashed = item.record.as_ref().map_err(|e| e.clone())?;
     let held = trash::take(item)?;
-    let listed = git::worktrees(&item.command_dir)?;
+    let _using = keep_open(item)?;
+    let main = &item.command_dir;
+    let listed = git::worktrees(main)?;
+    let unlocked = in_trash(&listed, &from).is_some_and(|e| e.locked.is_none());
+    if !unlocked {
+        return settle_trash(found, i, to, &from, trashed, &held, &listed);
+    }
+    git::lock_worktree(main, &from, trash::LOCK).map_err(|e| {
+        format!("residue could not lock it in the trash before it reads what else acts on it ({e}), so it changed nothing")
+    })?;
+    git::worktrees(main)
+        .and_then(|listed| settle_trash(found, i, to, &from, trashed, &held, &listed))
+        .map_err(|e| lift(main, &from, e))
+}
+
+/// The trash worktree's `.git`, open for reading, which the activity probe
+/// of every release sees as a use of the worktree. None when the entry
+/// holds no `.git` there: the restore then refuses later, as Git can no
+/// longer use what is left.
+fn keep_open(item: &trash::Item) -> Result<Option<File>, String> {
+    let Some(worktree) = item.worktree.as_ref().filter(|_| item.holds_worktree()) else {
+        return Ok(None);
+    };
+    let dot_git = worktree.join(".git");
+    match File::open(&dot_git) {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "cannot open {} ({e}), which residue keeps open while it restores so that no purge starts meanwhile; residue changed nothing",
+            dot_git.display()
+        )),
+    }
+}
+
+/// Git's entry for the trash worktree at `from`.
+fn in_trash<'a>(listed: &'a [git::Entry], from: &Path) -> Option<&'a git::Entry> {
+    listed
+        .iter()
+        .find(|e| e.path == from || git::canonical(&e.path).ok().as_deref() == Some(from))
+}
+
+/// A refusal `why`, after lifting the lock this restore put on the trash
+/// worktree at `from`, if Git still lists it there with that lock.
+fn lift(main: &Path, from: &Path, why: String) -> String {
+    let lifted = git::worktrees(main).and_then(|listed| match in_trash(&listed, from) {
+        Some(e) if trash::locked_by_residue(e) => git::unlock_worktree(main, from),
+        _ => Ok(()),
+    });
+    match lifted {
+        Ok(()) => why,
+        Err(e) => format!(
+            "{why}; and residue could not lift the lock it put on it in the trash ({e}): `git -C {} worktree unlock {}` lifts it",
+            output::shell(main),
+            output::shell(from)
+        ),
+    }
+}
+
+/// [`restore_trash`] once the entry is held and Git's list read since:
+/// `from` is its worktree, `trashed` its record.
+fn settle_trash(
+    found: &Found,
+    i: usize,
+    to: Option<&Path>,
+    from: &Path,
+    trashed: &trash::Record,
+    held: &Hold,
+    listed: &[git::Entry],
+) -> Result<Done, String> {
+    let item = &found.trash[i];
     // A purge writes its record before it deletes, so without one nothing
     // of the worktree is gone.
     let stopped = removed::stopped_purges(
         &item.common_dir,
         &item.command_dir,
-        &from,
+        from,
         &trashed.original,
-        &listed,
+        trashed.trashed,
+        listed,
     )?;
     // What such a purge left that cannot be moved back, its record brings
     // back (`removed::restore`).
     if let Some((record, _)) = stopped.first() {
-        let registered = listed.iter().find(|e| {
-            e.path == from || git::canonical(&e.path).ok().as_deref() == Some(from.as_path())
-        });
+        let registered = in_trash(listed, from);
         let name = output::clean(&record.name);
         let left = if !item.holds_worktree() {
             Some(format!(
@@ -531,10 +610,30 @@ fn restore_trash(found: &Found, i: usize, to: Option<&Path>) -> Result<Done, Str
             output::clean(&record.name)
         ));
     }
-    let (path, note) = trash::restore(item, to, &listed, &held)?;
+    // Where its purges' records name it, read while it is still there.
+    let asides: Vec<PathBuf> = [Some(from.to_path_buf()), git::canonical(from).ok()]
+        .into_iter()
+        .flatten()
+        .collect();
+    let (path, note) = trash::restore(item, to, listed, held)?;
     let mut notes: Vec<String> = note.into_iter().collect();
-    if !stopped.is_empty() {
-        notes.push(PURGE_STOPPED.into());
+    // A purge of a release that takes no hold may have raced this restore:
+    // its record says so, and it stays.
+    let seen: Vec<String> = stopped.iter().map(|(r, _)| r.name.clone()).collect();
+    let raced = removed::raced_purges(&item.common_dir, &item.command_dir, &asides, &seen);
+    if !stopped.is_empty() || !raced.as_ref().is_ok_and(Vec::is_empty) {
+        notes.push(removed::PURGE_STOPPED.into());
+    }
+    match raced {
+        Ok(raced) => notes.extend(raced.iter().map(|name| {
+            let name = output::clean(name);
+            format!(
+                "a purge by a residue release that takes no hold wrote the removal record {name} while this restore ran; it keeps the worktree's HEAD and reflog, and once that purge has ended, `residue restore {name}` puts back what the worktree lacks of them and drops the record"
+            )
+        })),
+        Err(e) => notes.push(format!(
+            "residue could not read the removal records again ({e}), so it cannot tell whether a purge by a residue release that takes no hold ran meanwhile; `residue restore` lists any record it left"
+        )),
     }
     match git::identity(&path) {
         Ok(id) => {
@@ -554,11 +653,10 @@ fn restore_trash(found: &Found, i: usize, to: Option<&Path>) -> Result<Done, Str
     for (r, _held) in &stopped {
         notes.extend(removed::after_trash_restore(r, &path));
     }
-    drop(held);
     let record = item.record.as_ref().ok();
     Ok(Done {
         path,
-        how: How::MovedBack(from),
+        how: How::MovedBack(from.to_path_buf()),
         branch: record.and_then(|r| r.branch.clone()),
         head: record.and_then(|r| r.head.clone()),
         not_kept: Vec::new(),

@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::activity::{Evidence, Snapshot};
 use crate::fsinfo::{Space, Usage};
+use crate::git::Entry;
 use crate::inspect::{LastChange, Report, Status, Verdict};
 use crate::json::Json;
 use crate::policy::{Policy, RuleSource};
@@ -291,6 +292,41 @@ pub fn rfc3339(seconds: i64) -> String {
     )
 }
 
+/// Unix seconds from a [`stamp`], or `None` when `text` is not one.
+pub fn unstamp(text: &str) -> Option<i64> {
+    let b = text.as_bytes();
+    if b.len() != 16
+        || b[8] != b'T'
+        || b[15] != b'Z'
+        || !b[..8].iter().chain(&b[9..15]).all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> i64 {
+        b[from..to]
+            .iter()
+            .fold(0, |n, d| n * 10 + i64::from(d - b'0'))
+    };
+    let (year, month, day) = (num(0, 4), num(4, 6), num(6, 8));
+    let (hour, minute, second) = (num(9, 11), num(11, 13), num(13, 15));
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    // Howard Hinnant's days-from-civil, the inverse of `civil`.
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let yoe = year - era * 400;
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
 /// `20261107T040000Z`: UTC, for names that sort by time.
 pub fn stamp(seconds: i64) -> String {
     let (year, month, day, rem) = civil(seconds);
@@ -302,12 +338,17 @@ pub fn stamp(seconds: i64) -> String {
     )
 }
 
-/// Why a stale entry is stale, and what clears Git's record of that one
-/// worktree: `git -C MAIN worktree remove PATH`, never `git worktree
+/// Why a stale entry is stale, and what to do about it. A directory that
+/// is gone may only be moved, or on a disk that is not mounted, so those
+/// come first: `git worktree remove` would delete that worktree's Git
+/// directory, and the directory, once back, would no longer be a Git
+/// worktree. Only then the line that clears Git's record of that one
+/// worktree, `git -C MAIN worktree remove PATH`, never `git worktree
 /// prune`, which acts on every unlocked worktree whose directory is
-/// missing, this one or not. Git marks a worktree prunable also when its
-/// directory is there without its `.git` file, and refuses to remove that
-/// one, so the note says to delete the directory first.
+/// missing, this one or not, and what it drops with it (`head_note`).
+/// Git marks a worktree prunable also when its directory is there without
+/// its `.git` file, and refuses to remove that one, so the note says to
+/// delete the directory first.
 pub fn stale_note(r: &Report, main: &Path) -> String {
     let why = clean(r.stale_reason.as_deref().unwrap_or("stale"));
     let clear = format!(
@@ -315,13 +356,66 @@ pub fn stale_note(r: &Report, main: &Path) -> String {
         shell(main),
         shell(&r.entry.path)
     );
+    let head = head_note(main, &r.entry);
     match std::fs::symlink_metadata(&r.entry.path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            format!("{why}; only Git metadata remains, {clear} clears it")
-        }
-        _ => format!(
-            "{why}; its directory is still there: copy out what you need, delete it, then {clear} clears Git's record of it"
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => format!(
+            "{why}; {}; otherwise {clear} clears Git's record of it, which drops its HEAD and reflog: {head}",
+            missing_note(main)
         ),
+        _ => format!(
+            "{why}; its directory is still there: copy out what you need, delete it, then {clear} clears Git's record of it, which drops its HEAD and reflog: {head}"
+        ),
+    }
+}
+
+/// What to try first for a worktree Git lists whose directory is gone.
+pub fn missing_note(main: &Path) -> String {
+    format!(
+        "if you moved it, `git -C {} worktree repair NEWPATH` reconnects it, and if its disk is not mounted, mounting it brings it back",
+        shell(main)
+    )
+}
+
+/// The HEAD of the worktree Git lists as `entry`, which `git worktree
+/// remove` drops with its Git directory, and how to keep it first: a
+/// branch at it, unless the worktree is on one.
+pub fn head_note(main: &Path, entry: &Entry) -> String {
+    match (entry.head.as_deref(), entry.short_branch()) {
+        (None, _) => "Git cannot read its HEAD".into(),
+        (Some(_), Some(branch)) => format!(
+            "its HEAD commit, {}, stays on its branch {}",
+            entry.short_head().unwrap_or_default(),
+            clean(branch)
+        ),
+        (Some(head), None) => format!(
+            "its HEAD commit, {}, is on no branch, and `git -C {} branch {} {}` keeps it",
+            entry.short_head().unwrap_or_default(),
+            shell(main),
+            keep_branch(&entry.path),
+            clean(head)
+        ),
+    }
+}
+
+/// `keep-NAME`, NAME the worktree's directory name in the characters a
+/// branch name takes in any shell.
+fn keep_branch(path: &Path) -> String {
+    let name: String = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    match name.trim_matches('-') {
+        "" => "keep-worktree".into(),
+        name => format!("keep-{name}"),
     }
 }
 

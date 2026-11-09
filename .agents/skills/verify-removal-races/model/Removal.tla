@@ -34,7 +34,10 @@
 (* record's deletion started, a restore refuses while the PID the record  *)
 (* names runs, or while a `git worktree remove` of W does, which covers   *)
 (* the run killed alone while its Git goes on (removed::unheld). Its      *)
-(* other steps are this release's.                                        *)
+(* other steps are this release's. A trash restore keeps such a purge     *)
+(* off W: it keeps W's .git open, which the purge's re-check sees as a    *)
+(* use, locks W while it reads the records, and reads them again once W   *)
+(* has moved. Late names what that leaves open (LatePurge).               *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -45,7 +48,7 @@ CONSTANTS
   Off,        \* actors that do not run
   After,      \* restores ("tr", "rr") that list only once no remove run or purge runs
   Old,        \* deleting actors ("rm", "pg") of a release that takes no hold
-  Late        \* restores that list only once each actor in Old has written its record, or stopped
+  Late        \* trash restores ("tr") that a purge in Old does not race in the window LatePurge names
 
 Mut(name) == name \in Broken
 
@@ -66,10 +69,14 @@ VARIABLES
   g,       \* each deleting actor's `git worktree remove` child
   chk,     \* each deleting actor's last passing check: where, and whether W was unchanged and idle
   ctx,     \* rm's Moved::put_back(locked) and the settle that follows it
-  ts,      \* what tr's listing (restore.rs gather) saw, then what it read under its hold
+  ts,      \* what tr's listing (restore.rs gather) saw, then what it read under its hold;
+           \* whether it put its own lock on W (mine), and found a purge record it
+           \* had not read once W moved (raced)
   rs,      \* what rr's listing saw, then what it read under its hold, and how it restored
   lk,      \* for each file a run can hold, who has taken its hold
-  pl,      \* the lock pg's re-check read, which trash::purge lifts
+  pl,      \* the lock pg's re-check read, which trash::purge lifts; whether that
+           \* re-check came before tr opened W's .git (early), and pg's record after
+           \* tr read the records (after)
   faults,
   hist     \* history: a rule broke at some step
 
@@ -116,25 +123,53 @@ OldBusy(r, pidMut, gitMut) ==
   /\ r \in Old
   /\ \/ Running(r) /\ ~Mut(pidMut)
      \/ g[r].step # "none" /\ ~Mut(gitMut)
-\* The steps of a deleting actor before its record is in place.
-BeforeRecord(a) == IF a = "rm" THEN {"r_recheck", "r_move", "r_lock", "r_record"}
-                   ELSE {"p_hold", "p_recheck", "p_record"}
 \* A restore in After waits for the remove run or purge to stop. A Git
-\* child left running by an orphaning kill does not count. One in Late
-\* waits until each actor in Old has its record in place, or has stopped.
-Waits(a) == /\ a \in After => \A d \in D : ~Running(d)
-            /\ a \in Late => \A o \in Old : pc[o] \notin BeforeRecord(o)
+\* child left running by an orphaning kill does not count.
+Waits(a) == a \in After => \A d \in D : ~Running(d)
+\* restore.rs keep_open: from just after its hold until it ends, tr keeps
+\* W's .git open, which the activity probe of a purge's re-check sees as a
+\* use.
+TrUses == pc["tr"] \notin {"t_list", "t_hold", "t_open", "done", "dead", "off"}
+          /\ ~Mut("TrashRestoreNoUse")
+\* What Late leaves out, for a purge in Old that re-checked before tr
+\* opened W's .git, so tr's use did not stop it, and writes its record
+\* after tr read the records, so tr does not see it there: its Git
+\* looking W up while tr is between its own unlock and its move
+\* (LateGit); the user locking W after tr read the records, while tr has
+\* yet to move W or that purge has yet to unlock it (LateLock), which
+\* lets that purge's unlock, or tr's, lift the user's lock; and a record
+\* restore dropping that purge's record between tr's move and its second
+\* read (LateForget), which then misses it.
+LatePurge == "pg" \in Old /\ "tr" \in Late /\ pl.early
+             /\ (pl.after \/ pc["pg"] = "p_record")
+LateGit(a) == a = "pg" /\ LatePurge /\ pc["tr"] = "t_move"
+LateLock == /\ LatePurge
+            /\ pc["tr"] \notin {"t_list", "t_hold", "t_open", "t_lock", "t_read"}
+            /\ \/ pc["tr"] \in {"t_check", "t_unlock", "t_move"}
+               \/ pc["pg"] \in {"p_record", "p_unlock"}
+LateForget == LatePurge /\ pc["tr"] \in {"t_discard", "t_forget"}
+\* Where tr goes when it refuses: through TLift when it put its own lock
+\* on W (TLock).
+Refuse == IF ts.mine THEN "t_lift" ELSE "done"
 NoChecks == [a \in D |-> [path |-> "none", clean |-> FALSE]]
 Clean == w.edits = 0 /\ ~w.busy
 Go(a, s) == pc' = [pc EXCEPT ![a] = s]
 Lifted == IF w.lock = "user" THEN [hist EXCEPT !.lockLifted = TRUE] ELSE hist
 
+\* A trash entry's worktree is locked with residue's trash lock, or not:
+\* the user unlocked it, or a `remove --trash` stopped between its move
+\* and its lock.
+InitLocks == IF Start = "trash" THEN {"trash", "none"} ELSE {"none"}
+
 Init ==
-  /\ w = [at |-> Start, tree |-> "whole", gitdir |-> "ok", gen |-> 0,
-          lock |-> IF Start = "trash" THEN "trash" ELSE "none",
-          edits |-> 0, busy |-> FALSE, ulock |-> FALSE,
-          entry |-> IF Start = "trash" THEN "info" ELSE "none",
-          records |-> {}]
+  /\ \E l \in InitLocks :
+       /\ w = [at |-> Start, tree |-> "whole", gitdir |-> "ok", gen |-> 0,
+               lock |-> l,
+               edits |-> 0, busy |-> FALSE, ulock |-> FALSE,
+               entry |-> IF Start = "trash" THEN "info" ELSE "none",
+               records |-> {}]
+       \* The plan's listing saw that lock.
+       /\ pl = [lock |-> l, early |-> TRUE, after |-> FALSE]
   /\ pc = [a \in Actors |->
              IF a \in Off THEN "off"
              ELSE CASE a = "rm" -> IF Start = "orig" THEN "r_recheck" ELSE "off"
@@ -144,12 +179,10 @@ Init ==
   /\ g = [a \in D |-> [step |-> "none", err |-> FALSE, res |-> "none"]]
   /\ chk = NoChecks
   /\ ctx = [locked |-> FALSE, settle |-> FALSE, paths |-> {}, files |-> FALSE]
-  /\ ts = [reg |-> FALSE, lock |-> "none", recs |-> {}]
+  /\ ts = [reg |-> FALSE, lock |-> "none", recs |-> {}, mine |-> FALSE, raced |-> FALSE]
   /\ rs = [rec |-> "none", reg |-> FALSE, back |-> FALSE, lock |-> "none",
            how |-> "none"]
   /\ lk = [f \in Files |-> {}]
-  \* The plan's listing saw residue's own trash lock.
-  /\ pl = IF Start = "trash" THEN "trash" ELSE "none"
   /\ faults = 0
   /\ hist = [lostBack |-> FALSE, unchecked |-> FALSE, lied |-> FALSE,
              lockLifted |-> FALSE, undoPart |-> FALSE]
@@ -357,17 +390,20 @@ PHold ==
           /\ Go("pg", "p_recheck")
   /\ UNCHANGED <<w, g, chk, ctx, ts, rs, pl, faults, hist>>
 
-\* recheck(path, ours = LOCK): residue's own trash lock counts as none.
-\* The lock it read is the one trash::purge lifts.
+\* recheck(path, ours = LOCK): residue's own trash lock counts as none,
+\* and a process the probe sees in W, a trash restore's open .git among
+\* them (TrUses), stops it. The lock it read is the one trash::purge lifts.
 PRecheck ==
   /\ pc["pg"] = "p_recheck"
   /\ IF Mut("PurgeNoRecheck")
        \/ (Listed("trash") /\ w.gitdir = "ok" /\ DotGit
-           /\ w.lock \in {"trash", "none"} /\ Clean /\ w.tree = "whole")
+           /\ w.lock \in {"trash", "none"} /\ Clean /\ ~TrUses /\ w.tree = "whole")
      THEN /\ Go("pg", "p_record")
           /\ chk' = IF Mut("PurgeNoRecheck") THEN chk
                     ELSE [chk EXCEPT !["pg"] = [path |-> "trash", clean |-> Clean]]
-          /\ pl' = IF Mut("PurgeNoRecheck") THEN pl ELSE w.lock
+          /\ pl' = IF Mut("PurgeNoRecheck") THEN pl
+                   ELSE [pl EXCEPT !.lock = w.lock,
+                                   !.early = pc["tr"] \in {"t_list", "t_hold", "t_open"}]
      ELSE /\ Go("pg", "done")
           /\ UNCHANGED <<chk, pl>>
   /\ UNCHANGED <<w, g, ctx, ts, rs, lk, faults, hist>>
@@ -378,10 +414,12 @@ PRecord ==
   /\ pc["pg"] = "p_record"
   /\ \/ /\ w' = [w EXCEPT !.records = @ \cup {"pg"}]
         /\ lk' = IF "pg" \in Old THEN lk ELSE [lk EXCEPT !["pg"] = {"pg"}]
+        /\ pl' = [pl EXCEPT !.after = pc["tr"] \notin
+                    {"t_list", "t_hold", "t_open", "t_lock", "t_read"}]
         /\ Go("pg", "p_unlock")
      \/ /\ Go("pg", "done")
-        /\ UNCHANGED <<w, lk>>
-  /\ UNCHANGED <<g, chk, ctx, ts, rs, pl, faults, hist>>
+        /\ UNCHANGED <<w, lk, pl>>
+  /\ UNCHANGED <<g, chk, ctx, ts, rs, faults, hist>>
 
 \* trash::purge: the re-check read residue's lock, so it unlocks; read no
 \* lock, so it does not; read another's, so it refuses. Then
@@ -389,12 +427,12 @@ PRecord ==
 \* failed unlock returns its error.
 PUnlock ==
   /\ pc["pg"] = "p_unlock"
-  /\ CASE pl = "trash" /\ Listed("trash") /\ w.lock # "none" ->
+  /\ CASE pl.lock = "trash" /\ Listed("trash") /\ w.lock # "none" ->
             /\ w' = [w EXCEPT !.lock = "none"]
             /\ hist' = Lifted
             /\ Go("pg", "p_wait")
             /\ StartGit("pg", {"T", "pg"})
-       [] pl = "none" ->
+       [] pl.lock = "none" ->
             /\ Go("pg", "p_wait")
             /\ StartGit("pg", {"T", "pg"})
             /\ UNCHANGED <<w, hist>>
@@ -443,6 +481,7 @@ GitExit(a, r) ==
 \* with WT_VALIDATE_WORKTREE_MISSING_OK.
 GFind(a) ==
   /\ g[a].step = "find"
+  /\ ~LateGit(a)
   /\ IF Listed(P(a)) /\ w.gitdir = "ok" /\ w.lock = "none" /\ w.tree # "nogit"
      THEN g' = [g EXCEPT ![a].step = "exists"]
      ELSE GitExit(a, "err")
@@ -547,7 +586,8 @@ TList ==
   /\ pc["tr"] = "t_list" /\ Waits("tr")
   /\ w.entry = "info"
   /\ ts' = [reg |-> Listed("trash"), lock |-> w.lock,
-            recs |-> {r \in w.records : Interrupted(r)}]
+            recs |-> {r \in w.records : Interrupted(r)}, mine |-> FALSE,
+            raced |-> FALSE]
   /\ Go("tr", "t_hold")
   /\ UNCHANGED <<w, g, chk, ctx, rs, lk, pl, faults, hist>>
 
@@ -556,14 +596,34 @@ TList ==
 THold ==
   /\ pc["tr"] = "t_hold"
   /\ IF Mut("TrashRestoreNoHold")
-     THEN /\ Go("tr", "t_read") /\ UNCHANGED lk
+     THEN /\ Go("tr", "t_open") /\ UNCHANGED lk
      ELSE IF w.entry # "info" \/ Held("T")
      THEN /\ Go("tr", "done") /\ UNCHANGED lk
      ELSE /\ lk' = [lk EXCEPT !["T"] = @ \cup {"tr"}]
-          /\ Go("tr", "t_read")
+          /\ Go("tr", "t_open")
   /\ UNCHANGED <<w, g, chk, ctx, ts, rs, pl, faults, hist>>
 
-\* Under the hold: `git worktree list` again, then
+\* restore.rs keep_open: W's .git stays open until tr ends (TrUses).
+TOpen ==
+  /\ pc["tr"] = "t_open"
+  /\ Go("tr", "t_lock")
+  /\ UNCHANGED <<w, g, chk, ctx, ts, rs, lk, pl, faults, hist>>
+
+\* restore_trash: `git worktree list`, and when Git lists W in the trash
+\* unlocked, `git worktree lock` with trash::LOCK, which fails when W is
+\* locked by then. One step: what comes between the two reads only locks
+\* W, which makes the lock fail and the restore refuse having changed
+\* nothing, as it does here once TRead reads that lock.
+TLock ==
+  /\ pc["tr"] = "t_lock"
+  /\ IF Listed("trash") /\ w.lock = "none" /\ ~Mut("TrashRestoreNoLock")
+     THEN /\ w' = [w EXCEPT !.lock = "trash"]
+          /\ ts' = [ts EXCEPT !.mine = TRUE]
+     ELSE UNCHANGED <<w, ts>>
+  /\ Go("tr", "t_read")
+  /\ UNCHANGED <<g, chk, ctx, rs, lk, pl, faults, hist>>
+
+\* Under the hold, and the lock: `git worktree list` again, then
 \* removed::stopped_purges, the records of purges of this entry Git still
 \* lists there, each held; one another run holds refuses, and so does one
 \* without a hold that something may still be deleting (refuse_unheld).
@@ -578,11 +638,11 @@ TRead ==
   /\ LET recs == {r \in w.records : P(r) = "trash" /\ Interrupted(r)} IN
        IF \E r \in recs :
             Held(r) \/ OldBusy(r, "TrashRestoreNoOldPid", "TrashRestoreNoOldGit")
-       THEN /\ Go("tr", "done")
+       THEN /\ Go("tr", Refuse)
             /\ UNCHANGED <<ts, lk>>
-       ELSE /\ ts' = [reg |-> Listed("trash"),
-                      lock |-> IF Mut("TrashRestoreStale") THEN ts.lock ELSE w.lock,
-                      recs |-> recs]
+       ELSE /\ ts' = [ts EXCEPT !.reg = Listed("trash"),
+                                !.lock = IF Mut("TrashRestoreStale") THEN ts.lock ELSE w.lock,
+                                !.recs = recs]
             /\ lk' = [f \in Files |-> IF f \in recs THEN lk[f] \cup {"tr"} ELSE lk[f]]
             /\ Go("tr", "t_check")
   /\ UNCHANGED <<w, g, chk, ctx, rs, pl, faults, hist>>
@@ -595,11 +655,11 @@ TRead ==
 \* nothing at the original path.
 TCheck ==
   /\ pc["tr"] = "t_check"
-  /\ Go("tr", IF ts.recs # {} /\ (w.gitdir = "part" \/ ~DotGit) THEN "done"
+  /\ Go("tr", IF ts.recs # {} /\ (w.gitdir = "part" \/ ~DotGit) THEN Refuse
               ELSE IF Exists("trash") /\ ts.reg /\ ts.lock \in {"none", "trash"}
                       /\ ~Exists("orig")
               THEN IF ts.lock # "none" THEN "t_unlock" ELSE "t_move"
-              ELSE "done")
+              ELSE Refuse)
   /\ UNCHANGED <<w, g, chk, ctx, ts, rs, lk, pl, faults, hist>>
 
 \* `if was_locked { git::unlock_worktree }`, from the read under the hold.
@@ -609,7 +669,7 @@ TUnlock ==
      THEN /\ w' = [w EXCEPT !.lock = "none"]
           /\ hist' = Lifted
           /\ Go("tr", "t_move")
-     ELSE /\ Go("tr", "done")
+     ELSE /\ Go("tr", Refuse)
           /\ UNCHANGED <<w, hist>>
   /\ UNCHANGED <<g, chk, ctx, ts, rs, lk, pl, faults>>
 
@@ -620,7 +680,7 @@ TMove ==
      THEN /\ w' = [w EXCEPT !.at = "orig"]
           /\ chk' = NoChecks
           /\ Go("tr", "t_discard")
-     ELSE /\ Go("tr", IF ts.lock # "none" THEN "t_relock" ELSE "done")
+     ELSE /\ Go("tr", IF ts.lock # "none" THEN "t_relock" ELSE Refuse)
           /\ UNCHANGED <<w, chk>>
   /\ UNCHANGED <<g, ctx, ts, rs, lk, pl, faults, hist>>
 
@@ -628,6 +688,15 @@ TRelock ==
   /\ pc["tr"] = "t_relock"
   /\ w' = IF Listed("trash") /\ w.lock = "none"
           THEN [w EXCEPT !.lock = "trash"] ELSE w
+  /\ Go("tr", Refuse)
+  /\ UNCHANGED <<g, chk, ctx, ts, rs, lk, pl, faults, hist>>
+
+\* restore.rs lift: on a refusal, `git worktree list`, and the lock TLock
+\* put on W is lifted while Git lists W in the trash with residue's lock.
+TLift ==
+  /\ pc["tr"] = "t_lift"
+  /\ w' = IF Listed("trash") /\ w.lock = "trash"
+          THEN [w EXCEPT !.lock = "none"] ELSE w
   /\ Go("tr", "done")
   /\ UNCHANGED <<g, chk, ctx, ts, rs, lk, pl, faults, hist>>
 
@@ -638,29 +707,36 @@ TDiscard ==
   /\ Go("tr", "t_forget")
   /\ UNCHANGED <<g, chk, ctx, ts, rs, lk, pl, faults, hist>>
 
-\* restore_trash: removed::after_trash_restore for each stopped purge,
-\* under its hold: removed.rs finish puts back the HEAD reflog W lacks
-\* (reflog_if_lost), then forgets the record once W holds what it keeps
-\* (holds). Only the user acts meanwhile, which changes none of this.
+\* restore_trash: removed::raced_purges reads the records again, now that
+\* W is moved: a record of a purge of the entry that the read under the
+\* hold did not see is one of a purge in Old that raced the restore; it
+\* stays, and the report says part may be gone (raced). Then
+\* removed::after_trash_restore for each stopped purge, under its hold:
+\* removed.rs finish puts back the HEAD reflog W lacks (reflog_if_lost),
+\* then forgets the record once W holds what it keeps (holds). Only the
+\* user, or a purge in Old, acts meanwhile, which changes none of this:
+\* once W has moved, no new Git of that purge finds it in the trash.
 TForget ==
   /\ pc["tr"] = "t_forget"
-  /\ LET stopped == ts.recs \cap w.records IN
-       w' = CASE stopped = {} -> w
-              [] Mut("TrashForgetsWithoutCheck") ->
-                   [w EXCEPT !.records = @ \ stopped]
-              [] Listed("orig") /\ w.gitdir \in {"ok", "noreflog"} ->
-                   [w EXCEPT !.gitdir = "ok", !.records = @ \ stopped]
-              [] OTHER -> w
+  /\ LET stopped == ts.recs \cap w.records
+         raced == {r \in w.records : P(r) = "trash"} \ ts.recs IN
+       /\ w' = CASE stopped = {} -> w
+                 [] Mut("TrashForgetsWithoutCheck") ->
+                      [w EXCEPT !.records = @ \ stopped]
+                 [] Listed("orig") /\ w.gitdir \in {"ok", "noreflog"} ->
+                      [w EXCEPT !.gitdir = "ok", !.records = @ \ stopped]
+                 [] OTHER -> w
+       /\ ts' = [ts EXCEPT !.raced = raced # {} /\ ~Mut("TrashRestoreNoReread")]
   /\ Go("tr", "t_report")
-  /\ UNCHANGED <<g, chk, ctx, ts, rs, lk, pl, faults, hist>>
+  /\ UNCHANGED <<g, chk, ctx, rs, lk, pl, faults, hist>>
 
 \* The restore reports W back at its path, with PURGE_STOPPED when a purge
-\* of the entry had stopped partway.
+\* of the entry had stopped partway, or raced it.
 TReport ==
   /\ pc["tr"] = "t_report"
   /\ hist' = IF Listed("orig") /\ w.gitdir = "ok"
                 /\ (w.tree = "whole"
-                    \/ (ts.recs # {} /\ ~Mut("TrashRestoreNoNote")))
+                    \/ ((ts.recs # {} \/ ts.raced) /\ ~Mut("TrashRestoreNoNote")))
              THEN hist ELSE [hist EXCEPT !.lied = TRUE]
   /\ Go("tr", "done")
   /\ UNCHANGED <<w, g, chk, ctx, ts, rs, lk, pl, faults>>
@@ -807,18 +883,21 @@ SRecreate ==
 \* finish: the HEAD reflog W lacks goes back (reflog_if_lost), then holds,
 \* then forget: the record goes once the worktree holds its commits.
 SAfter ==
-  /\ pc["rr"] = "s_after"
+  /\ pc["rr"] = "s_after" /\ ~(rs.rec = "pg" /\ LateForget)
   /\ w' = IF Listed("orig") /\ w.gitdir \in {"ok", "noreflog"}
           THEN [w EXCEPT !.gitdir = "ok", !.records = @ \ {rs.rec}] ELSE w
   /\ Go("rr", "s_report")
   /\ UNCHANGED <<g, chk, ctx, ts, rs, lk, pl, faults, hist>>
 
-\* move_back always notes that part of it may be gone.
+\* move_back always notes that part of it may be gone, and so does
+\* restore for a purge's record whose worktree is back already.
 SReport ==
   /\ pc["rr"] = "s_report"
   /\ hist' = IF Listed("orig") /\ w.gitdir = "ok"
                 /\ (w.tree = "whole"
-                    \/ (rs.how = "moved" /\ ~Mut("MoveBackNoNote")))
+                    \/ (rs.how = "moved" /\ ~Mut("MoveBackNoNote"))
+                    \/ (rs.how = "already" /\ P(rs.rec) = "trash"
+                        /\ ~Mut("BackPurgeNoNote")))
              THEN hist ELSE [hist EXCEPT !.lied = TRUE]
   /\ Go("rr", "done")
   /\ UNCHANGED <<w, g, chk, ctx, ts, rs, lk, pl, faults>>
@@ -839,6 +918,7 @@ UserStartsProcess ==
 \* `git worktree lock`; the user never unlocks residue's own lock.
 UserLocks ==
   /\ ~w.ulock /\ w.lock = "none" /\ w.gitdir # "gone"
+  /\ ~LateLock
   /\ w' = [w EXCEPT !.lock = "user", !.ulock = TRUE]
   /\ UNCHANGED <<pc, g, chk, ctx, ts, rs, lk, pl, faults, hist>>
 
@@ -861,8 +941,8 @@ Next ==
   \/ \E a \in D : GFind(a) \/ GExists(a) \/ GStatus(a) \/ GTree(a)
                   \/ GGitdir(a) \/ GitTimeout(a)
   \/ \E a \in Actors : Kill(a) \/ Orphan(a)
-  \/ TList \/ THold \/ TRead \/ TCheck \/ TUnlock \/ TMove \/ TRelock
-  \/ TDiscard \/ TForget \/ TReport
+  \/ TList \/ THold \/ TOpen \/ TLock \/ TRead \/ TCheck \/ TUnlock \/ TMove
+  \/ TRelock \/ TLift \/ TDiscard \/ TForget \/ TReport
   \/ SList \/ SHold \/ SRead \/ SDest \/ SCopies \/ SMoveBack \/ SClear
   \/ SUnlock \/ SMove \/ SRelock \/ SRecreate \/ SAfter \/ SReport
   \/ UserEdits \/ UserStartsProcess \/ UserLocks
@@ -903,6 +983,6 @@ TypeOK ==
   /\ w.lock \in {"none", "removing", "trash", "user"}
   /\ w.records \subseteq D
   /\ lk \in [Files -> SUBSET Holders]
-  /\ pl \in {"none", "removing", "trash", "user"}
+  /\ pl \in [lock: {"none", "removing", "trash", "user"}, early: BOOLEAN, after: BOOLEAN]
   /\ faults \in 0..1
 =============================================================================

@@ -37,6 +37,11 @@ pub enum Taken {
     /// The entry has no `info`: another run discarded it, or it never had
     /// one.
     Gone,
+    /// Its filesystem gives no flock(2) lock, such as some network mounts,
+    /// so no run holds anything there, and residue cannot exclude another
+    /// run: why, naming `info`. Only a release that takes no hold made the
+    /// entry, since this one writes no record there (`write_new`).
+    Unsupported(String),
 }
 
 /// Take the hold on the entry whose `info` is at `info`, without waiting.
@@ -59,13 +64,24 @@ pub fn take(info: &Path) -> Result<Taken, String> {
         }
         Err(e) => return Err(format!("cannot open {}: {e}", info.display())),
     };
-    let locked = lock(&file).map_err(|e| match &refused {
-        Some(w) => format!(
-            "cannot lock {} open for reading ({e}), and cannot open it for writing ({w})",
-            info.display()
-        ),
-        None => format!("cannot lock {}: {e}", info.display()),
-    })?;
+    let locked = match lock(&file) {
+        Ok(locked) => locked,
+        Err(e) if unsupported(&e) => {
+            return Ok(Taken::Unsupported(format!(
+                "the filesystem of {} gives no flock(2) lock ({e})",
+                info.display()
+            )));
+        }
+        Err(e) => {
+            return Err(match &refused {
+                Some(w) => format!(
+                    "cannot lock {} open for reading ({e}), and cannot open it for writing ({w})",
+                    info.display()
+                ),
+                None => format!("cannot lock {}: {e}", info.display()),
+            });
+        }
+    };
     if !locked {
         return Ok(Taken::Busy);
     }
@@ -87,11 +103,13 @@ pub fn take(info: &Path) -> Result<Taken, String> {
 
 /// Whether a run holds the entry whose `info` is at `info` now. It takes
 /// the hold and lets go of it at once, so for that instant a restore of
-/// the same entry would find it held.
+/// the same entry would find it held. A filesystem with no lock is an
+/// error: residue cannot tell.
 pub fn held(info: &Path) -> Result<bool, String> {
     match take(info)? {
         Taken::Busy => Ok(true),
         Taken::Held(_) | Taken::Gone => Ok(false),
+        Taken::Unsupported(why) => Err(why),
     }
 }
 
@@ -137,6 +155,18 @@ pub fn pass_to(cmd: &mut Command, holds: &[&Hold]) {
             Ok(())
         });
     }
+}
+
+/// The errors of a flock(2) on a filesystem that has none: no lock
+/// manager (`ENOLCK`, NFS without one), or no support (`ENOTSUP`,
+/// `EOPNOTSUPP`, `ENOSYS`, such as SMB and some FUSE mounts).
+fn unsupported(e: &io::Error) -> bool {
+    e.raw_os_error().is_some_and(|code| {
+        code == libc::ENOLCK
+            || code == libc::ENOTSUP
+            || code == libc::EOPNOTSUPP
+            || code == libc::ENOSYS
+    })
 }
 
 /// An exclusive, non-blocking flock(2): `false` when another open file

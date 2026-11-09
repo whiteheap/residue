@@ -15,9 +15,10 @@ use std::path::Path;
 /// `remove`, then one of `paths` (a trailing `/` aside): a `git worktree
 /// remove` of one of them, or a program that runs it with those arguments.
 /// A process whose arguments residue may not read (another user's, or one
-/// that exited since the listing) is skipped. `Err` when residue cannot
-/// list the processes, or reads the arguments of none, this one among
-/// them, so that it cannot tell.
+/// that exited since the listing) is skipped; a record another user wrote
+/// is refused before this is asked (`removed::unheld`). `Err` when residue
+/// cannot list the processes, or reads the arguments of none other than
+/// this one, so that it cannot tell.
 pub fn removing(paths: &[&Path]) -> Result<Vec<u32>, String> {
     let wanted: Vec<&[u8]> = paths
         .iter()
@@ -28,16 +29,19 @@ pub fn removing(paths: &[&Path]) -> Result<Vec<u32>, String> {
     let mut read = 0usize;
     let mut found = Vec::new();
     for pid in platform::pids()? {
+        if pid == me {
+            continue;
+        }
         let Some(args) = reader.args(pid) else {
             continue;
         };
         read += 1;
-        if pid != me && names_removal(&args, &wanted) {
+        if names_removal(&args, &wanted) {
             found.push(pid);
         }
     }
     if read == 0 {
-        return Err("residue could read the arguments of no process".into());
+        return Err("residue could read the arguments of no other process".into());
     }
     found.sort_unstable();
     Ok(found)
@@ -48,6 +52,19 @@ pub fn removing(paths: &[&Path]) -> Result<Vec<u32>, String> {
 /// cannot be read.
 pub fn started(pid: u32) -> Option<i64> {
     platform::started(pid)
+}
+
+/// The arguments of process `pid`, as the kernel keeps them, or `None`
+/// when residue may not read them: another user's process on most
+/// platforms, or one that has exited.
+pub fn arguments(pid: u32) -> Option<Vec<Vec<u8>>> {
+    platform::Reader::new().ok()?.args(pid)
+}
+
+/// `args` hold `remove` as one argument, as every residue run that removes
+/// or purges does: `residue remove`, a `watch` child, the Mac app's.
+pub fn removes(args: &[Vec<u8>]) -> bool {
+    args.iter().any(|a| a == b"remove")
 }
 
 /// `args` hold `worktree` then `remove`, and after them one of `paths`.
@@ -550,7 +567,8 @@ mod platform {
                 } else {
                     u64::from_ne_bytes(slot.try_into().ok()?)
                 };
-                let arg = self.string(&space, at, MOST - total)?;
+                // Past MOST bytes in all, the arguments are not read.
+                let arg = self.string(&space, at, MOST.checked_sub(total)?)?;
                 total += arg.len() + 1;
                 args.push(arg);
             }

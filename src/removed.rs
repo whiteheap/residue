@@ -108,6 +108,10 @@ const REFTABLE_REFLOG_NOTE: &str = "its HEAD reflog was not put back: in a refta
 /// one takes milliseconds, so an hour cannot catch one at work.
 pub const INCOMPLETE_AFTER: i64 = 3600;
 
+/// The note for a worktree back at its path that a purge may have deleted
+/// part of.
+pub const PURGE_STOPPED: &str = "if its purge had started deleting, part of it is gone: `git status` in it lists tracked files that are missing, and `git restore .` brings them back; ignored output comes back from the project's install";
+
 pub fn root(common_dir: &Path) -> PathBuf {
     common_dir.join(DIR)
 }
@@ -477,10 +481,17 @@ impl Record {
     }
 }
 
-/// A process that started this many seconds after a record was written is
-/// not the run that wrote it, which started before. A smaller gap may be a
-/// step of the clock, so that process still counts.
+/// A process whose arguments residue cannot read that started this many
+/// seconds after a record was written is not the run that wrote it, which
+/// started before (`writes`). A smaller gap may be a step of the clock, so
+/// that process still counts.
 const REUSED_AFTER: i64 = 600;
+
+/// How much earlier than a trash entry's `trashed` time the name of a
+/// record that residue cannot read may say it was written and still be a
+/// purge of that entry (`stopped_purges`): the two runs' clocks may
+/// differ, by a step or a wrong clock, and a day covers that.
+const NAMED_SLACK: i64 = 86_400;
 
 /// What may still delete the worktree of a record from a release that
 /// takes no hold (`unheld`).
@@ -496,34 +507,35 @@ pub enum Unheld {
     Using(u32, String),
 }
 
-/// What may still delete the worktree of `record` while Git lists it at
-/// `registered`, where its deletion started, when the record comes from a
-/// release that takes no hold (no `hold` line), whose run and Git no hold
-/// shows. In turn: the run that wrote it still runs, unless that PID
-/// started well after the record (`REUSED_AFTER`), where the platform says
-/// when (`process::started`); a `git worktree remove` of the worktree runs
-/// (`process::removing`); the activity probe (`snapshot`, or one taken
-/// now) sees a process using the worktree or its Git directory. `Ok(None)`
-/// for a record with its `hold` line, whose hold shows all of that. `Err`
-/// when residue cannot read the arguments of processes, so it cannot tell.
-/// Once Git no longer lists the worktree, its removal has ended and nothing
-/// of it is left to delete, so callers ask only while Git lists it.
+/// What may still delete the worktree of the record `item` holds,
+/// `record`, while Git lists it at `registered`, where its deletion
+/// started, when the record comes from a release that takes no hold (no
+/// `hold` line), whose run and Git no hold shows. In turn: the run that
+/// wrote it still runs (`writes`); a `git worktree remove` of the
+/// worktree runs (`process::removing`); the activity probe (`snapshot`,
+/// or one taken now) sees a process using the worktree or its Git
+/// directory. `Ok(None)` for a record with its `hold` line, whose hold
+/// shows all of that. `Err` when residue cannot tell: another user wrote
+/// the record and residue, not root, cannot see that user's processes
+/// (`foreign`), it cannot read the arguments of processes, or the probe
+/// cannot show that no process uses the worktree (a probe failure, or a
+/// partial probe). Once Git no longer lists the worktree, its removal has
+/// ended and nothing of it is left to delete, so callers ask only while
+/// Git lists it.
 pub fn unheld(
+    item: &Item,
     record: &Record,
     registered: &Entry,
-    common_dir: &Path,
     snapshot: Option<&Snapshot>,
 ) -> Result<Option<Unheld>, String> {
     if record.hold {
         return Ok(None);
     }
+    foreign(&item.dir.join(INFO))?;
     let me = std::process::id();
-    let writer = record.writer().filter(|&pid| {
-        pid != me
-            && crate::remove::running(pid)
-            && crate::process::started(pid)
-                .is_none_or(|at| at <= record.removed.saturating_add(REUSED_AFTER))
-    });
+    let writer = record
+        .writer()
+        .filter(|&pid| pid != me && crate::remove::running(pid) && writes(pid, record));
     if let Some(pid) = writer {
         return Ok(Some(Unheld::Writer(pid)));
     }
@@ -543,15 +555,67 @@ pub fn unheld(
             &taken
         }
     };
-    let git_dir = git_dir_of(common_dir, &named);
+    let git_dir = git_dir_of(&item.common_dir, &named);
     for dir in named.iter().copied().chain(git_dir.as_deref()) {
-        if let Evidence::InUse(uses) = snapshot.evidence(dir) {
-            if let Some((pid, command)) = uses.into_iter().next() {
-                return Ok(Some(Unheld::Using(pid, command)));
+        match snapshot.evidence(dir) {
+            Evidence::InUse(uses) => {
+                if let Some((pid, command)) = uses.into_iter().next() {
+                    return Ok(Some(Unheld::Using(pid, command)));
+                }
+            }
+            Evidence::NotObserved => {}
+            // A probe that failed, or reads too little, shows no use, and
+            // that is not evidence of none.
+            Evidence::Unknown(why) => {
+                return Err(format!(
+                    "the activity probe cannot show that no process is using {}: {}",
+                    dir.display(),
+                    why.detail
+                ));
             }
         }
     }
     Ok(None)
+}
+
+/// Whether the live process `pid`, the one `record` names, may be the run
+/// that wrote it. With its arguments readable, it is when they hold
+/// `remove` (`process::removes`), whenever it started: a step of the
+/// clock moves the start time Linux gives. Without them (another user's
+/// process), it is unless it started well after the record
+/// (`REUSED_AFTER`), where the platform says when (`process::started`).
+fn writes(pid: u32, record: &Record) -> bool {
+    match crate::process::arguments(pid) {
+        Some(args) => crate::process::removes(&args),
+        None => crate::process::started(pid)
+            .is_none_or(|at| at <= record.removed.saturating_add(REUSED_AFTER)),
+    }
+}
+
+/// `Err` when the record `info` belongs to another user and residue does
+/// not run as root: it cannot read the arguments or the open files of that
+/// user's processes on every platform, so a run or a Git of theirs, such
+/// as one `sudo residue remove` started, would go unseen.
+fn foreign(info: &Path) -> Result<(), String> {
+    // SAFETY: geteuid only returns this process's effective user.
+    let me = unsafe { libc::geteuid() };
+    if me == 0 {
+        return Ok(());
+    }
+    let owner = fs::metadata(info)
+        .map_err(|e| format!("cannot read {}: {e}", info.display()))?
+        .uid();
+    if owner == me {
+        return Ok(());
+    }
+    let (who, how) = if owner == 0 {
+        ("root".to_string(), ", such as with sudo")
+    } else {
+        (format!("uid {owner}"), "")
+    };
+    Err(format!(
+        "{who} wrote it, and residue runs as uid {me}, so it cannot see that user's processes; run residue as that user{how}"
+    ))
 }
 
 /// The Git directory, `GIT_COMMON_DIR/worktrees/ID`, whose `gitdir` names
@@ -588,15 +652,17 @@ fn lexical(path: &Path) -> PathBuf {
 }
 
 /// A restore's refusal while something may still delete the worktree of
-/// `record`, which Git lists at `registered` (`unheld`). `what` names the
-/// record.
+/// the record `item` holds, `record`, which Git lists at `registered`
+/// (`unheld`). `what` names the record. When residue cannot tell, the
+/// refusal names the move back by hand, for once nothing can still be
+/// deleting it.
 fn refuse_unheld(
+    item: &Item,
     record: &Record,
     registered: &Entry,
-    common_dir: &Path,
     what: &str,
 ) -> Result<(), String> {
-    let found = unheld(record, registered, common_dir, None);
+    let found = unheld(item, record, registered, None);
     let release = record
         .version
         .as_deref()
@@ -616,9 +682,27 @@ fn refuse_unheld(
             output::clean(&command)
         ),
         Err(e) => format!(
-            "{release} wrote {what} and takes no hold, and residue could not tell whether a `git worktree remove` of the worktree still runs ({e}), so it changed nothing"
+            "{release} wrote {what} and takes no hold, and residue cannot tell whether anything still deletes the worktree ({e}), so it changed nothing; once nothing can, such as after a restart, this moves it back: {}",
+            move_back_line(&item.command_dir, registered, &record.original)
         ),
     })
+}
+
+/// The commands that move the worktree Git lists at `registered` back to
+/// `original` by hand, lifting residue's own lock on it first.
+pub fn move_back_line(main: &Path, registered: &Entry, original: &Path) -> String {
+    let git = format!("git -C {} worktree", output::shell(main));
+    let path = output::shell(&registered.path);
+    let ours = matches!(
+        registered.locked.as_deref(),
+        Some(crate::remove::REMOVING | crate::trash::LOCK)
+    );
+    let unlock = if ours {
+        format!("{git} unlock {path} && ")
+    } else {
+        String::new()
+    };
+    format!("{unlock}{git} move {path} {}", output::shell(original))
 }
 
 /// What a restore says when a run holds a record: `info` is its file.
@@ -664,6 +748,21 @@ fn entry_base(original: &Path) -> String {
     } else {
         base
     }
+}
+
+/// [`Item::named_at`] for a record entry named `name`.
+fn named_at(name: &str, original: &Path) -> Option<i64> {
+    let rest = name
+        .strip_prefix(&entry_base(original))?
+        .strip_prefix('-')?;
+    let (stamp, n) = rest.split_at_checked(16)?;
+    let numbered = n
+        .strip_prefix('-')
+        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
+    if !n.is_empty() && !numbered {
+        return None;
+    }
+    output::unstamp(stamp)
 }
 
 /// One record in a repository.
@@ -753,16 +852,30 @@ impl Item {
     }
 
     /// A record with an `info` residue cannot read, whose name it could
-    /// have been given for a worktree at `original` (`create` names it
-    /// after the worktree's directory): residue cannot tell whether it
-    /// names that worktree, or whether a run holds it.
+    /// have been given for a worktree at `original` (`named_at`): residue
+    /// cannot tell whether it names that worktree, or whether a run holds
+    /// it.
     pub fn may_be_unreadable_for(&self, original: &Path) -> bool {
-        self.record.is_err()
-            && !self.incomplete
-            && self
-                .name
-                .strip_prefix(&entry_base(original))
-                .is_some_and(|rest| rest.starts_with('-'))
+        self.record.is_err() && !self.incomplete && self.named_at(original).is_some()
+    }
+
+    /// When this record was written, as its name says, if `create` could
+    /// have given it that name for a worktree at `original`: every release
+    /// names a record `BASE-STAMP` or `BASE-STAMP-N`, BASE from the
+    /// worktree's directory name (`entry_base`), STAMP the removal's time
+    /// by the clock of the run that wrote it (`output::stamp`), N from 2.
+    pub fn named_at(&self, original: &Path) -> Option<i64> {
+        named_at(&self.name, original)
+    }
+
+    /// The command that sets this record's directory aside, out of
+    /// residue's list, keeping its files and its refs: for a record residue
+    /// cannot read, which then no longer blocks a restore.
+    pub fn set_aside_line(&self) -> String {
+        let to = self
+            .common_dir
+            .join(format!("residue-damaged-{}", self.name));
+        format!("mv {} {}", output::shell(&self.dir), output::shell(&to))
     }
 
     /// A run with `--keep-removed` of `keep` seconds forgets this record:
@@ -824,13 +937,16 @@ pub fn of_repo(repo: &crate::discover::Repo) -> Result<Vec<Item>, String> {
 /// having changed nothing, while one may not have stopped: another run
 /// holds it, or it comes from a release that takes no hold and something
 /// may still delete the worktree (`unheld`). A record that may be one but
-/// cannot be read refuses it too while a run holds it, or while no record
-/// that can be read names the worktree.
+/// cannot be read refuses it too while a run holds it, while something
+/// may still delete the worktree, or while no record that can be read
+/// names the worktree, unless its name says it was written before the
+/// entry's `trashed` time, by more than a clock can be off.
 pub fn stopped_purges(
     common_dir: &Path,
     command_dir: &Path,
     aside: &Path,
     original: &Path,
+    trashed: i64,
     listed: &[Entry],
 ) -> Result<Vec<(Item, Hold)>, String> {
     let listed: Vec<&Entry> = listed.iter().collect();
@@ -846,25 +962,52 @@ pub fn stopped_purges(
     let named = items.iter().any(ours);
     let mut stopped = Vec::new();
     for item in &items {
-        if !item.may_be_unreadable_for(original) {
+        // A purge of the entry comes after the entry: a record named for an
+        // earlier time, by more than a clock can be off, is another one's.
+        let before = item
+            .named_at(original)
+            .is_some_and(|at| at < trashed.saturating_sub(NAMED_SLACK));
+        if !item.may_be_unreadable_for(original) || before {
             continue;
         }
         let e = item.record.as_ref().err().map_or("", String::as_str);
-        let busy = match hold::take(&item.dir.join(INFO))? {
-            Taken::Busy => true,
-            Taken::Held(_) | Taken::Gone => false,
-        };
+        let cannot = format!(
+            "residue cannot read the removal record {} ({e}), so it cannot tell whether a purge of this entry stopped partway, or still runs",
+            item.name
+        );
+        let info = item.dir.join(INFO);
+        match hold::take(&info)? {
+            Taken::Busy => {
+                return Err(format!(
+                    "{cannot}, and a process holds that record (`lsof {}` names it); residue changed nothing; run this restore again once that process ends",
+                    output::shell(&info)
+                ));
+            }
+            Taken::Held(_) => {}
+            // Forgotten since the listing.
+            Taken::Gone => continue,
+            Taken::Unsupported(why) => return Err(unsupported_note(&why, None)),
+        }
         // Its release, and so whether a free hold shows its run, is
-        // unknown: a `git worktree remove` of the worktree refuses too.
+        // unknown: a `git worktree remove` of the worktree refuses too, and
+        // so does a record of another user, whose Git residue cannot see.
         let paths: Vec<&Path> = [Some(aside), aside_now.as_deref()]
             .into_iter()
             .flatten()
             .collect();
-        let deleting = crate::process::removing(&paths).map_or(true, |p| !p.is_empty());
-        if busy || deleting || !named {
+        let deleting = match crate::process::removing(&paths) {
+            Ok(found) => found.first().map(|pid| {
+                format!("process {pid}, a `git worktree remove` of the worktree, still runs")
+            }),
+            Err(e) => Some(e),
+        };
+        if let Some(why) = deleting.or_else(|| foreign(&info).err()) {
+            return Err(format!("{cannot}, and {why}; residue changed nothing"));
+        }
+        if !named {
             return Err(format!(
-                "residue cannot read the removal record {} ({e}), so it cannot tell whether a purge of this entry stopped partway, or still runs; residue changed nothing",
-                item.name
+                "{cannot}; residue changed nothing; if that record is not about this entry, `{}` sets it aside, keeping its files and refs",
+                item.set_aside_line()
             ));
         }
     }
@@ -877,16 +1020,41 @@ pub fn stopped_purges(
         match hold::take(&info)? {
             Taken::Held(hold) => {
                 if let (Ok(record), Some(registered)) = (&item.record, &item.registered) {
-                    refuse_unheld(record, registered, common_dir, &what)?;
+                    refuse_unheld(&item, record, registered, &what)?;
                 }
                 stopped.push((item, hold));
             }
             Taken::Busy => return Err(busy_note(item.record.as_ref().ok(), &info, &what)),
             // Forgotten since the listing: nothing of it is left to settle.
             Taken::Gone => {}
+            Taken::Unsupported(why) => return Err(unsupported_note(&why, None)),
         }
     }
     Ok(stopped)
+}
+
+/// The names of the records of purges of the trash worktree at any of
+/// `asides` that are not in `seen`, read now. Once a trash restore has
+/// moved the worktree, a purge record it did not read under its hold
+/// (`stopped_purges`) is one of a release that takes no hold, written
+/// while the restore ran; its Git may have deleted part of the worktree
+/// before the move. Its writer may still run, so the record stays.
+pub fn raced_purges(
+    common_dir: &Path,
+    command_dir: &Path,
+    asides: &[PathBuf],
+    seen: &[String],
+) -> Result<Vec<String>, String> {
+    Ok(list(common_dir, command_dir, &[], &[])?
+        .into_iter()
+        .filter(|item| {
+            item.record
+                .as_ref()
+                .is_ok_and(|r| r.reason == Reason::TrashPurge.code() && asides.contains(&r.aside))
+                && !seen.contains(&item.name)
+        })
+        .map(|item| item.name)
+        .collect())
 }
 
 /// [`of_repo`] for a repository given by its directories. `live` is the
@@ -1443,6 +1611,9 @@ pub fn forget_expired(item: &Item) -> Result<bool, String> {
         Taken::Held(_hold) => forget(item).map(|()| true),
         Taken::Busy => Ok(false),
         Taken::Gone => Ok(true),
+        Taken::Unsupported(why) => Err(format!(
+            "{why}, so residue cannot tell whether a restore uses it, and keeps it"
+        )),
     }
 }
 // ---------------------------------------------------------------- restore
@@ -1537,7 +1708,29 @@ fn take(item: &Item) -> Result<Hold, String> {
             "this removal record",
         )),
         Taken::Gone => Err(TAKEN.into()),
+        Taken::Unsupported(why) => Err(unsupported_note(
+            &why,
+            match (&item.record, &item.registered) {
+                (Ok(record), Some(registered)) => Some(move_back_line(
+                    &item.command_dir,
+                    registered,
+                    &record.original,
+                )),
+                _ => None,
+            },
+        )),
     }
+}
+
+/// What a restore says where the filesystem gives no hold: it changed
+/// nothing, and `manual`, when there is one, moves the worktree back by
+/// hand. That filesystem has only entries a release that takes no hold
+/// made, and only its runs, or a hand, may still act on them.
+pub fn unsupported_note(why: &str, manual: Option<String>) -> String {
+    let manual = manual.map_or(String::new(), |line| {
+        format!("; once no residue run acts on it, this moves the worktree back by hand: {line}")
+    });
+    format!("{why}, so residue cannot hold it against another run, and changed nothing{manual}")
 }
 
 /// What may still act on a record's worktree now, as far as residue can
@@ -1566,8 +1759,7 @@ impl Item {
         let (Ok(record), Some(registered)) = (&self.record, &self.registered) else {
             return Ok(Activity::Idle);
         };
-        Ok(unheld(record, registered, &self.common_dir, snapshot)?
-            .map_or(Activity::Idle, Activity::Unheld))
+        Ok(unheld(self, record, registered, snapshot)?.map_or(Activity::Idle, Activity::Unheld))
     }
 }
 
@@ -1601,7 +1793,7 @@ pub fn restore(item: &Item, to: Option<&Path>) -> Result<Restored, String> {
         })
         .cloned();
     if let Some(registered) = &registered {
-        refuse_unheld(record, registered, &item.common_dir, "this removal record")?;
+        refuse_unheld(item, record, registered, "this removal record")?;
     }
     let purged = registered
         .as_ref()
@@ -1632,7 +1824,15 @@ pub fn restore(item: &Item, to: Option<&Path>) -> Result<Restored, String> {
     // meanwhile, and nothing else holds the copies.
     let copies = read_copies(item)?;
     let mut restored = match &registered {
-        _ if back => already_back(record, &listed)?,
+        _ if back => {
+            let mut restored = already_back(record, &listed)?;
+            // A purge's Git may have deleted part of it before it came
+            // back: moved back by hand, or by a trash restore it raced.
+            if record.reason == Reason::TrashPurge.code() {
+                restored.notes.push(PURGE_STOPPED.into());
+            }
+            restored
+        }
         Some(registered) if purged => {
             let note = clear_purged(item, registered, &hold)?;
             // Read again: the list before named the trash worktree, on
@@ -1689,6 +1889,7 @@ fn clear_purged(
             ));
         }
         Taken::Gone => None,
+        Taken::Unsupported(why) => return Err(unsupported_note(&why, None)),
     };
     let ours = crate::trash::locked_by_residue(registered);
     match registered.locked.as_deref() {
@@ -2100,8 +2301,8 @@ fn move_back(
     let ours = registered.locked.as_deref() == Some(crate::remove::REMOVING);
     if !left.present {
         return Err(format!(
-            "its removal stopped partway and its directory is gone; clear Git's record with `{}`, then run this restore again",
-            left.recovery
+            "its removal stopped partway and its directory is gone; {}; otherwise clear Git's record with `{}`, then run this restore again, which recreates it from this record",
+            left.missing, left.recovery
         ));
     }
     if registered.locked.is_some() && !ours {
@@ -2649,6 +2850,37 @@ mod tests {
         for (name, want) in cases {
             assert_eq!(entry_base(&Path::new("/r").join(name)), want, "{name}");
         }
+    }
+
+    #[test]
+    fn a_record_name_says_when_it_was_written() {
+        for t in [0, 951_782_400, 1_735_689_599, 1_790_000_000, 4_102_444_800] {
+            assert_eq!(output::unstamp(&output::stamp(t)), Some(t), "{t}");
+        }
+        for bad in [
+            "20261307T000000Z",
+            "20261107T240000Z",
+            "20261107 040000Z",
+            "2026110T040000Z",
+        ] {
+            assert_eq!(output::unstamp(bad), None, "{bad}");
+        }
+        let w = Path::new("/r/w");
+        let at = output::unstamp("20250101T000000Z");
+        assert!(at.is_some());
+        assert_eq!(named_at("w-20250101T000000Z", w), at);
+        assert_eq!(named_at("w-20250101T000000Z-12", w), at);
+        for other in [
+            "w-20250101T000000Z-",
+            "w-20250101T000000Z-x",
+            "w-login-20250101T000000Z",
+            "wx-20250101T000000Z",
+            "w-20250101T000000Z-20250102T000000Z",
+        ] {
+            assert_eq!(named_at(other, w), None, "{other}");
+        }
+        let login = Path::new("/r/w-login");
+        assert_eq!(named_at("w-login-20250101T000000Z", login), at);
     }
 
     #[test]

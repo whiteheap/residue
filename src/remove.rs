@@ -134,6 +134,16 @@ pub struct Leftover {
     /// The line that clears Git's record of it once its directory is
     /// gone, and of no other worktree.
     pub clear: String,
+    /// The line that moves it back by hand, when its directory is there
+    /// and Git can use it: what a refusal names once residue cannot tell
+    /// whether its removal still runs. Empty otherwise.
+    pub move_back: String,
+    /// What `clear` drops with Git's record, its HEAD, and how to keep it
+    /// (`output::head_note`), for when no removal record keeps it.
+    pub head: String,
+    /// What to try before `clear` when its directory is gone
+    /// (`output::missing_note`).
+    pub missing: String,
 }
 
 impl Leftover {
@@ -165,8 +175,15 @@ impl Leftover {
             record: None,
             activity: Ok(Activity::Idle),
             held_record: false,
+            move_back: if present {
+                recovery.clone()
+            } else {
+                String::new()
+            },
             recovery,
             clear: format!("{unlock}{git} remove {path}"),
+            head: output::head_note(main, entry),
+            missing: output::missing_note(main),
         })
     }
 
@@ -190,7 +207,8 @@ impl Leftover {
         {
             let e = item.record.as_ref().err().map_or("", String::as_str);
             self.activity = Err(format!(
-                "a removal record that may name it cannot be read: {e}"
+                "a removal record that may name it cannot be read ({e}), and if that record does not name it, `{}` sets it aside, keeping its files and refs",
+                item.set_aside_line()
             ));
         }
         match (&self.activity, &self.record) {
@@ -228,8 +246,15 @@ impl Leftover {
                 "process {pid} ({}) is using it or its Git directory, and the residue run that removed it is from a release that takes no hold, so its removal may still be deleting it; {again}",
                 clean(command)
             )),
+            // What makes residue unable to tell may never change, such as a
+            // probe that cannot see open files, so the move back by hand
+            // is named, for once nothing can still be deleting it.
+            Err(e) if !self.move_back.is_empty() => Some(format!(
+                "residue cannot tell whether its removal still runs: {e}; once nothing can still be deleting it, such as after a restart, this moves it back: {}",
+                clean(&self.move_back)
+            )),
             Err(e) => Some(format!(
-                "residue could not tell whether its removal still runs ({e}), so it names no line to recover it; fix that, then run residue scan again"
+                "residue cannot tell whether its removal still runs: {e}; fix that, then run residue scan again"
             )),
         }
     }
@@ -249,13 +274,24 @@ impl Leftover {
                 clean(&self.recovery)
             ),
             (Some(why), None) => format!(
-                "Git can no longer use it ({why}), and no removal record names it; copy out what you need, delete it, then clear Git's record of it: {}",
-                clean(&self.clear)
+                "Git can no longer use it ({why}), and no removal record names it; copy out what you need, delete it, then `{}` clears Git's record of it, which drops its HEAD and reflog: {}",
+                clean(&self.clear),
+                self.head
             ),
             (None, _) if self.present => format!("put it back: {}", clean(&self.recovery)),
-            (None, _) => format!(
-                "its directory is gone; clear Git's record: {}",
+            // Gone may be only moved, or on a disk not mounted now: those
+            // come first, since clearing Git's record then leaves the
+            // directory, once back, no longer a Git worktree.
+            (None, Some(_)) => format!(
+                "its directory is gone; {}; otherwise `{}` clears Git's record of it, and its removal record keeps its HEAD",
+                self.missing,
                 clean(&self.recovery)
+            ),
+            (None, None) => format!(
+                "its directory is gone; {}; otherwise `{}` clears Git's record of it, which drops its HEAD and reflog: {}",
+                self.missing,
+                clean(&self.recovery),
+                self.head
             ),
         };
         // A record with its hold line, free now, shows that its removal has
@@ -347,6 +383,10 @@ enum Outcome {
     /// Moved into the trash; the entry directory.
     Trashed(PathBuf),
     Refused,
+    /// A trash entry left alone on purpose, which does not fail the run:
+    /// why. Only one on a filesystem with no flock(2), which a run of this
+    /// release cannot hold (`Taken::Unsupported`).
+    Kept(String),
     Skipped(String),
     Failed(String),
     Invalid(String),
@@ -358,6 +398,7 @@ impl Outcome {
             Outcome::Removed(_) => "removed",
             Outcome::Trashed(_) => "trashed",
             Outcome::Refused => "refused",
+            Outcome::Kept(_) => "kept",
             Outcome::Skipped(_) => "skipped",
             Outcome::Failed(_) => "failed",
             Outcome::Invalid(_) => "invalid",
@@ -583,6 +624,12 @@ pub fn remove(options: &Options) -> u8 {
         if !options.json {
             println!("{}", purge_line(&purges[i], &outcome, &places));
         }
+        if let Outcome::Kept(why) = &outcome {
+            warnings.push(format!(
+                "kept the trash entry {}: {why}",
+                purges[i].item.dir.display()
+            ));
+        }
         purges[i].outcome = Some(outcome);
     }
     for f in &mut forgets {
@@ -621,7 +668,7 @@ pub fn remove(options: &Options) -> u8 {
     }) && purges.iter().all(|p| {
         matches!(
             p.outcome,
-            Some(Outcome::Removed(_)) | Some(Outcome::Refused)
+            Some(Outcome::Removed(_) | Outcome::Refused | Outcome::Kept(_))
         )
     }) && errors.is_empty();
     // After every deletion: a ledger it cannot write is a warning, like a
@@ -1180,7 +1227,6 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
         Err(outcome) => return outcome,
     };
     let main = target.repo.command_dir();
-    // Where it goes: a hidden sibling, or a new trash entry.
     // Where it goes: a hidden sibling, or a new trash entry, held until
     // this returns: through the move in, the lock and the check there.
     let (dest, entry, reason, _entry_hold) = if mode.trash {
@@ -1714,6 +1760,15 @@ fn purge(p: &Purge, policy: &Policy, mode: &Mode) -> Outcome {
                 "another residue run purged or restored it since the plan".into(),
             );
         }
+        // Only an older release made it there, and this run cannot keep a
+        // restore away while it deletes: it stays, every run, and the run
+        // does not fail for it (a warning says so).
+        Ok(Taken::Unsupported(why)) => {
+            return Outcome::Kept(format!(
+                "{why}, so residue cannot hold it against a restore while it purges; `residue restore {}` names the steps to move it back by hand",
+                output::shell(&p.item.dir)
+            ));
+        }
         Err(e) => return Outcome::Failed(e),
     };
     let (Some(worktree), Some(before), Ok(trashed)) = (&p.item.worktree, &p.report, &p.item.record)
@@ -2015,7 +2070,7 @@ fn outcome_line(item: &Item, outcome: &Outcome, places: &Places) -> String {
         ),
         Outcome::Skipped(why) => format!("skipped {shown}: {}", clean(why)),
         Outcome::Failed(why) => format!("failed {shown}: {}", clean(why)),
-        Outcome::Refused | Outcome::Invalid(_) => format!("not removed {shown}"),
+        Outcome::Refused | Outcome::Kept(_) | Outcome::Invalid(_) => format!("not removed {shown}"),
     }
 }
 
@@ -2042,7 +2097,9 @@ fn purge_line(p: &Purge, outcome: &Outcome, places: &Places) -> String {
                 .unwrap_or_default(),
             restore_hint(record)
         ),
-        Outcome::Skipped(why) => format!("kept {name} in the trash: {}", clean(why)),
+        Outcome::Skipped(why) | Outcome::Kept(why) => {
+            format!("kept {name} in the trash: {}", clean(why))
+        }
         Outcome::Failed(why) => format!("failed to purge {name}: {}", clean(why)),
         _ => format!("kept {name} in the trash"),
     }
@@ -2089,7 +2146,7 @@ fn forget_summary(item: &removed::Item, places: &Places, style: &Style) -> Strin
 fn reason_json(outcome: &Option<Outcome>) -> Json {
     match outcome {
         Some(Outcome::Removed(_) | Outcome::Trashed(_)) => Json::Null,
-        Some(Outcome::Skipped(r) | Outcome::Failed(r) | Outcome::Invalid(r)) => {
+        Some(Outcome::Kept(r) | Outcome::Skipped(r) | Outcome::Failed(r) | Outcome::Invalid(r)) => {
             Json::str(r.clone())
         }
         Some(Outcome::Refused) => Json::str("one or more checks did not pass"),
