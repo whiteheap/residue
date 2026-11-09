@@ -7,12 +7,13 @@
 # It installs or upgrades residue through the best channel here: Homebrew on
 # macOS; the signed apt, dnf or pacman repository on Linux when it can act as
 # root; otherwise the release archive, checked against SHA256SUMS and, when gh
-# is logged in, its build-provenance attestation. When the latest release has
-# no archive for this machine yet (FreeBSD's arrive minutes after a release),
-# it takes the newest release that has one and says so. Then it runs `residue
-# service install`, and prints what it did and how to undo it. Each command
-# that changes the machine is printed (+ ...) before it runs. Everything is in
-# functions called on the last line, so a download cut short runs nothing.
+# is logged in, its build-provenance attestation from the workflow that builds
+# it. When the latest release has no archive for this machine yet (FreeBSD's
+# arrive minutes after a release), it takes the newest release that has one
+# and says so. Then it runs `residue service install`, and prints what it did
+# and how to undo it. Each command that changes the machine is printed (+ ...)
+# before it runs. Everything is in functions called on the last line, so a
+# download cut short runs nothing.
 # Source: https://github.com/whiteheap/residue-cli/blob/main/site/public/install.sh
 set -eu
 
@@ -215,9 +216,13 @@ install_pacman() {
   as_root pacman-key --add "$tmp/residue.asc"
   as_root pacman-key --lsign-key "$KEY_FPR"
   if ! grep -q '^\[residue\]' /etc/pacman.conf; then
-    printf '\n[residue]\nServer = %s/arch/%sarch\n' "$PAGES" '$' >"$tmp/pacman.conf"
+    # The database's signature is required too: under pacman's default,
+    # DatabaseOptional, a residue.db served without one would be used.
+    printf '\n[residue]\nSigLevel = Required DatabaseRequired\nServer = %s/arch/%sarch\n' "$PAGES" '$' >"$tmp/pacman.conf"
     # shellcheck disable=SC2016 # $1 belongs to the inner sh.
     as_root sh -c 'cat "$1" >>/etc/pacman.conf' sh "$tmp/pacman.conf"
+  elif ! residue_siglevel; then
+    note="[residue] in /etc/pacman.conf sets no SigLevel, so under pacman's default its database need not be signed. To require it, add this line under [residue]: SigLevel = Required DatabaseRequired"
   fi
   # Arch supports only full upgrades, so this is `pacman -Syu`, as in the
   # docs. With a terminal, pacman shows the transaction and asks first.
@@ -229,6 +234,13 @@ install_pacman() {
   bin=/usr/bin/residue
   updates="pacman -Syu"
   undo="${sudo:+sudo }pacman -R residue, and remove the [residue] section from /etc/pacman.conf"
+}
+
+# Does the [residue] section of /etc/pacman.conf set a SigLevel? An older
+# install.sh, and the docs before it, wrote one without.
+residue_siglevel() {
+  awk '/^[[:space:]]*\[/ { on = ($0 ~ /^\[residue\][[:space:]]*$/) }
+    on && /^[[:space:]]*SigLevel[[:space:]]*=/ { found = 1 } END { exit !found }' /etc/pacman.conf
 }
 
 target() {
@@ -318,6 +330,12 @@ install_archive() {
     listed || die "SHA256SUMS of $tag lists no $name.tar.gz"
     say "residue $latest has no archive for $triple yet.$late Using $tag, the newest release that has one. To update to $latest, run this script again later."
   fi
+  # Who attests the archive: release.yml at the tag for the macOS and Linux
+  # ones, packages.yml on main for FreeBSD's (docs/installation.md).
+  case $triple in
+    *-freebsd) workflow=packages.yml ref=refs/heads/main ;;
+    *) workflow=release.yml ref=refs/tags/$tag ;;
+  esac
   bin=$prefix/residue
   updates="run this script again"
   undo="rm $bin"
@@ -326,7 +344,7 @@ install_archive() {
     return 0
   fi
   if [ "$dry_run" = 1 ]; then
-    say "+ download $base/$name.tar.gz; check it against SHA256SUMS and its attestation"
+    say "+ download $base/$name.tar.gz; check it against SHA256SUMS and its attestation from $workflow at $ref"
   else
     say "Downloading $name.tar.gz"
     code=$(fetch_status "$base/$name.tar.gz" "$tmp/$name.tar.gz")
@@ -341,16 +359,18 @@ install_archive() {
     # Up to OLD_REPO_UNTIL the old name first, then REPO, for an archive
     # attested again after the rename (a packages.yml re-run). Each verify
     # takes seconds, so a later release tries only REPO. gh's reasons are kept
-    # for the error.
+    # for the error. A gh without `gh attestation` (before 2.49) stops with
+    # a plain message, where it stopped with gh's own error before.
     if ! has gh; then
       attestation="skipped (gh is not installed)"
     elif ! gh auth status >/dev/null 2>&1; then
       attestation="skipped (gh is not logged in)"
-    elif at_least "$OLD_REPO_UNTIL" "${tag#v}" &&
-      gh attestation verify "$tmp/$name.tar.gz" --repo "$OLD_REPO" >/dev/null 2>>"$tmp/attestation.err"; then
-      attestation="verified, built by $OLD_REPO's release workflow ($REPO's name up to $OLD_REPO_UNTIL)"
-    elif gh attestation verify "$tmp/$name.tar.gz" --repo "$REPO" >/dev/null 2>>"$tmp/attestation.err"; then
-      attestation="verified, built by $REPO's release workflow"
+    elif ! gh attestation verify --help 2>/dev/null | grep -q -- --cert-identity; then
+      die "this gh cannot check which workflow built $name.tar.gz; gh 2.49 or later can. Update gh, then run this again. Nothing was installed."
+    elif at_least "$OLD_REPO_UNTIL" "${tag#v}" && attested_by "$OLD_REPO"; then
+      attestation="verified, built by $OLD_REPO's $workflow at $ref ($REPO's name up to $OLD_REPO_UNTIL)"
+    elif attested_by "$REPO"; then
+      attestation="verified, built by $REPO's $workflow at $ref"
     else
       cat "$tmp/attestation.err" >&2
       die "the build-provenance attestation of $name.tar.gz did not verify; nothing was installed"
@@ -364,6 +384,13 @@ install_archive() {
   run cp "$tmp/$name/residue" "$prefix/.residue.new"
   run chmod 0755 "$prefix/.residue.new"
   run mv -f "$prefix/.residue.new" "$bin"
+}
+
+# Did $1's $workflow at $ref attest the archive, on a GitHub-hosted runner?
+# --repo alone would accept any workflow in that repository, at any ref.
+attested_by() {
+  gh attestation verify "$tmp/$name.tar.gz" --repo "$1" --deny-self-hosted-runners \
+    --cert-identity "https://github.com/$1/.github/workflows/$workflow@$ref" >/dev/null 2>>"$tmp/attestation.err"
 }
 
 # A dotted version is at least another: is $1 >= $2?
@@ -464,7 +491,7 @@ main() {
   tmp=$(mktemp -d 2>/dev/null || mktemp -d -t residue)
   trap 'rm -rf "$tmp"' EXIT
   trap 'exit 130' INT TERM
-  failed=0 turned_on=0
+  failed=0 turned_on=0 note=
   choose_channel
   say "Installing residue through: $channel"
   case $channel in
@@ -476,6 +503,7 @@ main() {
   esac
   start_service
   summary
+  if [ -n "$note" ]; then say ""; say "Note: $note"; fi
   exit "$failed"
 }
 

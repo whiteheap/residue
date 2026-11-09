@@ -120,7 +120,7 @@ jobs:
           | FreeBSD, x86_64 | \`$v-x86_64-unknown-freebsd.tar.gz\` |
           | FreeBSD, aarch64 | \`$v-aarch64-unknown-freebsd.tar.gz\` |
 
-          Check a download: \`shasum -a 256 -c SHA256SUMS --ignore-missing\`, then \`gh attestation verify FILE --repo whiteheap/residue-cli\`.
+          Check a download: \`shasum -a 256 -c SHA256SUMS --ignore-missing\`, then which workflow built it. For a macOS or static Linux archive: \`gh attestation verify FILE --repo whiteheap/residue-cli --cert-identity https://github.com/whiteheap/residue-cli/.github/workflows/release.yml@refs/tags/v$version\`. For a package or a FreeBSD archive, the same with \`packages.yml@refs/heads/main\` in place of \`release.yml@refs/tags/v$version\`.
 
           The Mac app: https://github.com/whiteheap/residue-ui/releases
           EOF
