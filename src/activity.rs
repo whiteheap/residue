@@ -854,7 +854,9 @@ mod platform {
 /// first, then each descriptor. Packed means each record ends after its
 /// path's NUL, rounded up to 8 bytes, and `kf_structsize` gives its length
 /// (`pack_kinfo` in `sys/kern/kern_descrip.c`). A record of size 0 ends the
-/// list, as in libutil's kinfo_getfile(3).
+/// list, as in libutil's kinfo_getfile(3), but only where nothing but zero
+/// bytes follows it: the kernel writes no such record, so one with more of
+/// the answer after it means the answer is not what residue reads.
 #[cfg(any(target_os = "freebsd", test))]
 mod kinfo {
     pub const STRUCTSIZE: usize = 0;
@@ -895,7 +897,10 @@ mod kinfo {
             let size = match size {
                 Some(Ok(0)) => {
                     self.rest = &[];
-                    return None;
+                    if rest.iter().all(|b| *b == 0) {
+                        return None;
+                    }
+                    return Some(Err("a record of size 0 is followed by more of the answer"));
                 }
                 Some(Ok(size)) if size > PATH && size <= rest.len() => size,
                 _ => {
@@ -1504,10 +1509,16 @@ mod tests {
                 (TYPE_VNODE, 4, Vec::new()),
             ]
         );
-        // A record of size 0 ends the list, whatever follows it.
-        buf.extend([0u8; 16]);
-        buf.extend(kinfo_record(TYPE_VNODE, 5, b"/w/after"));
-        assert_eq!(Files::new(&buf).count(), 4);
+        // A record of size 0 ends the list when only zero bytes follow it,
+        // and is an error when a record does: the walk never skips one.
+        let mut ended = buf.clone();
+        ended.extend([0u8; 16]);
+        assert_eq!(Files::new(&ended).count(), 4);
+        assert!(Files::new(&ended).all(|f| f.is_ok()));
+        ended.extend(kinfo_record(TYPE_VNODE, 5, b"/w/after"));
+        let last = Files::new(&ended).last().map(|f| f.is_err());
+        assert_eq!(last, Some(true));
+        assert_eq!(Files::new(&ended).count(), 5);
     }
 
     #[test]
