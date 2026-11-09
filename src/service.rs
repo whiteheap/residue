@@ -21,8 +21,22 @@ Examples:
 Runs as:   a launchd agent (macOS) or a systemd user service (Linux)
 Folders:   without a ROOT, the usual code folders that exist now; install
            again to add a new one
-Options:   residue watch --help
+Options:   residue watch --help, and --expect (residue service install --help)
 ";
+
+/// The lines `residue service install --help` adds above `watch`'s help.
+const INSTALL_HELP: &str = "\
+residue service install: install or replace the service, then start it.
+It takes the options of residue watch, below, and one of its own:
+  --expect FINGERPRINT     Replace the service only while `residue service
+                           status` prints this fingerprint, or with `none`
+                           install only while none is; else exit 4, unchanged
+";
+
+/// The exit status of `service install --expect` when the service is not
+/// the one it names: nothing was written.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const CHANGED: u8 = 4;
 
 /// The launchd label on macOS.
 #[cfg(target_os = "macos")]
@@ -112,10 +126,11 @@ pub fn main(args: &[OsString]) -> u8 {
 }
 
 fn install(args: &[OsString]) -> u8 {
-    let mut opts = match Options::parse(args) {
-        Ok(Some(opts)) => opts,
-        Ok(None) => {
-            println!("residue service install: takes the options of residue watch, below.\n");
+    let parsed = expect_in(args).and_then(|(expect, rest)| Ok((expect, Options::parse(&rest)?)));
+    let (expect, mut opts) = match parsed {
+        Ok((expect, Some(opts))) => (expect, opts),
+        Ok((_, None)) => {
+            println!("{INSTALL_HELP}");
             print!("{}", watch::HELP);
             return 0;
         }
@@ -142,7 +157,15 @@ fn install(args: &[OsString]) -> u8 {
         );
         return 1;
     }
-    let replaced = platform::installed();
+    // Compared now to stop before any work; the comparison that decides is
+    // the one under the lock, right before the write.
+    let replaced = match &expect {
+        None => platform::installed(),
+        Some(expect) => match check(expect) {
+            Ok(installed) => installed,
+            Err(code) => return code,
+        },
+    };
     let mut kept = false;
     if opts.default_roots {
         if let Some(roots) = replaced.as_ref().and_then(named_roots) {
@@ -172,7 +195,21 @@ fn install(args: &[OsString]) -> u8 {
             ""
         }
     );
-    let code = platform::install(&exe, &opts, &watches);
+    // Right before the write: one install or uninstall at a time from here
+    // until this one returns, and --expect compared under that lock, so
+    // nothing another residue writes lands between the comparison and the
+    // write.
+    let before_write = || {
+        let held = lock("residue service install", expect.is_some()).map_err(|message| {
+            eprintln!("residue service install: {}", output::clean(&message));
+            1
+        })?;
+        if let Some(expect) = &expect {
+            check(expect)?;
+        }
+        Ok(held)
+    };
+    let code = platform::install(&exe, &opts, &watches, before_write);
     // Options are not kept, only ROOTs: say so for the one that matters.
     let was_dry_run = replaced
         .as_ref()
@@ -193,6 +230,283 @@ fn install(args: &[OsString]) -> u8 {
         }
     }
     code
+}
+
+/// What `service install --expect` installs over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Expect {
+    /// `none`: no service is installed.
+    None,
+    /// The `fingerprint:` line of `residue service status`.
+    Fingerprint(String),
+}
+
+impl Expect {
+    fn parse(text: &str) -> Result<Expect, String> {
+        if text == "none" {
+            return Ok(Expect::None);
+        }
+        if text.len() == 32 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Ok(Expect::Fingerprint(text.to_string()));
+        }
+        Err(format!(
+            "--expect {text}: use `none`, or the fingerprint `residue service status` prints"
+        ))
+    }
+}
+
+/// `--expect VALUE` taken out of `service install`'s arguments; the rest
+/// are `watch`'s.
+fn expect_in(args: &[OsString]) -> Result<(Option<Expect>, Vec<OsString>), String> {
+    let mut expect = None;
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg != "--expect" {
+            rest.push(arg.clone());
+            continue;
+        }
+        let value = it.next().ok_or_else(|| {
+            "--expect needs a value: `none`, or the fingerprint `residue service status` prints"
+                .to_string()
+        })?;
+        if expect.is_some() {
+            return Err("--expect can be given once".into());
+        }
+        expect = Some(Expect::parse(&value.to_string_lossy())?);
+    }
+    Ok((expect, rest))
+}
+
+/// The service as `--expect` compares it, read from the service manager and
+/// the file `install` writes.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Seen {
+    /// launchd has the agent loaded, which is what `service status` calls
+    /// installed on macOS. `None` on Linux, where the unit file is.
+    loaded: Option<bool>,
+    /// The service file's bytes; `None` when there is no file.
+    file: Option<Vec<u8>>,
+    /// The binary the file starts, resolved on disk: `brew upgrade` changes
+    /// it under the same link. `None` when the file names none, or it does
+    /// not resolve.
+    binary: Option<PathBuf>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Seen {
+    /// Read the file and the binary it names; `loaded` comes from the
+    /// service manager.
+    fn read(loaded: Option<bool>) -> Result<Seen, String> {
+        let path = platform::file().ok_or("HOME is not set")?;
+        let file = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let mut seen = Seen {
+            loaded,
+            file,
+            binary: None,
+        };
+        seen.binary = seen
+            .installed()
+            .and_then(|i| i.program.into_iter().next())
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .and_then(|p| p.canonicalize().ok());
+        Ok(seen)
+    }
+
+    /// No service: no file, and nothing loaded.
+    fn absent(&self) -> bool {
+        self.file.is_none() && self.loaded != Some(true)
+    }
+
+    /// What the file runs.
+    fn installed(&self) -> Option<Installed> {
+        platform::parse(std::str::from_utf8(self.file.as_deref()?).ok()?)
+    }
+}
+
+/// The fingerprint `service status` prints and `--expect` takes: 32 hex
+/// digits that change with anything `Seen` holds and with the residue
+/// release that computes it, which is the residue an install by this binary
+/// runs as. So it names the service and the residue that would replace it,
+/// and only the release that printed it can match it.
+///
+/// FNV-1a, 128 bits, over each part with its length: a check against change
+/// by accident, not a secret. Whoever can write the file can change the
+/// service anyway.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn fingerprint(seen: &Seen, release: &str) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    const BASIS: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+    let mut hash = BASIS;
+    let mut part = |bytes: &[u8]| {
+        for b in (bytes.len() as u64).to_le_bytes().iter().chain(bytes) {
+            hash ^= u128::from(*b);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    };
+    part(b"residue service fingerprint");
+    part(release.as_bytes());
+    part(match seen.loaded {
+        Some(true) => b"loaded",
+        Some(false) => b"not loaded",
+        None => b"",
+    });
+    match &seen.file {
+        Some(bytes) => {
+            part(b"file");
+            part(bytes);
+        }
+        None => part(b"no file"),
+    }
+    match &seen.binary {
+        Some(path) => {
+            part(b"binary");
+            part(path.as_os_str().as_bytes());
+        }
+        None => part(b"no binary"),
+    }
+    format!("{hash:032x}")
+}
+
+/// Whether `seen` is the service `expect` names, to an install by `release`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn is_expected(expect: &Expect, seen: &Seen, release: &str) -> bool {
+    match expect {
+        Expect::None => seen.absent(),
+        Expect::Fingerprint(want) => *want == fingerprint(seen, release),
+    }
+}
+
+/// Read the service and compare it with `expect`: what it runs, or on a
+/// mismatch the exit status, with its one line printed.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn check(expect: &Expect) -> Result<Option<Installed>, u8> {
+    let seen = Seen::read(platform::loaded()).map_err(|message| {
+        eprintln!(
+            "residue service install: cannot read the service to compare with --expect: {}",
+            output::clean(&message)
+        );
+        1
+    })?;
+    if is_expected(expect, &seen, crate::commands::VERSION) {
+        return Ok(seen.installed());
+    }
+    match expect {
+        Expect::None => eprintln!(
+            "residue service install: a service or its file exists, and --expect none installs only when neither does; nothing changed. See it: residue service status"
+        ),
+        Expect::Fingerprint(_) => eprintln!(
+            "residue service install: the service changed since that fingerprint was read, or another residue release printed it; nothing changed. Read it again: residue service status"
+        ),
+    }
+    Err(CHANGED)
+}
+
+/// Here residue writes no service, so it has nothing to compare: `install`
+/// only prints the command to run.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn check(_expect: &Expect) -> Result<Option<Installed>, u8> {
+    Ok(None)
+}
+
+/// The `fingerprint:` line of `service status`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn print_fingerprint(seen: &Result<Seen, String>) {
+    match seen {
+        Ok(seen) => println!(
+            "fingerprint: {}",
+            fingerprint(seen, crate::commands::VERSION)
+        ),
+        Err(message) => println!("fingerprint: unknown ({})", output::clean(message)),
+    }
+}
+
+/// How long `lock` waits for another install or uninstall: longer than one
+/// takes (launchd's bootstrap is tried for up to 5 seconds, and systemd's
+/// restart waits for the old `watch` to stop).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One `service install` or `uninstall` at a time: an exclusive flock(2) on
+/// the folder that holds the service file, held while the returned file is
+/// open, so two of them (a terminal and the Mac app, or an app that quit
+/// and opened again) run one after the other. The folder, not a file of
+/// residue's own, so every residue that writes that service file takes the
+/// same lock, whatever `XDG_STATE_HOME` it runs with.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn lock(command: &str, required: bool) -> Result<Option<std::fs::File>, String> {
+    let dir = platform::file()
+        .and_then(|f| f.parent().map(Path::to_path_buf))
+        .ok_or("HOME is not set")?;
+    lock_folder(&dir, command, required, LOCK_WAIT)
+}
+
+/// `lock` on `dir`. It waits up to `wait` for another one to end, then
+/// fails. `None` when the folder is missing (there is no service to change
+/// then) or cannot be locked, such as on a filesystem with no flock(2):
+/// then the command runs without it, as before, with a warning, unless
+/// `required`, when either is an error.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn lock_folder(
+    dir: &Path,
+    command: &str,
+    required: bool,
+    wait: std::time::Duration,
+) -> Result<Option<std::fs::File>, String> {
+    use std::os::unix::io::AsRawFd;
+    let unlocked = |e: std::io::Error| {
+        let why = format!("cannot lock {}: {e}", dir.display());
+        if required {
+            Err(format!("{why}, and --expect needs the lock"))
+        } else {
+            eprintln!(
+                "{command}: warning: {}; another install could run at the same time",
+                output::clean(&why)
+            );
+            Ok(None)
+        }
+    };
+    let folder = match std::fs::File::open(dir) {
+        Ok(folder) => folder,
+        Err(e) if !required && e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return unlocked(e),
+    };
+    let start = std::time::Instant::now();
+    let mut said = false;
+    loop {
+        // SAFETY: flock on a descriptor we own; the lock lives as long as
+        // `folder`, and the kernel drops it when this process exits.
+        if unsafe { libc::flock(folder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(folder));
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::WouldBlock {
+            return unlocked(e);
+        }
+        if start.elapsed() >= wait {
+            return Err(
+                "another residue service install or uninstall is still running; try again when it ends"
+                    .into(),
+            );
+        }
+        if !said {
+            eprintln!("{command}: waiting for another residue service install or uninstall to end");
+            said = true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn lock(_command: &str, _required: bool) -> Result<Option<std::fs::File>, String> {
+    Ok(None)
 }
 
 /// The lines `service install` prints under what it installed: what the
@@ -516,9 +830,13 @@ mod platform {
             .replace("&amp;", "&")
     }
 
-    /// What the installed plist runs, from its `ProgramArguments`.
+    /// What the installed plist runs.
     pub fn installed() -> Option<Installed> {
-        let text = std::fs::read_to_string(file()?).ok()?;
+        parse(&std::fs::read_to_string(file()?).ok()?)
+    }
+
+    /// What a plist runs, from its `ProgramArguments`.
+    pub fn parse(text: &str) -> Option<Installed> {
         let after = text.split_once("<key>ProgramArguments</key>")?.1;
         let array = after.split_once("<array>")?.1.split_once("</array>")?.0;
         let program = array
@@ -532,7 +850,26 @@ mod platform {
         })
     }
 
-    pub fn install(exe: &Path, opts: &Options, watches: &str) -> u8 {
+    /// `launchctl print` of the agent, which fails when launchd has not
+    /// loaded it.
+    fn launchd_print() -> Result<String, String> {
+        run(LAUNCHCTL, &["print", &format!("{}/{LABEL}", domain())])
+    }
+
+    /// Whether launchd has the agent loaded.
+    pub fn loaded() -> Option<bool> {
+        Some(launchd_print().is_ok())
+    }
+
+    /// `before_write` runs right before the plist is written. It returns the
+    /// lock, held until this returns, or an exit status: then nothing is
+    /// written.
+    pub fn install(
+        exe: &Path,
+        opts: &Options,
+        watches: &str,
+        before_write: impl FnOnce() -> Result<Option<std::fs::File>, u8>,
+    ) -> u8 {
         let (Some(plist), Some(log)) = (file(), log_file()) else {
             eprintln!("residue service install: HOME is not set");
             return 1;
@@ -593,6 +930,12 @@ mod platform {
                 return 1;
             }
         }
+        // Held until this returns, so the write and the start are one
+        // install's too.
+        let _lock = match before_write() {
+            Ok(lock) => lock,
+            Err(code) => return code,
+        };
         if let Err(e) = std::fs::write(&plist, body) {
             eprintln!("residue service install: {}: {e}", plist.display());
             return 1;
@@ -633,6 +976,13 @@ mod platform {
             eprintln!("residue service uninstall: HOME is not set");
             return 1;
         };
+        let _lock = match super::lock("residue service uninstall", false) {
+            Ok(lock) => lock,
+            Err(message) => {
+                eprintln!("residue service uninstall: {message}");
+                return 1;
+            }
+        };
         let was_loaded = run(LAUNCHCTL, &["bootout", &format!("{}/{LABEL}", domain())]).is_ok();
         let had_file = plist.exists();
         if had_file {
@@ -650,7 +1000,11 @@ mod platform {
     }
 
     pub fn status() -> u8 {
-        match run(LAUNCHCTL, &["print", &format!("{}/{LABEL}", domain())]) {
+        let printed = launchd_print();
+        // Its file and binary, read once for what it runs and its
+        // fingerprint.
+        let seen = super::Seen::read(Some(printed.is_ok()));
+        match printed {
             Ok(text) => {
                 let field = |name: &str| {
                     text.lines()
@@ -662,9 +1016,10 @@ mod platform {
                     Some(pid) => println!("launchd agent {LABEL}: {state} (pid {pid})"),
                     None => println!("launchd agent {LABEL}: {state}"),
                 }
-                if let Some(installed) = installed() {
+                if let Some(installed) = seen.as_ref().ok().and_then(super::Seen::installed) {
                     installed.print();
                 }
+                super::print_fingerprint(&seen);
                 super::freed(true);
                 if let Some(log) = log_file() {
                     println!("log: {}", log.display());
@@ -675,6 +1030,7 @@ mod platform {
             Err(_) => {
                 println!("launchd agent {LABEL}: not installed");
                 super::homebrew_note();
+                super::print_fingerprint(&seen);
                 super::freed(false);
                 3
             }
@@ -742,9 +1098,13 @@ mod platform {
         words
     }
 
-    /// What the installed unit runs, from its `ExecStart=`.
+    /// What the installed unit runs.
     pub fn installed() -> Option<Installed> {
-        let text = std::fs::read_to_string(file()?).ok()?;
+        parse(&std::fs::read_to_string(file()?).ok()?)
+    }
+
+    /// What a unit runs, from its `ExecStart=`.
+    pub fn parse(text: &str) -> Option<Installed> {
         let exec = text.lines().find_map(|l| l.strip_prefix("ExecStart="))?;
         Some(Installed {
             program: unquote(exec),
@@ -752,7 +1112,21 @@ mod platform {
         })
     }
 
-    pub fn install(exe: &Path, opts: &Options, watches: &str) -> u8 {
+    /// The unit file is the service here: `service status` calls it
+    /// installed when the file exists.
+    pub fn loaded() -> Option<bool> {
+        None
+    }
+
+    /// `before_write` runs right before the unit is written. It returns the
+    /// lock, held until this returns, or an exit status: then nothing is
+    /// written.
+    pub fn install(
+        exe: &Path,
+        opts: &Options,
+        watches: &str,
+        before_write: impl FnOnce() -> Result<Option<std::fs::File>, u8>,
+    ) -> u8 {
         if let Err(e) = run(SYSTEMCTL, &["--user", "show-environment"]) {
             eprintln!("residue service install: no systemd user session ({e})");
             eprintln!(
@@ -801,6 +1175,12 @@ mod platform {
                 return 1;
             }
         }
+        // Held until this returns, so the write and the start are one
+        // install's too.
+        let _lock = match before_write() {
+            Ok(lock) => lock,
+            Err(code) => return code,
+        };
         if let Err(e) = std::fs::write(&unit, body) {
             eprintln!("residue service install: {}: {e}", unit.display());
             return 1;
@@ -835,6 +1215,13 @@ mod platform {
             eprintln!("residue service uninstall: HOME is not set");
             return 1;
         };
+        let _lock = match super::lock("residue service uninstall", false) {
+            Ok(lock) => lock,
+            Err(message) => {
+                eprintln!("residue service uninstall: {message}");
+                return 1;
+            }
+        };
         let had_file = unit.exists();
         let _ = run(SYSTEMCTL, &["--user", "disable", "--now", UNIT]);
         if had_file {
@@ -852,9 +1239,13 @@ mod platform {
 
     pub fn status() -> u8 {
         let installed = file().is_some_and(|u| u.exists());
+        // Its file and binary, read once for what it runs and its
+        // fingerprint.
+        let seen = super::Seen::read(None);
         if !installed {
             println!("systemd user service {UNIT}: not installed");
             super::homebrew_note();
+            super::print_fingerprint(&seen);
             super::freed(false);
             return 3;
         }
@@ -863,9 +1254,10 @@ mod platform {
             Err(_) => "inactive".into(),
         };
         println!("systemd user service {UNIT}: {state}");
-        if let Some(installed) = self::installed() {
+        if let Some(installed) = seen.as_ref().ok().and_then(super::Seen::installed) {
             installed.print();
         }
+        super::print_fingerprint(&seen);
         super::freed(true);
         if let Ok(log) = run(
             "journalctl",
@@ -891,7 +1283,13 @@ mod platform {
         None
     }
 
-    pub fn install(exe: &Path, opts: &Options, watches: &str) -> u8 {
+    /// Writes nothing, so `before_write` never runs.
+    pub fn install(
+        exe: &Path,
+        opts: &Options,
+        watches: &str,
+        _before_write: impl FnOnce() -> Result<Option<std::fs::File>, u8>,
+    ) -> u8 {
         eprintln!(
             "residue service install: residue knows launchd and systemd, and this system has neither."
         );
@@ -1044,5 +1442,224 @@ mod tests {
         let lines = removes(&parse(&["--dry-run"]));
         assert!(lines[0].starts_with("  logs:    what it would remove (--dry-run):"));
         assert!(!lines.iter().any(|l| l.contains("deletes:")));
+    }
+
+    /// `service install --help` names `--expect` and its exit status, in
+    /// lines as wide as `watch --help`'s.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn install_help_names_expect() {
+        assert!(INSTALL_HELP.contains("--expect FINGERPRINT"));
+        assert!(INSTALL_HELP.contains(&format!("exit {CHANGED}")));
+        assert!(HELP.contains("--expect"));
+        for line in INSTALL_HELP.lines().chain(HELP.lines()) {
+            assert!(line.chars().count() <= 80, "{line}");
+        }
+    }
+
+    /// `--expect VALUE` comes out of the arguments once, wherever it is,
+    /// and leaves the rest, in order, for `watch`.
+    #[test]
+    fn expect_takes_one_value() {
+        let fp = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            expect_in(&args(&["--dry-run", "--expect", fp, "~/src"])),
+            Ok((
+                Some(Expect::Fingerprint(fp.into())),
+                args(&["--dry-run", "~/src"])
+            ))
+        );
+        assert_eq!(
+            expect_in(&args(&["--expect", "none"])),
+            Ok((Some(Expect::None), Vec::new()))
+        );
+        assert_eq!(
+            expect_in(&args(&["--grace", "3h", "/"])),
+            Ok((None, args(&["--grace", "3h", "/"])))
+        );
+        assert_eq!(
+            expect_in(&args(&["--grace", "3h", "--expect"])),
+            Err(
+                "--expect needs a value: `none`, or the fingerprint `residue service status` prints"
+                    .into()
+            )
+        );
+        assert_eq!(
+            expect_in(&args(&["--expect", "none", "--expect", fp])),
+            Err("--expect can be given once".into())
+        );
+        let upper = fp.to_uppercase();
+        let long = format!("{fp}0");
+        for bad in [
+            "",
+            "None",
+            "NONE",
+            "--dry-run",
+            &upper,
+            &fp[1..],
+            &long,
+            "0123456789abcdef0123456789abcdeg",
+        ] {
+            assert_eq!(
+                Expect::parse(bad),
+                Err(format!(
+                    "--expect {bad}: use `none`, or the fingerprint `residue service status` prints"
+                ))
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    const RELEASE: &str = "0.0.12";
+
+    /// A service launchd has loaded, from a file that starts a Homebrew
+    /// binary.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn installed() -> Seen {
+        Seen {
+            loaded: Some(true),
+            file: Some(b"<plist>runs residue watch /src</plist>\n".to_vec()),
+            binary: Some(PathBuf::from(
+                "/opt/homebrew/Cellar/residue/0.0.12/bin/residue",
+            )),
+        }
+    }
+
+    /// The fingerprint is 32 lowercase hex digits; the same service and
+    /// release give the same one, and a change to any part gives another.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn fingerprint_changes_with_each_input() {
+        let base = installed();
+        let fp = fingerprint(&base, RELEASE);
+        assert_eq!(fp.len(), 32);
+        assert!(fp.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        assert_eq!(Expect::parse(&fp), Ok(Expect::Fingerprint(fp.clone())));
+        assert_eq!(fingerprint(&base.clone(), RELEASE), fp);
+        let with = |change: fn(&mut Seen)| {
+            let mut seen = installed();
+            change(&mut seen);
+            fingerprint(&seen, RELEASE)
+        };
+        let all = [
+            ("same", fp.clone()),
+            ("another release", fingerprint(&base, "0.0.13")),
+            ("not loaded", with(|s| s.loaded = Some(false))),
+            ("Linux, no load state", with(|s| s.loaded = None)),
+            ("no file", with(|s| s.file = None)),
+            ("an empty file", with(|s| s.file = Some(Vec::new()))),
+            (
+                "one more byte",
+                with(|s| s.file.as_mut().unwrap().push(b' ')),
+            ),
+            (
+                "one byte changed",
+                with(|s| s.file.as_mut().unwrap()[1] = b'P'),
+            ),
+            ("no binary", with(|s| s.binary = None)),
+            (
+                "brew upgrade",
+                with(|s| s.binary = Some("/opt/homebrew/Cellar/residue/0.0.13/bin/residue".into())),
+            ),
+            // Each part is hashed with its length, so a byte cannot move
+            // from one part to the next and leave the same fingerprint.
+            (
+                "a byte moved from the file to the binary",
+                with(|s| {
+                    s.file.as_mut().unwrap().pop();
+                    s.binary = Some("\n/opt/homebrew/Cellar/residue/0.0.12/bin/residue".into());
+                }),
+            ),
+        ];
+        for (i, (what, a)) in all.iter().enumerate() {
+            for (other, b) in &all[i + 1..] {
+                assert_ne!(a, b, "{what} and {other}");
+            }
+        }
+    }
+
+    /// `--expect none` holds only with no file and nothing loaded, and a
+    /// fingerprint only for the service and the release that printed it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn expect_decides_on_the_service_seen() {
+        let none = Seen {
+            loaded: Some(false),
+            file: None,
+            binary: None,
+        };
+        let linux_none = Seen {
+            loaded: None,
+            ..none.clone()
+        };
+        let file_not_loaded = Seen {
+            loaded: Some(false),
+            ..installed()
+        };
+        let loaded_no_file = Seen {
+            file: None,
+            binary: None,
+            ..installed()
+        };
+        assert!(is_expected(&Expect::None, &none, RELEASE));
+        assert!(is_expected(&Expect::None, &linux_none, RELEASE));
+        for some in [&installed(), &file_not_loaded, &loaded_no_file] {
+            assert!(!is_expected(&Expect::None, some, RELEASE), "{some:?}");
+        }
+        let shown = Expect::Fingerprint(fingerprint(&installed(), RELEASE));
+        assert!(is_expected(&shown, &installed(), RELEASE));
+        assert!(!is_expected(&shown, &installed(), "0.0.13"));
+        let mut edited = installed();
+        edited.file.as_mut().unwrap().insert(0, b' ');
+        let mut upgraded = installed();
+        upgraded.binary = Some("/opt/homebrew/Cellar/residue/0.0.13/bin/residue".into());
+        for changed in [&edited, &upgraded, &file_not_loaded, &loaded_no_file, &none] {
+            assert!(!is_expected(&shown, changed, RELEASE), "{changed:?}");
+        }
+        // The fingerprint of no service names that, as `none` does.
+        let nothing = Expect::Fingerprint(fingerprint(&none, RELEASE));
+        assert!(is_expected(&nothing, &none, RELEASE));
+        assert!(!is_expected(&nothing, &installed(), RELEASE));
+    }
+
+    /// One holder at a time: a second waits for the first to let go, and
+    /// fails once it has waited long enough. A missing folder is no lock,
+    /// unless one is required.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn lock_folder_lets_one_hold_it() {
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!(
+            "residue-service-test-{}-{}",
+            std::process::id(),
+            output::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = lock_folder(&dir, "test", true, Duration::ZERO).unwrap();
+        assert!(first.is_some());
+        let busy = lock_folder(&dir, "test", true, Duration::from_millis(200)).unwrap_err();
+        assert_eq!(
+            busy,
+            "another residue service install or uninstall is still running; try again when it ends"
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(first);
+        });
+        let second = lock_folder(&dir, "test", true, Duration::from_secs(10)).unwrap();
+        assert!(second.is_some());
+        release.join().unwrap();
+        drop(second);
+        let missing = dir.join("missing");
+        assert!(matches!(
+            lock_folder(&missing, "test", false, Duration::ZERO),
+            Ok(None)
+        ));
+        let required = lock_folder(&missing, "test", true, Duration::ZERO).unwrap_err();
+        assert!(
+            required.ends_with(", and --expect needs the lock"),
+            "{required}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

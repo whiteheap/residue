@@ -33,6 +33,17 @@ A ROOT you name replaces the list. `service install` writes the folders it found
 
 `residue service install` replaces the service it finds, so running it twice leaves one service. Without a ROOT, it keeps the ROOTs you named for the service it replaces, and drops any that is no longer a folder, with a note; a service on the usual code folders looks for them again. To change the folders, name them. Options are not kept: each one you do not give goes back to its default, `--dry-run` included, and the command says so when the service it replaced was a dry run.
 
+Installs and `residue service uninstall` run one at a time. One that starts while another runs prints `waiting for another residue service install or uninstall to end`, waits up to 30 seconds, then exits 1.
+
+To replace only the service you looked at, as the Mac app does, pass its fingerprint. `residue service status` prints it, also when no service is installed:
+
+```sh
+fp=$(residue service status | sed -n 's/^fingerprint: //p')
+residue service install --expect "$fp" ~/src
+```
+
+If the service changed since that read, `install` writes nothing, prints one line, and exits 4. Read the status again and decide again. `--expect none` installs only while neither the service nor its file exists. The fingerprint is 32 hex digits. It changes when the service file changes, when the binary the file starts resolves to another file (a `brew upgrade` does that under the same link), and, on macOS, when launchd loads or unloads the agent. It also includes the residue release that reads it, so a fingerprint from another release never matches: read it with the same `residue` that installs. The comparison runs right before the write, under the lock above, so no residue install or uninstall can change the service in between. A program that edits the file without residue still can.
+
 residue's Homebrew formula defines no service, so turn on automatic cleanup with `residue service install`, not `brew services`. If a Homebrew service for residue exists anyway, from a formula of your own, `service install` says so and exits 1: only one `watch` runs per user. Stop that one first with `brew services stop residue`.
 
 ### Fetching
