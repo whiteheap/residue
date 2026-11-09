@@ -225,14 +225,21 @@
     return S;
   }
 
+  // The width in CSS px a room [left, top, right, bottom] gives the stack.
+  const TALL = B[1] + THICK + (THICK + SPACE) * (SHEETS - 1) + 22 + 24;
+  const span = ([left, top, right, bottom]) =>
+    Math.min(440, (right - left) * 0.8, ((bottom - top) * 0.85 * WIDE) / TALL);
+
   // The stack fills the room the text leaves, given in CSS px as
-  // [left, top, right, bottom], and centers in it.
+  // [left, top, right, bottom], and centers in it. A room too small for the
+  // smallest stack gets none, and the hero stays black, as without this
+  // script.
   function layout(w, h, room, seed) {
     const cols = Math.max(1, Math.ceil(w / CELL));
     const rows = Math.max(1, Math.ceil(h / CELL));
+    const key = [w, h, ...room.map(Math.round)].join();
     const [left, top, right, bottom] = room;
-    const tall = B[1] + THICK + (THICK + SPACE) * (SHEETS - 1) + 22 + 24;
-    const wide = Math.max(100, Math.min(440, (right - left) * 0.8, ((bottom - top) * 0.85 * WIDE) / tall));
+    const wide = Math.max(100, span(room));
     const s = wide / CELL / WIDE;
     const thick = Math.max(3, Math.round(THICK * s));
     const pitch = thick + Math.max(2, Math.round(SPACE * s));
@@ -240,6 +247,7 @@
     const gap = Math.round(22 * s);
     const square = Math.round(24 * s);
     const totalH = stackH + gap + square;
+    if ((totalH + 1) * CELL > bottom - top || (WIDE * s + 1) * CELL > right - left) return { key, cols, rows };
     const x0 = Math.round((left + right) / 2 / CELL - (WIDE * s) / 2);
     const y0 = Math.round((top + bottom) / 2 / CELL - totalH / 2);
     // Faint specks around the stack, denser near it, each breathing slowly.
@@ -257,7 +265,7 @@
       }
     }
     return {
-      key: [w, h, ...room.map(Math.round)].join(),
+      key,
       cols,
       rows,
       pitch,
@@ -286,6 +294,7 @@
   function draw(L, px, t, seed) {
     const { cols, rows } = L;
     px.fill(GRAY[0]);
+    if (!L.sheet) return;
 
     for (const [at, tone, phase] of L.specks) {
       px[at] = GRAY[(tone * (0.7 + 0.3 * Math.sin(t * 0.5 + phase))) | 0];
@@ -346,21 +355,21 @@
     ctx.putImageData(image, 0, 0);
   };
 
-  // The room beside the text on a landscape hero, above it on a portrait one,
-  // at the ratio of the container query in style.css. Where the hero is too
-  // small for both, the stack sits partly behind the text, which paints above.
+  // The room above the text or beside it, whichever holds the larger stack.
+  // No text box enters it: the room above ends 24px above the text, and the
+  // room beside ends 24px above the first box that reaches into it, such as
+  // the install command's row.
   const text = canvas.parentElement.querySelector(".hero-content");
   const room = (box, w, h) => {
-    let right = 0;
-    let top = h;
-    for (const el of text ? text.children : []) {
+    const boxes = [...(text ? text.children : [])].map((el) => {
       const r = el.getBoundingClientRect();
-      right = Math.max(right, r.right - box.left);
-      top = Math.min(top, r.top - box.top);
-    }
-    return w / h < 23 / 20
-      ? [0, h * 0.06, w, Math.max(h * 0.3, top - 24)]
-      : [Math.min(w * 0.6, right + 48), h * 0.08, w * 0.97, h * 0.92];
+      return { top: r.top - box.top, right: r.right - box.left };
+    });
+    const above = [0, h * 0.06, w, Math.min(h * 0.94, ...boxes.map((b) => b.top - 24))];
+    const left = Math.min(w * 0.6, Math.max(0, ...boxes.map((b) => b.right)) + 48);
+    const reach = boxes.filter((b) => b.right + 24 > left);
+    const beside = [left, h * 0.08, w * 0.97, Math.min(h * 0.92, ...reach.map((b) => b.top - 24))];
+    return span(above) > span(beside) ? above : beside;
   };
 
   const resize = () => {
@@ -376,9 +385,11 @@
     image = ctx.createImageData(L.cols, L.rows);
     pixels = new Uint32Array(image.data.buffer);
     render();
+    run();
   };
 
-  const moving = () => visible && !still.matches && !document.hidden;
+  // With no stack, nothing moves and no frame is drawn.
+  const moving = () => visible && !still.matches && !document.hidden && Boolean(L && L.sheet);
 
   const tick = (now) => {
     raf = 0;
