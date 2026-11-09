@@ -133,7 +133,7 @@ cargo install --locked residue
 Run it again to upgrade. Or build a release from its tag:
 
 ```sh
-cargo install --locked --git https://github.com/whiteheap/residue-cli --tag v0.0.12 residue
+cargo install --locked --git https://github.com/whiteheap/residue-cli --tag v0.0.13 residue
 ```
 
 The last word is the package name. Cargo searches the whole repository for packages, and from 0.0.8 to 0.0.10 the repository also held the Mac app's, so at those tags `cargo install` without the name stops with "multiple packages with binaries found".

@@ -1,11 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.0.13 (2026-11-09)
 
-- **A running `watch` on macOS and the BSDs no longer runs out of open files.** kqueue holds an open file for each folder `watch` watches, and launchd starts a service with a limit of 256. With many branch folders under `refs/remotes`, the watches took them all, and every pass after that failed with `could not start: Too many open files`, so automatic cleanup stopped and removed nothing. `watch` now raises its limit on open files and keeps 128 of it free for the Git and residue each pass starts.
-- **On macOS, residue spells each name in a path as Git does.** Git precomposes each name on its own and keeps a name it cannot convert, such as one with an emoji, as stored. residue now does the same, name by name, so its walk measures an ignored folder below such names.
-- **An ignored entry the walk did not reach is not judged.** A rule that matches it no longer makes it regenerable: the `ignored` check is `unknown` (`the walk did not reach it`), which keeps the worktree.
-- **For scripts and integrations:** such an entry is `"regenerable": false`, with `files` and `bytes` null as before, and the `ignored` check's `status` is `unknown`.
+Automatic cleanup on macOS and the BSDs no longer stops for good when `watch` runs out of open files, and a worktree with an ignored entry residue could not measure is kept.
+
+- **A running `watch` on macOS and the BSDs no longer runs out of open files.** kqueue holds an open file for each folder `watch` watches, and launchd starts a service with a limit of 256. With many branch folders under `refs/remotes`, the watches took them all, and every pass after that failed with `could not start: Too many open files`, so automatic cleanup stopped and removed nothing. `watch` now raises its limit on open files and keeps 128 of it free for the Git and residue each pass starts (#168).
+- **On macOS, residue spells each name in a path as Git does.** Git precomposes each name on its own and keeps a name it cannot convert, such as one with an emoji, as stored. residue now does the same, name by name, so its walk measures an ignored folder below such names (#172).
+- **An ignored entry the walk did not reach is not judged.** A rule that matches it no longer makes it regenerable: the `ignored` check is `unknown` (`the walk did not reach it`), which keeps the worktree (#172).
+- **For scripts and integrations (changed from 0.0.12):** such an entry is `"regenerable": false`, with `files` and `bytes` null as before, and the `ignored` check's `status` is `unknown` (#172).
 
 ### Details
 
