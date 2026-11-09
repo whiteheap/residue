@@ -21,7 +21,8 @@
 #    weight is preloaded from the URL style.css loads it from, and the
 #    Content Security Policy is the exact one below.
 # 8. install.sh passes shellcheck (when it is installed), and the signing key
-#    hashes it pins match packaging/signing-key.asc.
+#    hashes it pins match packaging/signing-key.asc; the watch defaults its
+#    summary names and the Git it needs match the source.
 # 9. Search engines, link previews and agents: robots.txt has one group for
 #    every crawler and the sitemap; sitemap.xml lists exactly the canonical
 #    URLs; every page has a title that starts with the brand, and every
@@ -335,6 +336,22 @@ if command -v gpg >/dev/null 2>&1; then
 else
   printf 'skip install.sh apt keyring and fingerprint: gpg is not installed\n'
 fi
+
+# The values install.sh's summary says the service runs with, and the Git it
+# needs, are residue's own.
+named() { sed -n "s/^$1=//p" "$install_sh"; }
+same() {
+  if [ -n "$2" ] && [ "$(named "$1")" = "$2" ]; then
+    ok "install.sh $1 is $2, as $3 says"
+  else
+    fail "install.sh $1 must be ${2:-the value} $3 has"
+  fi
+}
+same WATCH_GRACE "$(sed -n 's/.*Span::parse("--grace", "\([^"]*\)").*/\1/p' "$root/src/watch.rs" | head -n 1)" src/watch.rs
+same WATCH_IDLE "$(sed -n 's/.*Span::parse("--idle", "\([^"]*\)").*/\1/p' "$root/src/watch.rs" | head -n 1)" src/watch.rs
+same WATCH_MIN_FREE "$(sed -n 's/^ *let mut min_free = \([0-9]*\)\.0;$/\1/p' "$root/src/watch.rs")" src/watch.rs
+same KEEP_REMOVED "$(sed -n 's/^pub const DEFAULT_KEEP_REMOVED: &str = "\([^"]*\)";$/\1/p' "$root/src/cli.rs")" src/cli.rs
+same GIT_NEEDS "$(sed -n 's/^pub const MIN_VERSION: (u32, u32) = (\([0-9]*\), \([0-9]*\));$/\1.\2/p' "$root/src/git.rs")" src/git.rs
 
 # 9. Search engines, link previews and agents. A page with noindex (the 404
 #    page) is not public: it needs only the title and the icons.
