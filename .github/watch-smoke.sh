@@ -43,11 +43,24 @@
 #      exits 1 between passes once the link names another file, as
 #      `brew upgrade` leaves it, and says why, so the service manager
 #      starts the new release. Its first line ends with its version (#149).
+#  12. watch's fetch changes only remote-tracking refs. With refspecs into
+#      refs/tags/ and refs/notes/ and pruneTags set, or fetch.pruneTags
+#      alone, a dry run and then a real pass each prune a branch deleted on
+#      the remote, keep every local tag and note, those deleted on the
+#      remote included, and fetch no tag. A remote with no refspec into
+#      refs/remotes/ (a legacy .git/remotes file) is not fetched, which is
+#      logged once, and its refs stay. A remote's refspec into another
+#      remote's refs/remotes/OTHER/ is left out, and a worktree that tracks
+#      OTHER keeps its upstream; with remotes origin and origin/fork,
+#      neither is fetched; each is logged once. A symbolic ref under
+#      refs/remotes/ that names a local branch stays, and the branch does
+#      not move: Git stores nothing through one.
 # Every branch stays, and nothing goes to the trash: watch deletes.
 # On NetBSD, OpenBSD and DragonFly (scripts/partial-probe.sh) no worktree
 # is a candidate: there it checks that every worktree is `unknown` for the
 # probe's reason and that dry, landed and disk-pressure runs remove none,
-# skips 1-6, 8 and 9 by name, and runs 7 expecting no removal, and 10.
+# skips 1-6, 8 and 9 by name, and runs 7 and 12 expecting no removal, and
+# 10.
 set -eu
 
 residue=$1
@@ -199,6 +212,174 @@ fetch_case() {
   echo "watch-smoke: 7. watch without a ROOT fetched, pruned and kept what it should"
 }
 
+# 12. watch's fetch changes only remote-tracking refs, whatever else the
+# remote's refspecs or pruneTags name. Runs on NetBSD, OpenBSD and DragonFly
+# too: the fetch does not depend on the activity probe.
+refspec_case() {
+  R="$S/r12"
+  mkdir "$R"
+  for repo in tagged pruned legacy; do
+    git init -q --bare -b main "$R/$repo.git"
+    git clone -q "$R/$repo.git" "$R/$repo" 2> /dev/null
+    git -C "$R/$repo" config user.email smoke@example.com
+    git -C "$R/$repo" config user.name smoke
+    echo hello > "$R/$repo/README.md"
+    git -C "$R/$repo" add README.md
+    git -C "$R/$repo" commit -qm init
+    git -C "$R/$repo" push -q origin main
+    for name in dry real stays; do
+      git -C "$R/$repo" worktree add -q "$R/$repo/.worktrees/$name" -b "$name"
+      git -C "$R/$repo/.worktrees/$name" push -q -u origin "$name"
+    done
+    # Local-only tags and notes, shared ones the remote then lost, and a
+    # tag only the remote has.
+    git -C "$R/$repo" tag -a local-annotated -m local
+    git -C "$R/$repo" tag local-light
+    git -C "$R/$repo" notes add -m local HEAD
+    git -C "$R/$repo" notes --ref=review add -m local HEAD
+    git -C "$R/$repo" tag -a shared -m shared
+    git -C "$R/$repo" notes --ref=shared add -m shared HEAD
+    git -C "$R/$repo" push -q origin refs/tags/shared refs/notes/shared
+    git -C "$R/$repo.git" update-ref -d refs/tags/shared
+    git -C "$R/$repo.git" update-ref -d refs/notes/shared
+    git -C "$R/$repo.git" tag remote-only main
+    git -C "$R/$repo" for-each-ref --format='%(refname) %(objectname)' refs/tags refs/notes > "$R/$repo.kept"
+  done
+  git -C "$R/tagged" config --add remote.origin.fetch '+refs/tags/*:refs/tags/*'
+  git -C "$R/tagged" config --add remote.origin.fetch '+refs/notes/*:refs/notes/*'
+  git -C "$R/tagged" config fetch.pruneTags true
+  git -C "$R/tagged" config remote.origin.pruneTags true
+  git -C "$R/pruned" config fetch.pruneTags true
+  # legacy: the remote is defined only by a .git/remotes file, so it has no
+  # remote.origin.fetch. A Git that no longer reads those files gives its
+  # branches no upstream, and watch has nothing to fetch there.
+  git -C "$R/legacy" config --remove-section remote.origin
+  mkdir "$R/legacy/.git/remotes"
+  printf 'URL: %s\nPull: +refs/heads/*:refs/remotes/origin/*\nPull: +refs/tags/*:refs/tags/*\n' "$R/legacy.git" \
+    > "$R/legacy/.git/remotes/origin"
+  legacy=$(git -C "$R/legacy" for-each-ref --format='%(upstream)' refs/heads/dry 2> /dev/null)
+
+  # Three more, each with its own remote, and main on it.
+  for repo in cross nested linked; do
+    git init -q --bare -b main "$R/$repo.git"
+    git clone -q "$R/$repo.git" "$R/$repo" 2> /dev/null
+    git -C "$R/$repo" config user.email smoke@example.com
+    git -C "$R/$repo" config user.name smoke
+    echo hello > "$R/$repo/README.md"
+    git -C "$R/$repo" add README.md
+    git -C "$R/$repo" commit -qm init
+    git -C "$R/$repo" push -q origin main
+  done
+  # cross: mine tracks origin and is aged past --grace. Remote up has a
+  # second refspec into origin's refs, and no mine. theirs tracks up, so
+  # up is fetched, through its own refspec alone.
+  git -C "$R/cross" worktree add -q "$R/cross/.worktrees/mine" -b mine
+  git -C "$R/cross/.worktrees/mine" push -q -u origin mine
+  git init -q --bare -b main "$R/up.git"
+  git -C "$R/cross" remote add up "$R/up.git"
+  git -C "$R/cross" config --add remote.up.fetch '+refs/heads/*:refs/remotes/origin/*'
+  git -C "$R/cross" push -q up main
+  git -C "$R/cross" worktree add -q "$R/cross/.worktrees/theirs" -b theirs
+  git -C "$R/cross/.worktrees/theirs" push -q -u up theirs
+  find "$R/cross/.worktrees" "$R/cross/.git/worktrees" -exec touch -t 202601010000 {} +
+  mine=$(git -C "$R/cross" rev-parse refs/remotes/origin/mine)
+  # nested: remotes origin and origin/fork. a tracks origin; origin/fork's
+  # b is in refs/remotes/origin/fork/, inside origin's refs.
+  git -C "$R/nested" worktree add -q "$R/nested/.worktrees/a" -b a
+  git -C "$R/nested/.worktrees/a" push -q -u origin a
+  git init -q --bare -b main "$R/fork.git"
+  # Newer Git refuses to add a remote named inside another's ("is a subset
+  # of existing remote"); older Git made them, so the remote is written as
+  # such a repository's config holds it.
+  git -C "$R/nested" config remote.origin/fork.url "$R/fork.git"
+  git -C "$R/nested" config remote.origin/fork.fetch "+refs/heads/*:refs/remotes/origin/fork/*"
+  git -C "$R/nested" push -q origin/fork main:refs/heads/b
+  git -C "$R/nested" fetch -q origin/fork
+  fork_b=$(git -C "$R/nested" rev-parse refs/remotes/origin/fork/b)
+  # linked: wt tracks origin. refs/remotes/origin/topic names the local
+  # branch side, and the remote's topic moves on, inside the remote, so no
+  # push writes through it here. old is deleted on the remote.
+  git -C "$R/linked" worktree add -q "$R/linked/.worktrees/wt" -b wt
+  git -C "$R/linked/.worktrees/wt" push -q -u origin wt
+  git -C "$R/linked" push -q origin main:refs/heads/old
+  git -C "$R/linked" branch -q side
+  git -C "$R/linked" symbolic-ref refs/remotes/origin/topic refs/heads/side
+  side=$(git -C "$R/linked" rev-parse side)
+  git -C "$R/linked.git" update-ref refs/heads/topic \
+    "$(git -C "$R/linked.git" -c user.name=smoke -c user.email=smoke@example.com commit-tree -p main -m topic 'main^{tree}')"
+  git -C "$R/linked.git" branch -q -D old
+
+  same_refs() { # WHEN
+    for repo in tagged pruned legacy; do
+      git -C "$R/$repo" for-each-ref --format='%(refname) %(objectname)' refs/tags refs/notes > "$R/$repo.now"
+      cmp -s "$R/$repo.kept" "$R/$repo.now" \
+        || fail "12: $1 changed tags or notes in $repo: $(diff "$R/$repo.kept" "$R/$repo.now" | tr '\n' ' ')"
+      [ ! -e "$R/$repo/.git/FETCH_HEAD" ] || fail "12: $1 wrote FETCH_HEAD in $repo"
+    done
+  }
+  pruned_ref() { # WHEN BRANCH
+    for repo in tagged pruned; do
+      ! git -C "$R/$repo" rev-parse -q --verify "refs/remotes/origin/$2" > /dev/null \
+        || fail "12: $1 did not prune origin/$2 in $repo"
+      grep -q "fetched .*/r12/$repo: origin/$2 is gone from the remote" "$S/log" \
+        || fail "12: $1 did not log origin/$2 as gone in $repo"
+      git -C "$R/$repo" rev-parse -q --verify refs/remotes/origin/stays > /dev/null || fail "12: $1 pruned origin/stays in $repo"
+    done
+    if [ -n "$legacy" ]; then
+      [ "$(grep -c "not fetching origin in .*/r12/legacy: none of its fetch refspecs stores into refs/remotes/; its refs stay as they were" "$S/log")" = 1 ] \
+        || fail "12: $1 did not log once that it does not fetch legacy's origin"
+      git -C "$R/legacy" rev-parse -q --verify "refs/remotes/origin/$2" > /dev/null \
+        || fail "12: $1 changed legacy's refs, which it does not fetch"
+    fi
+  }
+
+  others_kept() { # WHEN
+    [ "$(git -C "$R/cross" rev-parse -q --verify refs/remotes/origin/mine)" = "$mine" ] \
+      || fail "12: $1 changed origin/mine in cross, which remote up does not track"
+    ! grep -q "remove.* .*/r12/cross/.worktrees/mine" "$S/log" \
+      || fail "12: $1 took mine in cross as landed"
+    [ "$(grep -c "fetch of up in .*/r12/cross leaves out +refs/heads/\*:refs/remotes/origin/\* (remote origin's refs)" "$S/log")" = 1 ] \
+      || fail "12: $1 did not log once that up's refspec into origin's refs is left out"
+    git -C "$R/cross" rev-parse -q --verify refs/remotes/up/theirs > /dev/null || fail "12: $1 lost up/theirs in cross"
+    [ "$(git -C "$R/nested" rev-parse -q --verify refs/remotes/origin/fork/b)" = "$fork_b" ] \
+      || fail "12: $1 changed origin/fork/b in nested, which remote origin does not track"
+    grep -q "not fetching origin in .*/r12/nested: each of its fetch refspecs into refs/remotes/ also stores into another remote's refs: +refs/heads/\*:refs/remotes/origin/\* (remote origin/fork's refs)" "$S/log" \
+      || fail "12: $1 did not log why it does not fetch origin in nested"
+    [ "$(git -C "$R/linked" rev-parse side)" = "$side" ] || fail "12: $1 moved the local branch side in linked"
+    [ "$(git -C "$R/linked" symbolic-ref -q refs/remotes/origin/topic)" = refs/heads/side ] \
+      || fail "12: $1 changed the symbolic ref origin/topic in linked"
+    ! git -C "$R/linked" rev-parse -q --verify refs/remotes/origin/old > /dev/null \
+      || fail "12: $1 did not fetch and prune origin in linked"
+  }
+
+  # A dry run fetches, and prunes origin/dry. The worktrees are new, so
+  # nothing is removed: this case is about the refs.
+  for repo in tagged pruned legacy; do
+    git -C "$R/$repo.git" branch -q -D dry
+  done
+  "$residue" watch --once --dry-run --grace 1m "$R" 2> "$S/log" || fail "12: the dry run failed"
+  ! grep -q "removed " "$S/log" || fail "12: the dry run removed a worktree"
+  same_refs "the dry run"
+  pruned_ref "the dry run" dry
+  others_kept "the dry run"
+
+  # A real pass, after real is deleted on the remotes.
+  for repo in tagged pruned legacy; do
+    git -C "$R/$repo.git" branch -q -D real
+  done
+  "$residue" watch --once --grace 1m "$R" 2> "$S/log" || fail "12: the pass failed"
+  same_refs "the pass"
+  pruned_ref "the pass" real
+  others_kept "the pass"
+  for repo in tagged pruned legacy; do
+    for b in dry real stays; do
+      git -C "$R/$repo" rev-parse --verify -q "$b" > /dev/null || fail "12: branch $b is gone in $repo"
+    done
+  done
+  [ -n "$legacy" ] || echo "watch-smoke: 12. this Git reads no .git/remotes file; the remote with no refspec into refs/remotes/ was not checked"
+  echo "watch-smoke: 12. watch's fetch pruned only its remote's remote-tracking refs; every tag, note, other remote's ref and local branch stayed"
+}
+
 # 10. An upgrade ends a running watch between passes (#149).
 upgrade_case() {
   U="$S/u10"
@@ -279,6 +460,7 @@ if [ -n "$partial_probe" ]; then
   done
   fetch_case
   upgrade_case
+  refspec_case
   echo "watch-smoke: ok (every worktree kept as activity unknown)"
   exit 0
 fi
@@ -629,4 +811,5 @@ many_case() {
 fetch_case
 upgrade_case
 many_case
+refspec_case
 echo "watch-smoke: ok"

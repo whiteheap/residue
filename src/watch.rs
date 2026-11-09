@@ -27,8 +27,11 @@
 //!
 //! To see a branch deleted on the remote, it fetches (`Fetcher`): about
 //! every `--fetch-every`, `git fetch --prune --no-tags` of each remote that
-//! a linked worktree's branch tracks (`git::fetch`, which never prompts). A
-//! fetch changes only remote-tracking refs. It is never a reason to remove:
+//! a linked worktree's branch tracks, with only that remote's refspecs into
+//! `refs/remotes/` that reach no other remote's refs (`git::fetch`, which
+//! never prompts). A fetch changes only that remote's remote-tracking refs;
+//! what it leaves out, and a remote with nothing left, which it does not
+//! fetch, are logged. It is never a reason to remove:
 //! it only refreshes the refs that the scan and the removal child read, and
 //! a failed fetch is logged and changes nothing. `--no-fetch` turns it off.
 //!
@@ -1793,6 +1796,10 @@ struct Fetcher {
     /// that stays unreachable is logged when the error changes, not on
     /// every try.
     failing: HashMap<(PathBuf, String), String>,
+    /// The note last logged for a repository and remote whose fetch left
+    /// out refspecs that store into another remote's refs, logged again
+    /// only when it changes.
+    leaving_out: HashMap<(PathBuf, String), String>,
     random: std::collections::hash_map::RandomState,
     draws: u64,
 }
@@ -1803,6 +1810,7 @@ impl Fetcher {
             every,
             due: HashMap::new(),
             failing: HashMap::new(),
+            leaving_out: HashMap::new(),
             random: std::collections::hash_map::RandomState::new(),
             draws: 0,
         }
@@ -1844,6 +1852,8 @@ impl Fetcher {
         self.due.retain(|dir, _| known.contains(dir.as_path()));
         self.failing
             .retain(|(dir, _), _| known.contains(dir.as_path()));
+        self.leaving_out
+            .retain(|(dir, _), _| known.contains(dir.as_path()));
         let mut changed = false;
         let repos: Vec<&Repo> = self.fetched(snap).collect();
         for repo in repos {
@@ -1881,15 +1891,49 @@ impl Fetcher {
         let mut fetched = false;
         for remote in &remotes {
             match git::fetch(&repo.dir, remote) {
-                Ok(()) => {
-                    if self
-                        .failing
-                        .remove(&(repo.common_dir.clone(), remote.clone()))
-                        .is_some()
-                    {
+                Ok(git::Fetched {
+                    skipped: None,
+                    reaching,
+                }) => {
+                    let key = (repo.common_dir.clone(), remote.clone());
+                    if self.failing.remove(&key).is_some() {
                         log(&format!("fetch of {remote} in {shown} works again"));
                     }
+                    if reaching.is_empty() {
+                        self.leaving_out.remove(&key);
+                    } else {
+                        let note = format!(
+                            "fetch of {remote} in {shown} leaves out {}",
+                            reaching_text(&reaching)
+                        );
+                        if self.leaving_out.get(&key) != Some(&note) {
+                            log(&note);
+                            self.leaving_out.insert(key, note);
+                        }
+                    }
                     fetched = true;
+                }
+                Ok(git::Fetched {
+                    skipped: Some(skip),
+                    reaching,
+                }) => {
+                    let why = match skip {
+                        git::Skip::NoRemoteTrackingRefspec => {
+                            "none of its fetch refspecs stores into refs/remotes/".to_string()
+                        }
+                        git::Skip::OtherRemotesRefs => format!(
+                            "each of its fetch refspecs into refs/remotes/ also stores into another remote's refs: {}",
+                            reaching_text(&reaching)
+                        ),
+                    };
+                    self.failed(
+                        repo,
+                        remote,
+                        &format!(
+                            "not fetching {remote} in {shown}: {why}; its refs stay as they were"
+                        ),
+                        every,
+                    );
                 }
                 Err(e) => self.failed(
                     repo,
@@ -1918,7 +1962,8 @@ impl Fetcher {
         before != after
     }
 
-    /// Log a failure once, until it changes or the fetch works again.
+    /// Log a failure, or a remote not fetched, once, until it changes or
+    /// the fetch works again.
     fn failed(&mut self, repo: &Repo, remote: &str, message: &str, every: &Span) {
         let key = (repo.common_dir.clone(), remote.to_string());
         if self.failing.get(&key).map(String::as_str) == Some(message) {
@@ -1927,6 +1972,17 @@ impl Fetcher {
         log(&format!("{message}; next try in about {}", every.text));
         self.failing.insert(key, message.to_string());
     }
+}
+
+/// The refspecs a fetch left out, each with the other remote whose refs
+/// it also stores into: `+refs/heads/*:refs/remotes/up/* (remote up's
+/// refs)`, joined by `, `.
+fn reaching_text(reaching: &[(String, String)]) -> String {
+    reaching
+        .iter()
+        .map(|(spec, other)| format!("{spec} (remote {other}'s refs)"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]

@@ -52,7 +52,14 @@ To see a branch deleted on the remote, `watch` runs `git fetch --prune --no-tags
 
 The fetch never prompts. Git runs without a terminal and with `GIT_TERMINAL_PROMPT=0`; SSH runs with `BatchMode=yes` unless you set your own SSH command (`GIT_SSH_COMMAND`, `GIT_SSH` or `core.sshCommand`), which is used as it is, still without a terminal. A fetch that needs a password, a passphrase or a host key answer fails. So does one that takes longer than five minutes. Use an SSH agent or a credential helper for a remote that needs one.
 
-A fetch changes only remote-tracking refs. It is never a reason to remove: it only refreshes the refs that the scan and the removal read, and every check above still decides. A fetch that fails logs one line, leaves that repository's refs as they were, and is tried again at the next interval; the log says when it works again. A branch the fetch finds deleted is logged too, before any removal it leads to:
+A fetch changes only the remote-tracking refs of the remote it fetches. `watch` gives Git only that remote's fetch refspecs that store under `refs/remotes/`, so tags, notes and every other ref stay as they are, whatever else the remote's refspecs, `fetch.pruneTags` or `remote.NAME.pruneTags` name; your own `git fetch` still uses them all. A refspec that also stores into another remote's `refs/remotes/OTHER/` is left out too, and so are both remotes' refspecs when one name holds the other, such as `origin` and `origin/fork`. A remote with nothing left is not fetched. The log says each once:
+
+```text
+2026-11-07T18:41:14Z residue watch: fetch of up in ~/src/app leaves out +refs/heads/*:refs/remotes/origin/* (remote origin's refs)
+2026-11-07T18:41:14Z residue watch: not fetching origin in ~/src/app: none of its fetch refspecs stores into refs/remotes/; its refs stay as they were; next try in about 30m
+```
+
+A fetch is never a reason to remove: it only refreshes the refs that the scan and the removal read, and every check above still decides. A fetch that fails logs one line, leaves that repository's refs as they were, and is tried again at the next interval; the log says when it works again. A branch the fetch finds deleted is logged too, before any removal it leads to:
 
 ```text
 2026-11-07T18:41:14Z residue watch: fetched ~/src/app: origin/fix-login is gone from the remote

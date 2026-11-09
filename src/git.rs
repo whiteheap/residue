@@ -7,7 +7,7 @@
 //! removed so it cannot bend `git status` or widen the regenerable rules.
 //! Arguments are passed as argv, never through a shell.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -1182,14 +1182,151 @@ pub fn remote_refs(dir: &Path) -> Result<std::collections::BTreeMap<String, Stri
         .collect())
 }
 
-/// `git fetch --prune --no-tags REMOTE`, run by `watch` from the main
-/// checkout (or the bare repository), so it notices a branch deleted on the
-/// remote without waiting for the user's own fetch.
+/// What `git config --null --get-regexp '^remote\.'` says for [`fetch`]
+/// of `remote`: the values of its `remote.NAME.fetch`, in order, and the
+/// names of the other remotes, every one with any `remote.OTHER.KEY`, as
+/// `git remote` lists them. Each record is the key, then a newline and the
+/// value when it has one; a remote's name is everything between `remote.`
+/// and the key's last `.`.
+fn remote_config(out: &[u8], remote: &str) -> (Vec<Vec<u8>>, BTreeSet<Vec<u8>>) {
+    let mut fetch = Vec::new();
+    let mut others = BTreeSet::new();
+    for record in nul_fields(out) {
+        let (key, value) = match record.iter().position(|b| *b == b'\n') {
+            Some(i) => (&record[..i], &record[i + 1..]),
+            None => (record, &b""[..]),
+        };
+        let Some(rest) = key.strip_prefix(b"remote.") else {
+            continue;
+        };
+        let Some(dot) = rest.iter().rposition(|b| *b == b'.') else {
+            continue;
+        };
+        let (name, var) = (&rest[..dot], &rest[dot + 1..]);
+        if name == remote.as_bytes() {
+            if var == b"fetch" {
+                fetch.push(value.to_vec());
+            }
+        } else if !name.is_empty() {
+            others.insert(name.to_vec());
+        }
+    }
+    (fetch, others)
+}
+
+/// Where a refspec stores what it fetches: what follows its last `:`, as
+/// Git splits it. `None` for a negative refspec (`^SRC`), which stores
+/// nothing, and for one with no `:`.
+fn destination(spec: &[u8]) -> Option<&[u8]> {
+    if spec.starts_with(b"^") {
+        return None;
+    }
+    let colon = spec.iter().rposition(|b| *b == b':')?;
+    Some(&spec[colon + 1..])
+}
+
+/// `refs/remotes/OTHER/`: where remote OTHER's remote-tracking refs are.
+fn namespace(remote: &[u8]) -> Vec<u8> {
+    [b"refs/remotes/", remote, b"/"].concat()
+}
+
+/// Whether the refspec destination `pattern` names some ref under
+/// `namespace` (which ends in `/`). With a `*`, it does when its part
+/// before the `*` and `namespace` start the same way, one the other.
+fn reaches(pattern: &[u8], namespace: &[u8]) -> bool {
+    match pattern.iter().position(|b| *b == b'*') {
+        Some(star) => {
+            pattern[..star].starts_with(namespace) || namespace.starts_with(&pattern[..star])
+        }
+        None => pattern.starts_with(namespace),
+    }
+}
+
+/// How [`fetch`] treats a remote's refspecs.
+#[derive(Debug, Default)]
+struct Selection<'a> {
+    /// Given to Git, in order: each refspec whose destination is under
+    /// `refs/remotes/` and reaches no other remote's refs, and each negative
+    /// one, which stores nothing and only narrows what the others match.
+    kept: Vec<&'a [u8]>,
+    /// Left out: each refspec into `refs/remotes/` whose destination reaches
+    /// another remote's `refs/remotes/OTHER/`, with the first such remote.
+    reaching: Vec<(&'a [u8], &'a [u8])>,
+}
+
+impl Selection<'_> {
+    /// Whether a kept refspec stores a ref, so a fetch can refresh one.
+    fn stores(&self) -> bool {
+        self.kept.iter().any(|spec| destination(spec).is_some())
+    }
+}
+
+/// Which of a remote's refspecs (`values`, from `remote.NAME.fetch`) [`fetch`]
+/// gives Git, `others` being every other remote's name. A refspec into any
+/// namespace but `refs/remotes/` (`refs/tags/`, `refs/notes/`,
+/// `refs/heads/`, a mirror's `+refs/*:refs/*`), or with no destination, is
+/// left out, and so is one into another remote's `refs/remotes/OTHER/`,
+/// either way round when one name is inside the other (`origin` and
+/// `origin/fork`), so the upstream of a branch that tracks OTHER changes
+/// only when OTHER is fetched. Git still checks each refspec it is given.
+fn select<'a>(values: &'a [Vec<u8>], others: &'a BTreeSet<Vec<u8>>) -> Selection<'a> {
+    let mut selection = Selection::default();
+    for spec in values.iter().map(Vec::as_slice) {
+        if spec.starts_with(b"^") {
+            selection.kept.push(spec);
+            continue;
+        }
+        let Some(dst) = destination(spec).filter(|d| d.starts_with(b"refs/remotes/")) else {
+            continue;
+        };
+        match others.iter().find(|other| reaches(dst, &namespace(other))) {
+            Some(other) => selection.reaching.push((spec, other)),
+            None => selection.kept.push(spec),
+        }
+    }
+    selection
+}
+
+/// What [`fetch`] did.
+#[derive(Debug)]
+pub struct Fetched {
+    /// `None` when Git fetched and succeeded; otherwise why Git did not run.
+    pub skipped: Option<Skip>,
+    /// The remote's refspecs left out because each stores into another
+    /// remote's remote-tracking refs, each with that remote:
+    /// `(refspec, OTHER)`.
+    pub reaching: Vec<(String, String)>,
+}
+
+/// Why [`fetch`] did not run Git for a remote.
+#[derive(Debug)]
+pub enum Skip {
+    /// No fetch refspec of the remote stores into `refs/remotes/`.
+    NoRemoteTrackingRefspec,
+    /// Each of its refspecs into `refs/remotes/` also stores into another
+    /// remote's refs (`Fetched::reaching`).
+    OtherRemotesRefs,
+}
+
+/// `git fetch --prune --no-tags REMOTE REFSPEC...`, run by `watch` from the
+/// main checkout (or the bare repository), so it notices a branch deleted
+/// on the remote without waiting for the user's own fetch.
 ///
-/// It changes only remote-tracking refs (and their reflogs) and adds
-/// objects: no `FETCH_HEAD` (`--no-write-fetch-head`; a linked worktree's
-/// `FETCH_HEAD` is part of its last change), no tags, no submodules, no
-/// automatic `git maintenance` or `gc`, and hooks stay off (`command`).
+/// It changes only this remote's remote-tracking refs (and their reflogs)
+/// and adds objects. It gives Git only the remote's refspecs into
+/// `refs/remotes/` that reach no other remote's `refs/remotes/OTHER/`, and
+/// its negative ones ([`select`]). Given refspecs, Git writes and prunes
+/// only their destinations; `--refmap=` stops it from also storing a
+/// fetched ref through the other configured refspecs, and `--no-prune-tags`
+/// overrides `fetch.pruneTags` and `remote.NAME.pruneTags`. A remote with
+/// no such refspec is not fetched. Git stores nothing through a symbolic
+/// ref at a destination and prunes none (`ignore_symref_update` and
+/// `get_stale_heads` in its remote.c), so one under `refs/remotes/` that
+/// names a local branch moves nothing. No `FETCH_HEAD`
+/// (`--no-write-fetch-head`; a linked worktree's `FETCH_HEAD` is part of
+/// its last change), no tags, no `refs/remotes/NAME/HEAD` (Git sets it only
+/// when no refspec is given), no submodules, no automatic
+/// `git maintenance` or `gc`, and hooks stay off (`command`).
 ///
 /// It never waits for a person. Git's terminal prompt is off (`command`);
 /// it runs in a new session, so neither Git nor SSH nor a credential
@@ -1203,7 +1340,42 @@ pub fn remote_refs(dir: &Path) -> Result<std::collections::BTreeMap<String, Stri
 /// itself (`GIT_ASKPASS`, `core.askPass`) is theirs, and stays. A fetch
 /// that needs a person fails instead, and so does one that runs past
 /// `FETCH_TIMEOUT`. The error is the first line Git or SSH printed.
-pub fn fetch(dir: &Path, remote: &str) -> Result<(), String> {
+pub fn fetch(dir: &Path, remote: &str) -> Result<Fetched, String> {
+    let exit = git_exit(dir, &["config", "--null", "--get-regexp", r"^remote\."])?;
+    let out = match exit.code {
+        Some(1) => Vec::new(),
+        _ if exit.success => exit.stdout,
+        _ => {
+            return Err(format!(
+                "git config could not read the remotes: {}",
+                exit.stderr
+            ));
+        }
+    };
+    let (values, others) = remote_config(&out, remote);
+    let selection = select(&values, &others);
+    let reaching = selection
+        .reaching
+        .iter()
+        .map(|(spec, other)| {
+            (
+                String::from_utf8_lossy(spec).into_owned(),
+                String::from_utf8_lossy(other).into_owned(),
+            )
+        })
+        .collect();
+    if !selection.stores() {
+        let skip = if selection.reaching.is_empty() {
+            Skip::NoRemoteTrackingRefspec
+        } else {
+            Skip::OtherRemotesRefs
+        };
+        return Ok(Fetched {
+            skipped: Some(skip),
+            reaching,
+        });
+    }
+    let refspecs = selection.kept;
     let user_ssh = std::env::var_os("GIT_SSH_COMMAND").is_some_and(|v| !v.is_empty())
         || std::env::var_os("GIT_SSH").is_some_and(|v| !v.is_empty())
         || ssh_command_configured(dir);
@@ -1221,7 +1393,10 @@ pub fn fetch(dir: &Path, remote: &str) -> Result<(), String> {
     let args: Vec<&OsStr> = [
         "fetch",
         "--prune",
+        "--no-prune-tags",
         "--no-tags",
+        // Empty: a fetched ref is stored only where a refspec below says.
+        "--refmap=",
         "--no-write-fetch-head",
         "--no-auto-maintenance",
         "--no-recurse-submodules",
@@ -1231,10 +1406,14 @@ pub fn fetch(dir: &Path, remote: &str) -> Result<(), String> {
     ]
     .into_iter()
     .map(OsStr::new)
+    .chain(refspecs.iter().map(|spec| OsStr::from_bytes(spec)))
     .collect();
     let exit = exec_command(&build, &args, FETCH_TIMEOUT)?;
     if exit.success {
-        Ok(())
+        Ok(Fetched {
+            skipped: None,
+            reaching,
+        })
     } else {
         Err(format!(
             "exit {}: {}",
@@ -1610,12 +1789,15 @@ mod tests {
     //! on synthetic lists only: which folders it limits the run to, the
     //! merged list's order, which entries count as traditional mode's, and
     //! the cap. What Git prints in each layout is checked against real Git
-    //! by `scripts/contract-check.sh` (section 13).
+    //! by `scripts/contract-check.sh` (section 13). Also which configured
+    //! refspecs [`super::fetch`] gives Git; what Git then writes and prunes
+    //! is checked by `.github/watch-smoke.sh` (case 12).
 
     use super::{
-        MAX_LIMITED, MAX_LIMITED_BYTES, Status, merge_limited, topmost_untracked, within_limit,
+        MAX_LIMITED, MAX_LIMITED_BYTES, Status, merge_limited, remote_config, select,
+        topmost_untracked, within_limit,
     };
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
     use std::path::{Path, PathBuf};
 
     fn set(items: &[&str]) -> HashSet<Vec<u8>> {
@@ -1692,6 +1874,189 @@ mod tests {
         assert!(!status.traditional_listed(Path::new("secrets")));
         let traditional = Status::default();
         assert!(traditional.traditional_listed(Path::new("secrets")));
+    }
+
+    /// The refspecs of `values` that a fetch gives Git, or `None` when it
+    /// does not fetch, and those left out because they reach another
+    /// remote's refs, with that remote. `others` are the other remotes.
+    fn chosen(values: &[&str], others: &[&str]) -> (Option<Vec<String>>, Vec<(String, String)>) {
+        let values: Vec<Vec<u8>> = values.iter().map(|v| v.as_bytes().to_vec()).collect();
+        let others: BTreeSet<Vec<u8>> = others.iter().map(|o| o.as_bytes().to_vec()).collect();
+        let selection = select(&values, &others);
+        let text = |b: &[u8]| String::from_utf8(b.to_vec()).unwrap();
+        let kept = selection
+            .stores()
+            .then(|| selection.kept.iter().map(|spec| text(spec)).collect());
+        let reaching = selection
+            .reaching
+            .iter()
+            .map(|(spec, other)| (text(spec), text(other)))
+            .collect();
+        (kept, reaching)
+    }
+
+    fn kept(values: &[&str]) -> Option<Vec<String>> {
+        chosen(values, &[]).0
+    }
+
+    fn strings(items: &[&str]) -> Option<Vec<String>> {
+        Some(items.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn only_refspecs_into_remote_tracking_refs_are_fetched() {
+        // Tags, notes, a local branch and a mirror's are left out; the
+        // default one, a non-forced one and the negative ones stay, in
+        // their order.
+        assert_eq!(
+            kept(&[
+                "+refs/heads/*:refs/remotes/origin/*",
+                "+refs/tags/*:refs/tags/*",
+                "^refs/heads/secret",
+                "+refs/notes/*:refs/notes/*",
+                "refs/heads/main:refs/heads/main",
+                "refs/heads/release:refs/remotes/origin/release",
+                "+refs/*:refs/*",
+                "^refs/heads/wip/*",
+            ]),
+            strings(&[
+                "+refs/heads/*:refs/remotes/origin/*",
+                "^refs/heads/secret",
+                "refs/heads/release:refs/remotes/origin/release",
+                "^refs/heads/wip/*",
+            ])
+        );
+    }
+
+    #[test]
+    fn a_refspec_is_judged_by_its_destination_alone() {
+        // A name under refs/remotes/ that no other remote has is still a
+        // remote-tracking ref, and so is a source outside refs/heads/.
+        assert_eq!(
+            kept(&[
+                "+refs/heads/*:refs/remotes/other/*",
+                "+refs/tags/*:refs/remotes/origin/tags/*",
+            ]),
+            strings(&[
+                "+refs/heads/*:refs/remotes/other/*",
+                "+refs/tags/*:refs/remotes/origin/tags/*",
+            ])
+        );
+        // No destination, an empty one, or one that only starts like
+        // refs/remotes/: none is a remote-tracking ref. Git splits at the
+        // last colon, so a source that names refs/remotes/ does not count.
+        assert_eq!(
+            kept(&[
+                "refs/heads/main",
+                "refs/heads/main:",
+                "",
+                "+refs/heads/*:refs/remotes",
+                "+refs/heads/*:refs/remotesx/*",
+                "+refs/remotes/origin/*:refs/tags/*",
+                "refs/heads/a:refs/remotes/x:refs/tags/y",
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_remote_with_no_refspec_into_refs_remotes_is_not_fetched() {
+        // No refspec (a URL alone), a mirror's, tags only, or negative
+        // ones only: nothing a fetch stores would be a remote-tracking ref.
+        assert_eq!(kept(&[]), None);
+        assert_eq!(kept(&["+refs/*:refs/*"]), None);
+        assert_eq!(kept(&["+refs/tags/*:refs/tags/*"]), None);
+        assert_eq!(
+            kept(&["^refs/heads/secret", "+refs/notes/*:refs/notes/*"]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_refspec_into_another_remotes_refs_is_left_out() {
+        // Fetching up, with origin another remote: anything that can name
+        // a ref under refs/remotes/origin/ is left out, with origin. A name
+        // that only starts like origin's (origin-old) is not origin's.
+        let (kept, reaching) = chosen(
+            &[
+                "+refs/heads/*:refs/remotes/up/*",
+                "+refs/heads/*:refs/remotes/origin/*",
+                "refs/heads/x:refs/remotes/origin/x",
+                "+refs/pull/*/head:refs/remotes/origin/pr/*",
+                "+refs/heads/*:refs/remotes/*",
+                "+refs/heads/*:refs/remotes/o*",
+                "+refs/heads/*:refs/remotes/origin-old/*",
+                "^refs/heads/secret",
+            ],
+            &["origin"],
+        );
+        assert_eq!(
+            kept,
+            strings(&[
+                "+refs/heads/*:refs/remotes/up/*",
+                "+refs/heads/*:refs/remotes/origin-old/*",
+                "^refs/heads/secret",
+            ])
+        );
+        let left: Vec<&str> = reaching.iter().map(|(spec, _)| spec.as_str()).collect();
+        assert_eq!(
+            left,
+            [
+                "+refs/heads/*:refs/remotes/origin/*",
+                "refs/heads/x:refs/remotes/origin/x",
+                "+refs/pull/*/head:refs/remotes/origin/pr/*",
+                "+refs/heads/*:refs/remotes/*",
+                "+refs/heads/*:refs/remotes/o*",
+            ]
+        );
+        assert!(reaching.iter().all(|(_, other)| other == "origin"));
+        // When every refspec into refs/remotes/ is left out, it is not
+        // fetched, and says which.
+        let (kept, reaching) = chosen(&["+refs/heads/*:refs/remotes/origin/*"], &["origin"]);
+        assert_eq!(kept, None);
+        assert_eq!(reaching.len(), 1);
+    }
+
+    #[test]
+    fn nested_remote_names_reach_each_other_both_ways() {
+        // origin's refs/remotes/origin/* holds origin/fork's refs, and
+        // origin/fork's refs/remotes/origin/fork/* is inside origin's.
+        let origin = chosen(&["+refs/heads/*:refs/remotes/origin/*"], &["origin/fork"]);
+        assert_eq!(origin.0, None);
+        assert_eq!(origin.1[0].1, "origin/fork");
+        let fork = chosen(&["+refs/heads/*:refs/remotes/origin/fork/*"], &["origin"]);
+        assert_eq!(fork.0, None);
+        assert_eq!(fork.1[0].1, "origin");
+        // origin and origin-old do not share refs.
+        let old = chosen(&["+refs/heads/*:refs/remotes/origin/*"], &["origin-old"]);
+        assert_eq!(old.0, strings(&["+refs/heads/*:refs/remotes/origin/*"]));
+    }
+
+    #[test]
+    fn the_remotes_are_read_from_git_config() {
+        // `git config --null --get-regexp '^remote\.'`: key, newline,
+        // value, NUL. Names may hold dots and slashes; a key with no
+        // value has no newline; remote.pushDefault names no remote.
+        let out = b"remote.origin.url\n/x\0\
+            remote.origin.fetch\n+refs/heads/*:refs/remotes/origin/*\0\
+            remote.origin/fork.url\n/y\0\
+            remote.origin.fetch\n+refs/tags/*:refs/tags/*\0\
+            remote.a.b.url\n/z\0\
+            remote.pushdefault\norigin\0\
+            remote.Up.prune\ntrue\0\
+            remote.origin.fetch\0";
+        let (fetch, others) = remote_config(out, "origin");
+        assert_eq!(
+            fetch,
+            [
+                b"+refs/heads/*:refs/remotes/origin/*".to_vec(),
+                b"+refs/tags/*:refs/tags/*".to_vec(),
+                Vec::new(),
+            ]
+        );
+        let others: Vec<&[u8]> = others.iter().map(Vec::as_slice).collect();
+        assert_eq!(others, [&b"Up"[..], b"a.b", b"origin/fork"]);
+        assert_eq!(remote_config(b"", "origin"), (Vec::new(), BTreeSet::new()));
     }
 
     #[test]
