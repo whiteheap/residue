@@ -82,11 +82,12 @@ The service runs the new release within about six minutes. Before each pass, and
 residue watch: a new residue is at /opt/homebrew/bin/residue, most likely an upgrade; exiting so the service manager starts the new one
 ```
 
-Each start's first log line ends with the version, such as `· residue 0.0.11`. A `watch` that 0.0.10 or earlier started has no such check; on macOS it switches at its next start, such as your next login. To switch it now, restart the service once:
+Each start's first log line ends with the version, such as `· residue 0.0.11`. A `watch` that 0.0.10 or earlier started has no such check, so its own loop runs on until it restarts, such as at your next login. Each of its passes already runs the new release: it starts them by its own path, which the upgrade points at the new file.
+
+Homebrew on Linux is the exception. There that path is the old version's own file. Unless Homebrew keeps old versions (`HOMEBREW_NO_INSTALL_CLEANUP`), the upgrade deletes it, and the `watch` exits and the service starts the new release. If it keeps them, the `watch` runs old passes until it restarts, so restart the service once:
 
 ```sh
-launchctl kickstart -k gui/$(id -u)/com.whiteheap.residue.watch   # macOS
-systemctl --user restart residue-watch.service                    # Linux
+systemctl --user restart residue-watch.service
 ```
 
 The restart stops a removal still running, with its Git, as Ctrl-C does, and `residue scan` then shows how to bring that worktree back. A `residue restore` of a record that a run of 0.0.10 or earlier wrote refuses while that run still runs, and names its process.

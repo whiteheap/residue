@@ -54,12 +54,7 @@ brew install whiteheap/tap/residue
 
 Signed apt, dnf, and pacman repositories, the key fingerprint, release archives, and `cargo install --locked --git https://github.com/whiteheap/residue-cli --tag v0.0.10 residue` are in [Install residue](docs/installation.md). On a Mac, the [Mac app](#mac-app) shows the same in a window, with residue inside.
 
-After an upgrade, automatic cleanup switches to the new release on its own, except a `residue watch` that 0.0.10 or earlier started, which runs on until it restarts. After upgrading from 0.0.10 or earlier, restart it once ([After an upgrade](docs/automation.md#after-an-upgrade)):
-
-```sh
-launchctl kickstart -k gui/$(id -u)/com.whiteheap.residue.watch   # macOS
-systemctl --user restart residue-watch.service                    # Linux
-```
+After an upgrade, automatic cleanup runs the new release on its own ([After an upgrade](docs/automation.md#after-an-upgrade)).
 
 ## Inspect a worktree
 
