@@ -80,11 +80,20 @@ pub struct Ignored {
     pub bytes: Option<u64>,
     /// How a collapsed directory was judged entry by entry, when it was.
     pub note: Option<String>,
+    /// The environment file inside it that keeps it, when a rule matches it
+    /// but names no environment file inside (`policy::env_file`).
+    pub env: Option<String>,
 }
 
 impl Ignored {
     pub fn regenerable(&self) -> bool {
         self.judgement == Judgement::Regenerable
+    }
+
+    /// The environment file that keeps it, `build/.env`, or else
+    /// [`Ignored::sized`]: what the one-line summary names.
+    fn brief(&self) -> String {
+        self.env.clone().unwrap_or_else(|| self.sized())
     }
 
     /// `node_modules/ (1204 files, 31 MB)`, or the bare path when unmeasured.
@@ -768,7 +777,7 @@ fn check_status(
     } else if !kept.is_empty() {
         (
             Status::Block,
-            format!("ignored: {}", ignored_examples(&kept, 2, Ignored::sized)),
+            format!("ignored: {}", ignored_examples(&kept, 2, Ignored::brief)),
             format!(
                 "ignored entries not known to be regenerable: {}. `git worktree remove` would delete them without asking. If they are regenerable, add their names or paths with `git config --add {GIT_CONFIG_KEY} PATH` in this repository, the residue config file, or --regenerable{from_config}",
                 ignored_examples(&kept, 8, Ignored::described)
@@ -807,6 +816,7 @@ fn check_status(
 
 /// Decide one ignored entry: matched by a rule itself, or (for a collapsed
 /// directory a path rule reaches into) by the walk's verdict on its contents.
+/// Either way, an environment file inside that no rule names keeps it.
 fn judge(
     path: String,
     rules: &Rules,
@@ -819,11 +829,31 @@ fn judge(
         .ok()
         .and_then(|u| u.buckets.get(index))
         .filter(|b| b.seen);
+    let item = judge_rules(path, rules, bucket, usage, measured);
+    match measured.and_then(|b| b.env_file.clone()) {
+        Some(env) if item.regenerable() => Ignored {
+            judgement: Judgement::Kept,
+            note: Some(format!("{env} is an environment file no rule names")),
+            env: Some(env),
+            ..item
+        },
+        _ => item,
+    }
+}
+
+fn judge_rules(
+    path: String,
+    rules: &Rules,
+    bucket: &Bucket,
+    usage: &std::io::Result<Usage>,
+    measured: Option<&BucketUsage>,
+) -> Ignored {
     let mut item = Ignored {
         judgement: Judgement::Kept,
         files: measured.map(|b| b.files),
         bytes: measured.map(|b| b.bytes),
         note: None,
+        env: None,
         path,
     };
     if rules.matches(&item.path) {
@@ -1283,11 +1313,12 @@ fn walk(
     rules: &Rules,
 ) -> (Vec<Bucket>, io::Result<Usage>) {
     let matcher = |rel: &str| rules.matches(rel);
+    let named = |rel: &str| rules.names_file(rel);
     let Ok(listed) = status else {
-        return (Vec::new(), fsinfo::measure(dir, &[], &matcher));
+        return (Vec::new(), fsinfo::measure(dir, &[], &matcher, &named));
     };
     let mut buckets = buckets_for(listed, rules);
-    let mut usage = fsinfo::measure(dir, &buckets, &matcher);
+    let mut usage = fsinfo::measure(dir, &buckets, &matcher, &named);
     let settled = match &mut usage {
         Ok(usage) if listed.matching => drop_unlisted(dir, listed, &mut buckets, usage),
         _ => Ok(()),
