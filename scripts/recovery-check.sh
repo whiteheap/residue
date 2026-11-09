@@ -1253,7 +1253,12 @@ done
 # the file under the hidden name, and put w back with the file. Where
 # FreeBSD's kernel gives the file by its filesystem and inode instead of
 # a path, the walk of the moved worktree finds it, so it is a use there
-# too.
+# too. The holder is the sleep the wrapper started, by its PID. Where the
+# wrapper's /bin/sh runs sleep as a builtin (ksh93, OmniOS's /bin/sh), no
+# sleep program runs: the holder is the subshell that forked from the
+# wrapper, which keeps the wrapper's name, git.
+holder='sleep'
+/bin/sh -c 'command -V sleep' 2>/dev/null | grep -q builtin && holder='git'
 name=opened-before-move
 make_repo
 echo open-before-move >"$work/mode"
@@ -1265,7 +1270,7 @@ reason=$(jq -r '.results[0].reason' "$out")
 if [ -z "$opener" ]; then fail "no sleep opened README.md before the move"
 elif [ "$status" != 3 ]; then fail "exit $status, want 3: $(outcome)"
 elif [ "$(jq -r '.results[0].result' "$out")" != skipped ]; then fail "result $(outcome), want skipped"
-elif [ "$reason" != "in use by sleep[$opener] after residue moved it aside; it is back in place" ]; then fail "reason: $reason"
+elif [ "$reason" != "in use by ${holder}[$opener] after residue moved it aside; it is back in place" ]; then fail "reason: $reason; want ${holder}[$opener]"
 elif [ "$(record "$wt")" != registered ]; then fail "at its original path Git has: $(record "$wt")"
 elif [ -n "$(asides)" ]; then fail "a moved-aside directory is left: $(asides)"
 elif [ "$(sums "$wt")" != "$w_sum" ]; then fail "the worktree's files changed"
