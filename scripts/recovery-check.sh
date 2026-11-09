@@ -2403,7 +2403,10 @@ else ok "the record that stays is named, and the next purge keeps the entry: one
 # --- 4v. A purge stopped after its record, before its re-check ------------
 # The record stays with w whole in the trash. The next purge forgets it,
 # since w holds all it keeps, then purges w with a record of its own: one
-# record for one worktree, counted once.
+# record for one worktree, counted once. A record is named for the second
+# it was written in, and a name a trash entry or record has is skipped, so
+# when both runs fall in one second the new record takes the name the
+# forgotten one had: each is told by its writer's PID, its `pid` line.
 name=purge-stopped-before-recheck
 make_repo
 rm -f "$XDG_STATE_HOME/residue/ledger.jsonl" "$HOME/Library/Application Support/residue/ledger.jsonl"
@@ -2415,6 +2418,7 @@ if ! await "$work/at-record"; then
     fail "the purge never wrote its record's refs (exit $status)"
 else
     stopped_at=$(find "$repo/.git/residue-removed" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+    stopped_pid=$(sed -n 's/^pid //p' "$stopped_at/info" 2>/dev/null)
     kill -TERM "$pid"
     finish "$pid"
     end_held record
@@ -2426,14 +2430,19 @@ else
     finish "$pid"
     again=$status
     out2=$work/$name.out.again
+    new_at=$(jq -r '.purged[0].removal_record // empty' "$out2")
+    # Each record left, as NAME (pid PID).
+    left=$(for d in "$repo"/.git/residue-removed/*/; do [ -d "$d" ] && printf '%s (pid %s) ' "$(basename "$d")" "$(sed -n 's/^pid //p' "$d/info" 2>/dev/null)"; done)
     if [ "$ended" != 0 ]; then fail "the held update-ref did not exit"
+    elif [ -z "$stopped_pid" ]; then fail "the stopped purge's record $(basename "$stopped_at") names no pid"
     elif [ "$between" != "1 records, 1 refs" ] || [ "$whole" != "$w_sum" ]; then fail "after the stop: $between, w whole: $([ "$whole" = "$w_sum" ] && echo yes || echo no)"
     elif [ "$again" != 0 ] || [ "$(jq -r '.purged[0].result' "$out2")" != purged ]; then fail "the next purge: exit $again, $(jq -r '.purged[0].result' "$out2"): $(jq -r '.purged[0].reason' "$out2")"
-    elif [ -e "$stopped_at" ]; then fail "the stopped purge's record $(basename "$stopped_at") is still there"
-    elif [ "$(records)" != "1 records, 1 refs" ]; then fail "removal records: $(records), want 1 records, 1 refs"
+    elif grep -qx "pid $stopped_pid" "$repo"/.git/residue-removed/*/info 2>/dev/null; then fail "the stopped purge's record (pid $stopped_pid) is still there; left: $left"
+    elif [ -z "$new_at" ] || [ ! -f "$new_at/info" ]; then fail "the next purge names no record of its own: ${new_at:-null}; left: $left"
+    elif [ "$(records)" != "1 records, 1 refs" ]; then fail "removal records: $(records), want 1 records, 1 refs; left: $left"
     elif [ "$(listed_freed)" != "1 records, 1 freed" ]; then fail "restore and stats: $(listed_freed), want 1 records, 1 freed"
     elif [ -n "$(ls -A "$repo/.git/residue-trash" 2>/dev/null)" ]; then fail "the trash entry is left: $(ls -A "$repo/.git/residue-trash")"
-    elif common_ok; then ok "the next purge forgets the stopped purge's record and leaves one of its own, counted once"; fi
+    elif common_ok; then ok "the next purge forgets the stopped purge's record $(basename "$stopped_at") (pid $stopped_pid) and leaves one of its own, counted once: $left"; fi
 fi
 
 # --- 5. git worktree remove fails part way ----------------------------------
