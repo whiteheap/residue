@@ -13,11 +13,13 @@ on:
   pull_request:
     paths:
       - "site/public/install.sh"
+      - ".github/pacman-siglevel-check.sh"
       - ".github/workflows/install.yml"
   push:
     branches: [main]
     paths:
       - "site/public/install.sh"
+      - ".github/pacman-siglevel-check.sh"
       - ".github/workflows/install.yml"
   workflow_dispatch:
 
@@ -159,7 +161,9 @@ jobs:
         run: XDG_RUNTIME_DIR="/run/user/$(id -u)" residue service uninstall || true
 
   # dnf, pacman and busybox in containers, as root: no sudo, no systemd, so
-  # --no-service. The script is mounted read-only.
+  # --no-service. The script is mounted read-only. pacman starts from a
+  # [residue] section an older install.sh wrote, with no SigLevel, and
+  # .github/pacman-siglevel-check.sh witnesses what the script does to it.
   container:
     name: ${{ matrix.channel }} (${{ matrix.image }})
     runs-on: ubuntu-24.04
@@ -170,9 +174,9 @@ jobs:
           - { image: "fedora:latest", channel: dnf, setup: "true", check: "true" }
           - image: "archlinux:base"
             channel: pacman
-            setup: "pacman-key --init && pacman-key --populate archlinux"
+            setup: "pacman-key --init && pacman-key --populate archlinux && sh /g/pacman-siglevel-check.sh seed"
             # pacman must require the database's signature, not only the packages'.
-            check: "grep -A1 '^\\[residue\\]$' /etc/pacman.conf | grep -qx 'SigLevel = Required DatabaseRequired'"
+            check: "sh /g/pacman-siglevel-check.sh check /s/install.sh"
           - { image: "alpine:latest", channel: archive, setup: "apk add -q curl", check: "true" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -183,10 +187,11 @@ jobs:
           SETUP: ${{ matrix.setup }}
           CHECK: ${{ matrix.check }}
         run: |
-          docker run --rm -e CHANNEL -v "$PWD/site/public:/s:ro" "$IMAGE" sh -c "
+          docker run --rm -e CHANNEL -v "$PWD/site/public:/s:ro" -v "$PWD/.github:/g:ro" "$IMAGE" sh -c "
             set -eu
             $SETUP
-            sh /s/install.sh --dry-run
+            sh /s/install.sh --dry-run > /tmp/dry.log 2>&1 || { cat /tmp/dry.log; exit 1; }
+            cat /tmp/dry.log
             sh /s/install.sh --no-service | tee /tmp/install.log
             grep -q \"^Channel:    \$CHANNEL\" /tmp/install.log
             command -v residue || export PATH=\$HOME/.local/bin:\$PATH

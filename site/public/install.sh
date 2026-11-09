@@ -32,6 +32,13 @@ KEY_ASC_SHA256=f63c31e514d7f8b87a2a61e7fe4833d6708c734fe3093286a505055482471554
 KEY_GPG_SHA256=1347e2c9b519414386f5997651a6bae055d0df86eb002b6e2b95ea946172e2cc
 # Where dnf finds that key: the repository file names this local file, not a URL.
 RPM_KEY=/etc/pki/rpm-gpg/RPM-GPG-KEY-residue
+# residue's pacman section requires the database's signature too, which
+# pacman's default, DatabaseOptional, does not.
+SIGLEVEL='SigLevel = Required DatabaseRequired'
+# /etc/pacman.conf as it was before install.sh added SIGLEVEL to an older
+# [residue] section. Not .pacnew, .pacsave or .pacorig: pacdiff takes those
+# for pacman's own and offers to merge them.
+PACMAN_BAK=/etc/pacman.conf.residue-bak
 # The first release whose `residue service install` needs no folder (#28).
 SERVICE_NO_ROOT_SINCE=0.0.7
 # residue needs Git 2.36 or later: src/git.rs MIN_VERSION, and the packages'
@@ -215,15 +222,16 @@ install_pacman() {
   [ "$dry_run" = 1 ] || fetch_key "$PAGES/residue-signing-key.asc" "$tmp/residue.asc" "$KEY_ASC_SHA256"
   as_root pacman-key --add "$tmp/residue.asc"
   as_root pacman-key --lsign-key "$KEY_FPR"
-  if ! grep -q '^\[residue\]' /etc/pacman.conf; then
-    # The database's signature is required too: under pacman's default,
-    # DatabaseOptional, a residue.db served without one would be used.
-    printf '\n[residue]\nSigLevel = Required DatabaseRequired\nServer = %s/arch/%sarch\n' "$PAGES" '$' >"$tmp/pacman.conf"
-    # shellcheck disable=SC2016 # $1 belongs to the inner sh.
-    as_root sh -c 'cat "$1" >>/etc/pacman.conf' sh "$tmp/pacman.conf"
-  elif ! residue_siglevel; then
-    note="[residue] in /etc/pacman.conf sets no SigLevel, so under pacman's default its database need not be signed. To require it, add this line under [residue]: SigLevel = Required DatabaseRequired"
-  fi
+  edited=
+  case $(residue_section /etc/pacman.conf) in
+    absent)
+      printf '\n[residue]\n%s\nServer = %s/arch/%sarch\n' "$SIGLEVEL" "$PAGES" '$' >"$tmp/pacman.conf"
+      # shellcheck disable=SC2016 # $1 belongs to the inner sh.
+      as_root sh -c 'cat "$1" >>/etc/pacman.conf' sh "$tmp/pacman.conf" ;;
+    none) add_siglevel ;;
+    required) ;;
+    *) note="[residue] in /etc/pacman.conf has a SigLevel of your own, left as it is. It does not itself require residue's database signature; this line would: $SIGLEVEL" ;;
+  esac
   # Arch supports only full upgrades, so this is `pacman -Syu`, as in the
   # docs. With a terminal, pacman shows the transaction and asks first.
   if [ "$dry_run" = 0 ] && has_tty; then
@@ -233,14 +241,41 @@ install_pacman() {
   fi
   bin=/usr/bin/residue
   updates="pacman -Syu"
-  undo="${sudo:+sudo }pacman -R residue, and remove the [residue] section from /etc/pacman.conf"
+  undo="${sudo:+sudo }pacman -R residue, and remove the [residue] section from /etc/pacman.conf${edited:+ ($PACMAN_BAK is that file before residue added its SigLevel)}"
 }
 
-# Does the [residue] section of /etc/pacman.conf set a SigLevel? An older
-# install.sh, and the docs before it, wrote one without.
-residue_siglevel() {
-  awk '/^[[:space:]]*\[/ { on = ($0 ~ /^\[residue\][[:space:]]*$/) }
-    on && /^[[:space:]]*SigLevel[[:space:]]*=/ { found = 1 } END { exit !found }' /etc/pacman.conf
+# What the [residue] section of the pacman.conf $1 asks of residue's
+# database: absent (no such section), none (no SigLevel), required, or other
+# (a SigLevel that does not itself require its signature). As pacman reads
+# it: a comment runs from # to the end of the line, and a later word wins.
+residue_section() {
+  awk '{ sub(/#.*/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, "") }
+    /^\[.*\]$/ { on = ($0 == "[residue]"); if (on) found = 1; next }
+    on && /^SigLevel[[:space:]]*=/ {
+      set = 1
+      sub(/^SigLevel[[:space:]]*=/, "")
+      for (i = 1; i <= NF; i++)
+        if ($i == "Required" || $i == "DatabaseRequired") db = 1
+        else if ($i ~ /^(Database)?(Optional|Never)$/) db = 0
+    }
+    END { if (!found) print "absent"; else if (!set) print "none"; else if (db) print "required"; else print "other" }' "$1"
+}
+
+# An older install.sh, and the docs before it, wrote [residue] with no
+# SigLevel. Add SIGLEVEL under that section's header and change nothing else;
+# the file as it was stays as PACMAN_BAK. Only a section with no SigLevel
+# gets here, so a second run changes nothing.
+add_siglevel() {
+  awk -v line="$SIGLEVEL" '{ print; s = $0; sub(/#.*/, "", s); gsub(/^[[:space:]]+|[[:space:]]+$/, "", s) }
+    s == "[residue]" { print line }' /etc/pacman.conf >"$tmp/pacman.conf"
+  if [ "$(residue_section "$tmp/pacman.conf")" != required ]; then
+    note="install.sh could not add \"$SIGLEVEL\" under [residue] in /etc/pacman.conf, so pacman does not require residue's database signature. Add the line there by hand."
+    return 0
+  fi
+  say "+ add \"$SIGLEVEL\" under [residue] in /etc/pacman.conf; the file as it was stays as $PACMAN_BAK"
+  # shellcheck disable=SC2016 # $1 to $3 belong to the inner sh.
+  as_root sh -c 'cp -p "$1" "$2" && cat "$3" >"$1"' sh /etc/pacman.conf "$PACMAN_BAK" "$tmp/pacman.conf"
+  edited=1
 }
 
 target() {
