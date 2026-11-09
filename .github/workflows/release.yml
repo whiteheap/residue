@@ -90,15 +90,46 @@ jobs:
           cd dist
           sha256sum residue-v*.tar.gz > SHA256SUMS
           cat SHA256SUMS
+      # How to install, then the version's CHANGELOG.md section. The file
+      # names are release.yml's four archives and packages.yml's packages and
+      # FreeBSD archives (packaging/linux-packages.sh names the packages).
       - name: Release notes from CHANGELOG.md
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          v="residue-v$version"
+          cat > dist/notes.md <<EOF
+          ### Install
+
+          \`\`\`sh
+          curl -fsSL https://residue.whiteheap.com/install.sh | sh
+          brew install whiteheap/tap/residue
+          \`\`\`
+
+          Either one; every other way is in [docs/installation.md](https://github.com/whiteheap/residue-cli/blob/main/docs/installation.md). Or download the file for your machine below. The packages and the FreeBSD archives arrive within half an hour of the release.
+
+          | Machine | File |
+          | --- | --- |
+          | macOS, Apple silicon | \`$v-aarch64-apple-darwin.tar.gz\` |
+          | macOS, Intel | \`$v-x86_64-apple-darwin.tar.gz\` |
+          | Linux, static (musl), x86_64 | \`$v-x86_64-unknown-linux-musl.tar.gz\` |
+          | Linux, static (musl), arm64 | \`$v-aarch64-unknown-linux-musl.tar.gz\` |
+          | Debian, Ubuntu | \`residue_amd64.deb\`, \`residue_arm64.deb\` |
+          | Fedora, RHEL | \`residue.x86_64.rpm\`, \`residue.aarch64.rpm\` |
+          | Arch Linux | \`residue-x86_64.pkg.tar.zst\`, \`residue-aarch64.pkg.tar.zst\` |
+          | FreeBSD, x86_64 | \`$v-x86_64-unknown-freebsd.tar.gz\` |
+          | FreeBSD, aarch64 | \`$v-aarch64-unknown-freebsd.tar.gz\` |
+
+          Check a download: \`shasum -a 256 -c SHA256SUMS --ignore-missing\`, then \`gh attestation verify FILE --repo whiteheap/residue-cli\`.
+
+          The Mac app: https://github.com/whiteheap/residue-ui/releases
+          EOF
           awk -v v="$version" '
             $0 ~ "^## " v "( |$)" { on = 1; next }
             on && /^## / { exit }
             on { print }
-          ' CHANGELOG.md > dist/notes.md
-          test -s dist/notes.md
+          ' CHANGELOG.md > dist/changes.md
+          test -s dist/changes.md
+          cat dist/changes.md >> dist/notes.md
           cat dist/notes.md
       - name: Summary
         run: |
