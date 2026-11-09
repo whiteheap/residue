@@ -2302,7 +2302,7 @@ fn move_back(
     if !left.present {
         return Err(format!(
             "its removal stopped partway and its directory is gone; {}; otherwise clear Git's record with `{}`, then run this restore again, which recreates it from this record",
-            left.missing, left.recovery
+            left.missing, left.clear
         ));
     }
     if registered.locked.is_some() && !ours {

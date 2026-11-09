@@ -124,12 +124,16 @@ pub struct Leftover {
     /// whether its removal still runs.
     pub held_record: bool,
     /// The one line that recovers it: moves it back, clears Git's record
-    /// when the directory is gone, or, when Git can no longer use it, the
+    /// when the directory is gone and a removal record names it, which
+    /// keeps its HEAD and reflog, or, when Git can no longer use it, the
     /// `residue restore` of its record, which says what to clear first.
     /// Empty when Git can no longer use it and no record names it, since no
-    /// one command brings it back, and unless residue could tell that its
-    /// removal has stopped, since any move then lets Git delete it where it
-    /// lands. Never a deletion.
+    /// one command brings it back; when its directory is gone and no record
+    /// names it, since clearing Git's record then drops a HEAD and reflog
+    /// that nothing else keeps, and the directory may only be moved or on a
+    /// disk not mounted (the text gives `missing` and `head` instead); and
+    /// unless residue could tell that its removal has stopped, since any
+    /// move then lets Git delete it where it lands. Never a deletion.
     pub recovery: String,
     /// The line that clears Git's record of it once its directory is
     /// gone, and of no other worktree.
@@ -158,12 +162,12 @@ impl Leftover {
         } else {
             String::new()
         };
-        let recovery = if unusable.is_some() {
-            String::new()
-        } else if present {
+        // Gone: only a removal record that names it makes `clear` safe to
+        // give as the line (`with_records`).
+        let recovery = if unusable.is_none() && present {
             format!("{unlock}{git} move {path} {}", output::shell(&original))
         } else {
-            format!("{unlock}{git} remove {path}")
+            String::new()
         };
         Some(Leftover {
             path: entry.path.clone(),
@@ -214,6 +218,11 @@ impl Leftover {
         match (&self.activity, &self.record) {
             (Ok(Activity::Idle), Some(dir)) if self.unusable.is_some() => {
                 self.recovery = format!("residue restore {}", output::shell(dir));
+            }
+            // Its directory is gone and its removal record keeps its HEAD
+            // and reflog, so clearing Git's record of it loses neither.
+            (Ok(Activity::Idle), Some(_)) if !self.present => {
+                self.recovery = self.clear.clone();
             }
             (Ok(Activity::Idle), _) => {}
             _ => self.recovery = String::new(),
@@ -285,12 +294,12 @@ impl Leftover {
             (None, Some(_)) => format!(
                 "its directory is gone; {}; otherwise `{}` clears Git's record of it, and its removal record keeps its HEAD",
                 self.missing,
-                clean(&self.recovery)
+                clean(&self.clear)
             ),
             (None, None) => format!(
                 "its directory is gone; {}; otherwise `{}` clears Git's record of it, which drops its HEAD and reflog: {}",
                 self.missing,
-                clean(&self.recovery),
+                clean(&self.clear),
                 self.head
             ),
         };

@@ -587,7 +587,7 @@ if [ -n "$partial_probe" ]; then
         remove-fails-part-way-reflog remove-fails-part-way-head remove-fails-part-way-dotgit remove-fails-part-way-running \
         remove-fails-part-way-files \
         nested-repo-after-move mount-after-move unreadable-after-move restore-forget-race forget-restore-race \
-        forget-before-restore-reads restore-forget-race-reftable stale-names-repair; do
+        forget-before-restore-reads restore-forget-race-reftable stale-names-repair gone-aside-no-record; do
         skip_partial "$scenario"
     done
     echo "recovery-check: $passes passed, $failures failed"
@@ -2257,6 +2257,38 @@ elif [[ $note != *"worktree repair NEWPATH\` reconnects it"*"worktree remove "*"
 elif [[ $note != *"branch keep-w $lone\` keeps it"* ]]; then fail "scan does not name the branch that keeps $lone: $note"
 elif [ "$(record "$moved")" != registered ] || [ "$(git -C "$moved" rev-parse HEAD)" != "$lone" ]; then fail "after the repair, w is not back at its HEAD: $(record "$moved")"
 elif common_ok; then ok "scan gives the repair first and names the HEAD the remove would drop; the repair brings w back"; fi
+
+# --- 8b. A hidden worktree whose directory is gone, named by no record ------
+# w, on a detached HEAD that only it holds, is under its hidden name, as a
+# removal that stopped after its move leaves it, and its directory is then
+# gone from there: moved by hand, or on a disk not mounted. No removal
+# record names it, so clearing Git's record of it drops a HEAD and reflog
+# that nothing else keeps: `recovery`, which a script may run, must be
+# empty, while the text gives the repair first and names that HEAD. The
+# repair must then bring w back at it.
+name=gone-aside-no-record
+make_repo
+setup git -C "$wt" checkout -q --detach
+setup git -C "$wt" commit -q --allow-empty -m lone
+lone=$(git -C "$wt" rev-parse HEAD) || exit 2
+sleep 0 &
+dead=$!
+wait "$dead"
+aside=$repo/.worktrees/.w.residue-removing-$dead
+setup git -C "$repo" worktree move "$wt" "$aside"
+moved=$work/$name-moved
+mv "$aside" "$moved" || exit 2
+left=$(interrupted)
+"$bin" scan "$repo" >"$work/$name.out" 2>&1
+scanned=$?
+note=$(grep -F 'worktree repair NEWPATH' "$work/$name.out")
+setup git -C "$repo" worktree repair "$moved"
+if [ "$scanned" != 0 ]; then fail "scan exited $scanned"
+elif ! jq -e 'length == 1 and .[0].present == false and .[0].removal_record == null' <<<"$left" >/dev/null; then fail "scan does not list w as gone with no record: $left"
+elif [ "$(jq -r '.[0].recovery' <<<"$left")" != "" ]; then fail "scan's recovery would drop the HEAD only w keeps: $(jq -r '.[0].recovery' <<<"$left")"
+elif [[ $note != *"its directory is gone; "*"worktree repair NEWPATH\` reconnects it"*"worktree remove "*"drops its HEAD and reflog"*"$lone\` keeps it"* ]]; then fail "scan does not give the repair first and name the HEAD: $note"
+elif [ "$(record "$moved")" != registered ] || [ "$(git -C "$moved" rev-parse HEAD)" != "$lone" ]; then fail "after the repair, w is not back at its HEAD: $(record "$moved")"
+elif common_ok; then ok "scan gives no recovery for a gone hidden worktree no record names, and the repair it names first brings w back"; fi
 
 echo "recovery-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]
