@@ -1499,6 +1499,7 @@ mod tests {
                 gone: Vec::new(),
                 pid,
                 version: Some("0.0.7".into()),
+                hold: false,
                 kept: Vec::new(),
             }),
             incomplete: false,

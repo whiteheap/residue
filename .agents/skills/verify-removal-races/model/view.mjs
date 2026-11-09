@@ -11,6 +11,7 @@ export const state = (v) => {
   const words = [where[w.at]];
   if (files[w.tree]) words.push(files[w.tree]);
   if (w.gitdir === "gone") words.push("Git no longer lists it");
+  if (w.gitdir === "noreflog") words.push("its HEAD reflog gone");
   if (w.gitdir === "part") words.push("part of its Git directory gone");
   if (Object.values(v.g).some((c) => c.step !== "none")) words.push("Git removing it");
   if (w.records.length > 0) words.push("record kept");
@@ -35,16 +36,17 @@ const labels = {
   RLock: () => "remove locks it",
   RRecord: () => "remove writes its removal record",
   RVerify: () => "remove checks it at the hidden path",
-  RUnlock: () => "remove unlocks it and runs git worktree remove",
+  RUnlock: () => "remove unlocks it and runs git worktree remove, which holds the record too",
   RAfter: (f) => (f.g.rm.res === "ok" ? "git worktree remove succeeds" : "git worktree remove fails"),
   PBCheck: () => "remove starts to put it back",
   PBUnlock: () => "remove unlocks it to put it back",
   PBMove: () => "remove moves it back to its path",
   PBStuck: () => "remove cannot put it back and locks it",
   RSettle: (f, t) => `remove ${kept(f, t)}`,
+  PHold: (f, t) => (t.pc.pg === "done" ? "the purge finds the entry held or gone and skips it" : "the purge holds the trash entry"),
   PRecheck: () => "the purge checks it again",
   PRecord: () => "the purge writes its removal record",
-  PUnlock: () => "the purge unlocks it and runs git worktree remove",
+  PUnlock: () => "the purge unlocks it and runs git worktree remove, which holds the entry and the record too",
   PAfter: (f) => (f.g.pg.res === "ok" ? "git worktree remove succeeds" : "git worktree remove fails"),
   PRelock: () => "the purge locks it again",
   PSettle: (f, t) => `the purge ${kept(f, t)}`,
@@ -56,16 +58,20 @@ const labels = {
   GGitdir: () => "Git deletes its Git directory",
   GitTimeout: () => "residue kills Git after 30 minutes",
   Kill: () => "residue is stopped",
-  Orphan: () => "residue alone is stopped; its git worktree remove runs on",
+  Orphan: () => "residue alone is stopped; its git worktree remove runs on, holding what residue held",
   TList: () => "you run residue restore ENTRY",
+  THold: (f, t) => (t.pc.tr === "done" ? "restore finds the entry held or gone and refuses" : "restore holds the trash entry"),
+  TRead: (f, t) => (t.pc.tr === "done" ? "restore finds the stopped purge's record held and refuses" : "restore reads Git's list again"),
   TCheck: () => "restore checks the trash entry",
   TUnlock: () => "restore unlocks it",
   TMove: () => "restore moves it back to its path",
   TRelock: () => "restore locks it again",
   TDiscard: () => "restore drops the trash entry",
-  TForget: (f, t) => (kept(f, t) === "drops its record" ? "restore forgets the purge's record" : "restore finds no record to forget"),
-  TReport: () => "restore says it is back",
+  TForget: (f, t) => (kept(f, t) === "drops its record" ? (f.w.gitdir === "noreflog" ? "restore puts back its HEAD reflog and forgets the stopped purge's record" : "restore forgets the stopped purge's record") : "restore finds no record to forget"),
+  TReport: (f) => (f.ts.recs.length > 0 ? "restore says it is back, and that part may be gone" : "restore says it is back"),
   SList: () => "you run residue restore RECORD",
+  SHold: (f, t) => (t.pc.rr === "done" ? "restore finds the record held or gone and refuses" : "restore holds the record"),
+  SRead: () => "restore reads Git's list again",
   SDest: () => "restore checks its path",
   SCopies: () => "restore reads the record",
   SMoveBack: () => "restore checks the hidden folder",

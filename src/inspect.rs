@@ -297,7 +297,7 @@ impl Report {
     }
 }
 
-fn examples(items: &[String], limit: usize) -> String {
+pub(crate) fn examples(items: &[String], limit: usize) -> String {
     let shown: Vec<&str> = items.iter().take(limit).map(String::as_str).collect();
     let more = items.len().saturating_sub(limit);
     if more > 0 {
@@ -844,7 +844,10 @@ fn check_index_flags(r: &mut Report, dir: &Path, hidden: Option<Result<Vec<Strin
     }
 }
 
-fn check_operation(r: &mut Report, git_dir: &Path) {
+/// The operations in progress in the worktree's Git directory: a rebase,
+/// merge, cherry-pick, revert or bisect, each named once. `Err` when a
+/// marker cannot be read.
+pub fn operations(git_dir: &Path) -> Result<Vec<String>, String> {
     const MARKERS: &[(&str, &str)] = &[
         ("rebase-merge", "rebase"),
         ("rebase-apply", "rebase or am"),
@@ -860,32 +863,37 @@ fn check_operation(r: &mut Report, git_dir: &Path) {
             Ok(_) => found.push(name.to_string()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => {
-                r.unknown(
-                    "operation",
-                    "git dir unreadable",
-                    format!("cannot read {}: {e}", git_dir.join(marker).display()),
-                );
-                return;
+                return Err(format!(
+                    "cannot read {}: {e}",
+                    git_dir.join(marker).display()
+                ));
             }
         }
     }
-    if found.is_empty() {
-        r.pass(
+    found.dedup();
+    Ok(found)
+}
+
+fn check_operation(r: &mut Report, git_dir: &Path) {
+    match operations(git_dir) {
+        Err(e) => r.unknown("operation", "git dir unreadable", e),
+        Ok(found) if found.is_empty() => r.pass(
             "operation",
             "no rebase, merge, cherry-pick, revert or bisect in progress",
-        );
-    } else {
-        found.dedup();
-        r.block(
+        ),
+        Ok(found) => r.block(
             "operation",
             format!("{} in progress", found.join(", ")),
             format!("{} in progress", found.join(", ")),
-        );
+        ),
     }
 }
 
-fn check_private_refs(r: &mut Report, dir: &Path) {
-    match git::git(
+/// The worktree's private refs (`refs/worktree/`, `refs/bisect/`,
+/// `refs/rewritten/`), which `git worktree remove` deletes with it, as
+/// Git lists them in `dir`.
+pub fn private_refs(dir: &Path) -> Result<Vec<String>, String> {
+    let out = git::git(
         dir,
         &[
             "for-each-ref",
@@ -894,26 +902,25 @@ fn check_private_refs(r: &mut Report, dir: &Path) {
             "refs/bisect/",
             "refs/rewritten/",
         ],
-    ) {
-        Ok(out) => {
-            let refs: Vec<String> = String::from_utf8_lossy(&out)
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect();
-            if refs.is_empty() {
-                r.pass("private_refs", "no worktree-private refs");
-            } else {
-                r.block(
-                    "private_refs",
-                    "private refs",
-                    format!(
-                        "worktree-private refs, deleted with the worktree: {}",
-                        examples(&refs, 5)
-                    ),
-                );
-            }
-        }
+    )?;
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn check_private_refs(r: &mut Report, dir: &Path) {
+    match private_refs(dir) {
+        Ok(refs) if refs.is_empty() => r.pass("private_refs", "no worktree-private refs"),
+        Ok(refs) => r.block(
+            "private_refs",
+            "private refs",
+            format!(
+                "worktree-private refs, deleted with the worktree: {}",
+                examples(&refs, 5)
+            ),
+        ),
         Err(e) => r.unknown("private_refs", "git failed", e),
     }
 }

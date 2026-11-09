@@ -112,15 +112,9 @@ pub fn scan(options: &Options) -> u8 {
         let leftovers = repo
             .interrupted
             .iter()
-            .filter_map(|e| Leftover::of(e, &repo.command_dir()))
-            .map(|l| {
-                // A run that stopped after writing its removal record.
-                let record = records
-                    .iter()
-                    .find(|i| i.record.as_ref().is_ok_and(|r| r.aside == l.path))
-                    .map(|i| i.dir.clone());
-                l.with_record(record)
-            })
+            .filter_map(|e| Leftover::of(e, &repo.command_dir(), &repo.common_dir))
+            // A run that stopped after writing its removal record.
+            .map(|l| l.with_records(&records, &snapshot))
             .collect();
         grouped.push(Group {
             repo,
@@ -266,7 +260,13 @@ pub fn scan(options: &Options) -> u8 {
             ));
         }
         for report in &g.list {
-            out.push_str(&output::scan_entry(report, &places, &style));
+            out.push_str(&output::scan_entry(
+                report,
+                &g.repo.command_dir(),
+                &g.repo.common_dir,
+                &places,
+                &style,
+            ));
         }
         if !g.trash.is_empty() {
             let bytes: u64 = g
@@ -542,8 +542,8 @@ pub fn explain_text(r: &Report, repo: &Repo, places: &Places, style: &Style) -> 
             }
         ),
         Verdict::Stale => format!(
-            "{}. Only Git metadata remains; `git worktree prune` clears it.",
-            clean(r.stale_reason.as_deref().unwrap_or("stale"))
+            "{}.",
+            output::stale_note(r, &repo.command_dir(), &repo.common_dir)
         ),
     };
     row(

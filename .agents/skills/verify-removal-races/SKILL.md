@@ -15,7 +15,7 @@ It is a TLA+ model of the code, `model/Removal.tla`, checked with TLC. TLC does 
 bash .agents/skills/verify-removal-races/check.sh
 ```
 
-It takes about a minute and exits 0 when the result matches `model/expected`: every rule holds except the known breaks it lists, each with its shortest path, and every mutant is caught. It exits 1 when the result differs, and 2 when the tools cannot be set up or TLC fails.
+It takes about two minutes and exits 0 when the result matches `model/expected`: every rule holds except any known break it lists, each with its shortest path, and every mutant is caught. At the sync commit it lists none. It exits 1 when the result differs, and 2 when the tools cannot be set up or TLC fails.
 
 The first run downloads TLC and a Java runtime into `~/.cache/residue-tla` (or `$RESIDUE_TLA_TOOLS`) and checks each against its pinned SHA-256. It needs bash, curl, tar, and `shasum` or `sha256sum`. To use your own, set `TLA2TOOLS` to a tla2tools.jar and `JAVA` to a java binary (11 or later); the run says when either is not the pinned one.
 
@@ -40,7 +40,7 @@ Each rule is an invariant in `model/Removal.tla`. TLC checks it in every state e
 | `ReflogCommitsKept` | A commit only the worktree's HEAD reflog holds stays held, by its Git directory or by a removal record's refs (AGENTS.md: "no removal, restore or forget by residue makes unreachable a commit the worktree's Git directory kept reachable"). | `git gc` deletes a commit no branch holds. |
 | `RestoreTellsTheTruth` | A restore that says the worktree is back leaves Git listing it at its path with its Git directory, and whole unless it says part may be gone. | The user trusts a worktree Git cannot use, or one with files missing. |
 | `OnlyOwnLocksLifted` | residue unlocks only a lock it set itself (AGENTS.md: "`git worktree unlock` only for a lock residue set itself"). | The user's `git worktree lock` is gone, and a later run may remove the worktree. |
-| `RecordDroppedOnlyWhenWhole` | A removal record is dropped only while nothing of the worktree is gone (README: "residue drops the record only while nothing of the worktree is gone"). | Part of a worktree is gone with no record to restore it from. |
+| `RecordDroppedOnlyWhenWhole` | A remove run or purge that did not delete the worktree drops its removal record only while nothing of it is gone (README: "residue drops the record only while nothing of the worktree is gone"). A restore drops it once the worktree is back and holds what the record keeps. | Part of a worktree is gone with no record to restore it from. |
 
 `TypeOK` checks that every variable keeps its type.
 
@@ -54,27 +54,36 @@ One repository, one worktree W, and these actors, each step one action of the mo
 - `rr`: `residue restore RECORD` on a removal record.
 - Git's `git worktree remove`, as the four steps of `remove_worktree` in Git 2.50's `builtin/worktree.c`: look the worktree up, `git status` in it, delete its files by path, delete its Git directory by id.
 - The user: edits W, starts a process in it, or runs `git worktree lock` on it, once each.
+- The holds (`src/hold.rs`): the purge holds the trash entry's `info`, each writer holds its removal record's `info` from the moment it is in place, and each `git worktree remove` residue starts inherits its run's holds. A restore takes the hold first and refuses while another process has it; so does a purge.
+- In the "old" and "old-orphan" setups, the remove run or the purge is one of a release that takes no hold, 0.0.10 and earlier (`Old`): it holds nothing, its Git inherits nothing, and its record has no `hold` line. While Git still lists the worktree where that record's deletion started, a restore refuses while the PID the record names runs, or while a `git worktree remove` of the worktree does, found by its arguments (`removed::unheld`). Its other steps are this release's. A trash restore keeps such a purge off the worktree three ways: from just after it takes the entry's hold it keeps the worktree's `.git` open, which that purge's re-check sees as a use (`TOpen`); when Git lists the worktree unlocked, it locks it with residue's trash lock before it reads the records, and lifts that lock if it then refuses (`TLock`, `TLift`); and once the worktree has moved, it reads the records again and names a purge's record that came meanwhile (`TForget`).
 
-The faults: a kill of residue with its Git child (Ctrl-C), the 30-minute Git timeout, or an orphaning kill of residue alone, which leaves its Git child deleting.
+The faults: a kill of residue with its Git child (Ctrl-C), the 30-minute Git timeout, or an orphaning kill of residue alone, which leaves its Git child deleting. A kill during Git's delete of its own directory leaves it whole, without its `logs/`, or without HEAD or commondir too, by readdir order. Git 2.50.1 moves a worktree whose Git directory lacks `logs/` or `index`, and refuses one that lacks HEAD, commondir or gitdir: probed on 2026-11-09 on macOS by deleting each by hand from a scratch worktree's Git directory before `git worktree move`.
 
 | Setup | Actors | Faults, at most one | Distinct states |
 | --- | --- | --- | --- |
-| Remove no-faults | rm, rr, user | none | 4,534 |
-| Remove faults | rm, rr, user | kill, timeout | 10,329 |
-| Remove orphan | rm, rr, user | orphaning kill | 7,012 |
-| Remove unraced | rm, user | kill, orphaning kill | 717 |
-| Remove after | rm, then rr, user | kill, timeout | 2,457 |
-| Trash no-faults | pg, tr, rr, user | none | 90,600 |
-| Trash faults | pg, tr, rr, user | kill, timeout | 227,001 |
-| Trash unraced | pg, rr, user | kill, orphaning kill | 6,712 |
-| Trash after | pg, then tr and rr, user | kill, timeout | 6,992 |
+| Remove no-faults | rm, rr, user | none | 2,638 |
+| Remove faults | rm, rr, user | kill, timeout | 8,044 |
+| Remove orphan | rm, rr, user | orphaning kill | 3,722 |
+| Remove unraced | rm, user | kill, orphaning kill | 743 |
+| Remove after | rm, then rr, user | kill, timeout | 3,479 |
+| Trash no-faults | pg, tr, rr, user | none | 48,509 |
+| Trash faults | pg, tr, rr, user | kill, timeout | 241,272 |
+| Trash orphan | pg, tr, rr, user | orphaning kill | 83,465 |
+| Trash unraced | pg, rr, user | kill, orphaning kill | 10,848 |
+| Trash after | pg, then tr and rr, user | kill, timeout | 52,660 |
+| Remove old | rm of a release that takes no hold, rr, user | kill, timeout | 10,591 |
+| Trash old | pg of a release that takes no hold, tr, rr, user | kill, timeout | 496,086 |
+| Remove old-orphan | rm of a release that takes no hold, rr, user | orphaning kill | 5,312 |
+| Trash old-orphan | pg of a release that takes no hold, tr, rr, user | orphaning kill | 215,556 |
 
-TLC stops at a rule's first break and reports the shortest path, so check.sh checks the other rules again without it. A rule that breaks in a setup is therefore not checked further there: a new way to break it shows only if it is shorter. Two kinds of setup check the rules again without the races the findings need. Unraced switches off the restore and the Git timeout, and every rule holds there. After lets a restore start only once the remove run or purge has stopped, the usual way to recover; there only Findings 3 and 5 break.
+TLC stops at a rule's first break and reports the shortest path, so check.sh checks the other rules again without it. A rule that breaks in a setup is therefore not checked further there: a new way to break it shows only if it is shorter. Two kinds of setup leave the races out, so a rule a race breaks is still checked in the rest. Unraced switches off the restore and the Git timeout. After lets a restore start only once the remove run or purge has stopped, the usual way to recover. Old and old-orphan check what a restore of this release can tell of a run that takes no hold: its record's PID, and a `git worktree remove` of the worktree. In old-orphan that run may be killed alone, so its Git goes on with no hold to show it. In "Trash old" and "Trash old-orphan" the trash restore races that purge throughout, except in the narrow window `LatePurge` names (`Late`); "Not covered" lists what that leaves out. At the sync commit every rule holds in all fourteen.
 
 Assumptions:
 
 - Each Git command, file system call, or read the code makes before it acts is one indivisible step. The time between residue's last check and Git's deletion is the window the README documents; an edit there is one Git's `git status` may not show (an ignored file).
-- The user never unlocks residue's own locks, `residue: removing` and `residue: in trash`.
+- The user never unlocks residue's own locks, `residue: removing` and `residue: in trash`. Git locks only an unlocked worktree, so while a run holds a worktree residue has locked, only residue changes its lock; that is why a restore that reads the lock under its hold lifts only residue's.
+- A hold is `flock(2)` on an open `info`, which the kernel frees once every process that has the file open has exited, however they exit, on one machine. residue runs Git with no fsmonitor daemon and no hooks (`git.rs` `command`), but a program Git starts, such as its `git status` or a filter driver, inherits the holds too and may outlive Git. The model ends Git's hold when Git exits: a program that keeps it longer only makes a restore refuse longer, which breaks no rule.
+- Outside the old setups, every run is this version. In them, the restores are this version's.
 - One remove run or one purge in each setup, never two; one edit, one process and one lock by the user.
 
 ## When a change touches the verified code
@@ -84,30 +93,35 @@ Run the check for a change to any function in this table, or for one that adds a
 | Model actions | Code |
 | --- | --- |
 | `RRecheck` | `remove.rs` `recheck(original)` |
-| `RMove`, `RLock`, `RRecord`, `RUnlock`, `RAfter` | `remove.rs` `execute`: `git::move_worktree` to `.NAME.residue-removing-PID`, `git::lock_worktree(REMOVING)`, `removed::create`, `git::unlock_worktree`, `git::remove_worktree` and the match on its result |
+| `RMove`, `RLock`, `RRecord`, `RUnlock`, `RAfter` | `remove.rs` `execute`: `git::move_worktree` to `.NAME.residue-removing-PID`, `git::lock_worktree(REMOVING)`, `removed::create`, `git::unlock_worktree`, `git::remove_worktree` with the record's hold, and the match on its result |
+| `RRecord`, `PRecord` (the hold) | `removed.rs` `write_entry`, `hold.rs` `write_new`: `info.new` is held before its rename |
 | `RVerify` | `remove.rs` `verify_moved` |
 | `PBCheck`, `PBUnlock`, `PBMove`, `PBStuck` | `remove.rs` `Moved::put_back`, `Moved::stuck` |
-| `RSettle`, `PSettle` | `remove.rs` `settle`, `standing` |
-| `PRecheck`, `PRecord`, `PAfter`, `PRelock` | `remove.rs` `purge`: `recheck(path, ours = trash::LOCK)`, `removed::create` |
-| `PUnlock` | `trash.rs` `purge` |
+| `RSettle`, `PSettle` | `remove.rs` `settle`, `standing`, `Files` |
+| `PHold`, `PRecheck`, `PRecord`, `PAfter`, `PRelock` | `remove.rs` `purge`: `hold::take(trash::info)`, `recheck(path, ours = trash::LOCK)`, `removed::create` |
+| `PUnlock` | `trash.rs` `purge(item, registered, holds)` |
+| `StartGit` | `git.rs` `remove_worktree(main, path, holds)`, `hold.rs` `pass_to` |
 | `GFind`, `GExists`, `GStatus`, `GTree`, `GGitdir` | Git's `remove_worktree`, run by `git.rs` `remove_worktree` |
 | `GitTimeout` | `git.rs` `REMOVE_TIMEOUT` and `run.rs` `stop` |
-| `Kill`, `Orphan` | No code: residue stopped with its Git child, or alone (`run.rs` `stop` on watch's 30-minute deadline for its `residue remove` kills that PID alone) |
-| `TList`, `SList` | `restore.rs` `gather`, `choose`; `removed.rs` `Item::interrupted`, `is_back` |
-| `TCheck`, `TUnlock`, `TMove`, `TRelock` | `trash.rs` `restore`: `holds_worktree`, `was_locked` |
+| `Kill`, `Orphan` | No code: residue stopped with its Git child, or alone (`run.rs` `stop` on watch's 30-minute deadline for its `residue remove` kills that PID alone); the kernel frees a hold once every process that has it has exited |
+| `TList`, `SList` | `restore.rs` `gather`, `choose` |
+| `THold`, `TOpen`, `TLock`, `TRead`, `TLift` | `trash.rs` `take`; `restore.rs` `restore_trash`: `keep_open`, `git::worktrees`, `git::lock_worktree(trash::LOCK)` when Git lists it unlocked, `lift`, `removed::stopped_purges` and its `refuse_unheld`: `unheld`, `process::removing`, `process::started` |
+| `TCheck`, `TUnlock`, `TMove`, `TRelock` | `restore.rs` `restore_trash`'s refusal when a stopped purge left no files or files Git cannot use (`holds_worktree`, `remove::unusable`); `trash.rs` `restore(item, to, listed, held)`: `holds_worktree`, `was_locked` |
 | `TDiscard` | `trash.rs` `discard` |
-| `TForget` | `restore.rs` `restore_trash`, `removed::forget` |
-| `SDest`, `SAfter` | `removed.rs` `restore`, `holds`, `forget` |
+| `TForget` | `removed.rs` `after_trash_restore`, `finish`; `restore.rs` `settle_trash`: `removed::raced_purges` after the move |
+| `SHold`, `SRead` | `removed.rs` `take`; `restore`: `git::worktrees`, `refuse_unheld` when Git lists the record's aside (`unheld`, `process::removing`, `process::started`), `Item::interrupted`, `is_back` |
+| `SDest`, `SAfter` | `removed.rs` `restore`, `finish`, `reflog_if_lost`, `holds`, `forget` |
 | `SCopies` | `removed.rs` `read_copies` |
-| `SMoveBack`, `SUnlock`, `SMove`, `SRelock` | `removed.rs` `move_back`; `remove.rs` `Leftover::of`, `running` |
+| `SMoveBack`, `SUnlock`, `SMove`, `SRelock` | `removed.rs` `restore`'s `purged_to_git_dir`, `move_back`; `remove.rs` `Leftover::of` |
+| `SClear` | `removed.rs` `clear_purged`: the entry's hold, `trash::locked_by_residue`, `git::unlock_worktree`, `git::remove_worktree`, `trash::discard` |
 | `SRecreate` | `removed.rs` `recreate` |
-| `TReport`, `SReport` | `restore.rs` `command`, the `restored ...` line and its notes |
+| `TReport`, `SReport` | `restore.rs` `command`, the `restored ...` line and its notes, `removed::PURGE_STOPPED`, also for a purge's record whose worktree is already back (`removed.rs` `restore`) |
 
-Sync commit: `3356770f658493f1f84dfe0236da09b3faf64ea8`. The model was last confirmed to describe the code above at that commit, on 2026-11-09. Move it forward only after you confirm, for each covered function a change touched, that the model still describes it. `git diff 3356770f65 -- src/remove.rs src/trash.rs src/removed.rs src/restore.rs src/git.rs src/run.rs src/watch.rs` lists what to read.
+Sync commit: the commit that fixed #135 to #139 (#147). The model was last confirmed to describe the code there, on 2026-11-09. Of the commits after `0ad6ec7`, only `083816d` (#150) changed the code above before it: `watch` exits between passes for an upgrade, when no child runs, and starts and stops a remove run as before. Move it forward only after you confirm, for each covered function a change touched, that the model still describes it. `git log --format='%h %s' 0ad6ec7.. -- src/hold.rs src/process.rs src/remove.rs src/trash.rs src/removed.rs src/restore.rs src/git.rs src/run.rs src/watch.rs` lists the changes; read each one after that fix.
 
 ## Read a result
 
-Read every result with `/statechart`: give it `model/Removal.tla`, one of the configs (`model/Remove.cfg`, `model/RemoveOrphan.cfg`, `model/Trash.cfg`), and the view `model/view.mjs`. It tells each break as numbered steps in plain words, such as "restore moves it back to its path", with the worktree's state after each, and draws a chart of a setup that passes. For a mutant or another setup, copy a config and set `Broken`, `Faults`, `Off` or `After` as in that line of check.sh or `model/mutants`.
+Read every result with `/statechart`: give it `model/Removal.tla`, one of the configs (`model/Remove.cfg`, `model/RemoveOrphan.cfg`, `model/Trash.cfg`), and the view `model/view.mjs`. It tells each break as numbered steps in plain words, such as "restore moves it back to its path", with the worktree's state after each, and draws a chart of a setup that passes. For a mutant or another setup, copy a config and set `Broken`, `Faults`, `Off`, `After`, `Old` or `Late` as in that line of check.sh or `model/mutants`.
 
 In check.sh's output:
 
@@ -125,9 +139,28 @@ Each mutant in `model/mutants` removes one guard the code has, to show that a ru
 | `PurgeNoRecheck` | `recheck` in `remove.rs` `purge` | `OnlyCheckedStateDeleted` |
 | `NoRecord` | no deletion without the record and its refs | `ReflogCommitsKept` |
 | `SettleAlwaysUndoes` | `standing` in `settle`: the record goes only while the worktree is whole | `ReflogCommitsKept`, `RecordDroppedOnlyWhenWhole` |
-| `MoveBackWhileRunning` | `Leftover::running` in `move_back` | `NotDeletedOnceBack` |
+| `StandingIgnoresFiles` | `standing`'s comparison of the files with the plan's once Git ran (`Files`) | `RecordDroppedOnlyWhenWhole` |
 | `MoveBackNoNote` | `move_back`'s "part of it is gone" note | `RestoreTellsTheTruth` |
 | `PutBackAlwaysUnlocks` | `Moved::put_back(locked)`: unlock only a lock residue set | `OnlyOwnLocksLifted` |
+| `PurgeNoHold` | the purge's `hold::take` on the entry | `NotDeletedOnceBack` |
+| `TrashRestoreNoHold` | `trash::take` in `restore_trash` | `NotDeletedOnceBack` |
+| `RestoreNoHold` | `removed.rs` `take` in `restore` | `NotDeletedOnceBack` |
+| `GitNoHold` | `hold::pass_to` in `git::remove_worktree`: Git inherits the holds | `NotDeletedOnceBack` |
+| `TrashRestoreStale` | `trash::restore` reading the lock from Git's list under the hold, not the listing's | `OnlyOwnLocksLifted` |
+| `RecordRestoreStale` | `removed::restore` reading Git's list under the hold, not the listing's | `OnlyOwnLocksLifted` |
+| `TrashRestoreNoNote` | `restore_trash`'s `PURGE_STOPPED` note | `RestoreTellsTheTruth` |
+| `TrashForgetsWithoutCheck` | `after_trash_restore`: put back the HEAD reflog, and forget only once the worktree holds what the record keeps | `ReflogCommitsKept` |
+| `ClearAnyLock` | `clear_purged` lifting only residue's trash lock | `OnlyOwnLocksLifted` |
+| `TrashRestoreNoOldPid` | `stopped_purges`' refusal while the run that wrote a record without a hold runs (`unheld`, `Unheld::Writer`), in the "Trash old" setup | `NotDeletedOnceBack` |
+| `RestoreNoOldPid` | `restore`'s refusal while the run that wrote a record without a hold runs (`unheld`, `Unheld::Writer`), in the "Trash old" and "Remove old" setups | `NotDeletedOnceBack` |
+| `TrashRestoreNoOldGit` | `stopped_purges`' refusal while a `git worktree remove` of the worktree runs for a record without a hold (`unheld`, `Unheld::Git`), in the "Trash old-orphan" setup | `NotDeletedOnceBack` |
+| `RestoreNoOldGit` | `restore`'s refusal while a `git worktree remove` of the worktree runs for a record without a hold (`unheld`, `Unheld::Git`), in the "Remove old-orphan" and "Trash old-orphan" setups | `NotDeletedOnceBack` |
+| `TrashRestoreNoUse` | `restore_trash`'s `keep_open`: the worktree's `.git` open from just after the hold, which the re-check of a purge that takes no hold sees as a use, in the "Trash old" setup | `NotDeletedOnceBack` |
+| `TrashRestoreNoLock` | `restore_trash`'s lock of a worktree Git lists unlocked, before it reads the records, in the "Trash old" setup | `NotDeletedOnceBack` |
+| `TrashRestoreNoReread` | `settle_trash`'s second read of the records once the worktree has moved (`raced_purges`), and its `PURGE_STOPPED` note, in the "Trash old" setup | `RestoreTellsTheTruth` |
+| `BackPurgeNoNote` | `removed.rs` `restore`'s `PURGE_STOPPED` note for a purge's record whose worktree is already back, in the "Trash old" setup | `RestoreTellsTheTruth` |
+
+Both refusals apply only while Git still lists the worktree where the record's deletion started. Once it lists it nowhere, that deletion is over, so a restore of a finished removal no longer refuses for a process that reused the record's PID; dropping that condition breaks no rule, it only makes a restore refuse longer. The model also leaves out the activity probe's part (`Unheld::Using`), a process seen using the worktree or its Git directory, which refuses too.
 
 ## A bug, or a modeling error
 
@@ -143,9 +176,9 @@ To witness one, build a scratch repository with a temporary `HOME` and run the r
 4. Never add a line to `model/expected`, or weaken a rule, to make the check pass. A new break is a finding until a replay against the code shows it is a modeling error.
 5. Run the check, follow it with `/statechart` for each new or changed line, and move the sync commit.
 
-## Findings at the sync commit
+## Findings, and their fixes
 
-Each finding has its lines in `model/expected`. The replays ran residue 0.0.10, the release binary, on macOS 26.3.1 (arm64) with Git 2.50.1, in scratch repositories with a temporary `HOME`.
+The check found these at `3356770`, the sync commit when the model came in (#134), and each had its lines in `model/expected` until the change that fixed it (#135 to #139) removed them. The replays ran the release binary of residue 0.0.10, and then that of the fix, on macOS 26.3.1 (arm64) with Git 2.50.1, in scratch repositories with a temporary `HOME`.
 
 **1. A restore of a trash entry during its purge deletes the worktree's Git directory and its record.** No fault needed.
 1. A remove run purges an expired trash entry: `remove.rs` `purge` rechecks it, `removed::create` writes its record, `trash.rs` `purge` runs `git worktree unlock`, and `git worktree remove TRASH/NAME` starts.
@@ -155,9 +188,15 @@ Each finding has its lines in `model/expected`. The replays ran residue 0.0.10, 
 
 Harm: the worktree is back with most of its files, but Git no longer knows it, and a commit only its HEAD reflog held is unreachable. Replayed on the release binary (0.0.10) on macOS: restore exited 0; `git worktree list` showed only the main worktree; `git status` in it said `fatal: not a git repository`; 28,936 of 30,000 `node_modules` files remained; the record and its refs were gone; `git gc --prune=now` deleted the reflog-only commit. The purge failed with exit 3 and pointed at the record restore had just forgotten. Also, `removed.rs` `move_back`'s refusal for a trash aside tells the user to run `residue restore ENTRY`, this racing command.
 
+Fixed (#135): the purge holds the entry's `info` from before its re-check, and its Git inherits the hold; `residue restore ENTRY` takes it first and refuses while anyone has it. Replayed: the restore exited 1 with ``a residue run, or the `git worktree remove` it started, is purging or restoring this trash entry now; run this restore again once it ends``, the purge finished and printed its record's restore command, that restore recreated the worktree, and the reflog-only commit survived `git gc --prune=now`.
+
 **2. A restore can lift the user's lock.** No fault needed. `trash.rs` `restore` (`was_locked`) and `removed.rs` `move_back` (`ours`) decide to unlock from the listing's lock reason. The user runs `git worktree lock` after the listing; Git's `worktree unlock` lifts any reason, so it lifts theirs. The window is between the listing and the unlock, milliseconds. Git has no compare-and-unlock. Model only; not witnessed.
 
+Fixed (#139): both restores take the hold, then read the lock from `git worktree list` again. Git locks only an unlocked worktree, and no other run changes residue's lock while the hold is taken, so the lock read is the lock lifted. The model shows it (`TrashRestoreStale`, `RecordRestoreStale`); not witnessed live.
+
 **3. A Git timeout during the delete drops the record of a worktree with files gone.** `git.rs` `REMOVE_TIMEOUT` (30 minutes), or a kill of Git alone, stops `git worktree remove` after it deleted some files but not the `.git` file. `standing` counts the worktree whole, so `settle` drops the record, and without `--trash` `Moved::put_back` says `it is back in place`. Replayed: residue printed `git worktree remove refused (exit signal): no error output; it is back in place`, 51,277 of 60,000 files remained, Git listed it at its path, and no record was left. Exit 3.
+
+Fixed (#137): once Git ran, `standing` also measures the files against the plan's fingerprint (`Files`), and any difference keeps the record with the worktree aside. Replayed: exit 3 with `Git still lists it at ~/code/.feat.residue-removing-49464, but part of its files may be gone: node_modules/ changed since the plan (60,000 -> 58,822 files); its removal record keeps its HEAD and reflog: residue restore RECORD`; that restore moved it back with its "part of it is gone" note. An edit of the user's during Git's run also keeps the record now, since residue cannot tell it from a deletion; the worktree stays aside until that restore.
 
 **4. A restore after residue alone is killed lets the still-running Git delete the restored worktree's Git directory.** `git worktree remove` runs in residue's process group, and residue sets no signal handler, so a signal to residue's PID alone (`kill PID`, a Force Quit, or watch's 30-minute deadline on its `residue remove`, `run.rs` `stop`) leaves Git deleting.
 1. `remove.rs` `execute` moves W to `.NAME.residue-removing-PID`, locks it, writes the record, verifies it, unlocks it and starts `git worktree remove`.
@@ -168,6 +207,8 @@ Harm: the worktree is back with most of its files, but Git no longer knows it, a
 
 Harm: the worktree is back with most of its files, but Git no longer knows it. Replayed on the release binary: restore exited 0 with a note that it could not find the Git directory; `git worktree list` showed only the main worktree; `git status` in it said `fatal: not a git repository`; 141,598 of 150,000 files remained. The record and its refs stayed, so the reflog-only commit survived `git gc --prune=now`. The model's `ReflogCommitsKept` path needs Git to finish after restore's own checks; live, Git finished first.
 
+Fixed (#136): the record's writer holds its `info`, and `git worktree remove` inherits the hold, so it lasts until Git exits however residue stops. `residue restore RECORD` takes it first and refuses while anyone has it, and `residue scan` reports `removal_running` with no recovery command. Replayed with residue alone killed: `scan --json` showed `"pid_running":false,"removal_running":true` and an empty `recovery`; the restore exited 1 with ``a residue run, or the `git worktree remove` it started, still holds this removal record, so it may still be deleting the worktree; run this restore again once it ends`` while Git ran; once Git exited, the same restore recreated the worktree, and the reflog-only commit survived `git gc --prune=now`.
+
 **5. A restore of a trash entry after its purge was stopped part way says nothing of the files the purge deleted.** Found by the "after" setup: the restore starts only once the purge has stopped.
 1. `remove.rs` `purge` rechecks the entry, `removed::create` writes its record, `trash.rs` `purge` unlocks it and starts `git worktree remove`.
 2. Ctrl-C stops residue and Git part way through the delete. The entry is left unlocked, with its `.git` file and part of its files.
@@ -175,6 +216,16 @@ Harm: the worktree is back with most of its files, but Git no longer knows it. R
 4. `restore_trash` forgets the purge's record and prints `restored ... from the trash entry ...` with no note. `removed.rs` `move_back` always adds "if its removal had started deleting, part of it is gone".
 
 Harm: the user gets the worktree back with files missing and no word of it, and a partly deleted `node_modules/` looks installed. Replayed on the release binary: 148,684 of 150,000 ignored files remained; restore exited 0 with `restored ~/code/repo-feat from the trash entry repo-feat-20261108T225724Z` and `on branch feat`, and no note; the purge's record was gone. Git had not reached the tracked files in that directory order; in another order it deletes them too.
+
+Fixed (#138): under the entry's hold, the trash restore reads the records of purges of the entry that Git still lists there and takes their holds. With any, it says `if its purge had started deleting, part of it is gone`, then settles each as `residue restore RECORD` would: puts back the HEAD reflog and `config.worktree` the worktree lacks, and forgets the record only once the worktree holds what it keeps. Replayed: the restore printed that note, 149,260 of 150,000 ignored files remained, and the record was gone. With `logs/` deleted by hand from its Git directory before the restore, as a stop during Git's delete of that directory can leave it: on 0.0.10 the reflog was empty after the restore and `git gc --prune=now` deleted the reflog-only commit; with the fix the reflog was back with 3 entries and the commit survived.
+
+Two changes came from modeling the fixes, not from a break. The Git directory gained the `noreflog` state above, which Finding 5 needs to lose a commit. And the trash restore takes the hold on each stopped purge's record, not only the entry's, so a `residue restore RECORD` cannot settle the same record meanwhile.
+
+The review of #147 added the old setups, `SClear`, and `TCheck`'s refusal. When a purge stopped after Git deleted the worktree's files, `residue restore ENTRY` and `residue restore RECORD` each named the other, and neither finished. Now `residue restore ENTRY` refuses and names the record, and `residue restore RECORD` clears what Git kept, under the record's and the entry's holds, and recreates the worktree. The check has no rule for a refusal that never ends, so this came from a replay, not from a break.
+
+Its second review added the old-orphan setups. For a record without a `hold` line, a restore now also refuses while a `git worktree remove` of the worktree runs, or while the activity probe sees a process using the worktree or its Git directory, and it applies these refusals only while Git still lists the worktree where the record's deletion started. Every rule holds in both.
+
+Its third review added the trash restore's open `.git`, its lock of a worktree Git lists unlocked, its second read of the records once the worktree has moved, and the note of a record restore whose purge's worktree is already back, each with a mutant. In the old setups the trash restore now races the purge throughout, outside the window `LatePurge` names. Every rule holds in all fourteen setups.
 
 ## Not covered
 
@@ -185,7 +236,14 @@ Harm: the user gets the worktree back with files missing and no word of it, and 
 - The stats ledger and the Mac app.
 - Reftable repositories, and branches others move during a run.
 - Disk errors, except `removed::create` failing.
-- Two faults in one run, and a restore of a trash entry after its purge was killed alone.
+- Two faults in one run.
+- `residue scan`, whose `removal_running` takes a record's hold for an instant: a restore in that instant refuses as busy and says to run it again.
+- Of a release that takes no hold, 0.0.10 and earlier: its restores; a purge whose activity probe cannot see the trash restore's open files; and the steps `LatePurge` in the model leaves out, for a purge whose re-check came before a trash restore of this release opened the worktree's `.git` and whose record comes after that restore read the records. After an upgrade, automatic cleanup runs the new release on its own ([After an upgrade](../../../docs/automation.md#after-an-upgrade)), so such a purge needs a run of that release still going.
+- A trash restore that finds, once it has moved the worktree, that Git can no longer use it. When a purge of a release that takes no hold deletes the worktree's Git directory during that move, `restore.rs` `restore_trash` checks `git::identity` after the move, exits 1, says where the files stay, and names `residue restore RECORD --to NEWPATH`. `TReport` has no such branch: it reports the worktree back, so a run that reached it would count as `lied`. `scripts/recovery-check.sh` `restore-raced-git-dir` checks that branch on the real code.
+- Two unlocks of one worktree. `git worktree unlock` checks for the lock, then deletes it, and a delete that finds no file still exits 0, so in that `LatePurge` window a trash restore and a purge of a release that takes no hold can both unlock, and the restore's move and that purge's `git worktree remove` can then run together. Git deletes its own directory for the worktree even after its delete of the checkout fails. The restore then names the purge's record; when Git can no longer use the moved worktree, it says its files stay at the original path and names `residue restore RECORD --to NEWPATH`, not a restore that would find the path taken.
+- Whether a refusal ends. The rules say what must never happen, not that a restore can finish; two restores that each send the user to the other break none of them.
+- A program that Git starts keeping a hold after Git exits, a process that reused a record's PID while Git still lists the worktree where that record's deletion started, and a record another user wrote, which a restore not run as root refuses because it cannot see that user's processes: each only makes a restore refuse longer. residue counts a live process with the record's PID as its writer while that process's arguments hold `remove`. Where it cannot read them, on macOS, Linux, FreeBSD and illumos it skips one that started more than ten minutes after the record was written; on NetBSD, OpenBSD and DragonFly it cannot, and `ps -p PID` shows what the process is.
+- A filesystem with no flock(2): residue writes no removal record or trash entry there and takes no hold, so it removes and restores nothing. A run plans a trash entry or record an earlier release made there as kept, and a restore of it refuses and names the Git commands that move the worktree back, or recreate it, by hand. The model takes the holds as given.
 
 ## Credit
 

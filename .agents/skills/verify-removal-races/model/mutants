@@ -1,19 +1,43 @@
 # One mutant per line: the guard it removes (Mut("NAME") in Removal.tla),
 # the setup (Start, the Faults set, the actors that do not run; After is
-# always {}), and the rule that must break. check.sh first checks that the
-# rule holds in that setup without the mutant, so each line shows that the
-# guard keeps it.
+# always {}), the rule that must break, and, when the setup has them, the
+# actors of a release that takes no hold (Old) and the trash restores
+# such a run does not race in the window Late names (LatePurge in
+# Removal.tla), both {} when left out. check.sh first checks that the
+# rule holds in that setup without the mutant, so each line shows that
+# the guard keeps it.
 #
-# MUTANT               START  FAULTS    OFF     RULE
-NoVerify               orig   {}        {}      OnlyCheckedStateDeleted
-NoFingerprint          orig   {}        {}      OnlyCheckedStateDeleted
-PurgeNoRecheck         trash  {}        {}      OnlyCheckedStateDeleted
-NoRecord               orig   {}        {}      ReflogCommitsKept
-SettleAlwaysUndoes     orig   {}        {}      ReflogCommitsKept
-SettleAlwaysUndoes     orig   {}        {}      RecordDroppedOnlyWhenWhole
-MoveBackWhileRunning   orig   {}        {}      NotDeletedOnceBack
-MoveBackNoNote         orig   {"kill"}  {}      RestoreTellsTheTruth
-PutBackAlwaysUnlocks   orig   {}        {"rr"}  OnlyOwnLocksLifted
+# MUTANT                   START  FAULTS       OFF     RULE                    OLD     LATE
+NoVerify                   orig   {}           {}      OnlyCheckedStateDeleted
+NoFingerprint              orig   {}           {}      OnlyCheckedStateDeleted
+PurgeNoRecheck             trash  {}           {}      OnlyCheckedStateDeleted
+NoRecord                   orig   {}           {}      ReflogCommitsKept
+SettleAlwaysUndoes         orig   {}           {}      ReflogCommitsKept
+SettleAlwaysUndoes         orig   {}           {}      RecordDroppedOnlyWhenWhole
+StandingIgnoresFiles       orig   {"timeout"}  {}      RecordDroppedOnlyWhenWhole
+StandingIgnoresFiles       trash  {"timeout"}  {}      RecordDroppedOnlyWhenWhole
+MoveBackNoNote             orig   {"kill"}     {}      RestoreTellsTheTruth
+PutBackAlwaysUnlocks       orig   {}           {"rr"}  OnlyOwnLocksLifted
+PurgeNoHold                trash  {}           {}      NotDeletedOnceBack
+TrashRestoreNoHold         trash  {}           {}      NotDeletedOnceBack
+RestoreNoHold              orig   {"orphan"}   {}      NotDeletedOnceBack
+GitNoHold                  orig   {"orphan"}   {}      NotDeletedOnceBack
+GitNoHold                  trash  {"orphan"}   {}      NotDeletedOnceBack
+TrashRestoreStale          trash  {}           {}      OnlyOwnLocksLifted
+RecordRestoreStale         orig   {}           {}      OnlyOwnLocksLifted
+TrashRestoreNoNote         trash  {"kill"}     {}      RestoreTellsTheTruth
+TrashForgetsWithoutCheck   trash  {"kill"}     {}      ReflogCommitsKept
+ClearAnyLock               trash  {"kill"}     {"tr"}  OnlyOwnLocksLifted
+TrashRestoreNoOldPid       trash  {}           {"rr"}  NotDeletedOnceBack      {"pg"}  {"tr"}
+RestoreNoOldPid            trash  {}           {"tr"}  NotDeletedOnceBack      {"pg"}  {}
+RestoreNoOldPid            orig   {}           {}      NotDeletedOnceBack      {"rm"}  {}
+TrashRestoreNoOldGit       trash  {"orphan"}   {"rr"}  NotDeletedOnceBack      {"pg"}  {"tr"}
+RestoreNoOldGit            orig   {"orphan"}   {}      NotDeletedOnceBack      {"rm"}  {}
+RestoreNoOldGit            trash  {"orphan"}   {"tr"}  NotDeletedOnceBack      {"pg"}  {}
+TrashRestoreNoUse          trash  {}           {}      NotDeletedOnceBack      {"pg"}  {"tr"}
+TrashRestoreNoLock         trash  {}           {}      NotDeletedOnceBack      {"pg"}  {"tr"}
+TrashRestoreNoReread       trash  {"timeout"}  {}      RestoreTellsTheTruth    {"pg"}  {"tr"}
+BackPurgeNoNote            trash  {"timeout"}  {}      RestoreTellsTheTruth    {"pg"}  {"tr"}
 # The same guards in the unraced setups, so they too reach the deletion.
-NoVerify               orig   {"kill","orphan"}  {"rr"}  OnlyCheckedStateDeleted
-PurgeNoRecheck         trash  {"kill","orphan"}  {"tr"}  OnlyCheckedStateDeleted
+NoVerify                   orig   {"kill","orphan"}  {"rr"}  OnlyCheckedStateDeleted
+PurgeNoRecheck             trash  {"kill","orphan"}  {"tr"}  OnlyCheckedStateDeleted

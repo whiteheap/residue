@@ -7,7 +7,10 @@
 //! record follows it, and it is locked with [`LOCK`] so `git worktree
 //! prune` and other tools leave it alone. That keeps every way out a Git
 //! command: `residue restore` moves it back with `git worktree move`, and
-//! the purge deletes it with `git worktree remove` without `--force`.
+//! the purge deletes it with `git worktree remove` without `--force`. A
+//! purge and a restore each hold the entry's `info` while they act on it,
+//! and the purge's Git holds it while it deletes (`hold`), so a restore
+//! never moves the worktree back while a purge may still delete it.
 //!
 //! Why the common directory: it belongs to the repository, so the trash is
 //! found from any of its worktrees and goes away with it; no worktree's
@@ -24,6 +27,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::git::{self, Entry};
+use crate::hold::{self, Hold, Taken};
 use crate::json::Json;
 use crate::output;
 use crate::removed;
@@ -283,9 +287,12 @@ pub fn list(
 }
 
 /// Make a new entry for a worktree at `original`, with its record written,
-/// and return the entry directory. The worktree is not moved yet; the
-/// caller moves it to `entry.join(original's name)`.
-pub fn create(common_dir: &Path, record: &Record) -> Result<PathBuf, String> {
+/// and return the entry directory and the hold on it, taken before its
+/// `info` is in place. The worktree is not moved yet; the caller moves it
+/// to `entry.join(original's name)` and checks it there while it keeps
+/// the hold, so no restore or purge acts on the entry meanwhile, and on a
+/// filesystem without flock(2) nothing is made or moved.
+pub fn create(common_dir: &Path, record: &Record) -> Result<(PathBuf, Hold), String> {
     let name = record
         .original
         .file_name()
@@ -314,31 +321,29 @@ pub fn create(common_dir: &Path, record: &Record) -> Result<PathBuf, String> {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(format!("cannot create {}: {e}", entry.display())),
         }
-        // As a removal record's: `info.new`, synced, renamed, then the
-        // directories synced, so a power loss leaves a whole `info` or none.
+        // As a removal record's: `info.new`, synced and held, renamed, then
+        // the directories synced, so a power loss leaves a whole `info` or
+        // none, and no restore finds the new entry free.
         let staged = entry.join(INFO_NEW);
-        let written = removed::write_new(&staged, &record.render(&entry))
+        let written = hold::write_new(&staged, &record.render(&entry))
             .map_err(|e| format!("cannot write {}: {e}", staged.display()))
-            .and_then(|()| {
+            .and_then(|hold| {
                 fs::rename(&staged, entry.join(INFO))
-                    .map_err(|e| format!("cannot rename {}: {e}", staged.display()))
-            })
-            .and_then(|()| removed::sync_dir(&entry))
-            .and_then(|()| removed::sync_dir(&root))
-            .and_then(|()| {
+                    .map_err(|e| format!("cannot rename {}: {e}", staged.display()))?;
+                removed::sync_dir(&entry)?;
+                removed::sync_dir(&root)?;
                 if new_root {
-                    removed::sync_dir(common_dir)
-                } else {
-                    Ok(())
+                    removed::sync_dir(common_dir)?;
                 }
+                Ok(hold)
             });
-        if let Err(message) = written {
-            return Err(match discard(&entry) {
+        return match written {
+            Ok(hold) => Ok((entry, hold)),
+            Err(message) => Err(match discard(&entry) {
                 Ok(()) => message,
                 Err(more) => format!("{message}; {more}"),
-            });
-        }
-        return Ok(entry);
+            }),
+        };
     }
     Err(format!(
         "{}: too many entries named {}-{stamp}",
@@ -408,10 +413,134 @@ pub fn locked_by_residue(entry: &Entry) -> bool {
     entry.locked.as_deref() == Some(LOCK)
 }
 
+/// The `info` of the entry at `entry`, which a run holds while it purges
+/// or restores the entry (`hold`).
+pub fn info(entry: &Path) -> PathBuf {
+    entry.join(INFO)
+}
+
+/// Take the hold on an entry before a restore acts on it. Held, it means
+/// that no removal moving a worktree in, no purge, no `git worktree
+/// remove` one started and no other restore is acting on the entry. Once
+/// the run that holds it has exited, what holds it is its Git or a
+/// program that Git started, which `lsof` names.
+pub fn take(item: &Item) -> Result<Hold, String> {
+    let info = info(&item.dir);
+    match hold::take(&info)? {
+        Taken::Held(hold) => Ok(hold),
+        Taken::Busy => Err(format!(
+            "a residue run, or the `git worktree remove` it started, is purging or restoring this trash entry now, or moving a worktree into it (`lsof {}` names it); run this restore again once it ends",
+            output::shell(&info)
+        )),
+        Taken::Gone => Err(
+            "another residue run purged or restored this trash entry after this restore listed it, so residue changed nothing; `residue restore` lists what is left".into(),
+        ),
+        Taken::Unsupported(why) => Err(removed::unsupported_note(
+            &why,
+            match (&item.record, &item.registered) {
+                (Ok(record), Some(registered)) => {
+                    Some(removed::Manual::MoveBack(removed::move_back_line(
+                        &item.command_dir,
+                        registered,
+                        &record.original,
+                    )))
+                }
+                _ => None,
+            },
+        )),
+    }
+}
+
+/// Why [`restore`] did not move the worktree back.
+pub enum NotBack {
+    /// A check refused, before Git changed anything.
+    Refused(String),
+    /// Git's unlock or move failed.
+    Git(Box<GitFailed>),
+}
+
+/// What a restore whose Git unlock or move failed, `error`, changed.
+pub struct GitFailed {
+    pub error: String,
+    /// The lock it lifted first and could not put back, with why: its
+    /// reason, then Git's error.
+    pub lifted: Option<(String, String)>,
+    /// The first folder it made for the destination, which stays.
+    pub created: Option<PathBuf>,
+    /// The destination, when Git renamed the worktree's directory there
+    /// and stopped before it recorded the new path.
+    pub moved: Option<PathBuf>,
+    /// The lock it lifted is back on the worktree.
+    pub relocked: bool,
+}
+
+impl From<String> for NotBack {
+    fn from(why: String) -> NotBack {
+        NotBack::Refused(why)
+    }
+}
+
 /// Put one entry's worktree back where it was, or at `to`, re-registered
-/// by `git worktree move`, and drop the entry. Returns the restored path,
-/// and a note when the record stays behind (the next purge clears it).
-pub fn restore(item: &Item, to: Option<&Path>) -> Result<(PathBuf, Option<String>), String> {
+/// by `git worktree move`, and drop the entry. The caller holds the entry
+/// (`take`) and passes every worktree Git lists for the repository, read
+/// since then (`listed`), so the lock it lifts is the one there now.
+/// Returns the restored path, and a note when the record stays behind (the
+/// next purge clears it).
+pub fn restore(
+    item: &Item,
+    to: Option<&Path>,
+    listed: &[Entry],
+    _held: &Hold,
+) -> Result<(PathBuf, Option<String>), NotBack> {
+    let (worktree, registered, dest, created) = restorable(item, to, listed)?;
+    let main = &item.command_dir;
+    let lock = registered.locked.as_deref();
+    if lock.is_some() {
+        git::unlock_worktree(main, worktree).map_err(|error| {
+            NotBack::Git(Box::new(GitFailed {
+                error,
+                lifted: None,
+                created: created.clone(),
+                moved: None,
+                relocked: false,
+            }))
+        })?;
+    }
+    if let Err(error) = git::move_worktree(main, worktree, dest) {
+        let lifted = match lock {
+            Some(reason) => git::lock_worktree(main, worktree, LOCK)
+                .err()
+                .map(|relock| (reason.to_string(), relock)),
+            None => None,
+        };
+        // Git renames the directory before it records the new path, and
+        // may stop between the two.
+        let moved = (fs::symlink_metadata(worktree).is_err() && fs::symlink_metadata(dest).is_ok())
+            .then(|| dest.to_path_buf());
+        return Err(NotBack::Git(Box::new(GitFailed {
+            error,
+            relocked: lock.is_some() && lifted.is_none(),
+            lifted,
+            created,
+            moved,
+        })));
+    }
+    let note = discard(&item.dir)
+        .err()
+        .map(|e| format!("could not remove the trash record ({e}); the next remove run clears it"));
+    Ok((dest.to_path_buf(), note))
+}
+
+/// What [`restore`] checks before Git changes anything: the entry's
+/// worktree, Git's entry for it, where it goes, and the first folder it
+/// made for that, if any. It checks that the destination is on the
+/// trash's filesystem before it makes a folder, by the nearest folder
+/// above it that exists.
+fn restorable<'a>(
+    item: &'a Item,
+    to: Option<&'a Path>,
+    listed: &'a [Entry],
+) -> Result<(&'a Path, &'a Entry, &'a Path, Option<PathBuf>), String> {
     let record = item.record.as_ref().map_err(|e| e.clone())?;
     let worktree = item
         .worktree
@@ -423,11 +552,15 @@ pub fn restore(item: &Item, to: Option<&Path>) -> Result<(PathBuf, Option<String
             worktree.display()
         ));
     }
-    let Some(registered) = &item.registered else {
+    let registered = listed.iter().find(|e| {
+        e.path == *worktree || git::canonical(&e.path).ok().as_deref() == Some(worktree.as_path())
+    });
+    let Some(registered) = registered else {
         return Err(format!(
-            "Git no longer lists {} as a worktree. If the repository moved, run `git worktree repair {}` in it, then restore again",
+            "Git no longer lists {} as a worktree. If the repository moved, `git -C {} worktree repair {}` reconnects it; then restore again",
             worktree.display(),
-            worktree.display()
+            output::shell(&item.command_dir),
+            output::shell(worktree)
         ));
     };
     match &registered.locked {
@@ -451,60 +584,50 @@ pub fn restore(item: &Item, to: Option<&Path>) -> Result<(PathBuf, Option<String
         Err(e) => return Err(format!("cannot check {}: {e}", dest.display())),
     }
     let parent = dest.parent().ok_or("the destination has no parent")?;
-    fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    let (existing, missing) = nearest_existing(parent);
     let here = fs::symlink_metadata(worktree)
         .map_err(|e| format!("{}: {e}", worktree.display()))?
         .dev();
-    let there = fs::metadata(parent)
-        .map_err(|e| format!("{}: {e}", parent.display()))?
+    let there = fs::metadata(existing)
+        .map_err(|e| format!("{}: {e}", existing.display()))?
         .dev();
     if here != there {
         return Err(format!(
             "{} is on another filesystem than the trash; residue moves, never copies",
-            parent.display()
+            existing.display()
         ));
     }
-    let main = &item.command_dir;
-    let was_locked = registered.locked.is_some();
-    if was_locked {
-        git::unlock_worktree(main, worktree)?;
-    }
-    if let Err(e) = git::move_worktree(main, worktree, dest) {
-        if was_locked {
-            if let Err(relock) = git::lock_worktree(main, worktree, LOCK) {
-                return Err(format!("{e}; and could not lock it again: {relock}"));
-            }
-        }
-        return Err(e);
-    }
-    let note = discard(&item.dir)
-        .err()
-        .map(|e| format!("could not remove the trash record ({e}); the next remove run clears it"));
-    Ok((dest.to_path_buf(), note))
+    fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    Ok((worktree, registered, dest, missing.map(Path::to_path_buf)))
+}
+
+/// The nearest folder at or above `parent` that exists, and the topmost
+/// one under it that does not, if any. The folders a restore makes on the
+/// way to `parent` are on the first one's filesystem, as no mount sits on
+/// a folder that is not there, so a restore checks it before it makes any.
+pub fn nearest_existing(parent: &Path) -> (&Path, Option<&Path>) {
+    let missing = parent.ancestors().take_while(|a| !a.exists()).last();
+    (missing.and_then(Path::parent).unwrap_or(parent), missing)
 }
 
 /// Delete one entry's worktree with `git worktree remove` (no `--force`)
-/// and drop the entry. The caller has re-checked it. If Git refuses, the
-/// worktree is locked again and stays in the trash.
-pub fn purge(item: &Item) -> Result<(), String> {
-    if item.holds_only_record() {
-        return discard(&item.dir);
-    }
+/// and drop the entry. The caller holds the entry and has re-checked it
+/// since: `registered` is Git's entry for it from that check, so the lock
+/// lifted is the one there now. Git inherits `holds`, the entry's and its
+/// removal record's. If Git refuses, the worktree is locked again and
+/// stays in the trash.
+pub fn purge(item: &Item, registered: &Entry, holds: &[&Hold]) -> Result<(), String> {
     let worktree = item
         .worktree
         .as_ref()
         .ok_or("the entry names no worktree")?;
-    let registered = item
-        .registered
-        .as_ref()
-        .ok_or("Git no longer lists it as a worktree")?;
     let main = &item.command_dir;
     if locked_by_residue(registered) {
         git::unlock_worktree(main, worktree)?;
     } else if let Some(reason) = &registered.locked {
         return Err(format!("it is locked by someone else ({reason})"));
     }
-    if let Err(e) = git::remove_worktree(main, worktree) {
+    if let Err(e) = git::remove_worktree(main, worktree, holds) {
         if let Err(relock) = git::lock_worktree(main, worktree, LOCK) {
             return Err(format!("{e}; and could not lock it again: {relock}"));
         }
