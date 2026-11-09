@@ -584,10 +584,7 @@ fn restorable<'a>(
         Err(e) => return Err(format!("cannot check {}: {e}", dest.display())),
     }
     let parent = dest.parent().ok_or("the destination has no parent")?;
-    // The folders it makes are on the filesystem of the nearest one above
-    // them that exists, as no mount sits on a folder that is not there.
-    let missing = parent.ancestors().take_while(|a| !a.exists()).last();
-    let existing = missing.and_then(Path::parent).unwrap_or(parent);
+    let (existing, missing) = nearest_existing(parent);
     let here = fs::symlink_metadata(worktree)
         .map_err(|e| format!("{}: {e}", worktree.display()))?
         .dev();
@@ -602,6 +599,15 @@ fn restorable<'a>(
     }
     fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     Ok((worktree, registered, dest, missing.map(Path::to_path_buf)))
+}
+
+/// The nearest folder at or above `parent` that exists, and the topmost
+/// one under it that does not, if any. The folders a restore makes on the
+/// way to `parent` are on the first one's filesystem, as no mount sits on
+/// a folder that is not there, so a restore checks it before it makes any.
+pub fn nearest_existing(parent: &Path) -> (&Path, Option<&Path>) {
+    let missing = parent.ancestors().take_while(|a| !a.exists()).last();
+    (missing.and_then(Path::parent).unwrap_or(parent), missing)
 }
 
 /// Delete one entry's worktree with `git worktree remove` (no `--force`)

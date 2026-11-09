@@ -852,7 +852,16 @@ fn how_text(done: &Done) -> String {
             short(tip)
         ),
         How::Recreated => format!("branch {branch} was gone; created it again at {head}"),
-        How::NewBranch { name, tip } => format!(
+        How::NewBranch {
+            name,
+            elsewhere: Some(at),
+            ..
+        } => format!(
+            "on the new branch {}, at {head}: the recorded branch is checked out {}, so residue left it and that worktree alone",
+            clean(name),
+            clean(at)
+        ),
+        How::NewBranch { name, tip, .. } => format!(
             "on the new branch {}, at {head}: the recorded branch no longer contains it (it is at {}), so residue left it alone",
             clean(name),
             short(tip)

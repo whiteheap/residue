@@ -374,10 +374,10 @@ pub fn missing_note(main: &Path) -> String {
 /// and whose directory is gone, or that Git can no longer use. residue
 /// names no line that clears it: that drops its HEAD, its reflog, its
 /// index and its private refs, and only a removal record keeps those.
-/// `git gc` clears it on its own (`git worktree prune --expire`), judged
-/// by when its index last changed, and never while it is `locked`.
-/// `git_dir` is its Git directory, `COMMON/worktrees/ID`, when residue
-/// found the one that names it.
+/// `git gc` clears it on its own (`git worktree prune --expire`) by Git's
+/// rule ([`prune_rule`]), and never while it is `locked`. `git_dir` is its
+/// Git directory, `COMMON/worktrees/ID`, when residue found the one that
+/// names it.
 pub fn gc_note(main: &Path, locked: Option<&str>, git_dir: Option<&Path>) -> String {
     if let Some(reason) = locked {
         let reason = if reason.is_empty() {
@@ -398,11 +398,63 @@ pub fn gc_note(main: &Path, locked: Option<&str>, git_dir: Option<&Path>) -> Str
     } else {
         ", ID being its folder in Git's worktrees directory,"
     };
-    format!(
-        "`git gc` drops Git's record of it, with its HEAD, reflog and index, 3 months by default (`gc.worktreePruneExpire`) after its index last changed, never while it is locked; `git -C {} reflog show {}`{which} lists the commits that may go with it",
+    let show = format!(
+        "`git -C {} reflog show {}`{which}",
         shell(main),
         word(&reflog)
-    )
+    );
+    match git_dir.map(prune_rule) {
+        Some(Prune::Kept(dotgit)) => format!(
+            "Git keeps its record, with its HEAD, reflog and index, while {} is there, which its `gitdir` file names; {show} lists the commits its HEAD reflog holds",
+            clean(&dotgit.to_string_lossy())
+        ),
+        Some(Prune::Now(why)) => format!(
+            "the next `git gc` or `git worktree prune` drops Git's record of it, with its HEAD and reflog, since {why}, unless it is locked first; {show} lists the commits that may go with it"
+        ),
+        Some(Prune::Expires) | None => format!(
+            "`git gc` drops Git's record of it, with its HEAD, reflog and index, 3 months by default (`gc.worktreePruneExpire`) after its index last changed, never while it is locked; {show} lists the commits that may go with it"
+        ),
+    }
+}
+
+/// What `git gc` does with Git's record of a worktree that is not locked.
+enum Prune {
+    /// Its `gitdir` file names a `.git` that is there, so Git keeps it.
+    Kept(PathBuf),
+    /// The next `git gc` or `git worktree prune` drops it, for this reason.
+    Now(&'static str),
+    /// `git gc` drops it once its index is older than
+    /// `gc.worktreePruneExpire`.
+    Expires,
+}
+
+/// Git's own rule for the record `git_dir`, `COMMON/worktrees/ID`, once
+/// it is not locked (`should_prune_worktree` in Git 2.50's worktree.c,
+/// which `git worktree prune` and `git gc` use): a `gitdir` file that is
+/// missing, cannot be read or is empty, after its trailing newlines and
+/// carriage returns, is dropped at once; one naming a path that exists, as
+/// `lstat` sees it, is kept; otherwise it is dropped at once when `stat`
+/// finds no index, and once the index is older than the expiry when it
+/// does.
+fn prune_rule(git_dir: &Path) -> Prune {
+    let Ok(bytes) = std::fs::read(git_dir.join("gitdir")) else {
+        return Prune::Now("its `gitdir` file is missing or cannot be read");
+    };
+    let mut len = bytes.len();
+    while len > 0 && matches!(bytes[len - 1], b'\n' | b'\r') {
+        len -= 1;
+    }
+    if len == 0 {
+        return Prune::Now("its `gitdir` file is empty");
+    }
+    let dotgit = git_dir.join(std::ffi::OsStr::from_bytes(&bytes[..len]));
+    if std::fs::symlink_metadata(&dotgit).is_ok() {
+        return Prune::Kept(dotgit);
+    }
+    match std::fs::metadata(git_dir.join("index")) {
+        Ok(_) => Prune::Expires,
+        Err(_) => Prune::Now("Git finds no index for it"),
+    }
 }
 
 /// What a file that is not a regular file is, as a phrase.
@@ -444,12 +496,20 @@ pub fn word(text: &str) -> String {
     word_bytes(text.as_bytes())
 }
 
-/// Bytes as a shell word that names them exactly: unchanged when they are
-/// only characters no shell treats specially; in single quotes when they
-/// are text with no control character; otherwise in `$'...'` (bash,
-/// zsh, ksh and POSIX.1-2024 sh), with each control character and each
-/// byte that is not UTF-8 as an octal escape, so a newline in a path
-/// stays a newline and nothing in the word reaches the terminal raw.
+/// Bytes as one shell word that names them exactly in any POSIX sh, dash
+/// included, and in bash and zsh: unchanged when they are only characters
+/// no shell treats specially; in single quotes when they are text with no
+/// control character; otherwise `"$(printf 'FMT')"`, where FMT writes each
+/// control character and each byte that is not UTF-8 as a `\ooo` octal
+/// escape, a backslash as `\\`, a percent sign as `%%`, a single quote as
+/// `\047` and a leading `-` as `\055`, so no such byte reaches the terminal
+/// raw: a raw escape or carriage return could rewrite what the user sees
+/// before they paste it. Command substitution drops trailing newlines, so
+/// bytes that end in one have no such word. residue refuses to remove a
+/// worktree whose path has a newline (its `identity` check), so only a
+/// path made by hand gets here; for it the word is `${NAME:?}` of a name
+/// no shell sets, which stops the line with an error before it runs
+/// anything.
 pub fn word_bytes(bytes: &[u8]) -> String {
     let plain = !bytes.is_empty()
         && bytes
@@ -463,28 +523,32 @@ pub fn word_bytes(bytes: &[u8]) -> String {
             return format!("'{}'", text.replace('\'', "'\\''"));
         }
     }
-    let mut out = String::from("$'");
-    let octal = |out: &mut String, b: u8| out.push_str(&format!("\\{b:03o}"));
+    if bytes.last() == Some(&b'\n') {
+        return "\"${residue_cannot_name_a_path_that_ends_in_a_newline:?}\"".into();
+    }
+    let mut fmt = String::new();
+    let octal = |fmt: &mut String, b: u8| fmt.push_str(&format!("\\{b:03o}"));
     for chunk in bytes.utf8_chunks() {
         for c in chunk.valid().chars() {
             match c {
-                '\\' => out.push_str("\\\\"),
-                '\'' => out.push_str("\\'"),
+                '\\' => fmt.push_str("\\\\"),
+                '%' => fmt.push_str("%%"),
+                '\'' => fmt.push_str("\\047"),
+                '-' if fmt.is_empty() => fmt.push_str("\\055"),
                 c if c.is_control() => {
                     let mut buf = [0u8; 4];
                     for &b in c.encode_utf8(&mut buf).as_bytes() {
-                        octal(&mut out, b);
+                        octal(&mut fmt, b);
                     }
                 }
-                c => out.push(c),
+                c => fmt.push(c),
             }
         }
         for &b in chunk.invalid() {
-            octal(&mut out, b);
+            octal(&mut fmt, b);
         }
     }
-    out.push('\'');
-    out
+    format!("\"$(printf '{fmt}')\"")
 }
 
 /// `HH:MM:SS +02:00` in the local time zone, with its UTC offset so a log

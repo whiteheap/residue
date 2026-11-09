@@ -734,47 +734,104 @@ pub fn move_back_line(main: &Path, registered: &Entry, original: &Path) -> Strin
 }
 
 /// The command that recreates by hand, at its original path, the worktree
-/// of `item`'s record, which Git no longer lists, the way `recreate`
-/// would: on its branch only when that branch is at the recorded HEAD or
-/// ahead of it and checked out nowhere; on a new branch of that name at
-/// the HEAD when the branch is gone, so Git never takes one from a remote
-/// instead; on `BRANCH-restored` at the HEAD when the branch was rewritten
-/// or is checked out elsewhere; detached at it when the record is. `Err`
-/// says why no line can bring it back.
+/// of `item`'s record, which Git no longer lists: the `git worktree add`
+/// that `recreate` runs (`choose`), after `output::vacant`, so it stops
+/// before Git makes a branch while anything is at that path. `Err` says
+/// why no line can bring it back.
 fn recreate_line(item: &Item, record: &Record) -> Result<String, String> {
+    let listed = git::worktrees(&item.command_dir)?;
+    let choice = choose(item, record, &listed)?;
+    let path = &record.original;
+    let words = match choice.checkout(&record.head) {
+        Checkout::Branch(branch) => format!("{} {}", output::shell(path), output::word(branch)),
+        Checkout::NewBranch(branch, commit) => format!(
+            "-b {} {} {}",
+            output::word(branch),
+            output::shell(path),
+            output::word(commit)
+        ),
+        Checkout::Detached(commit) => {
+            format!("--detach {} {}", output::shell(path), output::word(commit))
+        }
+    };
+    Ok(format!(
+        "{}git -C {} worktree add {words}",
+        output::vacant(path),
+        output::shell(&item.command_dir)
+    ))
+}
+
+/// How a restore recreates the worktree of a record Git no longer lists
+/// (`choose`): what `recreate` runs and what `recreate_line` names.
+enum Choice {
+    /// The branch is gone: a branch of its name again, at the recorded
+    /// HEAD, so Git never takes one from a remote instead.
+    Again(String),
+    /// The branch is at the recorded HEAD or ahead of it, and no worktree
+    /// has it checked out: that branch, at `tip`.
+    Branch { short: String, tip: String },
+    /// The branch, at `tip`, no longer contains the recorded HEAD, or a
+    /// worktree has it checked out (`elsewhere` says where): `name`, the
+    /// first free `BRANCH-restored`, at the recorded HEAD. The branch and
+    /// that worktree stay as they are.
+    NewBranch {
+        name: String,
+        tip: String,
+        elsewhere: Option<String>,
+    },
+    /// The record names no branch: detached at the recorded HEAD.
+    Detached,
+}
+
+impl Choice {
+    fn checkout<'a>(&'a self, head: &'a str) -> Checkout<'a> {
+        match self {
+            Choice::Again(short) => Checkout::NewBranch(short, head),
+            Choice::Branch { short, .. } => Checkout::Branch(short),
+            Choice::NewBranch { name, .. } => Checkout::NewBranch(name, head),
+            Choice::Detached => Checkout::Detached(head),
+        }
+    }
+}
+
+/// The one decision of how the worktree of `item`'s record comes back
+/// with `git worktree add`, from Git's worktrees as `listed` now. It never
+/// moves, resets or deletes a branch, and never touches another worktree.
+fn choose(item: &Item, record: &Record, listed: &[Entry]) -> Result<Choice, String> {
     let main = &item.command_dir;
     let head = record.head.as_str();
     if git::commit_of(main, head)?.is_none() {
         return Err(format!(
-            "its HEAD commit {} is no longer in the repository",
-            output::clean(head)
+            "commit {} is no longer in the repository: its ref {} was deleted and Git dropped it",
+            &head[..head.len().min(12)],
+            item.ref_name()
         ));
     }
-    let add = format!("git -C {} worktree add", output::shell(main));
-    let path = output::shell(&record.original);
     let (Some(full), Some(short)) = (&record.branch, record.short_branch()) else {
-        return Ok(format!("{add} --detach {path} {}", output::word(head)));
-    };
-    let new_branch = |name: &str| {
-        format!(
-            "{add} -b {} {path} {}",
-            output::word(name),
-            output::word(head)
-        )
+        return Ok(Choice::Detached);
     };
     let Some(tip) = git::commit_of(main, full)? else {
-        return Ok(new_branch(short));
+        return Ok(Choice::Again(short.to_string()));
     };
-    let elsewhere = git::worktrees(main)?
-        .iter()
-        .any(|e| e.branch.as_deref() == Some(full.as_str()));
-    if !elsewhere && (tip == head || git::is_ancestor(main, head, &tip)?) {
-        return Ok(format!("{add} {path} {}", output::word(short)));
+    let contains = tip == head || git::is_ancestor(main, head, &tip)?;
+    let elsewhere = listed.first().and_then(|first| {
+        let trash_root = crate::trash::root(&item.common_dir);
+        listed
+            .iter()
+            .find(|e| e.branch.as_deref() == Some(full.as_str()))
+            .map(|e| whereabouts(e, first, &trash_root))
+    });
+    if contains && elsewhere.is_none() {
+        return Ok(Choice::Branch {
+            short: short.to_string(),
+            tip,
+        });
     }
-    Ok(new_branch(&free_branch(
-        main,
-        &format!("{short}-restored"),
-    )?))
+    Ok(Choice::NewBranch {
+        name: free_branch(main, &format!("{short}-restored"))?,
+        tip,
+        elsewhere: if contains { elsewhere } else { None },
+    })
 }
 
 /// What a restore says when a run holds a record: `info` is its file.
@@ -1205,21 +1262,19 @@ fn list(
 }
 
 /// Git lists a worktree at the record's original path whose checkout is
-/// there (the `.git` file that ties it to its Git directory), on the
-/// recorded branch (detached when the record is), and whose HEAD is the
-/// recorded HEAD or contains it. A restore that kept its record, one
-/// stopped before it wrote its marker, a worktree added there by hand, a
-/// move back whose record could not be dropped, and a trash restore that
-/// lands during a purge all leave that. A new worktree on another branch
-/// at the same path is not one, and neither is a locked one whose folder
-/// is gone, which Git never marks prunable. One whose HEAD Git cannot
-/// compare with the recorded one is `Back::Unknown`.
+/// there (the `.git` file that ties it to its Git directory), and whose
+/// HEAD is the recorded HEAD, on any branch or detached, or contains it on
+/// the recorded branch (detached when the record is). A restore that kept
+/// its record, one stopped before it wrote its marker, a worktree added
+/// there by hand, such as by the `BRANCH-restored` line a restore names
+/// where it can hold no record, a move back whose record could not be
+/// dropped, and a trash restore that lands during a purge all leave that.
+/// A new worktree there at another commit on another branch is not one,
+/// and neither is a locked one whose folder is gone, which Git never
+/// marks prunable. One whose HEAD Git cannot compare with the recorded one
+/// is `Back::Unknown`.
 fn is_back(record: &Record, live: &[Entry], command_dir: &Path) -> Back {
-    let Some(entry) = live.iter().find(|e| {
-        e.prunable.is_none()
-            && (e.path == record.original
-                || git::canonical(&e.path).ok().as_deref() == Some(record.original.as_path()))
-    }) else {
+    let Some(entry) = at_original(record, live) else {
         return Back::No;
     };
     if !fs::symlink_metadata(entry.path.join(".git")).is_ok_and(|m| m.is_file()) {
@@ -1228,11 +1283,11 @@ fn is_back(record: &Record, live: &[Entry], command_dir: &Path) -> Back {
     let Some(head) = entry.head.as_deref() else {
         return Back::No;
     };
-    if entry.branch != record.branch {
-        return Back::No;
-    }
     if head == record.head {
         return Back::Yes;
+    }
+    if entry.branch != record.branch {
+        return Back::No;
     }
     match git::is_ancestor(command_dir, &record.head, head) {
         Ok(true) => Back::Yes,
@@ -1243,6 +1298,15 @@ fn is_back(record: &Record, live: &[Entry], command_dir: &Path) -> Back {
             &record.head[..record.head.len().min(12)]
         )),
     }
+}
+
+/// The worktree Git lists at the record's original path, not prunable.
+fn at_original<'a>(record: &Record, live: &'a [Entry]) -> Option<&'a Entry> {
+    live.iter().find(|e| {
+        e.prunable.is_none()
+            && (e.path == record.original
+                || git::canonical(&e.path).ok().as_deref() == Some(record.original.as_path()))
+    })
 }
 
 /// A record residue has written and not yet given up.
@@ -1737,11 +1801,13 @@ pub enum How {
     },
     /// The branch was gone; it was created again at the recorded HEAD.
     Recreated,
-    /// The branch no longer contains the recorded HEAD. It was left alone,
-    /// and a new branch was made at the recorded HEAD.
+    /// The branch no longer contains the recorded HEAD, or a worktree has
+    /// it checked out (`elsewhere` says where). It was left alone, and a
+    /// new branch was made at the recorded HEAD.
     NewBranch {
         name: String,
         tip: String,
+        elsewhere: Option<String>,
     },
     Detached,
     /// Git listed it at its path already, on its branch or detached as the
@@ -2377,20 +2443,15 @@ fn clear_steps(main: &Path, aside: &Path, ours: bool) -> String {
 }
 
 /// The worktree Git lists at the record's original path, which the listing
-/// found back there: read again from `listed`, as Git lists it now, so a
-/// worktree moved away or switched to another branch meanwhile is not
-/// taken for it. `holds` then checks its HEAD.
+/// found back there (`is_back`): read again from `listed`, as Git lists it
+/// now, so a worktree moved away, or switched to another branch at another
+/// commit, meanwhile is not taken for it. `holds` then checks its HEAD.
 fn already_back(record: &Record, listed: &[Entry]) -> Result<Restored, String> {
-    let entry = listed
-        .iter()
-        .find(|e| {
-            e.path == record.original
-                || git::canonical(&e.path).ok().as_deref() == Some(record.original.as_path())
-        })
-        .filter(|e| e.branch == record.branch)
+    let entry = at_original(record, listed)
+        .filter(|e| e.branch == record.branch || e.head.as_deref() == Some(record.head.as_str()))
         .ok_or_else(|| {
             format!(
-                "Git no longer lists its worktree at {} on its branch; run residue restore again to see where it stands",
+                "Git no longer lists its worktree at {} on its branch or at its HEAD; run residue restore again to see where it stands",
                 record.original.display()
             )
         })?;
@@ -2458,20 +2519,22 @@ fn move_back(
         ));
     }
     let parent = dest.parent().ok_or("the destination has no parent")?;
-    fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    // Checked before it makes any folder, so a refusal leaves none.
+    let (existing, _) = crate::trash::nearest_existing(parent);
     let here = fs::symlink_metadata(aside)
         .map_err(|e| format!("{}: {e}", aside.display()))?
         .dev();
-    let there = fs::metadata(parent)
-        .map_err(|e| format!("{}: {e}", parent.display()))?
+    let there = fs::metadata(existing)
+        .map_err(|e| format!("{}: {e}", existing.display()))?
         .dev();
     if here != there {
         return Err(format!(
             "{} is on another filesystem than {}; residue moves, never copies",
-            parent.display(),
+            existing.display(),
             aside.display()
         ));
     }
+    fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     if ours {
         git::unlock_worktree(main, aside)?;
     }
@@ -2509,58 +2572,35 @@ fn move_back(
     })
 }
 
-/// `git worktree add` at `dest`, on the recorded branch when that loses
-/// nothing, and never moving a branch that exists.
+/// `git worktree add` at `dest`, as `choose` decides: on the recorded
+/// branch when that loses nothing, and never moving a branch that exists.
 fn recreate(
     item: &Item,
     record: &Record,
     dest: &Path,
     listed: &[Entry],
 ) -> Result<Restored, String> {
-    let main = &item.command_dir;
-    let head = record.head.as_str();
-    if git::commit_of(main, head)?.is_none() {
-        return Err(format!(
-            "commit {} is no longer in the repository: its ref {} was deleted and Git dropped it",
-            &head[..12],
-            item.ref_name()
-        ));
-    }
-    let checked_out = |full: &str| -> Option<String> {
-        let first = listed.first()?;
-        let trash_root = crate::trash::root(&item.common_dir);
-        listed
-            .iter()
-            .find(|e| e.branch.as_deref() == Some(full))
-            .map(|e| whereabouts(e, first, &trash_root))
-    };
-    let (how, branch) = match (&record.branch, record.short_branch()) {
-        (Some(full), Some(short)) => match git::commit_of(main, full)? {
-            None => {
-                git::add_worktree(main, dest, &Checkout::NewBranch(short, head))?;
-                (How::Recreated, Some(full.clone()))
-            }
-            Some(tip) if tip == head || git::is_ancestor(main, head, &tip)? => {
-                if let Some(at) = checked_out(full) {
-                    return Err(format!(
-                        "branch {} is checked out {at}; Git allows one worktree per branch",
-                        output::clean(short)
-                    ));
-                }
-                git::add_worktree(main, dest, &Checkout::Branch(short))?;
-                (How::Branch { tip }, Some(full.clone()))
-            }
-            Some(tip) => {
-                let name = free_branch(main, &format!("{short}-restored"))?;
-                git::add_worktree(main, dest, &Checkout::NewBranch(&name, head))?;
-                let full = format!("refs/heads/{name}");
-                (How::NewBranch { name, tip }, Some(full))
-            }
-        },
-        _ => {
-            git::add_worktree(main, dest, &Checkout::Detached(head))?;
-            (How::Detached, None)
+    let choice = choose(item, record, listed)?;
+    git::add_worktree(&item.command_dir, dest, &choice.checkout(&record.head))?;
+    let (how, branch) = match choice {
+        Choice::Again(_) => (How::Recreated, record.branch.clone()),
+        Choice::Branch { tip, .. } => (How::Branch { tip }, record.branch.clone()),
+        Choice::NewBranch {
+            name,
+            tip,
+            elsewhere,
+        } => {
+            let full = format!("refs/heads/{name}");
+            (
+                How::NewBranch {
+                    name,
+                    tip,
+                    elsewhere,
+                },
+                Some(full),
+            )
         }
+        Choice::Detached => (How::Detached, None),
     };
     let mut notes = Vec::new();
     if matches!(how, How::Recreated) {

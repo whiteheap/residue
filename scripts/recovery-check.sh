@@ -596,7 +596,7 @@ follow() { # OUT
         cmd=${cmd%\`}
         case $cmd in *NEWPATH*) continue ;; "git -C "*) ;; *) continue ;; esac
         followed+="$cmd"$'\n'
-        bash -c "$cmd" >>"$work/$name.out-follow" 2>&1 || follow_failed+="$cmd"$'\n'
+        sh -c "$cmd" >>"$work/$name.out-follow" 2>&1 || follow_failed+="$cmd"$'\n'
     done < <(grep -o '`[^`]*`' "$1")
 }
 
@@ -633,7 +633,8 @@ if [ -n "$partial_probe" ]; then
         restore-lifts-its-lock old-damaged-record restore-opens-no-fifo restore-unlock-raced \
         remove-fails-part-way-reflog remove-fails-part-way-head remove-fails-part-way-dotgit remove-fails-part-way-running \
         remove-fails-part-way-files \
-        nested-repo-after-move mount-after-move unreadable-after-move restore-forget-race forget-restore-race \
+        nested-repo-after-move mount-after-move unreadable-after-move private-ref-after-move bisect-after-move \
+        restore-to-other-fs stale-no-index leftover-dotgit-kept restore-forget-race forget-restore-race \
         forget-before-restore-reads restore-forget-race-reftable stale-names-repair gone-aside-no-record \
         stale-keeps-reflog stale-keeps-reflog-reftable stale-keeps-same-name stale-locked-no-remove move-back-guard \
         restore-raced-git-dir restore-move-stops-after-rename noflock-recreate noflock-kept; do
@@ -1180,6 +1181,47 @@ else
     elif [ "$(sums "$wt" | grep -v '^\./x/kept\.txt ')" != "$w_sum" ]; then fail "the restored worktree's other files changed"
     elif common_ok; then ok "$(jq -r '.results[0].reason' "$work/$name.out")"; fi
 fi
+
+# --- 2e. A private ref or a bisect started during the move ------------------
+# The removal passed every check and waits at its move; meanwhile a Git
+# outside it gives w a private ref to a commit nothing else reaches, or
+# starts a bisect there. `git worktree remove` would delete both with w,
+# so the check after the move must refuse and put w back with them.
+for kind in private-ref bisect; do
+    name=$kind-after-move
+    make_repo
+    echo hold-move >"$work/mode"
+    start "" remove --yes --json "$wt"
+    if ! await "$work/at-move-$pid"; then
+        finish "$pid"
+        fail "the removal did not reach its move"
+        continue
+    fi
+    case $kind in
+    private-ref)
+        kept=$(git -C "$wt" commit-tree -p HEAD -m private-only "$(git -C "$wt" rev-parse 'HEAD^{tree}')") || exit 2
+        setup git -C "$wt" update-ref refs/worktree/keep "$kept"
+        want="it has worktree-private refs after residue moved it aside, which its deletion would delete: refs/worktree/keep; it is back in place"
+        ;;
+    bisect)
+        setup git -C "$wt" bisect start
+        setup git -C "$wt" bisect bad
+        want="bisect in progress after residue moved it aside; it is back in place"
+        ;;
+    esac
+    touch "$work/go-move-$pid"
+    finish "$pid"
+    out=$work/$name.out
+    if [ "$status" != 3 ]; then fail "exit $status, want 3: $(outcome)"
+    elif [ "$(jq -r '.results[0].result' "$out")" != skipped ]; then fail "result $(outcome), want skipped"
+    elif [ "$(jq -r '.results[0].reason' "$out")" != "$want" ]; then fail "reason: $(jq -r '.results[0].reason' "$out"); want: $want"
+    elif [ "$(record "$wt")" != registered ]; then fail "at its original path Git has: $(record "$wt")"
+    elif [ -n "$(asides)" ]; then fail "a moved-aside directory is left: $(asides)"
+    elif [ "$(records)" != "0 records, 0 refs" ]; then fail "removal records: $(records), want 0 records, 0 refs"
+    elif [ "$kind" = private-ref ] && [ "$(git -C "$wt" rev-parse -q --verify refs/worktree/keep)" != "$kept" ]; then fail "w's refs/worktree/keep no longer names the commit only it kept"
+    elif [ "$kind" = bisect ] && { [ ! -e "$repo/.git/worktrees/w/BISECT_LOG" ] || [ "$(git -C "$wt" rev-parse -q --verify refs/bisect/bad)" != "$w_sha" ]; }; then fail "w's bisect is gone"
+    elif common_ok; then ok "$(jq -r '.results[0].reason' "$out")"; fi
+done
 
 # --- 3. The check after the move fails, and so does the move back ----------
 name=move-back-fails
@@ -2329,6 +2371,66 @@ if part_remove_ok "part of its files may be gone: " "$(grep -v '^\./node_modules
     else ok "the record stays though Git lists w with its Git directory whole, and restore moves it back"; fi
 fi
 
+# --- 5f. A record restore with --to on another filesystem -------------------
+# residue moves, never copies, so it refuses a --to on another filesystem;
+# it checks the nearest folder that exists first, so the refusal leaves no
+# folder made on the way there, even when the folder --to names went
+# after residue read it. The other filesystem is a disk image on
+# macOS, which any user may attach, and /dev/shm on Linux.
+name=restore-to-other-fs
+other=
+case $(uname -s) in
+Darwin)
+    mkdir -p "$work/ovol/.fseventsd" && : >"$work/ovol/.metadata_never_index" && : >"$work/ovol/.fseventsd/no_log" || exit 2
+    setup hdiutil create -quiet -fs HFS+ -volname residue-other -layout NONE -format UDRW -srcfolder "$work/ovol" "$work/other.dmg"
+    mkdir -p "$work/other" || exit 2
+    echo "$work/other" >"$work/mounted-at"
+    if attached=$(hdiutil attach -nobrowse -noverify -noautoopen -mountpoint "$work/other" "$work/other.dmg"); then
+        echo "${attached%%[[:space:]]*}" >"$work/mounted-dev"
+        other=$work/other
+    fi
+    ;;
+Linux)
+    if [ -d /dev/shm ] && [ -w /dev/shm ] && [ "$(stat -c %d /dev/shm)" != "$(stat -c %d "$work")" ]; then
+        other=$(mktemp -d /dev/shm/residue-recovery.XXXXXX) || exit 2
+    fi
+    ;;
+esac
+if [ -z "$other" ]; then
+    echo "skip $name: no other filesystem a user may write to here"
+else
+    part_remove part-remove-files
+    if part_remove_ok "part of its files may be gone: " "$(grep -v '^\./node_modules/' <<<"$w_sum")"; then
+        # --to needs its parent to exist when residue reads it; the folder
+        # goes once the restore holds the record, so the move back would
+        # have to make it again.
+        mkdir -p "$other/a/b" || exit 2
+        echo hold-second-list >"$work/mode"
+        start ".r" restore --json --to "$other/a/b/w" "$wt"
+        pid_r=$pid
+        if ! await "$work/at-list"; then
+            finish "$pid_r"
+            fail "the restore never reached its second git worktree list (exit $status)"
+        else
+            : >"$work/mode"
+            rmdir "$other/a/b" || exit 2
+            touch "$work/go-list"
+            finish "$pid_r"
+            restored=$status
+            if [ "$restored" != 1 ]; then fail "restore --to on another filesystem exited $restored, want 1"
+            elif [ -e "$other/a/b" ]; then fail "the refused restore made folders on the other filesystem: $(find "$other/a" | sed "s#$other#OTHER#g" | tr '\n' ' ')"
+            elif ! grep -qF "$other/a is on another filesystem than " "$work/$name.err.r"; then fail "restore does not say the nearest folder of the destination is on another filesystem: $(cat "$work/$name.err.r")"
+            elif [ "$(record "$aside")" != registered ] || [ "$(records)" != "1 records, 2 refs" ]; then fail "the refused restore changed w or its record: $(record "$aside"), $(records)"
+            elif common_ok; then ok "restore refuses a --to on another filesystem before it makes any folder there"; fi
+        fi
+    fi
+fi
+case $other in
+/dev/shm/*) rm -rf -- "$other" ;;
+"$work/other") unmount_planted || echo "recovery-check: could not unmount the scratch volume at $other" >&2 ;;
+esac
+rm -f "$work/mounted-at" "$work/mounted-dev"
+
 # --- 6. A restore and a forget of the same removal record -------------------
 # w holds a commit only its HEAD reflog names, its removal record pins it,
 # and the record is past --keep-removed, so a sweep forgets it. Each run
@@ -2521,9 +2623,11 @@ elif common_ok; then ok "the whole traditional run answered, and logs/ keeps w";
 
 # Each line in backquotes in scan's text OUT that deletes Git's record of a
 # worktree, or makes a branch to keep commits first, one a line; status 0
-# when there is one. The note's own mention of `git gc` runs nothing.
+# when there is one. A line names its repository (`git -C MAIN ...`); the
+# note's own mentions of `git gc` and `git worktree prune`, which say when
+# Git drops a record, run nothing.
 deletes() { # OUT
-    grep -o '`[^`]*`' "$1" | grep -E 'worktree (remove|prune)|branch keep-|branch -[dD] |update-ref -d|git -C .* gc( |`)'
+    grep -o '`[^`]*`' "$1" | grep -E 'git -C .* worktree (remove|prune)|branch keep-|branch -[dD] |update-ref -d|git -C .* gc( |`)'
 }
 
 # --- 8. A worktree Git lists whose directory is gone -----------------------
@@ -2583,6 +2687,48 @@ elif deletes "$work/$name.out"; then fail "scan names a line that deletes Git's 
 elif [[ $note != *"its directory is gone; "*"worktree repair NEWPATH\` reconnects it"*"\`git gc\` drops Git's record of it"*"reflog show worktrees/w/HEAD\`"* ]]; then fail "scan does not give the repair first, then when git gc drops the record: $note"
 elif [ "$(record "$moved")" != registered ] || [ "$(git -C "$moved" rev-parse HEAD)" != "$lone" ]; then fail "after the repair, w is not back at its HEAD: $(record "$moved")"
 elif common_ok; then ok "scan gives no recovery and no line that deletes for a gone hidden worktree no record names, and the repair it names first brings w back"; fi
+
+# --- 8b2. What `git gc` does with a record, by Git's own rule -------------
+# Git drops the record of a worktree whose `.git` is gone at once when it
+# has no index, whatever gc.worktreePruneExpire says, and keeps the record
+# of one whose `gitdir` file names a `.git` that is there, however old its
+# index (`should_prune_worktree`). The note must say which, and Git must
+# then do what it says: `git gc` with the default expiry, and `git
+# worktree prune`, which drops every one that rule lets go at once.
+name=stale-no-index
+make_repo
+mv "$wt" "$work/$name-moved" || exit 2
+rm -f "$repo/.git/worktrees/w/index" || exit 2
+"$bin" scan "$repo" >"$work/$name.out" 2>&1
+scanned=$?
+note=$(grep -F 'worktree repair NEWPATH' "$work/$name.out")
+git -C "$repo" gc -q >"$work/$name.out-gc" 2>&1
+if [ "$scanned" != 0 ]; then fail "scan exited $scanned"
+elif deletes "$work/$name.out"; then fail "scan names a line that deletes Git's record of w: $(deletes "$work/$name.out")"
+elif [[ $note != *"worktree repair NEWPATH\` reconnects it"*"the next \`git gc\` or \`git worktree prune\` drops Git's record of it, with its HEAD and reflog, since Git finds no index for it, unless it is locked first; \`git -C "*" reflog show worktrees/w/HEAD\` lists the commits"* ]]; then fail "scan does not say that the next git gc drops the record of w, which has no index: $note"
+elif [ -d "$repo/.git/worktrees/w" ]; then fail "git gc kept the record of w, which the note says it drops"
+elif common_ok; then ok "scan says the next git gc drops the record of a gone worktree with no index, and git gc does"; fi
+
+name=leftover-dotgit-kept
+make_repo
+setup git -C "$wt" checkout -q --detach
+sleep 0 &
+dead=$!
+wait "$dead"
+aside=$repo/.worktrees/.w.residue-removing-$dead
+setup git -C "$repo" worktree move "$wt" "$aside"
+rm -f "$repo/.git/worktrees/w/HEAD" || exit 2
+touch -t 202001010000 "$repo/.git/worktrees/w/index" || exit 2
+"$bin" scan "$repo" >"$work/$name.out" 2>&1
+scanned=$?
+note=$(grep -F 'no removal record names it' "$work/$name.out")
+git -C "$repo" worktree prune >"$work/$name.out-prune" 2>&1
+git -C "$repo" gc -q >"$work/$name.out-gc" 2>&1
+if [ "$scanned" != 0 ]; then fail "scan exited $scanned"
+elif deletes "$work/$name.out"; then fail "scan names a line that deletes Git's record of w: $(deletes "$work/$name.out")"
+elif [[ $note != *"Git can no longer use it (Git reads no HEAD in its Git directory), and no removal record names it; Git keeps its record, with its HEAD, reflog and index, while "*"/.w.residue-removing-$dead/.git is there, which its \`gitdir\` file names; \`git -C "*" reflog show worktrees/w/HEAD\` lists the commits its HEAD reflog holds"* ]]; then fail "scan does not say that Git keeps the record while the .git its gitdir file names is there: $note"
+elif [ ! -d "$repo/.git/worktrees/w" ]; then fail "git worktree prune or git gc dropped the record of w, which the note says Git keeps"
+elif common_ok; then ok "scan says Git keeps the record of a hidden worktree whose .git is there, and git worktree prune and git gc keep it"; fi
 
 # Git's worktrees at a path that ends in one of SUFFIX...
 listed_at() { # SUFFIX...
@@ -2818,15 +2964,40 @@ nf() { # ARGS...: residue, where flock(2) fails
 record_of() { # NAME
     basename "$(find "$repo/.git/residue-removed" -mindepth 1 -maxdepth 1 -name "$1-*" | head -1)"
 }
+# Once: the interposer must take effect, or every case below would pass or
+# fail on a filesystem that does give flock(2).
+if [ -n "$noflock" ]; then
+    name=noflock-probe
+    make_repo
+    : >"$work/mode"
+    setup "$bin" remove --yes --json "$wt"
+    (cd "$repo" && nf restore "$(record_of w)") >"$work/$name.out" 2>&1
+    if ! grep -qF "gives no flock(2) lock" "$work/$name.out"; then
+        noflock=
+        noflock_skip="the flock(2) interposer did not take effect: a restore with it did not say the filesystem gives no flock(2) lock: $(head -c 300 "$work/$name.out")"
+    fi
+fi
+# The shells each printed line runs in: /bin/sh, and dash where it is
+# installed, which reads no $'...'.
+shells=(/bin/sh)
+dash=$(command -v dash 2>/dev/null)
+[ -n "$dash" ] && [ "$dash" != "$(readlink -f /bin/sh 2>/dev/null)" ] && shells+=("$dash")
+# The words SHELL splits LINE into, each in brackets, with stub test and git.
+words_in() { # SHELL LINE
+    "$1" -c 'test() { printf "[%s]" test "$@"; echo; return 0; }; git() { printf "[%s]" git "$@"; echo; return 0; }; '"$2"
+}
 
 # 9: records of worktrees Git no longer lists, then each restored there.
 # The restore can hold none of them, so it changes nothing and names the
-# `git worktree add` that recreates the worktree by hand, which, run as
-# given, must check out the recorded HEAD: d detached, its HEAD reflog
-# holding a commit only it reached; g's branch gone, with origin/g at
-# another commit, which Git would check out for `worktree add PATH g`; r's
-# branch rewritten; b's branch checked out elsewhere; k's branch as it was.
-# Once d is back, its restore must say so and name no recreate. The
+# `git worktree add` that recreates the worktree by hand, after a guard
+# that stops it while anything is at the path. Each line must split into
+# the same words in every shell, those naming the path byte for byte, and,
+# run as given, must check out the recorded HEAD: d detached, its HEAD
+# reflog holding a commit only it reached; g's branch gone, with origin/g
+# at another commit, which Git would check out for `worktree add PATH g`;
+# r's branch rewritten; b's branch checked out elsewhere; k's branch as it
+# was; t's too, at a path with a tab. Once each is back, its restore must
+# say so and name no recreate, also r and b on their BRANCH-restored. The
 # records keep d's reflog commit through `git gc --prune=now`.
 name=noflock-recreate
 if [ -z "$noflock" ]; then
@@ -2839,48 +3010,72 @@ else
     x_only=$(git -C "$repo/.worktrees/d" rev-parse HEAD) || exit 2
     setup git -C "$repo/.worktrees/d" reset -q --hard HEAD~1
     want_d=$base
-    for b in g r b k; do
-        setup git -C "$repo" worktree add -q -b "$b" "$repo/.worktrees/$b" "$base"
-        setup git -C "$repo/.worktrees/$b" commit -q --allow-empty -m "on-$b"
+    tab=$(printf 't\tx')
+    for b in g r b k t; do
+        p=$repo/.worktrees/$b
+        [ "$b" = t ] && p=$repo/.worktrees/$tab
+        setup git -C "$repo" worktree add -q -b "$b" "$p" "$base"
+        setup git -C "$p" commit -q --allow-empty -m "on-$b"
         eval "want_$b=\$(git -C \"\$repo\" rev-parse \"\$b\")" || exit 2
     done
     : >"$work/mode"
     for b in d g r b k; do
         setup "$bin" remove --yes --json "$repo/.worktrees/$b"
     done
+    setup "$bin" remove --yes --json "$repo/.worktrees/$tab"
     setup git -C "$repo" remote add origin "$repo"
     setup git -C "$repo" update-ref refs/remotes/origin/g "$base"
     setup git -C "$repo" branch -D g
     setup git -C "$repo" branch -f r "$base"
     setup git -C "$repo" worktree add -q "$work/$name-other" b
     wrong=
-    for b in d g r b k; do
-        rec=$(record_of "$b")
+    n=0
+    for b in d g r b k t; do
+        p=$repo/.worktrees/$b rec=$(record_of "$b")
+        [ "$b" = t ] && p=$repo/.worktrees/$tab rec=$(record_of t_x)
         (cd "$repo" && nf restore "$rec") >"$work/$name.out-$b" 2>&1
         st=$?
         line=$(sed -n 's/.*recreates the worktree by hand: \(.*\); the record still keeps .*/\1/p' "$work/$name.out-$b")
+        first=
+        for sh in "${shells[@]}"; do
+            words=$(words_in "$sh" "$line" 2>&1)
+            [ -n "$first" ] || first=$words
+            [ "$words" = "$first" ] || wrong+=" $b: $sh splits the line into other words: $words;"
+        done
+        case $first in
+        "[test][!][-e][$p]"*"[git][-C]["*"][worktree][add]"*"[$p]"*) ;;
+        *) wrong+=" $b: the line does not guard and name $p as one word: $first;" ;;
+        esac
+        # Each line runs for real in one shell, in turn.
+        sh=${shells[$((n % ${#shells[@]}))]}
+        n=$((n + 1))
         if [ "$st" != 1 ]; then wrong+=" $b: restore exited $st;"
         elif [ -z "$line" ]; then wrong+=" $b: no recreate line: $(head -c 400 "$work/$name.out-$b");"
-        elif ! bash -c "$line" >>"$work/$name.out-ran" 2>&1; then wrong+=" $b: the recreate failed: $line;"
+        elif LC_ALL=C grep -q '[[:cntrl:]]' <<<"$line"; then wrong+=" $b: the line holds a control character;"
+        elif ! "$sh" -c "$line" >>"$work/$name.out-ran" 2>&1; then wrong+=" $b: the recreate failed in $sh: $line;"
         else
             eval "want=\$want_$b"
-            got=$(git -C "$repo/.worktrees/$b" rev-parse HEAD 2>/dev/null)
+            got=$(git -C "$p" rev-parse HEAD 2>/dev/null)
             [ "$got" = "$want" ] || wrong+=" $b: HEAD $got, want $want: $line;"
         fi
         grep -qF "; the record still keeps the commits of its HEAD reflog" "$work/$name.out-$b" ||
             wrong+=" $b: the note does not say the record keeps the commits of its HEAD reflog;"
     done
-    (cd "$repo" && nf restore "$(record_of d)") >"$work/$name.out-again" 2>&1
-    again=$?
+    for b in d r b; do
+        (cd "$repo" && nf restore "$(record_of "$b")") >"$work/$name.out-again-$b" 2>&1
+        st=$?
+        if [ "$st" != 1 ]; then wrong+=" $b: the restore once it is back exited $st;"
+        elif ! grep -qF "Git lists its worktree at its original path again, and the record stays" "$work/$name.out-again-$b"; then wrong+=" $b: the restore once it is back does not say so: $(head -c 400 "$work/$name.out-again-$b");"
+        elif grep -qF "recreates the worktree by hand" "$work/$name.out-again-$b"; then wrong+=" $b: the restore once it is back names a recreate;"
+        fi
+    done
     setup git -C "$repo" gc -q --prune=now
     if [ -n "$wrong" ]; then fail "$wrong"
     elif [ "$(git -C "$repo" rev-parse r)" != "$base" ]; then fail "the recreate of r moved its rewritten branch"
-    elif [ "$again" != 1 ]; then fail "the restore of d once it is back exited $again"
-    elif ! grep -qF "Git lists its worktree at its original path again, and the record stays" "$work/$name.out-again"; then fail "the restore of d once it is back does not say so: $(head -c 400 "$work/$name.out-again")"
-    elif grep -qF "recreates the worktree by hand" "$work/$name.out-again"; then fail "the restore of d once it is back names a recreate"
+    elif [ "$(git -C "$repo" rev-parse -q --verify r-restored-2)" != "" ] || [ "$(git -C "$repo" rev-parse -q --verify b-restored-2)" != "" ]; then fail "a restore made a second BRANCH-restored"
     elif ! git -C "$repo" cat-file -e "$x_only^{commit}" 2>/dev/null; then fail "the commit only d's HEAD reflog held is gone"
-    elif [ "$(records)" != "5 records, 6 refs" ]; then fail "after the restores: $(records), want every record kept: 5 records, 6 refs"
-    elif common_ok; then ok "each recreate checks out the recorded HEAD, d's restore says it is back, and the records keep its reflog commit"; fi
+    elif [ "$(records)" != "6 records, 7 refs" ]; then fail "after the restores: $(records), want every record kept: 6 records, 7 refs"
+    elif common_ok; then ok "each recreate line splits alike in ${shells[*]}, checks out the recorded HEAD, and once back each restore says so"; fi
 fi
 
 # 9b: an expired removal record and an expired trash entry, which a sweep

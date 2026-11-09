@@ -1742,8 +1742,10 @@ impl Moved<'_> {
 
 /// After the move: Git lists the worktree at its new path, locked by
 /// residue, with the HEAD and branch of the plan; no process the probe can
-/// see is inside it; its fingerprint still matches the plan; and the walk
-/// finds no nested repository, mount point or unreadable entry there.
+/// see is inside it; its fingerprint still matches the plan; the walk
+/// finds no nested repository, mount point or unreadable entry there; and
+/// it has no operation in progress and no private ref, as the plan's
+/// `operation` and `private_refs` checks found.
 fn verify_moved(
     dest: &Path,
     before: &Report,
@@ -1792,6 +1794,24 @@ fn verify_moved(
     let now = planned.again(dest, listed.head.clone(), policy)?;
     if let Some(why) = planned.changed(&now, since) {
         return Err(why);
+    }
+    // After the measuring, which can take seconds: a bisect, or a private
+    // ref, started during the move or since is deleted with the worktree,
+    // and `git gc` then drops a commit only that ref kept.
+    let found = inspect::operations(&planned.git_dir)?;
+    if !found.is_empty() {
+        return Err(format!(
+            "{} in progress after residue moved it aside",
+            found.join(", ")
+        ));
+    }
+    let refs = inspect::private_refs(dest)
+        .map_err(|e| format!("cannot list its private refs after moving it aside: {e}"))?;
+    if !refs.is_empty() {
+        return Err(format!(
+            "it has worktree-private refs after residue moved it aside, which its deletion would delete: {}",
+            inspect::examples(&refs, 5)
+        ));
     }
     // Measuring again can take seconds on a large worktree, so read the
     // upstream once more, last, right before the deletion.

@@ -941,10 +941,14 @@ if [ -z "$partial_probe" ]; then
         elif common_ok; then ok; fi
     fi
 
-    if restore_case restore-branch-elsewhere 1 - git worktree add -q .worktrees/y w; then
-        if ! grep -q "branch w is checked out .*worktrees/y" "$err"; then fail "the refusal does not name .worktrees/y"
-        elif [ -e "$wt" ]; then fail "something was created at w's path"
-        elif [ "$(records)" != "1 records, 1 refs" ]; then fail "$(records) after the refusal, want 1 records, 1 refs"
+    # Branch w checked out in another worktree: restore leaves it and that
+    # worktree alone, and brings w back on w-restored at the recorded HEAD.
+    if restore_case restore-branch-elsewhere 0 new_branch git worktree add -q .worktrees/y w; then
+        recorded=$(jq -r .restore.head "$out")
+        if [ "$(jq -r .restore.new_branch "$out")" != w-restored ]; then fail "new_branch $(jq -r .restore.new_branch "$out"), want w-restored"
+        elif [ "$(git -C "$wt" symbolic-ref HEAD)" != refs/heads/w-restored ]; then fail "the restored worktree is not on w-restored"
+        elif [ "$(git -C "$repo" rev-parse w-restored)" != "$recorded" ]; then fail "w-restored is not at the recorded HEAD"
+        elif [ "$(git -C "$repo/.worktrees/y" symbolic-ref HEAD)" != refs/heads/w ]; then fail "the worktree that has branch w is no longer on it"
         elif common_ok; then ok; fi
     fi
 
