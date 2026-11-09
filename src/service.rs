@@ -39,22 +39,73 @@ const HOMEBREW: &[&str] = &["sh.brew.residue.plist", "homebrew.mxcl.residue.plis
 #[cfg(target_os = "linux")]
 const HOMEBREW: &[&str] = &["sh.brew.residue.service", "homebrew.residue.service"];
 
+/// What `residue service ARGS` does, decided from the arguments alone,
+/// before anything runs.
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    /// `install` with the rest of the arguments, which `watch` parses.
+    Install,
+    Uninstall,
+    Status,
+    /// Print `HELP`, exit 0.
+    Help,
+    /// No command: print `HELP` on stderr, exit 2.
+    Missing,
+    /// A usage error, exit 2: this line, then the pointer to `--help`.
+    Usage(String),
+}
+
+fn action(args: &[OsString]) -> Action {
+    let Some(first) = args.first() else {
+        return Action::Missing;
+    };
+    let command = match first.to_str() {
+        Some("install") => return Action::Install,
+        Some("-h" | "--help") => return Action::Help,
+        Some(command @ ("uninstall" | "status")) => command,
+        _ => {
+            return Action::Usage(format!(
+                "residue service: unknown command {}",
+                output::clean(&first.to_string_lossy())
+            ));
+        }
+    };
+    // `uninstall` and `status` take no arguments. One a person added, even
+    // `--help`, must never run them: `uninstall --help` would remove the
+    // service.
+    let rest = &args[1..];
+    if rest.iter().any(|a| a == "-h" || a == "--help") {
+        return Action::Help;
+    }
+    if let Some(extra) = rest.first() {
+        return Action::Usage(format!(
+            "residue service {command}: unexpected argument {}",
+            output::clean(&extra.to_string_lossy())
+        ));
+    }
+    if command == "uninstall" {
+        Action::Uninstall
+    } else {
+        Action::Status
+    }
+}
+
 pub fn main(args: &[OsString]) -> u8 {
-    match args.first().and_then(|a| a.to_str()) {
-        Some("install") => install(&args[1..]),
-        Some("uninstall") => platform::uninstall(),
-        Some("status") => platform::status(),
-        Some("-h" | "--help") => {
+    match action(args) {
+        Action::Install => install(&args[1..]),
+        Action::Uninstall => platform::uninstall(),
+        Action::Status => platform::status(),
+        Action::Help => {
             print!("{HELP}");
             0
         }
-        Some(other) => {
-            eprintln!("residue service: unknown command {}", output::clean(other));
-            eprintln!("Run `residue service --help` for usage.");
+        Action::Missing => {
+            eprint!("{HELP}");
             2
         }
-        None => {
-            eprint!("{HELP}");
+        Action::Usage(message) => {
+            eprintln!("{message}");
+            eprintln!("Run `residue service --help` for usage.");
             2
         }
     }
@@ -64,6 +115,7 @@ fn install(args: &[OsString]) -> u8 {
     let mut opts = match Options::parse(args) {
         Ok(Some(opts)) => opts,
         Ok(None) => {
+            println!("residue service install: takes the options of residue watch, below.\n");
             print!("{}", watch::HELP);
             return 0;
         }
@@ -76,6 +128,12 @@ fn install(args: &[OsString]) -> u8 {
     if opts.once {
         eprintln!("residue service install: --once makes no sense for a service");
         return 2;
+    }
+    // A service whose every pass would fail is no service: refuse it now,
+    // as every other command refuses to run.
+    if let Err(message) = crate::git::require_version() {
+        eprintln!("residue: {}", output::clean(&message));
+        return 1;
     }
     if let Some(file) = homebrew_service() {
         eprintln!(
@@ -135,6 +193,66 @@ fn install(args: &[OsString]) -> u8 {
         }
     }
     code
+}
+
+/// The lines `service install` prints under what it installed: what the
+/// service removes, with the values it was installed with, how to get a
+/// worktree back, and the command that previews a pass.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn removes(opts: &Options) -> Vec<String> {
+    let what = [
+        format!(
+            "a worktree whose upstream branch is gone, once unchanged for {};",
+            opts.grace.text
+        ),
+        format!(
+            "         below {}% free, worktrees unchanged for {}, largest first",
+            opts.min_free, opts.idle.text
+        ),
+    ];
+    let mut lines = Vec::new();
+    if opts.dry_run {
+        lines.push(format!(
+            "  logs:    what it would remove (--dry-run): {}",
+            what[0]
+        ));
+        lines.push(format!("  {}", what[1]));
+    } else {
+        lines.push(format!("  removes: {}", what[0]));
+        lines.push(format!("  {}", what[1]));
+        lines.push(format!(
+            "  deletes: without the trash; `residue restore` brings one back for {}",
+            opts.keep_removed.text
+        ));
+    }
+    lines.push(format!("  preview: {}", preview_command(opts)));
+    lines
+}
+
+/// `residue watch --once --dry-run`, with the ROOTs and the options that
+/// change what a pass would remove when they are not the defaults.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn preview_command(opts: &Options) -> String {
+    let mut words = vec!["residue watch --once --dry-run".to_string()];
+    let defaults = Options::parse(&[]).ok().flatten();
+    if let Some(d) = &defaults {
+        if opts.grace.text != d.grace.text {
+            words.push(format!("--grace {}", opts.grace.text));
+        }
+        if opts.idle.text != d.idle.text {
+            words.push(format!("--idle {}", opts.idle.text));
+        }
+        if opts.min_free != d.min_free {
+            words.push(format!("--min-free {}", opts.min_free));
+        }
+    }
+    if opts.fetch_every.is_none() {
+        words.push("--no-fetch".into());
+    }
+    if !opts.default_roots {
+        words.extend(opts.roots.iter().map(|r| output::home(&output::shell(r))));
+    }
+    words.join(" ")
 }
 
 /// The `--keep-removed` an installed service runs with: the default when
@@ -268,8 +386,8 @@ pub fn hint(common_dirs: &[&Path], scanned: &[PathBuf]) -> Option<String> {
             .iter()
             .all(|dir| roots.iter().any(|root| dir.starts_with(root)))
     });
-    let command = if covered {
-        "residue service install".to_string()
+    let roots = if covered {
+        String::new()
     } else {
         let paths: Vec<String> = scanned
             .iter()
@@ -279,9 +397,13 @@ pub fn hint(common_dirs: &[&Path], scanned: &[PathBuf]) -> Option<String> {
                 output::home(&shown)
             })
             .collect();
-        format!("residue service install {}", paths.join(" "))
+        format!(" {}", paths.join(" "))
     };
-    Some(format!("Automatic cleanup is off. Turn it on: {command}"))
+    // The preview first: it removes nothing, and shows what turning it on
+    // would remove now.
+    Some(format!(
+        "Automatic cleanup is off. Preview it: residue watch --once --dry-run{roots} · turn it on: residue service install{roots}"
+    ))
 }
 
 /// The path the service should start. When the `residue` on `PATH` is this
@@ -498,6 +620,9 @@ mod platform {
         println!("  runs:    {}", shown(exe, &args));
         println!("  plist:   {}", plist.display());
         println!("  log:     {}", log.display());
+        for line in super::removes(opts) {
+            println!("{line}");
+        }
         println!("  check:   residue service status");
         println!("  turn it off: residue service uninstall");
         0
@@ -695,6 +820,9 @@ mod platform {
         println!("  runs:    {}", shown(exe, &args));
         println!("  unit:    {}", unit.display());
         println!("  log:     journalctl --user -u {UNIT}");
+        for line in super::removes(opts) {
+            println!("{line}");
+        }
         println!("  check:   residue service status");
         println!("  turn it off: residue service uninstall");
         println!("User services stop when you log out. To keep it running, run once:");
@@ -814,5 +942,107 @@ fn tail(log: &Path) {
         for line in &lines[lines.len().saturating_sub(5)..] {
             println!("{line}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+
+    fn args(words: &[&str]) -> Vec<OsString> {
+        words.iter().map(OsString::from).collect()
+    }
+
+    /// `uninstall` and `status` run only when nothing follows them: help
+    /// anywhere prints help, and any other argument is a usage error.
+    #[test]
+    fn uninstall_and_status_take_no_arguments() {
+        for command in ["uninstall", "status"] {
+            for help in ["-h", "--help"] {
+                assert_eq!(action(&args(&[command, help])), Action::Help);
+                assert_eq!(action(&args(&[command, "extra", help])), Action::Help);
+            }
+            for extra in ["extra", "--dry-run", "~/src", "-", ""] {
+                assert_eq!(
+                    action(&args(&[command, extra])),
+                    Action::Usage(format!(
+                        "residue service {command}: unexpected argument {extra}"
+                    ))
+                );
+            }
+            assert_eq!(
+                action(&args(&[command, "a", "b"])),
+                Action::Usage(format!("residue service {command}: unexpected argument a"))
+            );
+        }
+        assert_eq!(action(&args(&["uninstall"])), Action::Uninstall);
+        assert_eq!(action(&args(&["status"])), Action::Status);
+    }
+
+    #[test]
+    fn other_commands() {
+        assert_eq!(action(&args(&[])), Action::Missing);
+        assert_eq!(action(&args(&["--help"])), Action::Help);
+        assert_eq!(action(&args(&["-h"])), Action::Help);
+        assert_eq!(action(&args(&["install", "--help"])), Action::Install);
+        assert_eq!(action(&args(&["install", "~/src"])), Action::Install);
+        assert_eq!(
+            action(&args(&["remove"])),
+            Action::Usage("residue service: unknown command remove".into())
+        );
+        let bad = std::ffi::OsStr::from_bytes(b"un\xffinstall").to_os_string();
+        assert!(matches!(action(&[bad]), Action::Usage(_)));
+        let bad = std::ffi::OsStr::from_bytes(b"x\xff").to_os_string();
+        assert!(matches!(
+            action(&[OsString::from("uninstall"), bad]),
+            Action::Usage(_)
+        ));
+    }
+
+    /// What `service install` says it removes names the values it was
+    /// installed with, and the preview runs a pass with them.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn removes_names_the_installed_values() {
+        let parse = |words: &[&str]| Options::parse(&args(words)).unwrap().unwrap();
+        let lines = removes(&parse(&[]));
+        assert_eq!(
+            lines,
+            [
+                "  removes: a worktree whose upstream branch is gone, once unchanged for 1h;",
+                "           below 10% free, worktrees unchanged for 2d, largest first",
+                "  deletes: without the trash; `residue restore` brings one back for 30d",
+                "  preview: residue watch --once --dry-run",
+            ]
+        );
+        let opts = parse(&[
+            "--grace",
+            "3h",
+            "--idle",
+            "1w",
+            "--min-free",
+            "15",
+            "--keep-removed",
+            "12w",
+            "--no-fetch",
+            "/",
+        ]);
+        let lines = removes(&opts).join("\n");
+        for want in [
+            "for 3h;",
+            "below 15% free",
+            "unchanged for 1w",
+            "back for 12w",
+        ] {
+            assert!(lines.contains(want), "{want} missing from {lines}");
+        }
+        assert_eq!(
+            preview_command(&opts),
+            "residue watch --once --dry-run --grace 3h --idle 1w --min-free 15 --no-fetch /"
+        );
+        let lines = removes(&parse(&["--dry-run"]));
+        assert!(lines[0].starts_with("  logs:    what it would remove (--dry-run):"));
+        assert!(!lines.iter().any(|l| l.contains("deletes:")));
     }
 }

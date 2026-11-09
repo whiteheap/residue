@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 
 use crate::git::{self, Entry};
 
-const MAX_DEPTH: usize = 4;
+/// How many levels below a PATH that is no repository the search looks.
+pub const MAX_DEPTH: usize = 4;
 const SKIP: &[&str] = &["node_modules", "target", "Library"];
 
 pub struct Repo {

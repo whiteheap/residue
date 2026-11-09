@@ -200,7 +200,7 @@ fn repository_of(wanted: &Path) -> Result<Option<PathBuf>, String> {
 }
 
 /// `dir` is the home folder, `/`, or a directory above the home folder.
-fn at_or_above_home(dir: &Path) -> bool {
+pub fn at_or_above_home(dir: &Path) -> bool {
     let Ok(dir) = git::canonical(dir) else {
         return false;
     };

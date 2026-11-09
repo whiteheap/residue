@@ -33,6 +33,16 @@ KEY_GPG_SHA256=1347e2c9b519414386f5997651a6bae055d0df86eb002b6e2b95ea946172e2cc
 RPM_KEY=/etc/pki/rpm-gpg/RPM-GPG-KEY-residue
 # The first release whose `residue service install` needs no folder (#28).
 SERVICE_NO_ROOT_SINCE=0.0.7
+# residue needs Git 2.36 or later: src/git.rs MIN_VERSION, and the packages'
+# dependency in packaging/nfpm.yaml.
+GIT_NEEDS=2.36
+# What the service it turns on removes: `residue watch`'s defaults, since it
+# runs `service install` with no options (src/watch.rs, src/cli.rs; site/check.sh
+# checks each). The same since 0.0.7, the first release it turns on.
+WATCH_GRACE=1h
+WATCH_MIN_FREE=10
+WATCH_IDLE=2d
+KEEP_REMOVED=30d
 
 usage() {
   cat <<'EOF'
@@ -116,7 +126,9 @@ parse_args() {
 }
 
 # Root, passwordless sudo, or sudo that may ask for a password on the
-# terminal. Sets $sudo; fails when none of them works.
+# terminal. Sets $sudo; fails when none of them works. $1, when given, runs
+# right before the password prompt: a check that needs no root, so a refusal
+# comes before the user types a password.
 can_root() {
   sudo=
   [ "$(id -u)" = 0 ] && return 0
@@ -125,6 +137,7 @@ can_root() {
   [ "$dry_run" = 1 ] && return 0
   sudo -n true 2>/dev/null && return 0
   has_tty || return 1
+  [ -z "${1:-}" ] || "$1"
   say "sudo asks for your password to add residue's package repository."
   sudo -v
 }
@@ -137,7 +150,7 @@ choose_channel() {
     Darwin) has brew && channel=brew ;;
     Linux)
       if has brew && brew list --formula whiteheap/tap/residue >/dev/null 2>&1; then channel=brew
-      elif has apt-get && can_root; then channel=apt
+      elif has apt-get && can_root apt_git_ok; then channel=apt
       elif has dnf && can_root; then channel=dnf
       elif has pacman && can_root; then channel=pacman
       fi ;;
@@ -153,7 +166,22 @@ install_brew() {
   undo="brew uninstall residue"
 }
 
+# The package depends on git (>= 1:2.36), so on a release whose apt offers an
+# older Git (Ubuntu 22.04 has 2.34) apt-get would stop after the repository
+# is added. Stop before anything under /etc instead, and before sudo asks
+# for a password (`can_root apt_git_ok`): it needs no root. With no package
+# lists yet there is no candidate to read, and apt-get decides.
+apt_git_ok() {
+  cand=$(apt-cache policy git 2>/dev/null | sed -n 's/^ *Candidate: *//p')
+  case $cand in '' | '(none)') return 0 ;; esac
+  dpkg --compare-versions "$cand" ge "1:$GIT_NEEDS" && return 0
+  say "install.sh: apt offers Git $cand here, and residue needs Git $GIT_NEEDS or later. Nothing was changed." >&2
+  say "Add a newer Git first; on Ubuntu 22.04: sudo add-apt-repository ppa:git-core/ppa, then run this again." >&2
+  exit 1
+}
+
 install_apt() {
+  apt_git_ok
   [ "$dry_run" = 1 ] || fetch_key "$PAGES/apt/residue-archive-keyring.gpg" "$tmp/residue.gpg" "$KEY_GPG_SHA256"
   say "deb [signed-by=/etc/apt/keyrings/residue.gpg] $PAGES/apt stable main" >"$tmp/residue.list"
   as_root install -d -m 0755 /etc/apt/keyrings
@@ -356,15 +384,39 @@ start_service() {
     service="on already, left as it is, with its own folders. To restart it on this version, run \`$bin service install\` with them"
     return 0
   fi
+  # The service would stop at every pass on an older Git. The apt, dnf and
+  # pacman packages depend on a new enough one, so a dry run through them has
+  # none to check yet; Homebrew's formula and the archive bring none.
+  if { [ "$dry_run" = 0 ] || [ "$channel" = brew ] || [ "$channel" = archive ]; } && ! git_ok; then
+    if [ -n "$git_v" ]; then git_found="git here is $git_v"
+    elif has git; then git_found="\`git --version\` does not say which Git this is"
+    else git_found="no git is on PATH"
+    fi
+    if [ "$dry_run" = 1 ]; then
+      service="would not be turned on: residue needs Git $GIT_NEEDS or later, and $git_found"
+      return 0
+    fi
+    service="NOT turned on: residue needs Git $GIT_NEEDS or later, and $git_found. Install a newer Git, then run: $turn_on"
+    failed=1
+    return 0
+  fi
   if [ "$dry_run" = 1 ]; then run "$bin" service install; service="would be turned on"; return 0; fi
   if [ "$turn_on" != "$bin service install" ]; then
     service="not turned on: residue $version needs the folder that holds your repositories. Run: $turn_on (your folder)"
   elif run "$bin" service install; then
     service="on: \`residue watch\` runs from login ($bin service status)"
+    turned_on=1
   else
-    service="NOT turned on: \`$bin service install\` failed above. Run it again with the folder that holds your repositories"
+    service="NOT turned on: \`$bin service install\` failed above; fix what it names, then run it again"
     failed=1
   fi
+}
+
+# Is `git --version` at least $GIT_NEEDS? Sets $git_v to its major.minor,
+# empty when there is no git or its version does not read.
+git_ok() {
+  git_v=$(git --version 2>/dev/null | sed -n 's/^git version \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p') || true
+  [ -n "$git_v" ] && at_least "$git_v.0" "$GIT_NEEDS.0"
 }
 
 summary() {
@@ -373,6 +425,12 @@ summary() {
   say "Installed:  $("$bin" --version) at $bin"
   say "Channel:    $channel. Updates: $updates"
   say "Cleanup:    $service"
+  if [ "$turned_on" = 1 ]; then
+    say "Removes:    a worktree whose upstream branch is gone, once unchanged $WATCH_GRACE;"
+    say "            below $WATCH_MIN_FREE% free, worktrees unchanged $WATCH_IDLE, largest first"
+    say "Deletes:    without the trash; \`residue restore\` brings one back for $KEEP_REMOVED"
+    say "Preview:    $bin watch --once --dry-run. Turn it off: $bin service uninstall"
+  fi
   say "Undo:       $bin service uninstall; then $undo"
   found=$(command -v residue 2>/dev/null || true)
   # Compare real directories: /usr/sbin may be a link to /usr/bin.
@@ -387,12 +445,26 @@ summary() {
   fi
 }
 
+# Stop before any channel on a machine residue has no build for: a package
+# manager would add residue's repository first and fail after.
+check_machine() {
+  case $(uname -s) in
+    MINGW* | MSYS* | CYGWIN*) die "residue does not run on Windows; run this inside WSL" ;;
+  esac
+  case $(uname -m) in
+    x86_64 | amd64 | arm64 | aarch64) ;;
+    *) die "no prebuilt residue for $(uname -m); to build it from source: https://github.com/$REPO/blob/main/docs/installation.md#from-source" ;;
+  esac
+}
+
 main() {
   parse_args "$@"
+  check_machine
+  has curl || die "curl is needed to download residue; install it, then run this again"
   tmp=$(mktemp -d 2>/dev/null || mktemp -d -t residue)
   trap 'rm -rf "$tmp"' EXIT
   trap 'exit 130' INT TERM
-  failed=0
+  failed=0 turned_on=0
   choose_channel
   say "Installing residue through: $channel"
   case $channel in

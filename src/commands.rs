@@ -9,7 +9,7 @@ use crate::cli::Options;
 use crate::discover::{self, Repo};
 use crate::fsinfo::{self, Space};
 use crate::git::{self, Entry};
-use crate::inspect::{self, Report, Verdict};
+use crate::inspect::{self, Kept, Report, Verdict};
 use crate::json::Json;
 use crate::output::{self, Places, Style, clean};
 use crate::policy::{GIT_CONFIG_KEY, Policy};
@@ -22,6 +22,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn fail(message: &str) -> u8 {
     eprintln!("residue: {}", clean(message));
+    1
+}
+
+/// `fail`, with a second line that says what to do.
+fn fail_with(message: &str, next: &str) -> u8 {
+    eprintln!("residue: {}", clean(message));
+    eprintln!("{}", clean(next));
     1
 }
 
@@ -75,20 +82,38 @@ pub fn scan(options: &Options) -> u8 {
         Ok(p) => p,
         Err(e) => return fail(&e),
     };
-    let roots = if options.paths.is_empty() {
-        vec![PathBuf::from(".")]
-    } else {
-        options.paths.clone()
+    let (roots, code_folders) = match scan_roots(&options.paths) {
+        Ok(found) => found,
+        Err(no_roots) => {
+            for line in no_roots.lines() {
+                eprintln!("{line}");
+            }
+            return 2;
+        }
     };
+    if code_folders {
+        eprintln!(
+            "residue: note: scanned only the usual code folders in your home folder ({}); for another folder, name it: residue scan PATH",
+            clean(&shown_roots(&roots))
+        );
+    }
     let found = discover::find(&roots);
     let snapshot = Snapshot::take();
-    let jobs: Vec<(&Entry, &Path)> = found
+    // What each repository keeps like a main checkout: one Git process for
+    // each bare repository, none for the others.
+    let kept: Vec<Kept> = found
         .repos
         .iter()
-        .flat_map(|repo| {
+        .map(|repo| Kept::of(&repo.main, &repo.common_dir))
+        .collect();
+    let jobs: Vec<inspect::Job> = found
+        .repos
+        .iter()
+        .zip(&kept)
+        .flat_map(|(repo, kept)| {
             repo.linked
                 .iter()
-                .map(move |e| (e, repo.common_dir.as_path()))
+                .map(move |e| (e, repo.common_dir.as_path(), kept))
         })
         .collect();
     let mut reports = inspect::all(&jobs, &snapshot, &policy).into_iter();
@@ -295,7 +320,15 @@ pub fn scan(options: &Options) -> u8 {
         }
     }
     if found.repos.is_empty() && errors.is_empty() {
-        out.push_str("\nno Git repositories found\n");
+        out.push_str(&format!(
+            "\nno Git repositories found {} or up to {} levels below\nname the folder that holds them: residue scan ~/path/to/repos\n",
+            if roots == [PathBuf::from(".")] {
+                "here".to_string()
+            } else {
+                format!("in {}", clean(&shown_roots(&roots)))
+            },
+            discover::MAX_DEPTH
+        ));
     }
     if !leftovers.is_empty() {
         out.push_str(&format!("\n{}\n", remove::LEFTOVER_TITLE));
@@ -387,6 +420,60 @@ pub fn scan(options: &Options) -> u8 {
     0
 }
 
+/// What `scan` searches: the PATHs given; with none, the current directory;
+/// or, at or above the home folder, the usual code folders in it that exist
+/// (`watch::default_roots`, `true`). Never the home folder itself: the walk
+/// would read Documents, Desktop and Downloads, and macOS asks for
+/// permission for each. `Err` when there is no folder to scan.
+fn scan_roots(paths: &[PathBuf]) -> Result<(Vec<PathBuf>, bool), NoRoots> {
+    if !paths.is_empty() {
+        return Ok((paths.to_vec(), false));
+    }
+    if !crate::restore::at_or_above_home(Path::new(".")) {
+        return Ok((vec![PathBuf::from(".")], false));
+    }
+    match crate::watch::default_roots() {
+        Ok(roots) if !roots.is_empty() => Ok((roots, true)),
+        Ok(_) => Err(NoRoots::NoCodeFolders),
+        // Its only error: HOME is unset, empty or `/`.
+        Err(_) => Err(NoRoots::NoHome),
+    }
+}
+
+/// Why `scan` with no PATH has no folder to scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoRoots {
+    /// HOME names no home folder, so there are no code folders in it.
+    NoHome,
+    /// None of `watch::DEFAULT_ROOTS` exists in the home folder.
+    NoCodeFolders,
+}
+
+impl NoRoots {
+    /// The lines `scan` prints on stderr before it exits 2. The advice is
+    /// given once, in scan's words.
+    fn lines(self) -> &'static [&'static str] {
+        match self {
+            NoRoots::NoHome => &[
+                "residue: no PATH given, and HOME names no home folder; name the folder that holds your repositories: residue scan PATH",
+            ],
+            NoRoots::NoCodeFolders => &[
+                "residue: none of the usual code folders exists in your home folder, and residue does not scan all of it",
+                "Name the folder that holds your repositories: residue scan ~/path/to/repos",
+            ],
+        }
+    }
+}
+
+/// The roots of a scan for a message: `~/src, ~/Work`.
+fn shown_roots(roots: &[PathBuf]) -> String {
+    roots
+        .iter()
+        .map(|r| output::home(&r.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// One repository of a scan: its judged worktrees, free space, trash,
 /// removal records and interrupted removals.
 struct Group<'a> {
@@ -453,12 +540,33 @@ pub fn explain(options: &Options) -> u8 {
         Ok(p) => p,
         Err(e) => return fail(&e),
     };
-    let target = match locate(&options.paths[0]) {
+    let path = &options.paths[0];
+    // What failed, then what to do: the two mistakes a person makes most.
+    if std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+        return fail_with(
+            &format!("{} does not exist", path.display()),
+            "Run `residue scan` in its repository: it lists its worktrees, a removed one as stale.",
+        );
+    }
+    let target = match locate(path) {
         Ok(t) => t,
+        Err(e) if e.contains("not a git repository") => {
+            return fail_with(
+                &format!("{} is not inside a Git repository", path.display()),
+                "Pass a linked worktree's path; `git worktree list` in its repository names them.",
+            );
+        }
         Err(e) => return fail(&e),
     };
     let snapshot = Snapshot::take();
-    let report = inspect::worktree(&target.entry, &target.repo.common_dir, &snapshot, &policy);
+    let kept = Kept::of(&target.repo.main, &target.repo.common_dir);
+    let report = inspect::worktree(
+        &target.entry,
+        &target.repo.common_dir,
+        &kept,
+        &snapshot,
+        &policy,
+    );
     if options.json {
         let doc = Json::Obj(vec![
             ("schema", Json::str(output::SCHEMA_EXPLAIN)),
@@ -670,4 +778,23 @@ pub fn explain_text(r: &Report, repo: &Repo, places: &Places, style: &Style) -> 
         );
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With no folder to scan, `scan` gives its advice once, in its own
+    /// words: PATH, never watch's ROOT.
+    #[test]
+    fn no_roots_advises_once_in_scan_terms() {
+        for reason in [NoRoots::NoHome, NoRoots::NoCodeFolders] {
+            let text = reason.lines().join("\n");
+            assert!(text.starts_with("residue: "), "{text}");
+            assert_eq!(text.matches("holds your repositories").count(), 1, "{text}");
+            assert_eq!(text.matches("residue scan ").count(), 1, "{text}");
+            assert!(!text.contains("ROOT"), "{text}");
+        }
+        assert_eq!(NoRoots::NoHome.lines().len(), 1);
+    }
 }

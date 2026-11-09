@@ -311,9 +311,48 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
+/// What a repository keeps the way it keeps its main checkout. A bare
+/// repository has no main checkout: every checkout is a linked worktree,
+/// and the one on the branch its HEAD names is the one a person works in,
+/// so residue keeps it (the `head` check). Read once per repository from
+/// Git's list of its worktrees, whose first entry is the main one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Kept {
+    /// A repository with a main checkout, a bare one whose HEAD is
+    /// detached. The trash purge passes it too: an entry in the trash is
+    /// purged as before.
+    Nothing,
+    /// A bare repository whose HEAD names this branch (`refs/heads/main`).
+    Branch(String),
+    /// A bare repository whose HEAD residue could not read: any branch may
+    /// be the kept one.
+    Unreadable(String),
+}
+
+impl Kept {
+    /// `main` is the first entry of Git's list for the repository whose
+    /// common directory is `common_dir`. Runs Git only for a bare one.
+    pub fn of(main: &Entry, common_dir: &Path) -> Kept {
+        if !main.bare {
+            return Kept::Nothing;
+        }
+        match git::head_branch(common_dir) {
+            Ok(Some(branch)) => Kept::Branch(branch),
+            Ok(None) => Kept::Nothing,
+            Err(e) => Kept::Unreadable(e),
+        }
+    }
+}
+
 /// Judge one linked worktree of the repository whose canonical common
-/// directory is `common_dir`.
-pub fn worktree(entry: &Entry, common_dir: &Path, snapshot: &Snapshot, policy: &Policy) -> Report {
+/// directory is `common_dir`, which keeps what `kept` names.
+pub fn worktree(
+    entry: &Entry,
+    common_dir: &Path,
+    kept: &Kept,
+    snapshot: &Snapshot,
+    policy: &Policy,
+) -> Report {
     let mut r = Report::new(entry);
     if let Some(reason) = &entry.prunable {
         r.stale_reason = Some(if reason.is_empty() {
@@ -394,7 +433,7 @@ pub fn worktree(entry: &Entry, common_dir: &Path, snapshot: &Snapshot, policy: &
     check_index_flags(&mut r, &canonical, hidden);
     check_operation(&mut r, &identity.git_dir);
     check_private_refs(&mut r, &canonical);
-    check_head(&mut r, entry, &canonical);
+    check_head(&mut r, entry, kept, &canonical);
     check_layout(&mut r, &canonical);
     check_size(&mut r, &canonical, usage);
     if let Some(idle) = &policy.idle {
@@ -926,7 +965,7 @@ fn check_private_refs(r: &mut Report, dir: &Path) {
     }
 }
 
-fn check_head(r: &mut Report, entry: &Entry, dir: &Path) {
+fn check_head(r: &mut Report, entry: &Entry, kept: &Kept, dir: &Path) {
     let Some(head) = entry.short_head() else {
         r.unknown(
             "head",
@@ -936,10 +975,26 @@ fn check_head(r: &mut Report, entry: &Entry, dir: &Path) {
         return;
     };
     if let Some(branch) = entry.short_branch() {
-        r.pass(
-            "head",
-            format!("on branch {branch}; removal keeps the branch and its commits"),
-        );
+        match kept {
+            Kept::Branch(main) if entry.branch.as_deref() == Some(main.as_str()) => r.block(
+                "head",
+                "the bare repository's HEAD branch",
+                format!(
+                    "on {branch}, the branch the bare repository's HEAD names; kept like a main checkout"
+                ),
+            ),
+            Kept::Unreadable(e) => r.unknown(
+                "head",
+                "bare HEAD unreadable",
+                format!(
+                    "cannot read which branch the bare repository's HEAD names, the one residue keeps like a main checkout: {e}"
+                ),
+            ),
+            Kept::Nothing | Kept::Branch(_) => r.pass(
+                "head",
+                format!("on branch {branch}; removal keeps the branch and its commits"),
+            ),
+        }
         return;
     }
     match git::git(
@@ -1176,9 +1231,13 @@ fn ref_absent(dir: &Path, full: &str, name: &str) -> Result<bool, String> {
     }
 }
 
+/// One worktree to judge: its entry, its repository's common directory, and
+/// what that repository keeps (`Kept::of`, read once per repository).
+pub type Job<'a> = (&'a Entry, &'a Path, &'a Kept);
+
 /// Judge many worktrees in parallel; results come back in job order.
 /// Measuring disk usage dominates, and it is independent per worktree.
-pub fn all(jobs: &[(&Entry, &Path)], snapshot: &Snapshot, policy: &Policy) -> Vec<Report> {
+pub fn all(jobs: &[Job], snapshot: &Snapshot, policy: &Policy) -> Vec<Report> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     let workers = std::thread::available_parallelism()
@@ -1194,11 +1253,11 @@ pub fn all(jobs: &[(&Entry, &Path)], snapshot: &Snapshot, policy: &Policy) -> Ve
             scope.spawn(move || {
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some((entry, common)) = jobs.get(i) else {
+                    let Some((entry, common, kept)) = jobs.get(i) else {
                         break;
                     };
                     // The receiver lives until every worker has finished.
-                    drop(tx.send((i, worktree(entry, common, snapshot, policy))));
+                    drop(tx.send((i, worktree(entry, common, kept, snapshot, policy))));
                 }
             });
         }

@@ -8,6 +8,7 @@ name: install
 # which must be an upgrade or a no-op. It installs the latest release, so it
 # also checks that release's packages, repositories and checksums. On FreeBSD,
 # --version of a release with no FreeBSD archive must stop with a plain error.
+# The refusals and windows jobs check the machines it must turn away.
 on:
   pull_request:
     paths:
@@ -189,3 +190,95 @@ jobs:
             grep -q 'residue v0.0.4 has no archive for x86_64-unknown-freebsd' /tmp/exact.log
             if grep -q 'curl: (22)' /tmp/exact.log; then exit 1; fi
             test "$("$HOME/.local/bin/residue" --version)" != "residue 0.0.4"
+
+  # Machines the script must turn away before it changes anything: no curl,
+  # a CPU with no build, Ubuntu 22.04's Git 2.34 on the apt path (before
+  # anything under /etc) and on the archive path (installed, cleanup not
+  # turned on, exit 1). As root in containers; the script is mounted read-only.
+  refusals:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: No curl, then a CPU with no build
+        run: |
+          docker run --rm -v "$PWD/site/public:/s:ro" ubuntu:24.04 sh -c '
+            set -eu
+            if command -v curl; then exit 1; fi
+            sh /s/install.sh --help > /dev/null
+            if sh /s/install.sh > /tmp/curl.log 2>&1; then exit 1; fi
+            cat /tmp/curl.log
+            grep -q "^install.sh: curl is needed to download residue" /tmp/curl.log
+            printf "#!/bin/sh\ncase \$1 in -m) echo armv7l ;; *) exec /usr/bin/uname \"\$@\" ;; esac\n" > /usr/local/bin/uname
+            chmod +x /usr/local/bin/uname
+            if sh /s/install.sh > /tmp/cpu.log 2>&1; then exit 1; fi
+            cat /tmp/cpu.log
+            grep -q "^install.sh: no prebuilt residue for armv7l; to build it from source:" /tmp/cpu.log
+            test ! -e /etc/apt/sources.list.d/residue.list
+          '
+      - name: Ubuntu 22.04, apt offers Git 2.34
+        run: |
+          docker run --rm -v "$PWD/site/public:/s:ro" ubuntu:22.04 sh -c '
+            set -eu
+            apt-get -q update > /dev/null
+            DEBIAN_FRONTEND=noninteractive apt-get -q install -y curl ca-certificates > /dev/null
+            if sh /s/install.sh > /tmp/apt.log 2>&1; then exit 1; fi
+            cat /tmp/apt.log
+            grep -q "^install.sh: apt offers Git 1:2.34" /tmp/apt.log
+            grep -q "sudo add-apt-repository ppa:git-core/ppa" /tmp/apt.log
+            test ! -e /etc/apt/sources.list.d/residue.list
+            test ! -e /etc/apt/keyrings/residue.gpg
+          '
+      # A user whose sudo asks for a password, on a terminal (-t): the Git
+      # refusal must come before the prompt. A prompt would wait for a
+      # password until timeout ends it with 124.
+      - name: Ubuntu 22.04, apt offers Git 2.34, no sudo prompt first
+        run: |
+          docker run --rm -t -v "$PWD/site/public:/s:ro" ubuntu:22.04 sh -c '
+            set -eu
+            apt-get -q update > /dev/null
+            DEBIAN_FRONTEND=noninteractive apt-get -q install -y curl ca-certificates sudo > /dev/null
+            useradd -m -G sudo tester
+            echo tester:not-typed | chpasswd
+            as_tester() { setpriv --reuid=tester --regid=tester --init-groups env HOME=/home/tester USER=tester "$@"; }
+            if as_tester sudo -n true 2> /dev/null; then exit 1; fi
+            as_tester sh -c "(exec < /dev/tty)"
+            set +e
+            timeout 60 setpriv --reuid=tester --regid=tester --init-groups env HOME=/home/tester USER=tester sh /s/install.sh < /dev/null > /tmp/user.log 2>&1
+            status=$?
+            set -e
+            cat /tmp/user.log
+            test "$status" = 1
+            grep -q "^install.sh: apt offers Git 1:2.34" /tmp/user.log
+            if grep -q "sudo asks for your password" /tmp/user.log; then exit 1; fi
+            test ! -e /etc/apt/sources.list.d/residue.list
+          '
+      - name: Ubuntu 22.04 with Git 2.34, the archive
+        run: |
+          docker run --rm -v "$PWD/site/public:/s:ro" ubuntu:22.04 sh -c '
+            set -eu
+            apt-get -q update > /dev/null
+            DEBIAN_FRONTEND=noninteractive apt-get -q install -y curl ca-certificates git > /dev/null
+            git --version
+            set +e
+            sh /s/install.sh --archive > /tmp/archive.log 2>&1
+            status=$?
+            set -e
+            cat /tmp/archive.log
+            test "$status" = 1
+            "$HOME/.local/bin/residue" --version
+            grep -q "^Cleanup:    NOT turned on: residue needs Git 2.36 or later, and git here is 2.34" /tmp/archive.log
+          '
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Git Bash is turned away, toward WSL
+        run: |
+          uname -s
+          if sh site/public/install.sh > win.log 2>&1; then exit 1; fi
+          cat win.log
+          grep -q '^install.sh: residue does not run on Windows; run this inside WSL' win.log

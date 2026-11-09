@@ -328,7 +328,9 @@ pub fn git_exit(dir: &Path, args: &[&str]) -> Result<Exit, String> {
     exec(dir, &args, QUERY_TIMEOUT)
 }
 
-pub fn require_version() -> Result<(), String> {
+/// The Git on PATH, `(major, minor)`, when it is `MIN_VERSION` or later;
+/// otherwise why not, one line.
+pub fn require_version() -> Result<(u32, u32), String> {
     let out = git(Path::new("."), &["--version"])?;
     let text = String::from_utf8_lossy(&out);
     let version = text
@@ -348,7 +350,7 @@ pub fn require_version() -> Result<(), String> {
             MIN_VERSION.0, MIN_VERSION.1
         ));
     }
-    Ok(())
+    Ok((major, minor))
 }
 
 fn path_from(bytes: &[u8]) -> PathBuf {
@@ -1331,6 +1333,26 @@ pub fn commit_of(dir: &Path, name: &str) -> Result<Option<String>, String> {
             "git rev-parse --verify {name} failed: {}",
             exit.stderr
         )),
+    }
+}
+
+/// The branch HEAD names in the repository at `dir` (`refs/heads/main`), or
+/// `None` when HEAD is detached: `symbolic-ref -q` exits 1 for that, and
+/// anything else is an error. It reads HEAD as Git does, so it works for a
+/// repository that keeps its refs in reftable too.
+pub fn head_branch(dir: &Path) -> Result<Option<String>, String> {
+    let exit = git_exit(dir, &["symbolic-ref", "-q", "HEAD"])?;
+    match exit.code {
+        Some(0) => {
+            let name = String::from_utf8_lossy(&exit.stdout).trim().to_string();
+            if name.is_empty() {
+                Err("git symbolic-ref HEAD printed nothing".into())
+            } else {
+                Ok(Some(name))
+            }
+        }
+        Some(1) => Ok(None),
+        _ => Err(format!("git symbolic-ref HEAD failed: {}", exit.stderr)),
     }
 }
 
