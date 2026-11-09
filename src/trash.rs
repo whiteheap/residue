@@ -7,7 +7,10 @@
 //! record follows it, and it is locked with [`LOCK`] so `git worktree
 //! prune` and other tools leave it alone. That keeps every way out a Git
 //! command: `residue restore` moves it back with `git worktree move`, and
-//! the purge deletes it with `git worktree remove` without `--force`.
+//! the purge deletes it with `git worktree remove` without `--force`. A
+//! purge and a restore each hold the entry's `info` while they act on it,
+//! and the purge's Git holds it while it deletes (`hold`), so a restore
+//! never moves the worktree back while a purge may still delete it.
 //!
 //! Why the common directory: it belongs to the repository, so the trash is
 //! found from any of its worktrees and goes away with it; no worktree's
@@ -24,6 +27,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::git::{self, Entry};
+use crate::hold::{self, Hold, Taken};
 use crate::json::Json;
 use crate::output;
 use crate::removed;
@@ -408,10 +412,39 @@ pub fn locked_by_residue(entry: &Entry) -> bool {
     entry.locked.as_deref() == Some(LOCK)
 }
 
+/// The `info` of the entry at `entry`, which a run holds while it purges
+/// or restores the entry (`hold`).
+pub fn info(entry: &Path) -> PathBuf {
+    entry.join(INFO)
+}
+
+/// Take the hold on an entry before a restore acts on it. Held, it means
+/// that no purge, no `git worktree remove` one started and no other
+/// restore is acting on the entry.
+pub fn take(item: &Item) -> Result<Hold, String> {
+    match hold::take(&info(&item.dir))? {
+        Taken::Held(hold) => Ok(hold),
+        Taken::Busy => Err(
+            "a residue run, or the `git worktree remove` it started, is purging or restoring this trash entry now; run this restore again once it ends".into(),
+        ),
+        Taken::Gone => Err(
+            "another residue run purged or restored this trash entry after this restore listed it, so residue changed nothing; `residue restore` lists what is left".into(),
+        ),
+    }
+}
+
 /// Put one entry's worktree back where it was, or at `to`, re-registered
-/// by `git worktree move`, and drop the entry. Returns the restored path,
-/// and a note when the record stays behind (the next purge clears it).
-pub fn restore(item: &Item, to: Option<&Path>) -> Result<(PathBuf, Option<String>), String> {
+/// by `git worktree move`, and drop the entry. The caller holds the entry
+/// (`take`) and passes every worktree Git lists for the repository, read
+/// since then (`listed`), so the lock it lifts is the one there now.
+/// Returns the restored path, and a note when the record stays behind (the
+/// next purge clears it).
+pub fn restore(
+    item: &Item,
+    to: Option<&Path>,
+    listed: &[Entry],
+    _held: &Hold,
+) -> Result<(PathBuf, Option<String>), String> {
     let record = item.record.as_ref().map_err(|e| e.clone())?;
     let worktree = item
         .worktree
@@ -423,7 +456,10 @@ pub fn restore(item: &Item, to: Option<&Path>) -> Result<(PathBuf, Option<String
             worktree.display()
         ));
     }
-    let Some(registered) = &item.registered else {
+    let registered = listed.iter().find(|e| {
+        e.path == *worktree || git::canonical(&e.path).ok().as_deref() == Some(worktree.as_path())
+    });
+    let Some(registered) = registered else {
         return Err(format!(
             "Git no longer lists {} as a worktree. If the repository moved, run `git worktree repair {}` in it, then restore again",
             worktree.display(),
@@ -484,27 +520,23 @@ pub fn restore(item: &Item, to: Option<&Path>) -> Result<(PathBuf, Option<String
 }
 
 /// Delete one entry's worktree with `git worktree remove` (no `--force`)
-/// and drop the entry. The caller has re-checked it. If Git refuses, the
-/// worktree is locked again and stays in the trash.
-pub fn purge(item: &Item) -> Result<(), String> {
-    if item.holds_only_record() {
-        return discard(&item.dir);
-    }
+/// and drop the entry. The caller holds the entry and has re-checked it
+/// since: `registered` is Git's entry for it from that check, so the lock
+/// lifted is the one there now. Git inherits `holds`, the entry's and its
+/// removal record's. If Git refuses, the worktree is locked again and
+/// stays in the trash.
+pub fn purge(item: &Item, registered: &Entry, holds: &[&Hold]) -> Result<(), String> {
     let worktree = item
         .worktree
         .as_ref()
         .ok_or("the entry names no worktree")?;
-    let registered = item
-        .registered
-        .as_ref()
-        .ok_or("Git no longer lists it as a worktree")?;
     let main = &item.command_dir;
     if locked_by_residue(registered) {
         git::unlock_worktree(main, worktree)?;
     } else if let Some(reason) = &registered.locked {
         return Err(format!("it is locked by someone else ({reason})"));
     }
-    if let Err(e) = git::remove_worktree(main, worktree) {
+    if let Err(e) = git::remove_worktree(main, worktree, holds) {
         if let Err(relock) = git::lock_worktree(main, worktree, LOCK) {
             return Err(format!("{e}; and could not lock it again: {relock}"));
         }

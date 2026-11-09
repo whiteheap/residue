@@ -4,16 +4,26 @@
 # rule holds in that setup without the mutant, so each line shows that the
 # guard keeps it.
 #
-# MUTANT               START  FAULTS    OFF     RULE
-NoVerify               orig   {}        {}      OnlyCheckedStateDeleted
-NoFingerprint          orig   {}        {}      OnlyCheckedStateDeleted
-PurgeNoRecheck         trash  {}        {}      OnlyCheckedStateDeleted
-NoRecord               orig   {}        {}      ReflogCommitsKept
-SettleAlwaysUndoes     orig   {}        {}      ReflogCommitsKept
-SettleAlwaysUndoes     orig   {}        {}      RecordDroppedOnlyWhenWhole
-MoveBackWhileRunning   orig   {}        {}      NotDeletedOnceBack
-MoveBackNoNote         orig   {"kill"}  {}      RestoreTellsTheTruth
-PutBackAlwaysUnlocks   orig   {}        {"rr"}  OnlyOwnLocksLifted
+# MUTANT                   START  FAULTS       OFF     RULE
+NoVerify                   orig   {}           {}      OnlyCheckedStateDeleted
+NoFingerprint              orig   {}           {}      OnlyCheckedStateDeleted
+PurgeNoRecheck             trash  {}           {}      OnlyCheckedStateDeleted
+NoRecord                   orig   {}           {}      ReflogCommitsKept
+SettleAlwaysUndoes         orig   {}           {}      ReflogCommitsKept
+SettleAlwaysUndoes         orig   {}           {}      RecordDroppedOnlyWhenWhole
+StandingIgnoresFiles       orig   {"timeout"}  {}      RecordDroppedOnlyWhenWhole
+StandingIgnoresFiles       trash  {"timeout"}  {}      RecordDroppedOnlyWhenWhole
+MoveBackNoNote             orig   {"kill"}     {}      RestoreTellsTheTruth
+PutBackAlwaysUnlocks       orig   {}           {"rr"}  OnlyOwnLocksLifted
+PurgeNoHold                trash  {}           {}      NotDeletedOnceBack
+TrashRestoreNoHold         trash  {}           {}      NotDeletedOnceBack
+RestoreNoHold              orig   {"orphan"}   {}      NotDeletedOnceBack
+GitNoHold                  orig   {"orphan"}   {}      NotDeletedOnceBack
+GitNoHold                  trash  {"orphan"}   {}      NotDeletedOnceBack
+TrashRestoreStale          trash  {}           {}      OnlyOwnLocksLifted
+RecordRestoreStale         orig   {}           {}      OnlyOwnLocksLifted
+TrashRestoreNoNote         trash  {"kill"}     {}      RestoreTellsTheTruth
+TrashForgetsWithoutCheck   trash  {"kill"}     {}      ReflogCommitsKept
 # The same guards in the unraced setups, so they too reach the deletion.
-NoVerify               orig   {"kill","orphan"}  {"rr"}  OnlyCheckedStateDeleted
-PurgeNoRecheck         trash  {"kill","orphan"}  {"tr"}  OnlyCheckedStateDeleted
+NoVerify                   orig   {"kill","orphan"}  {"rr"}  OnlyCheckedStateDeleted
+PurgeNoRecheck             trash  {"kill","orphan"}  {"tr"}  OnlyCheckedStateDeleted

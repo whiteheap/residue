@@ -2,56 +2,11 @@
 # breaks in a setup, with TLC's shortest path to it (the actions, after
 # the initial state). Every rule not listed holds. A line goes only when
 # the code it describes changed, with the reason in the same change.
-
-# Finding 1. `residue restore ENTRY` lands while a remove run purges that
-# trash entry. trash::restore trusts the listing's lock, so it moves the
-# worktree back after the purge unlocked it and while `git worktree remove`
-# runs; Git then deletes the worktree's Git directory by id, at its original
-# path, and restore_trash forgets the purge's removal record and its refs.
-# Replayed on the release binary, 2026-11-09 (SKILL.md, "Findings").
-Trash no-faults NotDeletedOnceBack: PRecheck PRecord PUnlock GFind TList TCheck TMove GExists GGitdir
-Trash no-faults ReflogCommitsKept: PRecheck PRecord PUnlock GFind TList TCheck TMove GExists GGitdir TDiscard TForget
-Trash no-faults RestoreTellsTheTruth: PRecheck PRecord PUnlock GFind TList TCheck TMove GExists GGitdir TDiscard TForget TReport
-Trash faults NotDeletedOnceBack: PRecheck PRecord PUnlock GFind TList TCheck TMove GExists GGitdir
-Trash faults ReflogCommitsKept: PRecheck PRecord PUnlock GFind TList TCheck TMove GExists GGitdir TDiscard TForget
-Trash faults RestoreTellsTheTruth: PRecheck PRecord PUnlock GFind TList TCheck TMove GExists GGitdir TDiscard TForget TReport
-
-# Finding 2. A restore unlocks by the lock its listing saw, and Git's
-# `worktree unlock` lifts any lock: one the user set after the listing goes
-# too (trash::restore `was_locked`, removed.rs move_back `ours`).
-Trash no-faults OnlyOwnLocksLifted: PRecheck PRecord TList PUnlock TCheck UserLocks TUnlock
-Trash faults OnlyOwnLocksLifted: PRecheck PRecord TList PUnlock TCheck UserLocks TUnlock
-Remove no-faults OnlyOwnLocksLifted: RRecheck RMove RLock RRecord SList SDest SCopies UserEdits RVerify PBCheck PBUnlock UserLocks PBMove PBStuck RSettle SMoveBack SUnlock
-Remove faults OnlyOwnLocksLifted: RRecheck RMove RLock RRecord RVerify SList RUnlock Kill SDest SCopies SMoveBack UserLocks SUnlock
-Remove orphan OnlyOwnLocksLifted: RRecheck RMove RLock RRecord RVerify SList RUnlock Orphan SDest SCopies SMoveBack UserLocks SUnlock
-
-# Finding 3. Git is killed part way through deleting the files (residue's
-# 30-minute REMOVE_TIMEOUT, or another kill of Git alone) while the .git
-# file survives: standing() counts the worktree whole, so the record is
-# dropped, and without --trash put_back says "it is back in place", with
-# files gone.
-Remove faults RecordDroppedOnlyWhenWhole: RRecheck RMove RLock RRecord RVerify RUnlock GFind GExists GStatus GTree GitTimeout RAfter PBCheck PBMove RSettle
-Remove faults RestoreTellsTheTruth: RRecheck RMove RLock RRecord RVerify RUnlock GFind GExists GStatus GTree GitTimeout RAfter PBCheck PBMove SList SDest SCopies SAfter SReport
-Trash faults RecordDroppedOnlyWhenWhole: PRecheck PRecord PUnlock GFind GExists GStatus GTree GitTimeout PAfter PRelock PSettle
-Remove after RecordDroppedOnlyWhenWhole: RRecheck RMove RLock RRecord RVerify RUnlock GFind GExists GStatus GTree GitTimeout RAfter PBCheck PBMove RSettle
-Trash after RecordDroppedOnlyWhenWhole: PRecheck PRecord PUnlock GFind GExists GStatus GTree GitTimeout PAfter PRelock PSettle
-
-# Finding 4. residue alone is stopped while its `git worktree remove` runs,
-# by a signal to its PID only: Git runs in residue's process group, and
-# residue sets no handler, so the Git child keeps deleting. move_back's guard
-# is the PID in the aside name (Leftover::running), which is residue's PID,
-# not Git's, so `residue restore RECORD` moves the worktree back, and Git
-# then deletes its Git directory by id. Replayed on the release binary,
-# 2026-11-09 (SKILL.md, "Findings"); the ReflogCommitsKept path needs Git to
-# be slower than restore's checks after the move, and live Git was faster.
-Remove orphan NotDeletedOnceBack: RRecheck RMove RLock RRecord RVerify RUnlock GFind Orphan SList SDest SCopies SMoveBack SMove GExists GGitdir
-Remove orphan ReflogCommitsKept: RRecheck RMove RLock RRecord RVerify RUnlock GFind Orphan SList SDest SCopies SMoveBack SMove GExists SAfter GGitdir
-Remove orphan RestoreTellsTheTruth: RRecheck RMove RLock RRecord RVerify RUnlock GFind Orphan SList SDest SCopies SMoveBack SMove GExists GGitdir SAfter SReport
-
-# Finding 5. A purge is stopped with its Git child part way through the
-# delete (Ctrl-C), leaving the entry unlocked and part of its files gone.
-# `residue restore ENTRY` after it: trash::restore moves it back, and
-# restore_trash forgets the purge's record and reports it back with no
-# note that part of it is gone, where removed.rs move_back always says so.
-# Replayed on the release binary, 2026-11-09 (SKILL.md, "Findings").
-Trash after RestoreTellsTheTruth: PRecheck PRecord PUnlock GFind GExists GStatus GTree Kill TList TCheck TMove TDiscard TForget TReport
+#
+# None break. The five findings of 2026-11-09 (SKILL.md, "Findings") had
+# their lines here until the change that fixed them (#135 to #139):
+# restores and purges take a hold on the trash entry or the removal
+# record before they act and read Git's list again under it, each `git
+# worktree remove` residue starts inherits its run's holds, standing()
+# compares the files with the plan's once Git ran, and a trash restore
+# settles the records of a purge that stopped partway, with a note.

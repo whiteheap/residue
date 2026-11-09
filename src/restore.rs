@@ -475,11 +475,25 @@ struct Done {
     notes: Vec<String>,
 }
 
+/// A trash restore's note when a purge of the entry stopped partway, as
+/// `removed.rs` `move_back` says it for a removal.
+const PURGE_STOPPED: &str = "if its purge had started deleting, part of it is gone: `git status` in it lists tracked files that are missing, and `git restore .` brings them back; ignored output comes back from the project's install";
+
+/// Hold the entry, read where it stands now, move it back, then settle the
+/// records of any purge of it that stopped partway.
 fn restore_trash(found: &Found, i: usize, to: Option<&Path>) -> Result<Done, String> {
     let item = &found.trash[i];
     let from = item.worktree.clone().unwrap_or_default();
-    let (path, note) = trash::restore(item, to)?;
+    let held = trash::take(item)?;
+    let listed = git::worktrees(&item.command_dir)?;
+    // A purge writes its record before it deletes, so without one nothing
+    // of the worktree is gone.
+    let stopped = removed::stopped_purges(&item.common_dir, &item.command_dir, &from, &listed)?;
+    let (path, note) = trash::restore(item, to, &listed, &held)?;
     let mut notes: Vec<String> = note.into_iter().collect();
+    if !stopped.is_empty() {
+        notes.push(PURGE_STOPPED.into());
+    }
     match git::identity(&path) {
         Ok(id) => {
             if let Err(e) = removed::mark(&id.git_dir, &format!("trash entry {}", item.name)) {
@@ -492,18 +506,13 @@ fn restore_trash(found: &Found, i: usize, to: Option<&Path>) -> Result<Done, Str
             "could not find its Git directory to mark it as restored ({e}); `residue watch` may remove it once its upstream is gone: lock it with `git worktree lock` to keep it"
         )),
     }
-    // A purge of this entry that was interrupted left a removal record for
-    // the worktree that is now back; it has nothing left to restore.
-    for r in &found.removed {
-        if r.interrupted() && r.record.as_ref().is_ok_and(|rec| rec.aside == from) {
-            if let Err(e) = removed::forget(r) {
-                notes.push(format!(
-                    "could not drop the removal record {} of its interrupted purge ({e})",
-                    r.name
-                ));
-            }
-        }
+    // Its record goes once the worktree holds what it keeps, the HEAD
+    // reflog and config.worktree the stopped Git may have deleted among
+    // them.
+    for (r, _held) in &stopped {
+        notes.extend(removed::after_trash_restore(r, &path));
     }
+    drop(held);
     let record = item.record.as_ref().ok();
     Ok(Done {
         path,
@@ -517,8 +526,7 @@ fn restore_trash(found: &Found, i: usize, to: Option<&Path>) -> Result<Done, Str
 
 fn restore_removed(found: &Found, i: usize, to: Option<&Path>) -> Result<Done, String> {
     let item = &found.removed[i];
-    let listed = git::worktrees(&item.command_dir)?;
-    let restored = removed::restore(item, to, &listed)?;
+    let restored = removed::restore(item, to)?;
     let record = item.record.as_ref().ok();
     let gone = record.map_or_else(Vec::new, |r| r.gone.clone());
     let not_kept = match restored.how {

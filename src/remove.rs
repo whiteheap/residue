@@ -31,7 +31,8 @@ use crate::cli::{Options, Span};
 use crate::commands::{self, Target, VERSION, fail, locate};
 use crate::discover::{self, Repo};
 use crate::git::{self, Entry};
-use crate::inspect::{self, Report, Verdict};
+use crate::hold::{self, Taken};
+use crate::inspect::{self, Fingerprint, Report, Verdict};
 use crate::json::Json;
 use crate::output::{self, Places, Style, clean};
 use crate::policy::Policy;
@@ -105,11 +106,16 @@ pub struct Leftover {
     /// The removal record that names it, which `residue restore` takes
     /// (`with_record`).
     pub record: Option<PathBuf>,
+    /// A run, or the `git worktree remove` it started, holds that record
+    /// now: the removal may still be deleting it, or a restore moving it
+    /// back. `Err` when residue could not tell; `Ok(false)` with no record.
+    pub removal_running: Result<bool, String>,
     /// The one line that recovers it: moves it back, clears Git's record
     /// when the directory is gone, or, when Git can no longer use it, the
     /// `residue restore` of its record, which says what to clear first.
-    /// Empty when Git can no longer use it and no record names it: no one
-    /// command brings it back. Never a deletion.
+    /// Empty when Git can no longer use it and no record names it, since no
+    /// one command brings it back, and while its removal runs, since any
+    /// move then lets Git delete it where it lands. Never a deletion.
     pub recovery: String,
 }
 
@@ -140,21 +146,35 @@ impl Leftover {
             present,
             unusable,
             record: None,
+            removal_running: Ok(false),
             recovery,
         })
     }
 
     /// The removal record that names it, if one does. When Git can no
     /// longer use it, the record's restore is the only line that works.
+    /// While a run holds the record, no line is safe.
     pub fn with_record(mut self, dir: Option<PathBuf>) -> Leftover {
-        if let (Some(dir), Some(_)) = (&dir, &self.unusable) {
-            self.recovery = format!("residue restore {}", output::shell(dir));
+        if let Some(dir) = &dir {
+            self.removal_running = removed::held(dir);
+            if self.removal_running == Ok(true) {
+                self.recovery = String::new();
+            } else if self.unusable.is_some() {
+                self.recovery = format!("residue restore {}", output::shell(dir));
+            }
         }
         self.record = dir;
         self
     }
 
     pub fn text(&self, places: &Places, style: &Style) -> String {
+        if self.removal_running == Ok(true) {
+            return format!(
+                "  {}  {}\n    a residue run, or the `git worktree remove` it started, still holds its removal record, so it may still be deleting it; run residue scan again once it ends\n",
+                places.show(&self.path),
+                style.dim(&format!("was {}", places.show(&self.original))),
+            );
+        }
         let line = match (&self.unusable, &self.record) {
             (Some(why), Some(_)) => format!(
                 "Git can no longer use it ({why}); restore says what to clear, then recreates it: {}",
@@ -177,6 +197,12 @@ impl Leftover {
         } else {
             line
         };
+        let line = match &self.removal_running {
+            Err(e) => format!(
+                "residue could not tell whether its removal still runs ({e}); if none does, {line}"
+            ),
+            Ok(_) => line,
+        };
         let mut out = format!(
             "  {}  {}\n    {}\n",
             places.show(&self.path),
@@ -197,6 +223,13 @@ impl Leftover {
             ("original_path", Json::path(&self.original)),
             ("pid", Json::UInt(u64::from(self.pid))),
             ("pid_running", Json::Bool(self.running)),
+            (
+                "removal_running",
+                match &self.removal_running {
+                    Ok(running) => Json::Bool(*running),
+                    Err(_) => Json::Null,
+                },
+            ),
             ("present", Json::Bool(self.present)),
             ("recovery", Json::str(self.recovery.clone())),
             ("unusable", Json::opt(self.unusable.clone(), Json::Str)),
@@ -1061,6 +1094,15 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
     };
     let since = mode.since;
     let original = target.canonical.as_path();
+    // `recheck` skips it too without one.
+    let planned = match &before.fingerprint {
+        Ok(planned) => planned,
+        Err(e) => {
+            return Outcome::Skipped(format!(
+                "residue could not record what the plan showed: {e}"
+            ));
+        }
+    };
     let listed = match recheck(
         original,
         &target.repo.common_dir,
@@ -1188,31 +1230,49 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
             );
         }
     };
+    // Git deleted nothing yet, so only the checkout and the Git directory
+    // count: a check that failed on an edit of the user's puts it back.
     if let Err(why) = check() {
         let outcome = moved.put_back(true, &why);
-        return settle(&written, &main, &[original, &dest], None, outcome);
+        return settle(&written, &main, &[original, &dest], None, None, outcome);
     }
     if let Err(e) = git::unlock_worktree(&main, &dest) {
         let outcome = moved.put_back(true, &format!("could not unlock it: {e}"));
-        return settle(&written, &main, &[original, &dest], None, outcome);
+        return settle(&written, &main, &[original, &dest], None, None, outcome);
     }
-    match git::remove_worktree(&main, &dest) {
-        Ok(()) => Outcome::Removed(Some(written.dir)),
-        // A failure can come after Git deleted part of it: its files, its
-        // HEAD, its reflog. Then it stays where it is, since Git may not
-        // move it, and the record is how it comes back: `residue restore`
-        // moves it back and puts back what its Git directory lost.
-        Err(e) if matches!(standing(&written, &main, &[&dest]), Standing::Lacking(..)) => {
-            settle(&written, &main, &[&dest], None, Outcome::Failed(e))
-        }
-        Err(e) => {
-            let outcome = match moved.put_back(false, &e) {
-                Outcome::Skipped(why) => Outcome::Failed(why),
-                other => other,
-            };
-            settle(&written, &main, &[original, &dest], None, outcome)
-        }
+    // Git inherits the record's hold, so a restore waits for it even if
+    // this process is killed alone.
+    let Err(e) = git::remove_worktree(&main, &dest, &[written.hold()]) else {
+        return Outcome::Removed(Some(written.dir));
+    };
+    // A failure can come after Git deleted part of it: its files, its
+    // HEAD, its reflog. Then it stays where it is, since Git may not move
+    // it, and the record is how it comes back: `residue restore` moves it
+    // back and puts back what its Git directory lost. Its files count too:
+    // Git may have been stopped partway through them.
+    let files = Files {
+        planned,
+        policy,
+        since,
+    };
+    let at_dest = standing(&written, &main, &[&dest], Some(&files));
+    if let Standing::Lacking(..) = at_dest {
+        return settle(
+            &written,
+            &main,
+            &[&dest],
+            Some(&files),
+            None,
+            Outcome::Failed(e),
+        );
     }
+    let outcome = match moved.put_back(false, &e) {
+        Outcome::Skipped(why) => Outcome::Failed(why),
+        other => other,
+    };
+    // Measured whole just now, and the move back changes no file.
+    let measure = (!matches!(at_dest, Standing::Whole)).then_some(&files);
+    settle(&written, &main, &[original, &dest], measure, None, outcome)
 }
 
 /// What the removal record keeps of a worktree about to be deleted at
@@ -1273,9 +1333,9 @@ fn checkout_present(path: &Path) -> bool {
 /// What is left of a worktree whose deletion did not complete, as far as
 /// its removal record is concerned.
 enum Standing<'a> {
-    /// Git lists it at this path, with its checkout and everything the
-    /// record keeps: nothing of it is gone.
-    Whole(&'a Path),
+    /// Git lists it at one of the paths, with its checkout and everything
+    /// the record keeps: nothing of it is gone.
+    Whole,
     /// Git lists it at this path, but this part of it is gone.
     Lacking(&'a Path, String),
     /// Git no longer lists it at any of the paths.
@@ -1284,10 +1344,22 @@ enum Standing<'a> {
     Unknown(String),
 }
 
+/// The plan's measure of a worktree's files, to compare once `git
+/// worktree remove` has run: Git deletes the files before its own
+/// directory, so a Git stopped partway (residue's `REMOVE_TIMEOUT`, or a
+/// kill of Git alone) leaves part of them gone and the rest intact.
+struct Files<'a> {
+    planned: &'a Fingerprint,
+    policy: &'a Policy,
+    since: &'a str,
+}
+
 /// Where Git lists the worktree among `paths`, and whether all the record
 /// keeps is still there: its checkout (the `.git` file that ties it to its
 /// Git directory), a Git directory Git can use, and in it what
-/// `Written::lacks` checks.
+/// `Written::lacks` checks. With `files`, once Git ran, every file the
+/// plan measured counts too: any difference from the plan, or a measure
+/// that fails, is `Lacking`.
 /// Git deletes the checkout, then its own directory for the worktree, each
 /// in the order the filesystem lists the files and stopping at the first
 /// it cannot delete, so it can list a worktree part of which is gone.
@@ -1298,7 +1370,12 @@ enum Standing<'a> {
 /// worktree's HEAD never stands in for this one's. A listed path whose
 /// Git directory residue cannot read may be this worktree, part of which
 /// is gone: it is the answer unless another path is this worktree.
-fn standing<'a>(written: &removed::Written, main: &Path, paths: &[&'a Path]) -> Standing<'a> {
+fn standing<'a>(
+    written: &removed::Written,
+    main: &Path,
+    paths: &[&'a Path],
+    files: Option<&Files>,
+) -> Standing<'a> {
     let list = match git::worktrees(main) {
         Ok(list) => list,
         Err(e) => return Standing::Unknown(e),
@@ -1330,52 +1407,51 @@ fn standing<'a>(written: &removed::Written, main: &Path, paths: &[&'a Path]) -> 
         if !written.is_its_git_dir(&id.git_dir) {
             continue;
         }
-        return match written.lacks(entry.head.as_deref()) {
-            None => Standing::Whole(at),
-            Some(why) => Standing::Lacking(at, why),
+        if let Some(why) = written.lacks(entry.head.as_deref()) {
+            return Standing::Lacking(at, why);
+        }
+        let Some(files) = files else {
+            return Standing::Whole;
+        };
+        return match files.planned.again(at, entry.head.clone(), files.policy) {
+            Ok(now) => match files.planned.changed(&now, files.since) {
+                None => Standing::Whole,
+                Some(why) => Standing::Lacking(at, format!("part of its files may be gone: {why}")),
+            },
+            Err(e) => Standing::Lacking(
+                at,
+                format!("residue could not measure its files to tell whether any are gone ({e})"),
+            ),
         };
     }
     unsure.unwrap_or(Standing::Unlisted)
 }
 
 /// After a deletion that did not complete: when nothing of the worktree
-/// is gone (`standing`), its removal record is dropped. Otherwise the
-/// record stays, and the outcome says so: it is how the worktree comes
-/// back. `back` is where another run may have put it back meanwhile (a
-/// trash restore during a purge); Git listing it whole there makes the
-/// outcome a skip that says so.
+/// is gone (`standing`, with `files` once Git ran), its removal record is
+/// dropped. Otherwise the record stays, and the outcome says so: it is how
+/// the worktree comes back. `entry` is the trash entry a purge's worktree
+/// is still in, whose restore brings it back while Git lists it there.
+/// The run holds the record, and a purge the entry, so no restore moved
+/// the worktree meanwhile.
 fn settle(
     written: &removed::Written,
     main: &Path,
     paths: &[&Path],
-    back: Option<&Path>,
+    files: Option<&Files>,
+    entry: Option<&Path>,
     outcome: Outcome,
 ) -> Outcome {
     let restore = output::shell(&written.dir);
-    let mut search = paths.to_vec();
-    search.extend(back);
-    let note = match standing(written, main, &search) {
-        Standing::Whole(at) if Some(at) == back => {
-            let why = match &outcome {
-                Outcome::Skipped(why) | Outcome::Failed(why) => why.as_str(),
-                _ => "",
-            };
-            let kept = match written.undo() {
-                Ok(()) => String::new(),
-                Err(e) => format!("; its removal record stays ({e})"),
-            };
-            return Outcome::Skipped(format!(
-                "another run put it back at {} while this one ran, and nothing of it is gone ({why}){kept}",
-                at.display()
-            ));
-        }
-        Standing::Whole(_) => match written.undo() {
+    let note = match standing(written, main, paths, files) {
+        Standing::Whole => match written.undo() {
             Ok(()) => return outcome,
             Err(e) => format!("its removal record stays ({e})"),
         },
         Standing::Lacking(at, why) => format!(
-            "Git still lists it at {}, but {why}; its removal record keeps its HEAD and reflog: residue restore {restore}",
-            at.display()
+            "Git still lists it at {}, but {why}; its removal record keeps its HEAD and reflog: residue restore {}",
+            at.display(),
+            entry.map_or(restore, output::shell)
         ),
         Standing::Unlisted => format!(
             "Git no longer lists it, so part of it may be gone; its removal record keeps its HEAD and reflog: residue restore {restore}"
@@ -1515,18 +1591,44 @@ fn verify_moved(
     Ok(())
 }
 
-/// Re-check one expired trash entry, then delete it with `git worktree
-/// remove`.
+/// Hold one expired trash entry, re-check it, then delete it with `git
+/// worktree remove`. The hold comes first, so no restore moves the
+/// worktree between the check and the deletion, nor while Git deletes.
 fn purge(p: &Purge, policy: &Policy, mode: &Mode) -> Outcome {
+    // One that holds only its record has no worktree to delete or restore,
+    // and may have no `info` to hold; the hour since it was made keeps it
+    // from being a run's still moving a worktree in (`trash::Item`).
     if p.item.holds_only_record() {
-        return match trash::purge(&p.item) {
+        return match trash::discard(&p.item.dir) {
             Ok(()) => Outcome::Removed(None),
             Err(e) => Outcome::Failed(e),
         };
     }
+    let held = match hold::take(&trash::info(&p.item.dir)) {
+        Ok(Taken::Held(held)) => held,
+        Ok(Taken::Busy) => {
+            return Outcome::Skipped(
+                "a residue run, or the `git worktree remove` it started, is purging or restoring it now".into(),
+            );
+        }
+        Ok(Taken::Gone) => {
+            return Outcome::Skipped(
+                "another residue run purged or restored it since the plan".into(),
+            );
+        }
+        Err(e) => return Outcome::Failed(e),
+    };
     let (Some(worktree), Some(before), Ok(trashed)) = (&p.item.worktree, &p.report, &p.item.record)
     else {
         return Outcome::Failed("internal: no report".into());
+    };
+    let planned = match &before.fingerprint {
+        Ok(planned) => planned,
+        Err(e) => {
+            return Outcome::Skipped(format!(
+                "residue could not record what the plan showed: {e}"
+            ));
+        }
     };
     let path = git::canonical(worktree).unwrap_or_else(|_| worktree.clone());
     let listed = match recheck(
@@ -1551,12 +1653,12 @@ fn purge(p: &Purge, policy: &Policy, mode: &Mode) -> Outcome {
         mode.by,
         &mode.keep_removed,
     );
-    let git_dir = before
-        .fingerprint
-        .as_ref()
-        .ok()
-        .map(|f| f.git_dir.as_path());
-    let written = match removed::create(&p.item.common_dir, &p.item.command_dir, &record, git_dir) {
+    let written = match removed::create(
+        &p.item.common_dir,
+        &p.item.command_dir,
+        &record,
+        Some(planned.git_dir.as_path()),
+    ) {
         Ok(w) => w,
         Err(e) => {
             return Outcome::Failed(format!(
@@ -1564,13 +1666,21 @@ fn purge(p: &Purge, policy: &Policy, mode: &Mode) -> Outcome {
             ));
         }
     };
-    match trash::purge(&p.item) {
+    // The lock lifted is the one the re-check read, under the hold.
+    match trash::purge(&p.item, &listed, &[&held, written.hold()]) {
         Ok(()) => Outcome::Removed(Some(written.dir)),
+        // Its files count whether or not Git ran: the re-check found them
+        // as the plan did a moment ago, so a difference keeps the record.
         Err(e) => settle(
             &written,
             &p.item.command_dir,
             &[&path],
-            Some(&trashed.original),
+            Some(&Files {
+                planned,
+                policy,
+                since: mode.since,
+            }),
+            Some(&p.item.dir),
             Outcome::Failed(e),
         ),
     }

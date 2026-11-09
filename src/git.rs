@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use crate::hold::{self, Hold};
 use crate::policy::RuleSource;
 use crate::run::{self, RunError};
 
@@ -945,13 +946,22 @@ fn config_values(exit: Exit, what: &str) -> Result<Vec<Vec<u8>>, String> {
         .collect())
 }
 
-pub fn remove_worktree(main: &Path, worktree: &Path) -> Result<(), String> {
+/// `git worktree remove` without `--force`. Git inherits `holds`, the
+/// entries that name the worktree, and keeps them held while it deletes,
+/// also after residue has exited (`hold::pass_to`). fsmonitor and hooks are
+/// off, so no process Git starts outlives it holding them.
+pub fn remove_worktree(main: &Path, worktree: &Path, holds: &[&Hold]) -> Result<(), String> {
     let args = [
         OsStr::new("worktree"),
         OsStr::new("remove"),
         worktree.as_os_str(),
     ];
-    let exit = exec(main, &args, REMOVE_TIMEOUT)?;
+    let build = |program: &OsStr| {
+        let mut cmd = command(program, main);
+        hold::pass_to(&mut cmd, holds);
+        cmd
+    };
+    let exit = exec_command(&build, &args, REMOVE_TIMEOUT)?;
     if exit.success {
         Ok(())
     } else {

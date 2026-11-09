@@ -26,7 +26,8 @@
 #   hold-remove    stop at `worktree remove ASIDE`, before it runs: only a
 #                  removal that passed the check after the move gets there
 #                  (a refused one moves back instead); the test kills
-#                  residue there (scenario 1)
+#                  residue there (scenario 1), or residue alone while this
+#                  command, as Git, keeps the hold it inherited (1b)
 #   touch-aside    create a file in ASIDE before the check after the move
 #                  runs `status` there, so that check fails (scenarios 2, 3)
 #   plant-nested, plant-mount, plant-unreadable
@@ -41,12 +42,14 @@
 #                  so both have passed every check; the test releases one,
 #                  waits for it to finish, then releases the other (4, and
 #                  4b with --trash, where each made a trash entry first)
-#   part-remove-reflog, part-remove-head, part-remove-dotgit
+#   part-remove-reflog, part-remove-head, part-remove-dotgit,
+#   part-remove-files
 #                  fail `worktree remove ASIDE` after deleting the
 #                  worktree's HEAD reflog, or its HEAD, from its Git
-#                  directory, or the `.git` file from its checkout: what
-#                  Git's own remove leaves when it stops at a file it
-#                  cannot delete, or is killed during the delete (5, 5b, 5c)
+#                  directory, the `.git` file from its checkout, or one of
+#                  its ignored files: what Git's own remove leaves when it
+#                  stops at a file it cannot delete, or is killed during
+#                  the delete (5, 5b, 5c, 5e)
 #   hold-after     with a part-remove mode, hold the Git command after the
 #                  failed remove, so residue still runs (5d)
 #   hold-add      stop `residue restore` at its `git worktree add`, so a
@@ -58,6 +61,9 @@
 #                  and before it reads the one it restores (6c)
 #   hold-purge     stop a purge at `worktree remove` of its trash entry,
 #                  after it wrote its removal record (4d)
+#   stop-purge     at the same point, delete an ignored file and the
+#                  worktree's logs/, then stop there, so the test can kill
+#                  the purge part way through the delete (4i)
 #   hold-in-w      stop at the first Git command run in .worktrees/w: a
 #                  restore's first one in the worktree it recreated, before
 #                  it writes its marker; the test kills it there (4e)
@@ -231,6 +237,16 @@ case " \$* " in
     case "\$last \$mode" in
     *residue-removing-*hold-remove*) [ -e "\$work/at-remove" ] || hold remove ;;
     */residue-trash/*hold-purge*) [ -e "\$work/at-purge" ] || hold purge ;;
+    */residue-trash/*stop-purge*)
+        # Git's own remove, stopped part way: an ignored file and the
+        # worktree's logs/ deleted, the rest still there. The test kills
+        # the sweep and this command together, as Ctrl-C does.
+        gd=\$("\$real" -C "\$last" rev-parse --absolute-git-dir) || exit 1
+        rm -f "\$last/node_modules/a.js"
+        rm -rf "\$gd/logs"
+        hold purge
+        exit 1
+        ;;
     */residue-trash/*part-purge*)
         gd=\$("\$real" -C "\$last" rev-parse --absolute-git-dir) || exit 1
         rm -rf "\$last"
@@ -244,13 +260,14 @@ case " \$* " in
     *residue-removing-*part-remove-*)
         # Git's own remove stops at the first file it cannot delete, after
         # the ones the filesystem listed before it: here, the worktree's
-        # HEAD reflog or its HEAD, or the checkout's .git file, while Git
-        # still lists the worktree.
+        # HEAD reflog or its HEAD, the checkout's .git file, or one of its
+        # ignored files, while Git still lists the worktree.
         gd=\$("\$real" -C "\$last" rev-parse --absolute-git-dir) || exit 1
         case \$mode in
         *part-remove-reflog*) rm -f "\$gd/logs/HEAD" ;;
         *part-remove-head*) rm -f "\$gd/HEAD" ;;
         *part-remove-dotgit*) rm -f "\$last/.git" ;;
+        *part-remove-files*) rm -f "\$last/node_modules/a.js" ;;
         esac
         : >"\$work/part-done"
         echo "error: recovery-check: the remove stops part way on purpose" >&2
@@ -473,6 +490,24 @@ await() { # FILE: wait up to 60 s for a barrier to be reached
     return 1
 }
 
+# Abort the Git command held at the barrier NAME without running it, and
+# wait at most 10 s for it to exit: until then it keeps any hold on a
+# removal record it inherited. It exits between two of its sleeps, so no
+# child of it outlives it with that hold, as one would after a kill.
+end_held() { # NAME
+    local held i
+    held=$(cat "$work/at-$1" 2>/dev/null) || return 1
+    touch "$work/abort-$1" "$work/go-$1"
+    for ((i = 0; i < 100; i++)); do
+        kill -0 "$held" 2>/dev/null || return 0
+        # A zombie has closed its files; only its new parent's wait is left.
+        case $(ps -o stat= -p "$held" 2>/dev/null) in Z*) return 0 ;; esac
+        sleep 0.1
+    done
+    kill -KILL "$held" 2>/dev/null
+    return 1
+}
+
 common_ok() { # u untouched and branch w still has its commit
     [ "$(record "$repo/.worktrees/u")" = registered ] || { fail "the unrelated worktree u is not registered as before"; return 1; }
     [ "$(sums "$repo/.worktrees/u")" = "$u_sum" ] || { fail "the unrelated worktree u changed"; return 1; }
@@ -518,11 +553,12 @@ if [ -n "$partial_probe" ]; then
     elif [ "$(interrupted)" != "[]" ]; then fail "scan lists an interrupted removal: $(interrupted)"
     elif [ "$(records)" != "0 records, 0 refs" ]; then fail "removal records: $(records), want 0 records, 0 refs"
     elif common_ok; then ok "refused before any move: $(jq -r '.results[0].worktree.activity.detail' "$out")"; fi
-    for scenario in stopped-after-move stopped-after-move-restore stopped-after-move-control refused-after-move \
+    for scenario in stopped-after-move stopped-after-move-restore stopped-after-move-control stopped-while-git-runs refused-after-move \
         refused-after-move-control move-back-fails original-taken two-removers two-removers-trash trash-move-in-flight \
         purge-restore-race restore-stopped-before-mark purge-other-worktree purge-other-worktree-reftable \
-        back-locked-missing back-unknown \
+        back-locked-missing back-unknown purge-stopped-restore \
         remove-fails-part-way-reflog remove-fails-part-way-head remove-fails-part-way-dotgit remove-fails-part-way-running \
+        remove-fails-part-way-files \
         nested-repo-after-move mount-after-move unreadable-after-move restore-forget-race forget-restore-race \
         forget-before-restore-reads restore-forget-race-reftable; do
         skip_partial "$scenario"
@@ -549,11 +585,12 @@ else
     main=$(cd "$repo" && pwd -P)
     kill -TERM "$pid"
     finish "$pid"
-    touch "$work/abort-remove" "$work/go-remove"
-    kill -TERM "$(cat "$work/held")" 2>/dev/null
+    end_held remove
+    ended=$?
     rm -f "$work/held"
     left=$(interrupted)
-    if [ -z "$aside" ] || [ "$(asides | wc -l | tr -d ' ')" != 1 ]; then fail "want exactly one moved-aside directory, got: $(asides)"
+    if [ "$ended" != 0 ]; then fail "the held git worktree remove did not exit"
+    elif [ -z "$aside" ] || [ "$(asides | wc -l | tr -d ' ')" != 1 ]; then fail "want exactly one moved-aside directory, got: $(asides)"
     elif [ "$phase" != registered ]; then fail "at the barrier Git had: $phase, want registered and unlocked"
     elif [ "$status" = 0 ]; then fail "residue exited 0 although it was stopped"
     elif [ -e "$wt" ]; then fail "something is at the original path again"
@@ -563,6 +600,7 @@ else
     elif [ "$(jq -r '.[0].original_path' <<<"$left")" != "$(cd "$repo/.worktrees" && pwd -P)/w" ]; then fail "scan names the original as $(jq -r '.[0].original_path' <<<"$left")"
     elif [ "$(jq -r '.[0].path' <<<"$left")" != "$aside" ] || [ "$(jq -r '.[0].present' <<<"$left")" != true ]; then fail "scan does not point at the moved worktree: $left"
     elif [ "$(jq -r '.[0].pid_running' <<<"$left")" != false ]; then fail "scan says the stopped run is still running"
+    elif [ "$(jq -r '.[0].removal_running' <<<"$left")" != false ]; then fail "scan says its removal still runs: $left"
     elif [ "$(jq -r '.[0].recovery' <<<"$left")" != "git -C $main worktree move $aside $main/.worktrees/w" ]; then fail "scan's recovery line: $(jq -r '.[0].recovery' <<<"$left")"
     elif common_ok; then
         # residue does not resume it: naming the hidden directory is invalid.
@@ -612,6 +650,53 @@ else
     elif [ -e "$wt" ] || [ -n "$(asides)" ]; then fail "something of w is left"
     elif [ "$(records)" != "1 records, 1 refs" ]; then fail "removal records: $(records), want 1 records, 1 refs"
     elif common_ok; then ok "released at the same barrier, the removal completes"; fi
+fi
+
+# --- 1b. residue stopped alone while its `git worktree remove` runs -------
+# residue is killed alone at `git worktree remove`, as `kill PID`, a Force
+# Quit or watch's deadline do, and that Git (the wrapper, held) runs on
+# with the hold on the removal record it inherited. Until it exits, scan
+# must say the removal may still run and give no recovery line, and
+# restore must refuse and leave w where it is: moved back, w would be
+# deleted where it lands. Once it exits, here without deleting, scan gives
+# the move back and restore brings w back.
+name=stopped-while-git-runs
+make_repo
+echo hold-remove >"$work/mode"
+start "" remove --yes --json "$wt"
+if ! await "$work/at-remove"; then
+    finish "$pid"
+    fail "residue never reached git worktree remove (exit $status)"
+else
+    cp "$work/at-remove" "$work/held"
+    aside=$(asides)
+    main=$(cd "$repo" && pwd -P)
+    kill -KILL "$pid"
+    finish "$pid"
+    during=$(interrupted)
+    (cd "$repo" && "$bin" restore --json w >"$work/$name.out-restore" 2>"$work/$name.err-restore")
+    restored=$?
+    still=$(record "$aside")
+    still_sum=$(sums "$aside")
+    end_held remove
+    ended=$?
+    rm -f "$work/held"
+    left=$(interrupted)
+    (cd "$repo" && "$bin" restore --json w >"$work/$name.out-again" 2>"$work/$name.err-again")
+    again=$?
+    if [ -z "$aside" ]; then fail "no moved-aside directory at the barrier"
+    elif ! jq -e '.[0].pid_running == false and .[0].removal_running == true and .[0].recovery == ""' <<<"$during" >/dev/null; then fail "while its Git runs, scan says: $during"
+    elif [ "$restored" != 1 ]; then fail "restore while its Git runs exited $restored, want 1"
+    elif ! grep -qF "still holds this removal record, so it may still be deleting the worktree; run this restore again once it ends" "$work/$name.err-restore"; then fail "restore: $(cat "$work/$name.err-restore")"
+    elif [ "$still" != registered ] || [ "$still_sum" != "$w_sum" ]; then fail "the refused restore changed w, at the moved-aside path: $still"
+    elif [ "$ended" != 0 ]; then fail "the held git worktree remove did not exit"
+    elif [ "$(jq -r '.[0].removal_running' <<<"$left")" != false ]; then fail "once its Git exited, scan says: $left"
+    elif [ "$(jq -r '.[0].recovery' <<<"$left")" != "git -C $main worktree move $aside $main/.worktrees/w" ]; then fail "once its Git exited, scan's recovery line: $(jq -r '.[0].recovery' <<<"$left")"
+    elif [ "$again" != 0 ]; then fail "restore once its Git exited: exit $again: $(cat "$work/$name.err-again")"
+    elif [ "$(jq -r '.restore.checkout' "$work/$name.out-again")" != moved_back ]; then fail "checkout $(jq -r '.restore.checkout' "$work/$name.out-again"), want moved_back"
+    elif [ "$(record "$wt")" != registered ] || [ "$(sums "$wt")" != "$w_sum" ]; then fail "w is not back whole: $(record "$wt")"
+    elif [ "$(records)" != "0 records, 0 refs" ]; then fail "after restore: $(records), want 0 records, 0 refs"
+    elif common_ok; then ok "while its Git holds the record, scan gives no recovery and restore refuses; once it exits, restore moves w back"; fi
 fi
 
 # --- 2. The check after the move fails, the move back works ----------------
@@ -886,15 +971,15 @@ else
     fi
 fi
 
-# --- 4d. A trash restore that lands while a purge deletes the entry --------
+# --- 4d. A trash restore while a purge deletes the entry -------------------
 # A sweep purges w's week-old trash entry and is held at its `git worktree
-# remove`, after it wrote its removal record. `residue restore` moves w
-# back out of the trash meanwhile and drops that record. The purge's remove
-# then fails: Git lists w at its original path, whole. The purge must say
-# another run put it back, not that part of it may be gone, and leave no
-# record. Outside the wrapper: a restore that moves w while Git's own remove
-# is deleting it; then w is not whole where it lands, and the purge says
-# what it lacks (scenario 5's case).
+# remove`, after it wrote its removal record and unlocked the entry's
+# worktree. The purge holds the entry, and so does the Git it started.
+# `residue restore` of the entry meanwhile must refuse and leave w where it
+# is: moved back, w would be deleted where it lands. Released, the purge
+# must delete w and empty the trash, and the removal record it left must
+# bring w back. Outside the wrapper: the same restore while Git's own
+# remove is deleting w, which the hold keeps out the same way.
 name=purge-restore-race
 make_repo
 setup "$bin" remove --yes --json --trash "$wt"
@@ -911,22 +996,35 @@ else
     held_records=$(records)
     (cd "$repo" && "$bin" restore --json "$entry" >"$work/$name.out-restore" 2>"$work/$name.err-restore")
     restored=$?
+    during=$(record "$entry/w")
+    during_sum=$(sums "$entry/w")
+    at_path=no
+    [ -e "$wt" ] && at_path=yes
     touch "$work/go-purge"
     finish "$sweep_pid"
     sweep_status=$status
     out=$work/$name.out.sweep
     result=$(jq -r '.purged[0].result' "$out")
-    reason=$(jq -r '.purged[0].reason' "$out")
+    after_records=$(records)
+    left=$(ls -A "$repo/.git/residue-trash" 2>/dev/null)
+    record_dir=$(find "$repo/.git/residue-removed" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+    (cd "$repo" && "$bin" restore --json "$record_dir" >"$work/$name.out-record" 2>"$work/$name.err-record")
+    again=$?
     if [ "$held_records" != "1 records, 1 refs" ]; then fail "while the purge is held: $held_records, want 1 records, 1 refs"
-    elif [ "$restored" != 0 ]; then fail "restore exited $restored: $(cat "$work/$name.err-restore")"
-    elif [ "$sweep_status" != 3 ]; then fail "the sweep exited $sweep_status, want 3"
-    elif [ "$result" != skipped ]; then fail "the purge's result is $result, want skipped: $reason"
-    elif ! grep -qF "another run put it back at $(cd "$wt" && pwd -P) while this one ran, and nothing of it is gone" <<<"$reason"; then fail "reason: $reason"
-    elif grep -qF "part of it may be gone" <<<"$reason"; then fail "the purge says part of it may be gone: $reason"
-    elif [ "$(record "$wt")" != registered ] || [ "$(sums "$wt")" != "$w_sum" ]; then fail "w is not back whole: $(record "$wt")"
-    elif [ "$(records)" != "0 records, 0 refs" ]; then fail "removal records: $(records), want 0 records, 0 refs"
-    elif [ -n "$(ls -A "$repo/.git/residue-trash" 2>/dev/null)" ]; then fail "the trash entry is left after the restore"
-    elif common_ok; then ok "the purge says another run put w back: $(jq -r '.purged[0].reason' "$out" | cut -c1-120)"; fi
+    elif [ "$restored" != 1 ]; then fail "restore while the purge runs exited $restored, want 1"
+    elif ! grep -qF "is purging or restoring this trash entry now; run this restore again once it ends" "$work/$name.err-restore"; then fail "restore: $(cat "$work/$name.err-restore")"
+    elif [ "$during" != registered ] || [ "$during_sum" != "$w_sum" ]; then fail "the refused restore changed w, in the trash: $during"
+    elif [ "$at_path" != no ]; then fail "something is at w's path while the purge runs"
+    elif [ "$sweep_status" != 0 ]; then fail "the sweep exited $sweep_status, want 0"
+    elif [ "$result" != purged ]; then fail "the purge's result is $result, want purged: $(jq -r '.purged[0].reason' "$out")"
+    elif [ "$after_records" != "1 records, 1 refs" ]; then fail "after the purge: $after_records, want 1 records, 1 refs"
+    elif [ -n "$left" ]; then fail "the trash entry is left after the purge: $left"
+    elif [ "$again" != 0 ]; then fail "restore of the purge's record exited $again: $(cat "$work/$name.err-record")"
+    elif [ "$(jq -r '.restore.checkout' "$work/$name.out-record")" != checked_out_branch ]; then fail "checkout $(jq -r '.restore.checkout' "$work/$name.out-record"), want checked_out_branch"
+    elif [ "$(record "$wt")" != registered ] || [ "$(git -C "$wt" rev-parse HEAD)" != "$w_sha" ]; then fail "w is not back at its HEAD: $(record "$wt")"
+    elif [ "$(sums "$wt")" != "$(grep -v '^\./node_modules/' <<<"$w_sum")" ]; then fail "the recreated worktree's tracked files differ"
+    elif [ "$(records)" != "0 records, 0 refs" ]; then fail "after restore: $(records), want 0 records, 0 refs"
+    elif common_ok; then ok "restore refuses while the purge holds the entry; the purge completes and its record brings w back"; fi
 fi
 
 # --- 4e. A restore stopped after `git worktree add`, before its marker -------
@@ -1090,6 +1188,57 @@ elif [ "$(records)" != "1 records, 1 refs" ]; then fail "removal records: $(reco
 elif [ "$(record "$wt")" != registered ] || [ "$(git -C "$wt" rev-parse HEAD)" != "$w_sha" ]; then fail "the worktree at w's path changed: $(record "$wt")"
 elif common_ok; then ok "the record reads as unknown: $(cut -c1-100 <<<"$why")"; fi
 
+# --- 4i. A purge stopped part way, then its entry restored ------------------
+# w holds a commit only its HEAD reflog names. A sweep purges w's week-old
+# trash entry. Its Git deletes an ignored file, stops in the checkout at a
+# file it cannot delete, goes on to its own directory, as Git's remove
+# does, and is stopped there once its logs/ is gone: the sweep and that
+# Git are killed together, as Ctrl-C does. The purge's removal record
+# stays, and its refs keep the commit through `git gc`. `residue restore`
+# of the entry must move w back, say part of it may be gone, put the HEAD
+# reflog back from the record, and only then drop the record.
+name=purge-stopped-restore
+make_repo
+setup git -C "$wt" checkout -q --detach
+setup git -C "$wt" commit -q --allow-empty -m lone
+lone=$(git -C "$wt" rev-parse HEAD) || exit 2
+setup git -C "$wt" checkout -q w
+: >"$work/mode"
+setup "$bin" remove --yes --json --trash "$wt"
+entry=$(find "$repo/.git/residue-trash" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+tinfo=$entry/info
+sed 's/^trashed [0-9]* .*/trashed 1767225600 2026-01-01T00:00:00Z/' "$tinfo" >"$work/$name.info" && cat "$work/$name.info" >"$tinfo" || exit 2
+echo stop-purge >"$work/mode"
+start ".sweep" remove --all --yes --json --idle 30d "$repo"
+sweep_pid=$pid
+if ! await "$work/at-purge"; then
+    finish "$sweep_pid"
+    fail "the sweep never reached the purge's git worktree remove (exit $status)"
+else
+    kill_tree "$sweep_pid"
+    finish "$sweep_pid"
+    : >"$work/mode"
+    stopped_records=$(records)
+    stopped_at=$(record "$entry/w")
+    git -C "$repo" -c gc.reflogExpire=now -c gc.reflogExpireUnreachable=now gc -q --prune=now >/dev/null 2>&1
+    kept=no
+    git -C "$repo" cat-file -e "$lone^{commit}" 2>/dev/null && kept=yes
+    (cd "$repo" && "$bin" restore --json "$entry" >"$work/$name.out-restore" 2>"$work/$name.err-restore")
+    restored=$?
+    out=$work/$name.out-restore
+    if [ "$stopped_records" != "1 records, 2 refs" ]; then fail "after the stopped purge: $stopped_records, want 1 records, 2 refs"
+    elif [ "$stopped_at" != registered ]; then fail "after the stopped purge Git has, in the trash: $stopped_at"
+    elif [ "$kept" != yes ]; then fail "git gc lost the commit only the purge's record held"
+    elif [ "$restored" != 0 ]; then fail "restore exited $restored: $(cat "$work/$name.err-restore")"
+    elif ! jq -e '.restore.notes | any(contains("if its purge had started deleting, part of it is gone"))' "$out" >/dev/null; then fail "restore does not say part of it may be gone: $(jq -c '.restore.notes' "$out")"
+    elif [ "$(record "$wt")" != registered ] || [ "$(git -C "$wt" rev-parse HEAD)" != "$w_sha" ]; then fail "w is not back at its HEAD: $(record "$wt")"
+    elif ! grep -qx "$lone" <<<"$(git -C "$wt" reflog --format=%H)"; then fail "the restored worktree's reflog does not name the commit only its HEAD reflog held"
+    elif [ "$(sums "$wt")" != "$(grep -v '^\./node_modules/' <<<"$w_sum")" ]; then fail "w's tracked files changed, or its deleted ignored file is back"
+    elif [ "$(records)" != "0 records, 0 refs" ]; then fail "after restore: $(records), want 0 records, 0 refs"
+    elif [ -n "$(ls -A "$repo/.git/residue-trash" 2>/dev/null)" ]; then fail "the trash entry is left after the restore"
+    elif common_ok; then ok "restore moves w back, says part may be gone, puts its reflog back, then drops the purge's record"; fi
+fi
+
 # --- 5. git worktree remove fails part way ----------------------------------
 # Git deletes the checkout, then its own directory for the worktree, each
 # in the order the filesystem lists the files, and stops at the first it
@@ -1117,14 +1266,15 @@ part_remove() { # MODE: make the repository and run the failing removal
     git -C "$repo" -c gc.reflogExpire=now -c gc.reflogExpireUnreachable=now gc -q --prune=now >/dev/null 2>&1
 }
 # The failed removal left w at the moved-aside path, and its record keeps
-# it. LACK is what the reason must say is gone.
-part_remove_ok() { # LACK
+# it. LACK is what the reason must say is gone; SUMS what its files are now,
+# by default all of them as they were.
+part_remove_ok() { # LACK [SUMS]
     if [ "$status" != 3 ]; then fail "exit $status, want 3"
     elif [ "$(jq -r '.results[0].result' "$out")" != failed ]; then fail "result $(jq -r '.results[0].result' "$out"), want failed"
     elif ! grep -qF "but $1" <<<"$reason" || ! grep -q "; its removal record keeps its HEAD and reflog: residue restore " <<<"$reason"; then fail "reason: $reason"
     elif grep -q "Recover with: " <<<"$reason"; then fail "it gives a move back as the recovery: $reason"
     elif [ -z "$aside" ] || [ "$(record "$aside")" != registered ]; then fail "want it at the moved-aside path, which Git lists: ${aside:-none}"
-    elif [ "$(sums "$aside")" != "$w_sum" ]; then fail "the moved worktree's files changed"
+    elif [ "$(sums "$aside")" != "${2:-$w_sum}" ]; then fail "the moved worktree's files changed"
     elif [ "$(records)" != "1 records, 2 refs" ]; then fail "removal records: $(records), want 1 records, 2 refs"
     elif ! git -C "$repo" cat-file -e "$lone^{commit}" 2>/dev/null; then fail "git gc lost the commit only its HEAD reflog held"
     else return 0; fi
@@ -1199,9 +1349,9 @@ name=remove-fails-part-way-dotgit
 part_remove_unusable part-remove-dotgit "its .git file is gone" "its files are gone"
 
 # 5d: restore while the run that left w, which Git can no longer use, still
-# runs. No command can move it back: restore says to wait for that process
-# and run it again, or, if the PID is another process (PIDs are reused),
-# what to clear; it never prints an empty command.
+# runs. That run holds the record, so restore must say so, change nothing
+# and never print an empty command; once it ends, restore says what to
+# clear (5b). A PID would not do: PIDs are reused, a hold is not.
 name=remove-fails-part-way-running
 make_repo
 echo "part-remove-head hold-after" >"$work/mode"
@@ -1214,15 +1364,32 @@ if ! await "$work/at-after"; then
 else
     aside=$(asides)
     restore_w
+    held_records=$(records)
     : >"$work/go-after"
     finish "$pid"
     if [ "$restored" != 1 ]; then fail "restore while the removal runs exited $restored, want 1"
-    elif ! grep -qF "process $pid still runs, so residue may still be removing it, and Git can no longer use it (Git reads no HEAD in its Git directory); once that process has exited, run this restore again: it says what to clear; if it is not residue (\`ps -p $pid\` shows what it is): delete $aside, run \`git -C $(cd "$repo" && pwd -P) worktree prune\`, then run this restore again" "$work/$name.err-restore"; then fail "restore: $(cat "$work/$name.err-restore")"
+    elif ! grep -qF "a residue run, or the \`git worktree remove\` it started, still holds this removal record, so it may still be deleting the worktree; run this restore again once it ends" "$work/$name.err-restore"; then fail "restore: $(cat "$work/$name.err-restore")"
     elif grep -qE "put it back with: *$" "$work/$name.err-restore"; then fail "restore prints an empty command: $(cat "$work/$name.err-restore")"
+    elif [ "$held_records" != "1 records, 1 refs" ]; then fail "while the removal runs: $held_records, want 1 records, 1 refs"
     elif [ "$status" != 3 ]; then fail "the removal exited $status, want 3"
     elif [ -z "$aside" ] || [ "$(record "$aside")" != registered ]; then fail "want it at the moved-aside path, which Git lists: ${aside:-none}"
     elif [ "$(records)" = "0 records, 0 refs" ]; then fail "the removal record is gone"
-    else ok "restore says to wait for process $pid, with no empty command"; fi
+    else ok "restore says the removal still holds the record, with no empty command"; fi
+fi
+
+# 5e: Git's remove stops in the checkout after it deleted an ignored file,
+# before any file of its own directory: Git lists w at the moved-aside
+# path, its Git directory is whole, and only the plan's measure of its
+# files shows that part of it is gone. The record must stay, and restore
+# must move w back, saying part of it may be gone.
+name=remove-fails-part-way-files
+part_remove part-remove-files
+if part_remove_ok "part of its files may be gone: " "$(grep -v '^\./node_modules/' <<<"$w_sum")"; then
+    restore_w
+    if ! restored_ok moved_back; then :
+    elif ! jq -e '.restore.notes | any(contains("if its removal had started deleting, part of it is gone"))' "$work/$name.out-restore" >/dev/null; then fail "restore does not say part of it may be gone: $(jq -c '.restore.notes' "$work/$name.out-restore")"
+    elif [ "$(sums "$wt")" != "$(grep -v '^\./node_modules/' <<<"$w_sum")" ]; then fail "the restored worktree's tracked files changed"
+    else ok "the record stays though Git lists w with its Git directory whole, and restore moves it back"; fi
 fi
 
 # --- 6. A restore and a forget of the same removal record -------------------

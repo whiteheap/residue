@@ -8,6 +8,7 @@ mod discover;
 mod events;
 mod fsinfo;
 mod git;
+mod hold;
 mod inspect;
 mod json;
 mod jsonread;

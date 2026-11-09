@@ -3,9 +3,9 @@
 #
 #   bash .agents/skills/verify-removal-races/check.sh
 #
-# Checks model/Removal.tla in the nine setups below (a removal or a purge;
+# Checks model/Removal.tla in the ten setups below (a removal or a purge;
 # no fault, a kill, a Git timeout, or residue killed alone; and with the
-# races the findings need left out), then runs each mutant in
+# races between them left out), then runs each mutant in
 # model/mutants, a model with one guard of the code removed, which must
 # fail its rule. The result must match model/expected: every rule holds
 # except the known breaks listed there, each with its shortest path.
@@ -146,8 +146,8 @@ start_time=$(date +%s)
 # Each setup: check every rule; when one breaks, record its shortest path
 # and check the rest again without it. TLC stops at a rule's first break,
 # so a rule that breaks is not checked further in that setup. Two kinds of
-# setup leave out the races the findings need, so the rules get checked
-# again in the rest: "unraced" switches off the restore and the Git
+# setup leave out the races, so a rule a race breaks still gets checked
+# in the rest: "unraced" switches off the restore and the Git
 # timeout, and "after" lets the restores list only once the remove run or
 # purge has stopped. "faults" is at most one kill of residue with its Git
 # child (Ctrl-C) or one Git timeout; "orphan" is at most one kill of
@@ -161,6 +161,7 @@ for setup in "Remove no-faults orig {} {} {}" \
              "Remove after orig {\"kill\",\"timeout\"} {} {\"rr\"}" \
              "Trash no-faults trash {} {} {}" \
              "Trash faults trash {\"kill\",\"timeout\"} {} {}" \
+             "Trash orphan trash {\"orphan\"} {} {}" \
              "Trash unraced trash {\"kill\",\"orphan\"} {\"tr\"} {}" \
              "Trash after trash {\"kill\",\"timeout\"} {} {\"tr\",\"rr\"}"; do
   read -r name kind start faults off after <<< "$setup"
@@ -223,6 +224,11 @@ fi
 echo
 echo "$(grep -m1 -o 'TLC2 Version [^ ]*' "$(cat "$work/last")"), $("$java" -version 2>&1 | head -1); $(( $(date +%s) - start_time ))s"
 if [ "$failed" = 0 ]; then
-  echo "matches model/expected: every rule holds except the $(wc -l < "$work/expected" | tr -d ' ') known breaks listed there, and every mutant is caught"
+  known=$(wc -l < "$work/expected" | tr -d ' ')
+  if [ "$known" = 0 ]; then
+    echo "matches model/expected: every rule holds in every setup, and every mutant is caught"
+  else
+    echo "matches model/expected: every rule holds except the $known known breaks listed there, and every mutant is caught"
+  fi
 fi
 exit "$failed"
