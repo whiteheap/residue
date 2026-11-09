@@ -393,7 +393,7 @@ In short: CI runs the scripts listed there on every push, on macOS, Linux x86_64
 <a id="exit-status"></a>
 <a id="for-coding-agents"></a>
 
-Exit codes and the `results[].result` values are in the [reference](docs/reference.md#exit-status). `residue remove --yes --json "$WORKTREE"`, run from outside the worktree, is there too: exit 0 means removed or trashed, exit 3 means it is still there, and diagnostics stay on stderr. `residue --help` lists every command and option.
+Exit codes and the `results[].result` values are in the [reference](docs/reference.md#exit-status). `residue remove --yes --json "$WORKTREE"`, run from outside the worktree, is there too: exit 0 means removed or trashed, exit 3 means it is still there, and diagnostics stay on stderr. The [residue skill](skills/residue/SKILL.md) gives Claude Code, Codex and other agents these steps: `npx skills add whiteheap/residue-cli --skill residue -g`. `residue --help` lists every command and option.
 
 Ignored does not mean disposable. An untracked file that is not ignored always keeps the worktree. residue never takes a regenerable rule from a file committed in the repository, or from `git -c`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`, or `GIT_CONFIG`. The built-in names, the path grammar, and where a rule is stored are in the [reference](docs/reference.md#the-regenerable-list).
 

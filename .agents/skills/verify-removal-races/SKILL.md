@@ -1,6 +1,8 @@
 ---
 name: verify-removal-races
 description: Model-check every order of steps of `residue remove`, a trash purge, both kinds of `residue restore`, Git's own `git worktree remove` and the user, to show whether any of them can lose a worktree, a commit or a lock. Use before you merge a change to src/remove.rs, src/trash.rs, src/removed.rs or src/restore.rs, to the worktree move, lock, unlock or remove calls in src/git.rs, or to how src/run.rs and src/watch.rs stop a remove run, and when someone asks whether a removal, purge or restore can lose work.
+metadata:
+  internal: true
 ---
 
 # Verify the removal races
