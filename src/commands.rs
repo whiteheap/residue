@@ -97,12 +97,6 @@ pub fn scan(options: &Options) -> u8 {
     for repo in &found.repos {
         let mut list: Vec<Report> = reports.by_ref().take(repo.linked.len()).collect();
         list.sort_by_key(|r| std::cmp::Reverse(r.usage.as_ref().map_or(0, |u| u.allocated)));
-        // Only the text shows a stale worktree's note.
-        if !options.json {
-            for r in list.iter_mut().filter(|r| r.verdict == Verdict::Stale) {
-                r.drops = Some(removed::drops(repo, &r.entry));
-            }
-        }
         let space = fsinfo::space(&repo.main.path)
             .or_else(|_| fsinfo::space(&repo.common_dir))
             .ok();
@@ -118,15 +112,9 @@ pub fn scan(options: &Options) -> u8 {
         let leftovers = repo
             .interrupted
             .iter()
-            .filter_map(|e| Some((e, Leftover::of(e, &repo.command_dir())?)))
+            .filter_map(|e| Leftover::of(e, &repo.command_dir(), &repo.common_dir))
             // A run that stopped after writing its removal record.
-            .map(|(e, l)| {
-                let mut l = l.with_records(&records, &snapshot);
-                if !options.json && l.drops_shown() {
-                    l.drops = Some(removed::drops(repo, e));
-                }
-                l
-            })
+            .map(|l| l.with_records(&records, &snapshot))
             .collect();
         grouped.push(Group {
             repo,
@@ -275,6 +263,7 @@ pub fn scan(options: &Options) -> u8 {
             out.push_str(&output::scan_entry(
                 report,
                 &g.repo.command_dir(),
+                &g.repo.common_dir,
                 &places,
                 &style,
             ));
@@ -469,10 +458,7 @@ pub fn explain(options: &Options) -> u8 {
         Err(e) => return fail(&e),
     };
     let snapshot = Snapshot::take();
-    let mut report = inspect::worktree(&target.entry, &target.repo.common_dir, &snapshot, &policy);
-    if !options.json && report.verdict == Verdict::Stale {
-        report.drops = Some(removed::drops(&target.repo, &target.entry));
-    }
+    let report = inspect::worktree(&target.entry, &target.repo.common_dir, &snapshot, &policy);
     if options.json {
         let doc = Json::Obj(vec![
             ("schema", Json::str(output::SCHEMA_EXPLAIN)),
@@ -555,7 +541,10 @@ pub fn explain_text(r: &Report, repo: &Repo, places: &Places, style: &Style) -> 
                 format!("{unknowns} checks")
             }
         ),
-        Verdict::Stale => format!("{}.", output::stale_note(r, &repo.command_dir())),
+        Verdict::Stale => format!(
+            "{}.",
+            output::stale_note(r, &repo.command_dir(), &repo.common_dir)
+        ),
     };
     row(
         &mut out,

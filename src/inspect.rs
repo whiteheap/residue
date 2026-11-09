@@ -229,10 +229,6 @@ pub struct Report {
     /// An error when residue could not read the mark, which counts as
     /// marked for that rule.
     pub restored: Result<Option<crate::removed::Mark>, String>,
-    /// For a stale worktree, what clearing Git's record of it drops
-    /// (`removed::drops`), read only where its note is shown; `None`
-    /// otherwise, and then the note names no line that clears it.
-    pub drops: Option<crate::removed::Drops>,
 }
 
 impl Report {
@@ -252,7 +248,6 @@ impl Report {
             rule_sources: Vec::new(),
             fingerprint: Err("not measured".into()),
             restored: Ok(None),
-            drops: None,
         }
     }
 
@@ -890,9 +885,16 @@ fn check_operation(r: &mut Report, git_dir: &Path) {
 }
 
 fn check_private_refs(r: &mut Report, dir: &Path) {
-    let mut args = vec!["for-each-ref", "--format=%(refname)"];
-    args.extend(git::PRIVATE_REFS);
-    match git::git(dir, &args) {
+    match git::git(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/worktree/",
+            "refs/bisect/",
+            "refs/rewritten/",
+        ],
+    ) {
         Ok(out) => {
             let refs: Vec<String> = String::from_utf8_lossy(&out)
                 .lines()

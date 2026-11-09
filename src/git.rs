@@ -1536,31 +1536,17 @@ pub fn is_reftable(dir: &Path) -> Result<bool, String> {
 /// Git no longer has is left out (`--ignore-missing`): there is nothing
 /// left of it to keep.
 pub fn unreferenced(dir: &Path, commits: &[&str]) -> Result<Vec<String>, String> {
-    unreached(dir, commits, &["--exclude=refs/residue/*", "--all"])
-}
-
-/// Those of `commits` that, in the repository whose common directory is
-/// `common_dir`, no ref outside `refs/residue/` reaches, nor its main
-/// worktree's HEAD, nor any of `heads`. `--single-worktree` leaves out
-/// the HEADs of the linked worktrees, which `--all` adds otherwise: a
-/// worktree whose record Git is to clear keeps nothing after it, so only
-/// the HEADs of those that stay count, passed as `heads`.
-pub fn unreached_but_by(
-    common_dir: &Path,
-    commits: &[&str],
-    heads: &[&str],
-) -> Result<Vec<String>, String> {
-    let mut not = vec!["--single-worktree", "--exclude=refs/residue/*", "--all"];
-    not.extend(heads);
-    unreached(common_dir, commits, &not)
-}
-
-fn unreached(dir: &Path, commits: &[&str], not: &[&str]) -> Result<Vec<String>, String> {
     if commits.is_empty() {
         return Ok(Vec::new());
     }
-    let mut args = vec!["rev-list", "--ignore-missing", "--stdin", "--not"];
-    args.extend(not);
+    let args = [
+        "rev-list",
+        "--ignore-missing",
+        "--stdin",
+        "--not",
+        "--exclude=refs/residue/*",
+        "--all",
+    ];
     let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
     let mut input = commits.join("\n");
     input.push('\n');
@@ -1579,53 +1565,6 @@ fn unreached(dir: &Path, commits: &[&str], not: &[&str]) -> Result<Vec<String>, 
         .filter(|c| unreached.contains(c.as_bytes()))
         .map(|c| (*c).to_string())
         .collect())
-}
-
-/// The refs only one worktree has, which Git deletes with it.
-pub const PRIVATE_REFS: [&str; 3] = ["refs/worktree/", "refs/bisect/", "refs/rewritten/"];
-
-/// The commits the private refs ([`PRIVATE_REFS`]) of the worktree whose
-/// Git directory is `git_dir` point at, in lowercase. One that points at
-/// anything else, a tag included, is an error: a branch keeps only a
-/// commit.
-pub fn private_ref_commits(git_dir: &Path) -> Result<Vec<String>, String> {
-    let mut args = vec![
-        "for-each-ref",
-        "--format=%(objecttype) %(objectname) %(refname)",
-    ];
-    args.extend(PRIVATE_REFS);
-    let out = git(git_dir, &args)?;
-    let mut commits = Vec::new();
-    for line in lines(&out) {
-        let line = String::from_utf8_lossy(line);
-        let mut parts = line.splitn(3, ' ');
-        let (Some(kind), Some(id), Some(name)) = (parts.next(), parts.next(), parts.next()) else {
-            return Err(format!("git for-each-ref printed {line:?}"));
-        };
-        if kind != "commit" {
-            return Err(format!(
-                "its private ref {name} points at a {kind}, which no branch can keep"
-            ));
-        }
-        commits.push(id.to_ascii_lowercase());
-    }
-    Ok(commits)
-}
-
-/// `id` as `git rev-parse --short=12` abbreviates it: twelve hex digits,
-/// or more where twelve would name more than one object.
-pub fn abbrev(dir: &Path, id: &str) -> Result<String, String> {
-    let out = git(
-        dir,
-        &[
-            "rev-parse",
-            "--verify",
-            "--short=12",
-            "--end-of-options",
-            id,
-        ],
-    )?;
-    Ok(String::from_utf8_lossy(&out).trim().to_string())
 }
 
 /// The fewest of `commits` that reach all of them: `git merge-base

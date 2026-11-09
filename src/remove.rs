@@ -133,34 +133,47 @@ pub struct Leftover {
     /// one command brings it back; when its directory is gone and no record
     /// names it, since clearing Git's record then drops a HEAD and reflog
     /// that nothing else keeps, and the directory may only be moved or on a
-    /// disk not mounted (the text gives `missing` and `head` instead); and
-    /// unless residue could tell that its removal has stopped, since any
-    /// move then lets Git delete it where it lands. Never a deletion.
+    /// disk not mounted (the text gives `missing` and `output::gc_note`
+    /// instead); and unless residue could tell that its removal has
+    /// stopped, since any move then lets Git delete it where it lands.
+    /// Never a deletion.
     pub recovery: String,
     /// The line that clears Git's record of it once its directory is
-    /// gone, and of no other worktree.
+    /// gone, and of no other worktree: given only where a removal record
+    /// names it and keeps what that drops.
     pub clear: String,
     /// The line that moves it back by hand, when its directory is there
     /// and Git can use it: what a refusal names once residue cannot tell
     /// whether its removal still runs. Empty otherwise.
     pub move_back: String,
-    /// Someone else's lock on it, which `clear` does not lift; Git keeps
-    /// its record while it holds.
-    pub locked: Option<String>,
-    /// What `clear` drops with Git's record when no removal record keeps
-    /// it (`removed::drops`), read only where the text shows it
-    /// (`drops_shown`); with none, the text names no line that clears it.
-    pub drops: Option<removed::Drops>,
-    /// What to try before `clear` when its directory is gone
+    /// The lock on Git's record of it, residue's own included: while it
+    /// holds, `git gc` keeps that record.
+    pub lock: Option<String>,
+    /// Its Git directory, `COMMON/worktrees/ID`, when its directory is
+    /// gone or Git can no longer use it, and residue found the one that
+    /// names it: the text names its HEAD reflog by that ID.
+    pub git_dir: Option<PathBuf>,
+    /// What is at `original` now, when its directory is there: the move
+    /// back stops while anything is (`output::vacant`), so the text says
+    /// what instead of naming it.
+    pub taken: Option<&'static str>,
+    /// What to try first when its directory is gone
     /// (`output::missing_note`).
     pub missing: String,
 }
 
 impl Leftover {
-    pub fn of(entry: &Entry, main: &Path) -> Option<Leftover> {
+    pub fn of(entry: &Entry, main: &Path, common_dir: &Path) -> Option<Leftover> {
         let (original, pid) = parse_aside(&entry.path)?;
         let present = fs::symlink_metadata(&entry.path).is_ok();
         let unusable = unusable(entry);
+        let taken = present
+            .then(|| fs::symlink_metadata(&original).ok())
+            .flatten()
+            .map(|m| output::file_kind(&m.file_type()));
+        let git_dir = (!present || unusable.is_some())
+            .then(|| removed::git_dir_of(common_dir, &[&entry.path]))
+            .flatten();
         let git = format!("git -C {} worktree", output::shell(main));
         let path = output::shell(&entry.path);
         let ours = entry.locked.as_deref() == Some(REMOVING);
@@ -194,8 +207,9 @@ impl Leftover {
             },
             recovery,
             clear: format!("{unlock}{git} remove {path}"),
-            locked: entry.locked.clone().filter(|l| l != REMOVING),
-            drops: None,
+            lock: entry.locked.clone(),
+            git_dir,
+            taken,
             missing: output::missing_note(main),
         })
     }
@@ -237,12 +251,6 @@ impl Leftover {
             _ => self.recovery = String::new(),
         }
         self
-    }
-
-    /// The text names a line that clears Git's record of it with no
-    /// removal record to keep what that drops (`drops`).
-    pub fn drops_shown(&self) -> bool {
-        self.record.is_none() && (self.unusable.is_some() || !self.present) && self.busy().is_none()
     }
 
     /// Why no line is safe while something may still act on it.
@@ -300,28 +308,25 @@ impl Leftover {
         if let Some(why) = self.busy() {
             return format!("{head}    {why}\n");
         }
-        let clear = || {
-            output::clear_line(
-                &self.main,
-                &self.clear,
-                self.locked.as_deref(),
-                self.drops.as_ref(),
-            )
-        };
+        // No removal record keeps what clearing Git's record drops, so the
+        // text names no line that clears it.
+        let gc = || output::gc_note(&self.main, self.lock.as_deref(), self.git_dir.as_deref());
         let line = match (&self.unusable, &self.record) {
             (Some(why), Some(_)) => format!(
                 "Git can no longer use it ({why}); restore says what to clear, then recreates it: {}",
                 clean(&self.recovery)
             ),
-            (Some(why), None) => match clear() {
-                Ok(line) => format!(
-                    "Git can no longer use it ({why}), and no removal record names it; copy out what you need, delete it, then {line}"
+            (Some(why), None) => format!(
+                "Git can no longer use it ({why}), and no removal record names it; {}",
+                gc()
+            ),
+            (None, _) if self.present => match self.taken {
+                Some(kind) => format!(
+                    "{} is {kind} now, so it cannot go back there; move that away, then run residue scan again",
+                    places.show(&self.original)
                 ),
-                Err(none) => format!(
-                    "Git can no longer use it ({why}), and no removal record names it; {none}"
-                ),
+                None => format!("put it back: {}", clean(&self.recovery)),
             },
-            (None, _) if self.present => format!("put it back: {}", clean(&self.recovery)),
             // Gone may be only moved, or on a disk not mounted now: those
             // come first, since clearing Git's record then leaves the
             // directory, once back, no longer a Git worktree.
@@ -330,10 +335,7 @@ impl Leftover {
                 self.missing,
                 clean(&self.clear)
             ),
-            (None, None) => match clear() {
-                Ok(line) => format!("its directory is gone; {}; otherwise {line}", self.missing),
-                Err(none) => format!("its directory is gone; {}; {none}", self.missing),
-            },
+            (None, None) => format!("its directory is gone; {}; {}", self.missing, gc()),
         };
         // A record with its hold line, free now, shows that its removal has
         // stopped, whatever process has that PID now.
@@ -349,7 +351,15 @@ impl Leftover {
         // A run that stopped after writing its removal record: restore
         // moves it back, with the same checks.
         if let (None, Some(dir)) = (&self.unusable, &self.record) {
-            out.push_str(&format!("    or: residue restore {}\n", output::shell(dir)));
+            let to = if self.taken.is_some() {
+                " --to NEWPATH"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "    or: residue restore {}{to}\n",
+                output::shell(dir)
+            ));
         }
         out
     }
@@ -577,24 +587,9 @@ pub fn remove(options: &Options) -> u8 {
     // did what it was asked; otherwise one bad record would fail every run
     // in its repository.
     let mut warnings: Vec<String> = Vec::new();
+    // What the plan keeps because its filesystem gives no hold is in the
+    // plan's "kept" lists and `kept` in the JSON, never also a warning.
     let mut forgets = expired_records(&repos, &mode.keep_removed, started, &mut warnings);
-    // What the plan keeps because its filesystem gives no hold, said once.
-    for p in &purges {
-        if let Some(Outcome::Kept(why)) = &p.outcome {
-            warnings.push(format!(
-                "kept the trash entry {}: {why}",
-                p.item.dir.display()
-            ));
-        }
-    }
-    for f in &forgets {
-        if let Some(Outcome::Kept(why)) = &f.outcome {
-            warnings.push(format!(
-                "kept the removal record {}: {why}",
-                f.item.dir.display()
-            ));
-        }
-    }
     let judge = |p: &Purge| p.item.registered.is_some() && p.outcome.is_none();
     let judged: Vec<Entry> = purges
         .iter()
@@ -1814,9 +1809,6 @@ fn verify_moved(
     Ok(())
 }
 
-/// Hold one expired trash entry, re-check it, then delete it with `git
-/// worktree remove`. The hold comes first, so no restore moves the
-/// worktree between the check and the deletion, nor while Git deletes.
 /// Why a trash entry whose filesystem gives no flock(2) lock stays, on
 /// every run, which does not fail for it. Only an older release made it
 /// there, and this run cannot keep a restore away while it deletes.
@@ -1827,6 +1819,9 @@ fn unpurgeable(why: &str, dir: &Path) -> String {
     )
 }
 
+/// Hold one expired trash entry, re-check it, then delete it with `git
+/// worktree remove`. The hold comes first, so no restore moves the
+/// worktree between the check and the deletion, nor while Git deletes.
 fn purge(p: &Purge, policy: &Policy, mode: &Mode) -> Outcome {
     // One that holds only its record has no worktree to delete or restore,
     // and may have no `info` to hold; the hour since it was made keeps it

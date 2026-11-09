@@ -639,7 +639,7 @@ fn foreign(info: &Path) -> Result<(), String> {
 /// The Git directory, `GIT_COMMON_DIR/worktrees/ID`, whose `gitdir` names
 /// the `.git` of one of `paths`. Git writes that path absolute, or
 /// relative to the Git directory with `worktree.useRelativePaths`.
-fn git_dir_of(common_dir: &Path, paths: &[&Path]) -> Option<PathBuf> {
+pub fn git_dir_of(common_dir: &Path, paths: &[&Path]) -> Option<PathBuf> {
     let wanted: Vec<PathBuf> = paths.iter().map(|p| p.join(".git")).collect();
     for child in fs::read_dir(common_dir.join("worktrees")).ok()?.flatten() {
         let dir = child.path();
@@ -734,15 +734,47 @@ pub fn move_back_line(main: &Path, registered: &Entry, original: &Path) -> Strin
 }
 
 /// The command that recreates by hand, at its original path, the worktree
-/// of `record`, which Git no longer lists: `git worktree add` of its
-/// branch, or of its HEAD detached.
-fn recreate_line(main: &Path, record: &Record) -> String {
+/// of `item`'s record, which Git no longer lists, the way `recreate`
+/// would: on its branch only when that branch is at the recorded HEAD or
+/// ahead of it and checked out nowhere; on a new branch of that name at
+/// the HEAD when the branch is gone, so Git never takes one from a remote
+/// instead; on `BRANCH-restored` at the HEAD when the branch was rewritten
+/// or is checked out elsewhere; detached at it when the record is. `Err`
+/// says why no line can bring it back.
+fn recreate_line(item: &Item, record: &Record) -> Result<String, String> {
+    let main = &item.command_dir;
+    let head = record.head.as_str();
+    if git::commit_of(main, head)?.is_none() {
+        return Err(format!(
+            "its HEAD commit {} is no longer in the repository",
+            output::clean(head)
+        ));
+    }
     let add = format!("git -C {} worktree add", output::shell(main));
     let path = output::shell(&record.original);
-    match record.short_branch() {
-        Some(branch) => format!("{add} {path} {}", output::word(branch)),
-        None => format!("{add} --detach {path} {}", output::word(&record.head)),
+    let (Some(full), Some(short)) = (&record.branch, record.short_branch()) else {
+        return Ok(format!("{add} --detach {path} {}", output::word(head)));
+    };
+    let new_branch = |name: &str| {
+        format!(
+            "{add} -b {} {path} {}",
+            output::word(name),
+            output::word(head)
+        )
+    };
+    let Some(tip) = git::commit_of(main, full)? else {
+        return Ok(new_branch(short));
+    };
+    let elsewhere = git::worktrees(main)?
+        .iter()
+        .any(|e| e.branch.as_deref() == Some(full.as_str()));
+    if !elsewhere && (tip == head || git::is_ancestor(main, head, &tip)?) {
+        return Ok(format!("{add} {path} {}", output::word(short)));
     }
+    Ok(new_branch(&free_branch(
+        main,
+        &format!("{short}-restored"),
+    )?))
 }
 
 /// What a restore says when a run holds a record: `info` is its file.
@@ -1489,86 +1521,6 @@ fn reflog_only(reflog: Option<&[u8]>, worktree: &Path, main: &Path) -> Result<Ve
     git::independent(main, &lost)
 }
 
-/// What clearing Git's record of a worktree no removal record names drops
-/// besides the record: its HEAD, its HEAD reflog and its private refs, and
-/// with them, at the next `git gc`, every commit only they reach
-/// (`output::clear_line`).
-pub struct Drops {
-    /// Git's name for the worktree, its directory under `COMMON/worktrees`,
-    /// when residue found it.
-    pub id: Option<String>,
-    /// The fewest commits that reach every commit only the worktree
-    /// reaches, each with its abbreviation; or why residue cannot tell.
-    pub keep: Result<Vec<(String, String)>, String>,
-}
-
-/// [`Drops`] for the worktree Git lists as `entry` in `repo`. What stays
-/// after its record goes is every ref outside `refs/residue/` (whose
-/// records expire), the main worktree's HEAD, and the HEAD of each other
-/// linked worktree whose directory is there and that Git does not mark
-/// prunable: a stale one, or one residue moved aside, may be cleared too.
-/// Its HEAD reflog is the bytes of `logs/HEAD` in a files repository;
-/// otherwise Git says which commits it names (`git_head_reflog`).
-pub fn drops(repo: &crate::discover::Repo, entry: &Entry) -> Drops {
-    let common_dir = &repo.common_dir;
-    let Some(git_dir) = git_dir_of(common_dir, &[&entry.path]) else {
-        return Drops {
-            id: None,
-            keep: Err(format!(
-                "no Git directory in {} names it",
-                common_dir.join("worktrees").display()
-            )),
-        };
-    };
-    let id = git_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned());
-    let heads: Vec<&str> = std::iter::once(&repo.main)
-        .chain(&repo.linked)
-        .filter(|e| e.path != entry.path && e.prunable.is_none())
-        .filter(|e| fs::symlink_metadata(&e.path).is_ok())
-        .filter_map(|e| e.head.as_deref())
-        .filter(|h| is_object_id(h))
-        .collect();
-    let keep = only_reached_by(common_dir, &git_dir, entry, &heads);
-    Drops { id, keep }
-}
-
-fn only_reached_by(
-    common_dir: &Path,
-    git_dir: &Path,
-    entry: &Entry,
-    heads: &[&str],
-) -> Result<Vec<(String, String)>, String> {
-    let reftable = git::is_reftable(common_dir)?;
-    let reflog = if reftable {
-        None
-    } else {
-        read_if_present(Some(git_dir.join("logs").join("HEAD")))
-            .map_err(|e| format!("cannot read its HEAD reflog: {e}"))?
-    };
-    let mut named = match reflog {
-        Some(bytes) => reflog_ids(&bytes),
-        None => git_head_reflog(git_dir, common_dir)?,
-    };
-    if entry.branch.is_none() {
-        named.extend(entry.head.iter().map(|h| h.to_ascii_lowercase()));
-    }
-    named.extend(git::private_ref_commits(git_dir)?);
-    let mut seen = HashSet::new();
-    let named: Vec<&str> = named
-        .iter()
-        .filter(|id| is_object_id(id) && id.bytes().any(|b| b != b'0'))
-        .filter(|id| seen.insert(id.as_str()))
-        .map(String::as_str)
-        .collect();
-    let lost = git::unreached_but_by(common_dir, &named, heads)?;
-    git::independent(common_dir, &lost)?
-        .into_iter()
-        .map(|id| git::abbrev(common_dir, &id).map(|short| (id, short)))
-        .collect()
-}
-
 /// The commits Git reads the HEAD reflog of the worktree at `worktree` as
 /// naming, once each: each entry's new value and the oldest entry's old
 /// value. Git reads no other old value on its own, and one after a gap in
@@ -1761,8 +1713,14 @@ pub fn unforgettable(item: &Item) -> Option<String> {
 }
 
 fn kept_unheld(item: &Item, why: &str) -> String {
+    let kept = format!(
+        "{why}, so residue cannot tell whether a restore uses it, and keeps it, with the commits it keeps"
+    );
+    if item.registered.is_none() && item.back == Back::Yes {
+        return format!("{kept}; Git lists its worktree at its original path again");
+    }
     format!(
-        "{why}, so residue cannot tell whether a restore uses it, and keeps it, with the commits it keeps; `residue restore {}` names the steps that bring its worktree back by hand",
+        "{kept}; `residue restore {}` names the steps that bring its worktree back by hand",
         output::word(&item.name)
     )
 }
@@ -1860,23 +1818,30 @@ fn take(item: &Item) -> Result<Hold, String> {
             "this removal record",
         )),
         Taken::Gone => Err(TAKEN.into()),
-        Taken::Unsupported(why) => Err(unsupported_note(
-            &why,
-            match (&item.record, &item.registered) {
-                (Ok(record), Some(registered)) => Some(Manual::MoveBack(move_back_line(
-                    &item.command_dir,
-                    registered,
-                    &record.original,
-                ))),
-                // Its worktree is gone, and residue cannot forget the
-                // record there either (`forget_expired`), so its refs stay.
-                (Ok(record), None) => {
-                    Some(Manual::Recreate(recreate_line(&item.command_dir, record)))
-                }
-                _ => None,
-            },
-        )),
+        Taken::Unsupported(why) => Err(unsupported_note(&why, manual(item))),
     }
+}
+
+/// What to do by hand with the worktree of `item`'s record where the
+/// filesystem gives no hold: move it back while Git lists it where its
+/// deletion started; nothing when Git lists it at its original path
+/// again; otherwise recreate it, the way `recreate` would.
+fn manual(item: &Item) -> Option<Manual> {
+    let record = item.record.as_ref().ok()?;
+    if let Some(registered) = &item.registered {
+        return Some(Manual::MoveBack(move_back_line(
+            &item.command_dir,
+            registered,
+            &record.original,
+        )));
+    }
+    // Its worktree is gone, and residue cannot forget the record there
+    // either (`forget_expired`), so its refs stay.
+    Some(match &item.back {
+        Back::Yes => Manual::Back,
+        Back::Unknown(e) => Manual::Recreate(Err(output::clean(e))),
+        Back::No => Manual::Recreate(recreate_line(item, record)),
+    })
 }
 
 /// What a restore where the filesystem gives no hold names to do by hand.
@@ -1884,8 +1849,10 @@ pub enum Manual {
     /// The line that moves the worktree, which Git still lists, back.
     MoveBack(String),
     /// The line that recreates the worktree of a record Git no longer
-    /// lists, whose refs still keep its commits.
-    Recreate(String),
+    /// lists, whose refs still keep its commits, or why none can.
+    Recreate(Result<String, String>),
+    /// Git lists the worktree at its original path again.
+    Back,
 }
 
 /// What a restore says where the filesystem gives no hold: it changed
@@ -1893,13 +1860,20 @@ pub enum Manual {
 /// That filesystem has only entries a release that takes no hold made,
 /// and only its runs, or a hand, may still act on them.
 pub fn unsupported_note(why: &str, manual: Option<Manual>) -> String {
+    const STAYS: &str = "residue cannot forget it there either";
     let manual = match manual {
         None => String::new(),
         Some(Manual::MoveBack(line)) => format!(
             "; once no residue run acts on it, this moves the worktree back by hand: {line}"
         ),
-        Some(Manual::Recreate(line)) => format!(
-            "; once no residue run acts on it, this recreates the worktree by hand: {line}; the record still keeps its commits, and residue cannot forget it there either"
+        Some(Manual::Recreate(Ok(line))) => format!(
+            "; once no residue run acts on it, this recreates the worktree by hand: {line}; the record still keeps the commits of its HEAD reflog, and {STAYS}"
+        ),
+        Some(Manual::Recreate(Err(e))) => format!(
+            "; residue names no line that recreates the worktree ({e}); the record still keeps the commits of its HEAD reflog, and {STAYS}"
+        ),
+        Some(Manual::Back) => format!(
+            "; Git lists its worktree at its original path again, and the record stays, since {STAYS}"
         ),
     };
     format!("{why}, so residue cannot hold it against another run, and changed nothing{manual}")
@@ -2461,7 +2435,7 @@ fn move_back(
             output::word(&entry)
         ));
     }
-    let Some(left) = crate::remove::Leftover::of(registered, main) else {
+    let Some(left) = crate::remove::Leftover::of(registered, main, &item.common_dir) else {
         return Err(format!(
             "Git still lists it at {}, where its removal started; residue cannot tell how it got there, so it leaves it",
             aside.display()

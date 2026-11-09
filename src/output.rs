@@ -5,6 +5,7 @@
 //! or branch name cannot inject escape sequences.
 
 use std::io::IsTerminal;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -339,34 +340,25 @@ pub fn stamp(seconds: i64) -> String {
 
 /// Why a stale entry is stale, and what to do about it. A directory that
 /// is gone may only be moved, or on a disk that is not mounted, so those
-/// come first: `git worktree remove` would delete that worktree's Git
-/// directory, and the directory, once back, would no longer be a Git
-/// worktree. Only then the line that clears Git's record of that one
-/// worktree, `git -C MAIN worktree remove PATH`, never `git worktree
-/// prune`, which acts on every unlocked worktree whose directory is
-/// missing, this one or not, after a branch for each commit only it
-/// reaches (`clear_line`). Git marks a worktree prunable also when its
-/// directory is there without its `.git` file, and refuses to remove that
-/// one, so the note says to delete the directory first.
-pub fn stale_note(r: &Report, main: &Path) -> String {
+/// come first. residue names no line that clears Git's record of it, as
+/// no removal record keeps what that drops (`gc_note`).
+pub fn stale_note(r: &Report, main: &Path, common_dir: &Path) -> String {
     let why = clean(r.stale_reason.as_deref().unwrap_or("stale"));
-    let remove = format!(
-        "git -C {} worktree remove {}",
-        shell(main),
-        shell(&r.entry.path)
-    );
-    let clear = clear_line(main, &remove, r.entry.locked.as_deref(), r.drops.as_ref());
-    let gone = matches!(
-        std::fs::symlink_metadata(&r.entry.path),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound
-    );
-    match (gone, clear) {
-        (true, Ok(line)) => format!("{why}; {}; otherwise {line}", missing_note(main)),
-        (true, Err(none)) => format!("{why}; {}; {none}", missing_note(main)),
-        (false, Ok(line)) => format!(
-            "{why}; its directory is still there: copy out what you need, delete it, then {line}"
-        ),
-        (false, Err(none)) => format!("{why}; its directory is still there; {none}"),
+    let git_dir = crate::removed::git_dir_of(common_dir, &[&r.entry.path]);
+    let gc = gc_note(main, r.entry.locked.as_deref(), git_dir.as_deref());
+    match std::fs::symlink_metadata(&r.entry.path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            format!("{why}; {}; {gc}", missing_note(main))
+        }
+        // Git marks it prunable also when its directory is there without
+        // the `.git` file that names its Git directory.
+        _ => match &git_dir {
+            Some(dir) => format!(
+                "{why}; its directory is still there, and a `.git` file in it that reads `gitdir: {}` reconnects it; {gc}",
+                clean(&dir.to_string_lossy())
+            ),
+            None => format!("{why}; its directory is still there; {gc}"),
+        },
     }
 }
 
@@ -378,95 +370,59 @@ pub fn missing_note(main: &Path) -> String {
     )
 }
 
-/// The line that clears Git's record of a worktree no removal record
-/// names, `remove`, and what it does: first a `git branch` for each
-/// commit only that worktree reaches (`removed::Drops`), all joined with
-/// `&&`, so the remove runs only once every branch is made. `Err` says why
-/// residue names no such line: someone locked the worktree, as people do
-/// one on a disk not always mounted, so Git keeps its record (`locked`,
-/// the lock unless `remove` lifts it); or residue could not tell which
-/// commits only it reaches, and then names where Git lists them.
-pub fn clear_line(
-    main: &Path,
-    remove: &str,
-    locked: Option<&str>,
-    drops: Option<&crate::removed::Drops>,
-) -> Result<String, String> {
+/// What becomes of Git's record of a worktree that no removal record names
+/// and whose directory is gone, or that Git can no longer use. residue
+/// names no line that clears it: that drops its HEAD, its reflog, its
+/// index and its private refs, and only a removal record keeps those.
+/// `git gc` clears it on its own (`git worktree prune --expire`), judged
+/// by when its index last changed, and never while it is `locked`.
+/// `git_dir` is its Git directory, `COMMON/worktrees/ID`, when residue
+/// found the one that names it.
+pub fn gc_note(main: &Path, locked: Option<&str>, git_dir: Option<&Path>) -> String {
     if let Some(reason) = locked {
         let reason = if reason.is_empty() {
             String::new()
         } else {
             format!(" ({})", clean(reason))
         };
-        return Err(format!(
-            "it is locked{reason}, so Git keeps its record and its HEAD, and residue names no line that clears them"
-        ));
+        return format!(
+            "it is locked{reason}, so Git keeps its record, with its HEAD, reflog and index"
+        );
     }
-    let id = drops.and_then(|d| d.id.as_deref());
-    let keep = match drops.map(|d| &d.keep) {
-        Some(Ok(keep)) => keep,
-        failed => {
-            let why = match failed {
-                Some(Err(e)) => clean(e),
-                _ => "not read".into(),
-            };
-            let reflog = format!("worktrees/{}/HEAD", id.unwrap_or("NAME"));
-            return Err(format!(
-                "residue cannot tell which commits only it reaches ({why}), so it names no line that clears Git's record of it, which drops its HEAD and reflog; `git -C {} reflog show {}` lists the commits its HEAD reflog names",
-                shell(main),
-                word(&reflog)
-            ));
-        }
-    };
-    if keep.is_empty() {
-        return Ok(format!(
-            "`{}` clears Git's record of it, with its HEAD and reflog, whose commits other refs keep",
-            clean(remove)
-        ));
-    }
-    let name = id.map(keep_name).filter(|n| !n.is_empty());
-    let mut line: Vec<String> = keep
-        .iter()
-        .map(|(full, short)| {
-            let branch = match &name {
-                Some(name) => format!("keep-{name}-{short}"),
-                None => format!("keep-{short}"),
-            };
-            format!(
-                "git -C {} branch {} {}",
-                shell(main),
-                word(&branch),
-                word(full)
-            )
-        })
-        .collect();
-    line.push(remove.to_string());
-    let what = if keep.len() == 1 {
-        "the commit only it reaches on a branch".to_string()
+    let id = git_dir
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned());
+    let reflog = format!("worktrees/{}/HEAD", id.as_deref().unwrap_or("ID"));
+    let which = if id.is_some() {
+        ""
     } else {
-        format!("the {} commits only it reaches on branches", keep.len())
+        ", ID being its folder in Git's worktrees directory,"
     };
-    Ok(format!(
-        "`{}` keeps {what}, then clears Git's record of it, with its HEAD and reflog",
-        clean(&line.join(" && "))
-    ))
+    format!(
+        "`git gc` drops Git's record of it, with its HEAD, reflog and index, 3 months by default (`gc.worktreePruneExpire`) after its index last changed, never while it is locked; `git -C {} reflog show {}`{which} lists the commits that may go with it",
+        shell(main),
+        word(&reflog)
+    )
 }
 
-/// Git's name for a worktree in the characters a branch name takes in any
-/// shell: each other one becomes `-`, and none leads or ends it. Git
-/// makes the name unique among the repository's worktrees (`wt`, `wt1`).
-fn keep_name(id: &str) -> String {
-    let name: String = id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    name.trim_matches('-').to_string()
+/// What a file that is not a regular file is, as a phrase.
+pub fn file_kind(file_type: &std::fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    if file_type.is_symlink() {
+        "a symbolic link"
+    } else if file_type.is_dir() {
+        "a directory"
+    } else if file_type.is_fifo() {
+        "a FIFO"
+    } else if file_type.is_socket() {
+        "a socket"
+    } else if file_type.is_block_device() || file_type.is_char_device() {
+        "a device"
+    } else if file_type.is_file() {
+        "a file"
+    } else {
+        "of a kind Git does not write"
+    }
 }
 
 /// `test ! -e PATH && test ! -L PATH && `, to lead a line that moves a
@@ -478,24 +434,57 @@ pub fn vacant(path: &Path) -> String {
     format!("test ! -e {path} && test ! -L {path} && ")
 }
 
-/// A path as a shell word ([`word`]).
+/// A path as a shell word ([`word_bytes`]), byte for byte.
 pub fn shell(path: &Path) -> String {
-    word(&path.to_string_lossy())
+    word_bytes(path.as_os_str().as_bytes())
 }
 
-/// Text as a shell word: unchanged when it holds only characters no shell
-/// treats specially, otherwise in single quotes.
+/// Text as a shell word ([`word_bytes`]).
 pub fn word(text: &str) -> String {
-    let text = clean(text);
-    let plain = !text.is_empty()
-        && text
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"@%_+=:,./-".contains(&b));
+    word_bytes(text.as_bytes())
+}
+
+/// Bytes as a shell word that names them exactly: unchanged when they are
+/// only characters no shell treats specially; in single quotes when they
+/// are text with no control character; otherwise in `$'...'` (bash,
+/// zsh, ksh and POSIX.1-2024 sh), with each control character and each
+/// byte that is not UTF-8 as an octal escape, so a newline in a path
+/// stays a newline and nothing in the word reaches the terminal raw.
+pub fn word_bytes(bytes: &[u8]) -> String {
+    let plain = !bytes.is_empty()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || b"@%_+=:,./-".contains(b));
     if plain {
-        text
-    } else {
-        format!("'{}'", text.replace('\'', "'\\''"))
+        return String::from_utf8_lossy(bytes).into_owned();
     }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        if !text.chars().any(char::is_control) {
+            return format!("'{}'", text.replace('\'', "'\\''"));
+        }
+    }
+    let mut out = String::from("$'");
+    let octal = |out: &mut String, b: u8| out.push_str(&format!("\\{b:03o}"));
+    for chunk in bytes.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '\'' => out.push_str("\\'"),
+                c if c.is_control() => {
+                    let mut buf = [0u8; 4];
+                    for &b in c.encode_utf8(&mut buf).as_bytes() {
+                        octal(&mut out, b);
+                    }
+                }
+                c => out.push(c),
+            }
+        }
+        for &b in chunk.invalid() {
+            octal(&mut out, b);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// `HH:MM:SS +02:00` in the local time zone, with its UTC offset so a log
@@ -762,7 +751,13 @@ pub fn report_json(r: &Report) -> Json {
 // ---------------------------------------------------------------- text
 
 /// The two-line scan entry for one worktree.
-pub fn scan_entry(r: &Report, main: &Path, places: &Places, style: &Style) -> String {
+pub fn scan_entry(
+    r: &Report,
+    main: &Path,
+    common_dir: &Path,
+    places: &Places,
+    style: &Style,
+) -> String {
     let path = places.show(r.canonical.as_deref().unwrap_or(&r.entry.path));
     let size = r
         .usage
@@ -774,7 +769,7 @@ pub fn scan_entry(r: &Report, main: &Path, places: &Places, style: &Style) -> St
         (None, None) => String::new(),
     };
     let notes = match r.verdict {
-        Verdict::Stale => stale_note(r, main),
+        Verdict::Stale => stale_note(r, main, common_dir),
         Verdict::Candidate => fact_phrases(r).join(" · "),
         Verdict::Keep | Verdict::Unknown => {
             let reasons: Vec<String> = r.blocking().map(|c| clean(&c.short)).collect();

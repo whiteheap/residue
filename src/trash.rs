@@ -455,12 +455,23 @@ pub fn take(item: &Item) -> Result<Hold, String> {
 pub enum NotBack {
     /// A check refused, before Git changed anything.
     Refused(String),
-    /// Git's unlock or move failed, `error`. `lifted` is the lock it lifted
-    /// first and could not put back, with why: its reason, then Git's error.
-    Git {
-        error: String,
-        lifted: Option<(String, String)>,
-    },
+    /// Git's unlock or move failed.
+    Git(Box<GitFailed>),
+}
+
+/// What a restore whose Git unlock or move failed, `error`, changed.
+pub struct GitFailed {
+    pub error: String,
+    /// The lock it lifted first and could not put back, with why: its
+    /// reason, then Git's error.
+    pub lifted: Option<(String, String)>,
+    /// The first folder it made for the destination, which stays.
+    pub created: Option<PathBuf>,
+    /// The destination, when Git renamed the worktree's directory there
+    /// and stopped before it recorded the new path.
+    pub moved: Option<PathBuf>,
+    /// The lock it lifted is back on the worktree.
+    pub relocked: bool,
 }
 
 impl From<String> for NotBack {
@@ -481,13 +492,18 @@ pub fn restore(
     listed: &[Entry],
     _held: &Hold,
 ) -> Result<(PathBuf, Option<String>), NotBack> {
-    let (worktree, registered, dest) = restorable(item, to, listed)?;
+    let (worktree, registered, dest, created) = restorable(item, to, listed)?;
     let main = &item.command_dir;
     let lock = registered.locked.as_deref();
     if lock.is_some() {
-        git::unlock_worktree(main, worktree).map_err(|error| NotBack::Git {
-            error,
-            lifted: None,
+        git::unlock_worktree(main, worktree).map_err(|error| {
+            NotBack::Git(Box::new(GitFailed {
+                error,
+                lifted: None,
+                created: created.clone(),
+                moved: None,
+                relocked: false,
+            }))
         })?;
     }
     if let Err(error) = git::move_worktree(main, worktree, dest) {
@@ -497,7 +513,17 @@ pub fn restore(
                 .map(|relock| (reason.to_string(), relock)),
             None => None,
         };
-        return Err(NotBack::Git { error, lifted });
+        // Git renames the directory before it records the new path, and
+        // may stop between the two.
+        let moved = (fs::symlink_metadata(worktree).is_err() && fs::symlink_metadata(dest).is_ok())
+            .then(|| dest.to_path_buf());
+        return Err(NotBack::Git(Box::new(GitFailed {
+            error,
+            relocked: lock.is_some() && lifted.is_none(),
+            lifted,
+            created,
+            moved,
+        })));
     }
     let note = discard(&item.dir)
         .err()
@@ -506,12 +532,15 @@ pub fn restore(
 }
 
 /// What [`restore`] checks before Git changes anything: the entry's
-/// worktree, Git's entry for it, and where it goes.
+/// worktree, Git's entry for it, where it goes, and the first folder it
+/// made for that, if any. It checks that the destination is on the
+/// trash's filesystem before it makes a folder, by the nearest folder
+/// above it that exists.
 fn restorable<'a>(
     item: &'a Item,
     to: Option<&'a Path>,
     listed: &'a [Entry],
-) -> Result<(&'a Path, &'a Entry, &'a Path), String> {
+) -> Result<(&'a Path, &'a Entry, &'a Path, Option<PathBuf>), String> {
     let record = item.record.as_ref().map_err(|e| e.clone())?;
     let worktree = item
         .worktree
@@ -528,9 +557,10 @@ fn restorable<'a>(
     });
     let Some(registered) = registered else {
         return Err(format!(
-            "Git no longer lists {} as a worktree. If the repository moved, run `git worktree repair {}` in it, then restore again",
+            "Git no longer lists {} as a worktree. If the repository moved, `git -C {} worktree repair {}` reconnects it; then restore again",
             worktree.display(),
-            worktree.display()
+            output::shell(&item.command_dir),
+            output::shell(worktree)
         ));
     };
     match &registered.locked {
@@ -554,21 +584,26 @@ fn restorable<'a>(
         Err(e) => return Err(format!("cannot check {}: {e}", dest.display())),
     }
     let parent = dest.parent().ok_or("the destination has no parent")?;
-    fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    // The folders it makes are on the filesystem of the nearest one above
+    // them that exists, as no mount sits on a folder that is not there.
+    let missing = parent.ancestors().take_while(|a| !a.exists()).last();
+    let existing = missing.and_then(Path::parent).unwrap_or(parent);
     let here = fs::symlink_metadata(worktree)
         .map_err(|e| format!("{}: {e}", worktree.display()))?
         .dev();
-    let there = fs::metadata(parent)
-        .map_err(|e| format!("{}: {e}", parent.display()))?
+    let there = fs::metadata(existing)
+        .map_err(|e| format!("{}: {e}", existing.display()))?
         .dev();
     if here != there {
         return Err(format!(
             "{} is on another filesystem than the trash; residue moves, never copies",
-            parent.display()
+            existing.display()
         ));
     }
-    Ok((worktree, registered, dest))
+    fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    Ok((worktree, registered, dest, missing.map(Path::to_path_buf)))
 }
+
 /// Delete one entry's worktree with `git worktree remove` (no `--force`)
 /// and drop the entry. The caller holds the entry and has re-checked it
 /// since: `registered` is Git's entry for it from that check, so the lock
