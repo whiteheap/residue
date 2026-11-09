@@ -30,9 +30,11 @@
 (*                                                                         *)
 (* An actor in Old is a remove run or purge of a release that takes no    *)
 (* hold (0.0.10 and earlier): it holds nothing, its Git inherits nothing, *)
-(* and its record has no `hold` line, so a restore refuses while the PID  *)
-(* the record names runs (Record::unheld_writer). Its other steps are     *)
-(* this release's.                                                        *)
+(* and its record has no `hold` line. While Git still lists W where that  *)
+(* record's deletion started, a restore refuses while the PID the record  *)
+(* names runs, or while a `git worktree remove` of W does, which covers   *)
+(* the run killed alone while its Git goes on (removed::unheld). Its      *)
+(* other steps are this release's.                                        *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -105,8 +107,15 @@ Running(a) == pc[a] \notin {"done", "dead", "off"}
 Alive(h) == IF h \in Actors THEN Running(h)
             ELSE g[IF h = "grm" THEN "rm" ELSE "pg"].step # "none"
 Held(f) == \E h \in lk[f] : Alive(h)
-\* The record r of an actor in Old, whose PID still runs: unheld_writer.
-OldRuns(r) == r \in Old /\ Running(r)
+\* removed::unheld: the record r of an actor in Old, whose PID still runs
+\* (Unheld::Writer), or whose `git worktree remove` does, found by its
+\* arguments (Unheld::Git). Each mutant drops one of the two. The model
+\* leaves out the third source, a process the activity probe sees using W
+\* or its Git directory (Unheld::Using).
+OldBusy(r, pidMut, gitMut) ==
+  /\ r \in Old
+  /\ \/ Running(r) /\ ~Mut(pidMut)
+     \/ g[r].step # "none" /\ ~Mut(gitMut)
 \* The steps of a deleting actor before its record is in place.
 BeforeRecord(a) == IF a = "rm" THEN {"r_recheck", "r_move", "r_lock", "r_record"}
                    ELSE {"p_hold", "p_recheck", "p_record"}
@@ -557,13 +566,18 @@ THold ==
 \* Under the hold: `git worktree list` again, then
 \* removed::stopped_purges, the records of purges of this entry Git still
 \* lists there, each held; one another run holds refuses, and so does one
-\* without a hold whose PID runs (unheld_refusal). While tr holds the
-\* entry, only the user, or a purge in Old, can change W, and the user
-\* locks only an unlocked worktree, so these two reads are one step.
+\* without a hold that something may still be deleting (refuse_unheld).
+\* While tr holds the entry, only the user, or a purge in Old, can change
+\* W, and the user locks only an unlocked worktree, so these reads are one
+\* step: unheld reads the writer's PID before the Git processes, once that
+\* PID has stopped no new Git of it starts, and what its Git does between
+\* the reads only ends the deletion sooner, which the steps after read
+\* again.
 TRead ==
   /\ pc["tr"] = "t_read"
   /\ LET recs == {r \in w.records : P(r) = "trash" /\ Interrupted(r)} IN
-       IF \E r \in recs : Held(r) \/ (OldRuns(r) /\ ~Mut("TrashRestoreNoOldPid"))
+       IF \E r \in recs :
+            Held(r) \/ OldBusy(r, "TrashRestoreNoOldPid", "TrashRestoreNoOldGit")
        THEN /\ Go("tr", "done")
             /\ UNCHANGED <<ts, lk>>
        ELSE /\ ts' = [reg |-> Listed("trash"),
@@ -667,29 +681,38 @@ SList ==
   /\ UNCHANGED <<w, g, chk, ctx, ts, lk, pl, faults, hist>>
 
 \* removed.rs take: Busy (the removal that wrote it, its Git, or another
-\* restore holds the record), Gone (forgotten since the listing), or a
-\* record without a hold whose PID runs (unheld_refusal) refuses.
+\* restore holds the record) or Gone (forgotten since the listing)
+\* refuses.
 SHold ==
   /\ pc["rr"] = "s_hold"
   /\ IF Mut("RestoreNoHold")
      THEN /\ Go("rr", "s_read") /\ UNCHANGED lk
      ELSE IF rs.rec \notin w.records \/ Held(rs.rec)
-             \/ (OldRuns(rs.rec) /\ ~Mut("RestoreNoOldPid"))
      THEN /\ Go("rr", "done") /\ UNCHANGED lk
      ELSE /\ lk' = [lk EXCEPT ![rs.rec] = @ \cup {"rr"}]
           /\ Go("rr", "s_read")
   /\ UNCHANGED <<w, g, chk, ctx, ts, rs, pl, faults, hist>>
 
 \* Under the hold: `git worktree list` again, then registered, is_back and
-\* the lock from it.
+\* the lock from it. While Git still lists W where the record's deletion
+\* started, a record without a hold that something may still be deleting
+\* refuses (refuse_unheld); once Git lists it nowhere, that deletion is
+\* over, and a PID the record names no longer counts. unheld reads the
+\* writer's PID before the Git processes: once that PID has stopped, no
+\* new Git of it starts, and what its Git does between the reads only ends
+\* the deletion sooner, which the steps after read again. So the reads are
+\* one step, as in TRead.
 SRead ==
   /\ pc["rr"] = "s_read"
-  /\ rs' = IF Mut("RecordRestoreStale") THEN rs
-           ELSE [rs EXCEPT !.reg = Interrupted(rs.rec),
-                           !.back = ~Interrupted(rs.rec) /\ Listed("orig")
-                                    /\ w.gitdir = "ok" /\ DotGit,
-                           !.lock = w.lock]
-  /\ Go("rr", "s_dest")
+  /\ IF Interrupted(rs.rec) /\ OldBusy(rs.rec, "RestoreNoOldPid", "RestoreNoOldGit")
+     THEN /\ Go("rr", "done")
+          /\ UNCHANGED rs
+     ELSE /\ rs' = IF Mut("RecordRestoreStale") THEN rs
+                   ELSE [rs EXCEPT !.reg = Interrupted(rs.rec),
+                                   !.back = ~Interrupted(rs.rec) /\ Listed("orig")
+                                            /\ w.gitdir = "ok" /\ DotGit,
+                                   !.lock = w.lock]
+          /\ Go("rr", "s_dest")
   /\ UNCHANGED <<w, g, chk, ctx, ts, lk, pl, faults, hist>>
 
 \* Something at the destination stops it, unless the record is back.
@@ -711,13 +734,11 @@ SCopies ==
 \* restore's purged_to_git_dir, read under the record's hold: Git lists W
 \* in its trash entry, the entry is there, and W's directory is gone, so
 \* it is cleared, then recreated. Otherwise move_back's refusals: a trash
-\* aside; for a record without a hold, the PID in the aside name still
-\* runs (Leftover::running); the directory is gone; another's lock.
+\* aside; the directory is gone; another's lock.
 SMoveBack ==
   /\ pc["rr"] = "s_moveback"
   /\ Go("rr", IF rs.rec = "pg"
               THEN IF ~Exists("trash") /\ w.entry = "info" THEN "s_clear" ELSE "done"
-              ELSE IF rs.rec \in Old /\ Running("rm") THEN "done"
               ELSE IF ~Exists("aside") THEN "done"
               ELSE IF rs.lock \notin {"none", "removing"} THEN "done"
               ELSE IF rs.lock = "removing" THEN "s_unlock"

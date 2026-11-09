@@ -3,10 +3,11 @@
 #
 #   bash .agents/skills/verify-removal-races/check.sh
 #
-# Checks model/Removal.tla in the twelve setups below (a removal or a
+# Checks model/Removal.tla in the fourteen setups below (a removal or a
 # purge; no fault, a kill, a Git timeout, or residue killed alone; with
 # the races between them left out; and a removal or a purge by a release
-# that takes no hold), then runs each mutant in
+# that takes no hold, stopped with its Git or killed alone while its Git
+# goes on), then runs each mutant in
 # model/mutants, a model with one guard of the code removed, which must
 # fail its rule. The result must match model/expected: every rule holds
 # except the known breaks listed there, each with its shortest path.
@@ -157,7 +158,8 @@ start_time=$(date +%s)
 # residue alone, which leaves its Git child running. "old" runs the remove
 # run or purge as a release that takes no hold (OLD), and the trash
 # restore lists only once that purge has written its record or stopped
-# (LATE).
+# (LATE); "old-orphan" may kill that run alone, so its Git goes on with no
+# hold to show it.
 #
 # Each entry: NAME KIND START FAULTS OFF AFTER OLD LATE.
 for setup in "Remove no-faults orig {} {} {} {} {}" \
@@ -171,7 +173,9 @@ for setup in "Remove no-faults orig {} {} {} {} {}" \
              "Trash unraced trash {\"kill\",\"orphan\"} {\"tr\"} {} {} {}" \
              "Trash after trash {\"kill\",\"timeout\"} {} {\"tr\",\"rr\"} {} {}" \
              "Remove old orig {\"kill\",\"timeout\"} {} {} {\"rm\"} {}" \
-             "Trash old trash {\"kill\",\"timeout\"} {} {} {\"pg\"} {\"tr\"}"; do
+             "Trash old trash {\"kill\",\"timeout\"} {} {} {\"pg\"} {\"tr\"}" \
+             "Remove old-orphan orig {\"orphan\"} {} {} {\"rm\"} {}" \
+             "Trash old-orphan trash {\"orphan\"} {} {} {\"pg\"} {\"tr\"}"; do
   read -r name kind start faults off after old late <<< "$setup"
   label="$name $kind"
   left=$rules

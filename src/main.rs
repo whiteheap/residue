@@ -14,6 +14,7 @@ mod json;
 mod jsonread;
 mod output;
 mod policy;
+mod process;
 mod remove;
 mod removed;
 mod restore;

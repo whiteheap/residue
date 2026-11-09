@@ -518,6 +518,19 @@ fn restore_trash(found: &Found, i: usize, to: Option<&Path>) -> Result<Done, Str
             return Err(format!("a purge of it stopped partway and {left}"));
         }
     }
+    // A purge whose Git deleted the worktree and its Git directory, but
+    // that stopped before it dropped the entry: its record, listed before
+    // this restore took the entry, is how the worktree comes back.
+    let purged = found
+        .removed
+        .iter()
+        .find(|r| r.record.as_ref().is_ok_and(|r| r.aside == from));
+    if let (true, false, Some(record)) = (stopped.is_empty(), item.holds_worktree(), purged) {
+        return Err(format!(
+            "a purge of it deleted its files; its removal record keeps its HEAD and reflog: `residue restore {}` recreates it",
+            output::clean(&record.name)
+        ));
+    }
     let (path, note) = trash::restore(item, to, &listed, &held)?;
     let mut notes: Vec<String> = note.into_iter().collect();
     if !stopped.is_empty() {

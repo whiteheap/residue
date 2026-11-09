@@ -302,6 +302,29 @@ pub fn stamp(seconds: i64) -> String {
     )
 }
 
+/// Why a stale entry is stale, and what clears Git's record of that one
+/// worktree: `git -C MAIN worktree remove PATH`, never `git worktree
+/// prune`, which acts on every unlocked worktree whose directory is
+/// missing, this one or not. Git marks a worktree prunable also when its
+/// directory is there without its `.git` file, and refuses to remove that
+/// one, so the note says to delete the directory first.
+pub fn stale_note(r: &Report, main: &Path) -> String {
+    let why = clean(r.stale_reason.as_deref().unwrap_or("stale"));
+    let clear = format!(
+        "`git -C {} worktree remove {}`",
+        shell(main),
+        shell(&r.entry.path)
+    );
+    match std::fs::symlink_metadata(&r.entry.path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            format!("{why}; only Git metadata remains, {clear} clears it")
+        }
+        _ => format!(
+            "{why}; its directory is still there: copy out what you need, delete it, then {clear} clears Git's record of it"
+        ),
+    }
+}
+
 /// A path as a shell word: unchanged when it holds only characters no
 /// shell treats specially, otherwise in single quotes.
 pub fn shell(path: &Path) -> String {
@@ -581,7 +604,7 @@ pub fn report_json(r: &Report) -> Json {
 // ---------------------------------------------------------------- text
 
 /// The two-line scan entry for one worktree.
-pub fn scan_entry(r: &Report, places: &Places, style: &Style) -> String {
+pub fn scan_entry(r: &Report, main: &Path, places: &Places, style: &Style) -> String {
     let path = places.show(r.canonical.as_deref().unwrap_or(&r.entry.path));
     let size = r
         .usage
@@ -593,10 +616,7 @@ pub fn scan_entry(r: &Report, places: &Places, style: &Style) -> String {
         (None, None) => String::new(),
     };
     let notes = match r.verdict {
-        Verdict::Stale => format!(
-            "{}; only Git metadata remains, `git worktree prune` clears it",
-            clean(r.stale_reason.as_deref().unwrap_or("stale"))
-        ),
+        Verdict::Stale => stale_note(r, main),
         Verdict::Candidate => fact_phrases(r).join(" · "),
         Verdict::Keep | Verdict::Unknown => {
             let reasons: Vec<String> = r.blocking().map(|c| clean(&c.short)).collect();

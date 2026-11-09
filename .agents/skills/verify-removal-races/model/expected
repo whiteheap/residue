@@ -11,4 +11,7 @@
 # compares the files with the plan's once Git ran, and a trash restore
 # settles the records of a purge that stopped partway, with a note.
 # The old setups (#147) add a remove run or purge of a release that takes
-# no hold: a restore refuses while the PID its record names runs.
+# no hold, stopped with its Git or killed alone while its Git goes on:
+# while Git still lists the worktree where the record's deletion started,
+# a restore refuses while the PID its record names runs, or while a `git
+# worktree remove` of the worktree does.

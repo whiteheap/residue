@@ -287,9 +287,12 @@ pub fn list(
 }
 
 /// Make a new entry for a worktree at `original`, with its record written,
-/// and return the entry directory. The worktree is not moved yet; the
-/// caller moves it to `entry.join(original's name)`.
-pub fn create(common_dir: &Path, record: &Record) -> Result<PathBuf, String> {
+/// and return the entry directory and the hold on it, taken before its
+/// `info` is in place. The worktree is not moved yet; the caller moves it
+/// to `entry.join(original's name)` and checks it there while it keeps
+/// the hold, so no restore or purge acts on the entry meanwhile, and on a
+/// filesystem without flock(2) nothing is made or moved.
+pub fn create(common_dir: &Path, record: &Record) -> Result<(PathBuf, Hold), String> {
     let name = record
         .original
         .file_name()
@@ -318,31 +321,29 @@ pub fn create(common_dir: &Path, record: &Record) -> Result<PathBuf, String> {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(format!("cannot create {}: {e}", entry.display())),
         }
-        // As a removal record's: `info.new`, synced, renamed, then the
-        // directories synced, so a power loss leaves a whole `info` or none.
+        // As a removal record's: `info.new`, synced and held, renamed, then
+        // the directories synced, so a power loss leaves a whole `info` or
+        // none, and no restore finds the new entry free.
         let staged = entry.join(INFO_NEW);
-        let written = removed::write_new(&staged, &record.render(&entry))
+        let written = hold::write_new(&staged, &record.render(&entry))
             .map_err(|e| format!("cannot write {}: {e}", staged.display()))
-            .and_then(|()| {
+            .and_then(|hold| {
                 fs::rename(&staged, entry.join(INFO))
-                    .map_err(|e| format!("cannot rename {}: {e}", staged.display()))
-            })
-            .and_then(|()| removed::sync_dir(&entry))
-            .and_then(|()| removed::sync_dir(&root))
-            .and_then(|()| {
+                    .map_err(|e| format!("cannot rename {}: {e}", staged.display()))?;
+                removed::sync_dir(&entry)?;
+                removed::sync_dir(&root)?;
                 if new_root {
-                    removed::sync_dir(common_dir)
-                } else {
-                    Ok(())
+                    removed::sync_dir(common_dir)?;
                 }
+                Ok(hold)
             });
-        if let Err(message) = written {
-            return Err(match discard(&entry) {
+        return match written {
+            Ok(hold) => Ok((entry, hold)),
+            Err(message) => Err(match discard(&entry) {
                 Ok(()) => message,
                 Err(more) => format!("{message}; {more}"),
-            });
-        }
-        return Ok(entry);
+            }),
+        };
     }
     Err(format!(
         "{}: too many entries named {}-{stamp}",
@@ -419,14 +420,18 @@ pub fn info(entry: &Path) -> PathBuf {
 }
 
 /// Take the hold on an entry before a restore acts on it. Held, it means
-/// that no purge, no `git worktree remove` one started and no other
-/// restore is acting on the entry.
+/// that no removal moving a worktree in, no purge, no `git worktree
+/// remove` one started and no other restore is acting on the entry. Once
+/// the run that holds it has exited, what holds it is its Git or a
+/// program that Git started, which `lsof` names.
 pub fn take(item: &Item) -> Result<Hold, String> {
-    match hold::take(&info(&item.dir))? {
+    let info = info(&item.dir);
+    match hold::take(&info)? {
         Taken::Held(hold) => Ok(hold),
-        Taken::Busy => Err(
-            "a residue run, or the `git worktree remove` it started, is purging or restoring this trash entry now; run this restore again once it ends".into(),
-        ),
+        Taken::Busy => Err(format!(
+            "a residue run, or the `git worktree remove` it started, is purging or restoring this trash entry now, or moving a worktree into it (`lsof {}` names it); run this restore again once it ends",
+            output::shell(&info)
+        )),
         Taken::Gone => Err(
             "another residue run purged or restored this trash entry after this restore listed it, so residue changed nothing; `residue restore` lists what is left".into(),
         ),

@@ -29,6 +29,10 @@ TrashForgetsWithoutCheck   trash  {"kill"}     {}      ReflogCommitsKept
 ClearAnyLock               trash  {"kill"}     {"tr"}  OnlyOwnLocksLifted
 TrashRestoreNoOldPid       trash  {}           {"rr"}  NotDeletedOnceBack      {"pg"}  {"tr"}
 RestoreNoOldPid            trash  {}           {"tr"}  NotDeletedOnceBack      {"pg"}  {}
+RestoreNoOldPid            orig   {}           {}      NotDeletedOnceBack      {"rm"}  {}
+TrashRestoreNoOldGit       trash  {"orphan"}   {"rr"}  NotDeletedOnceBack      {"pg"}  {"tr"}
+RestoreNoOldGit            orig   {"orphan"}   {}      NotDeletedOnceBack      {"rm"}  {}
+RestoreNoOldGit            trash  {"orphan"}   {"tr"}  NotDeletedOnceBack      {"pg"}  {}
 # The same guards in the unraced setups, so they too reach the deletion.
 NoVerify                   orig   {"kill","orphan"}  {"rr"}  OnlyCheckedStateDeleted
 PurgeNoRecheck             trash  {"kill","orphan"}  {"tr"}  OnlyCheckedStateDeleted

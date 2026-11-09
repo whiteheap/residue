@@ -36,7 +36,7 @@ use crate::inspect::{self, Fingerprint, Report, Verdict};
 use crate::json::Json;
 use crate::output::{self, Places, Style, clean};
 use crate::policy::Policy;
-use crate::removed::{self, Activity, By, Reason};
+use crate::removed::{self, Activity, By, Reason, Unheld};
 use crate::stats;
 use crate::trash;
 
@@ -71,6 +71,12 @@ fn parse_aside(aside: &Path) -> Option<(PathBuf, u32)> {
 /// from: a residue run stopped before it finished the removal.
 pub fn original_of(aside: &Path) -> Option<PathBuf> {
     parse_aside(aside).map(|(original, _)| original)
+}
+
+/// The PID in a `.NAME.residue-removing-PID` directory's name: the run
+/// that moved it there.
+pub fn pid_of(aside: &Path) -> Option<u32> {
+    parse_aside(aside).map(|(_, pid)| pid)
 }
 
 /// A process with this PID exists (it may belong to another user).
@@ -125,6 +131,9 @@ pub struct Leftover {
     /// removal has stopped, since any move then lets Git delete it where it
     /// lands. Never a deletion.
     pub recovery: String,
+    /// The line that clears Git's record of it once its directory is
+    /// gone, and of no other worktree.
+    pub clear: String,
 }
 
 impl Leftover {
@@ -157,6 +166,7 @@ impl Leftover {
             activity: Ok(Activity::Idle),
             held_record: false,
             recovery,
+            clear: format!("{unlock}{git} remove {path}"),
         })
     }
 
@@ -164,13 +174,14 @@ impl Leftover {
     /// When Git can no longer use it, the record's restore is the only line
     /// that works. Unless residue can tell that no run acts on the record
     /// (`Activity::Idle`), no line is safe, so there is none; that includes
-    /// a record that may name it and cannot be read.
-    pub fn with_records(mut self, records: &[removed::Item]) -> Leftover {
+    /// a record that may name it and cannot be read. `snapshot` is the
+    /// command's activity probe.
+    pub fn with_records(mut self, records: &[removed::Item], snapshot: &Snapshot) -> Leftover {
         let named = records
             .iter()
             .find(|i| i.record.as_ref().is_ok_and(|r| r.aside == self.path));
         if let Some(item) = named {
-            self.activity = item.activity();
+            self.activity = item.activity(Some(snapshot));
             self.held_record = item.record.as_ref().is_ok_and(|r| r.hold);
             self.record = Some(item.dir.clone());
         } else if let Some(item) = records
@@ -207,8 +218,15 @@ impl Leftover {
                     "a residue run, or the `git worktree remove` it started, still holds its removal record, so it may still be deleting it; {again}"
                 )),
             },
-            Ok(Activity::Unheld(pid)) => Some(format!(
+            Ok(Activity::Unheld(Unheld::Writer(pid))) => Some(format!(
                 "process {pid}, the residue run that removed it, is from a release that takes no hold and still runs, so it may still be deleting it; {again}; `ps -p {pid}` shows what it is"
+            )),
+            Ok(Activity::Unheld(Unheld::Git(pid))) => Some(format!(
+                "process {pid}, a `git worktree remove` of it, still runs, and the residue run that removed it is from a release that takes no hold, so that Git may still be deleting it; {again}; `ps -p {pid}` shows what it is"
+            )),
+            Ok(Activity::Unheld(Unheld::Using(pid, command))) => Some(format!(
+                "process {pid} ({}) is using it or its Git directory, and the residue run that removed it is from a release that takes no hold, so its removal may still be deleting it; {again}",
+                clean(command)
             )),
             Err(e) => Some(format!(
                 "residue could not tell whether its removal still runs ({e}), so it names no line to recover it; fix that, then run residue scan again"
@@ -231,7 +249,8 @@ impl Leftover {
                 clean(&self.recovery)
             ),
             (Some(why), None) => format!(
-                "Git can no longer use it ({why}), and no removal record names it; copy out what you need, delete it, then run `git worktree prune` in its repository"
+                "Git can no longer use it ({why}), and no removal record names it; copy out what you need, delete it, then clear Git's record of it: {}",
+                clean(&self.clear)
             ),
             (None, _) if self.present => format!("put it back: {}", clean(&self.recovery)),
             (None, _) => format!(
@@ -1161,9 +1180,10 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
         Err(outcome) => return outcome,
     };
     let main = target.repo.command_dir();
-
     // Where it goes: a hidden sibling, or a new trash entry.
-    let (dest, entry, reason) = if mode.trash {
+    // Where it goes: a hidden sibling, or a new trash entry, held until
+    // this returns: through the move in, the lock and the check there.
+    let (dest, entry, reason, _entry_hold) = if mode.trash {
         match same_filesystem(original, &target.repo.common_dir) {
             Ok(true) => {}
             Ok(false) => {
@@ -1182,14 +1202,14 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
             allocated: before.usage.as_ref().map(|u| u.allocated),
             reclaimable: before.usage.as_ref().map(|u| u.reclaimable),
         };
-        let entry = match trash::create(&target.repo.common_dir, &record) {
+        let (entry, hold) = match trash::create(&target.repo.common_dir, &record) {
             Ok(e) => e,
             Err(e) => return Outcome::Failed(format!("cannot make a trash entry: {e}")),
         };
         let Some(name) = original.file_name() else {
             return Outcome::Failed("the worktree path has no name".into());
         };
-        (entry.join(name), Some(entry), trash::LOCK)
+        (entry.join(name), Some(entry), trash::LOCK, Some(hold))
     } else {
         let Some(dest) = aside_path(original) else {
             return Outcome::Failed("the worktree path has no name".into());
@@ -1217,7 +1237,7 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
             }
             Err(e) => return Outcome::Failed(format!("{}: {e}", dest.display())),
         }
-        (dest, None, REMOVING)
+        (dest, None, REMOVING, None)
     };
     let moved = Moved {
         main: &main,
