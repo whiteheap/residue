@@ -139,8 +139,10 @@ pub struct Bucket {
 
 #[derive(Clone, Default)]
 pub struct BucketUsage {
-    /// False when the walk never reached the entry (it vanished, or lies
-    /// behind an unreadable directory or a mount point).
+    /// False when the walk never reached the entry (it vanished, lies
+    /// behind an unreadable directory or a mount point, or Git spelled its
+    /// path in a way the walk did not find). `inspect::judge` then calls it
+    /// not judged, whatever the rules say.
     pub seen: bool,
     /// Non-directory entries, each hard-linked inode counted once.
     pub files: u64,
@@ -317,10 +319,11 @@ pub fn measure(
             }
             let mut here = place;
             if here.bucket.is_none() {
-                // Git's path, which can spell the name another way (#103).
-                let found = lookup.get(&path).or_else(|| {
-                    git_spelling(&path, root).and_then(|rel| lookup.get(&root.join(rel)))
-                });
+                // Git's path, which can spell the names another way (#103),
+                // by its bytes.
+                let found = lookup
+                    .get(&path)
+                    .or_else(|| git_path(&path, root).and_then(|rel| lookup.get(&root.join(rel))));
                 if let Some(&i) = found {
                     here.bucket = Some(i);
                     usage.buckets[i].seen = true;
@@ -763,23 +766,56 @@ fn relative(path: &Path, root: &Path) -> Option<String> {
 /// The path relative to the worktree root as Git prints it, when that is
 /// not how the disk spells it. On macOS, where `git init` sets
 /// `core.precomposeunicode`, Git precomposes (NFC) each name it reads that
-/// holds a non-ASCII byte, with `iconv` from UTF-8-MAC to UTF-8
+/// holds a non-ASCII byte, one name at a time, with `iconv` from UTF-8-MAC
+/// to UTF-8, and keeps a name the conversion refuses as stored
 /// (`precompose_utf8_readdir` in Git's `compat/precompose_utf8.c`). A name
 /// stored decomposed (NFD) then never equals Git's path byte for byte
-/// (#103). None for an ASCII path, one the conversion leaves alone or
-/// refuses (Git then prints the name as stored), and on other systems,
-/// where Git prints every name as stored. The walk tries the disk's
-/// spelling first, which is Git's when the setting is off.
-fn git_spelling(path: &Path, root: &Path) -> Option<String> {
+/// (#103). Apple's converter refuses a name with a character above U+FFFF,
+/// such as an emoji, so one path can hold a name Git composed and a name it
+/// kept: this converts each name on its own, as Git does. Bytes, as Git
+/// prints them, so a name that is not UTF-8, which Git keeps too, cannot
+/// lose the match. None when no name changes: an ASCII path, one whose
+/// every name the conversion leaves alone or refuses, and on other
+/// systems, where Git prints every name as stored. The walk tries the
+/// disk's spelling first, which is Git's when the setting is off.
+fn git_path(path: &Path, root: &Path) -> Option<PathBuf> {
     let rel = path.strip_prefix(root).ok()?.as_os_str().as_bytes();
-    if rel.is_ascii() {
+    if rel.is_ascii() || !cfg!(target_os = "macos") {
         return None;
     }
-    precompose(rel)
+    let spelled = spell_names(rel, precompose)?;
+    Some(PathBuf::from(OsStr::from_bytes(&spelled)))
+}
+
+/// [`git_path`] as text, for the rule matchers: a path that is not UTF-8
+/// matches no rule.
+fn git_spelling(path: &Path, root: &Path) -> Option<String> {
+    git_path(path, root)?.into_os_string().into_string().ok()
+}
+
+/// `rel` with each name that holds a non-ASCII byte replaced by what
+/// `convert` makes of it, and each name it refuses or leaves alone kept as
+/// it is. None when no name changes.
+fn spell_names(rel: &[u8], convert: impl Fn(&[u8]) -> Option<Vec<u8>>) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(rel.len());
+    let mut changed = false;
+    for (i, name) in rel.split(|&b| b == b'/').enumerate() {
+        if i > 0 {
+            out.push(b'/');
+        }
+        match (!name.is_ascii()).then(|| convert(name)).flatten() {
+            Some(spelled) if spelled != name => {
+                out.extend_from_slice(&spelled);
+                changed = true;
+            }
+            _ => out.extend_from_slice(name),
+        }
+    }
+    changed.then_some(out)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn precompose(_: &[u8]) -> Option<String> {
+fn precompose(_: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
@@ -807,10 +843,13 @@ mod nfc {
         fn iconv_close(cd: *mut c_void) -> c_int;
     }
 
-    /// Git's own conversion, called as Git calls it: the name with its NUL,
-    /// through a fresh descriptor (about 0.6 us on Apple silicon). A slash
-    /// never composes, so a whole path converts as its names do one by one.
-    pub fn precompose(name: &[u8]) -> Option<String> {
+    /// Git's own conversion of one name, called as Git calls it: the name
+    /// with its NUL, through a fresh descriptor (about 0.6 us on Apple
+    /// silicon). None when iconv refuses it, as Apple's converter refuses a
+    /// character above U+FFFF; Git then keeps the name as stored. Never
+    /// given a whole path: one refused name would lose the names Git
+    /// composed beside it.
+    pub fn precompose(name: &[u8]) -> Option<Vec<u8>> {
         // SAFETY: both arguments are NUL-terminated literals.
         let cd = unsafe { iconv_open(c"UTF-8".as_ptr(), c"UTF-8-MAC".as_ptr()) };
         if cd.addr() == usize::MAX {
@@ -839,7 +878,7 @@ mod nfc {
         if out.pop() != Some(0) || out == name {
             return None;
         }
-        String::from_utf8(out).ok()
+        Some(out)
     }
 }
 
@@ -1379,11 +1418,14 @@ mod tests {
     //! parent was listed is reported as changed and never read, a walk
     //! deeper than [`HELD`] reads every level and keeps the same checks,
     //! and a worktree that can be looked up but not read is one unreadable
-    //! entry.
+    //! entry. And Git's spelling of a path, name by name, with the walk
+    //! finding an ignored entry by it.
 
+    #[cfg(target_os = "macos")]
+    use super::git_spelling;
     use super::{
         Bucket, HELD, Parent, Pending, Place, REOPENED, Reopened, Step, lstat_at, measure,
-        open_listed, open_root,
+        open_listed, open_root, spell_names,
     };
     use std::ffi::CString;
     use std::fs;
@@ -1734,6 +1776,121 @@ mod tests {
             [None, None, None, None, None, None],
             "{found:?}"
         );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Git converts each name on its own and keeps one the conversion
+    /// refuses as stored, so a path can mix both. Here a stand-in for
+    /// Apple's converter composes `e` and U+0301 and refuses any name with
+    /// a four-byte character, as that converter refuses U+1F680.
+    #[test]
+    fn each_name_is_spelled_on_its_own_and_a_refused_one_is_kept() {
+        let calls = std::cell::Cell::new(0);
+        let convert = |name: &[u8]| {
+            calls.set(calls.get() + 1);
+            if name.iter().any(|&b| b >= 0xf0) {
+                return None;
+            }
+            let text = std::str::from_utf8(name).ok()?;
+            Some(text.replace("e\u{301}", "\u{e9}").into_bytes())
+        };
+        let spell = |rel: &str| spell_names(rel.as_bytes(), convert).map(String::from_utf8);
+        assert_eq!(
+            spell("cafe\u{301}/\u{1f680}/build"),
+            Some(Ok("caf\u{e9}/\u{1f680}/build".to_string())),
+            "the composed name beside a refused one"
+        );
+        assert_eq!(
+            spell("\u{1f680}/cafe\u{301}/build"),
+            Some(Ok("\u{1f680}/caf\u{e9}/build".to_string())),
+            "in the other order"
+        );
+        assert_eq!(
+            spell("cafe\u{301}\u{1f680}/build"),
+            None,
+            "one refused name stays whole"
+        );
+        assert_eq!(spell("\u{1f680}/build"), None, "nothing changes");
+        assert_eq!(
+            spell("caf\u{e9}/\u{65e5}"),
+            None,
+            "names the conversion leaves alone"
+        );
+        calls.set(0);
+        assert_eq!(spell("build/out/a.o"), None);
+        assert_eq!(calls.get(), 0, "an ASCII name is never converted");
+        assert_eq!(
+            spell_names(b"\xff/cafe\xcc\x81/build", convert),
+            Some(b"\xff/caf\xc3\xa9/build".to_vec()),
+            "a name that is not UTF-8 is kept, byte for byte"
+        );
+    }
+
+    /// The same with Apple's converter, which Git calls: it refuses U+1F680
+    /// and U+20000, so a path that holds one beside a decomposed name is
+    /// spelled name by name, never not at all.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn git_spells_a_path_name_by_name_with_apples_converter() {
+        let root = Path::new("/w");
+        let spell = |rel: &str| git_spelling(&root.join(rel), root);
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            spell("cafe\u{301}/\u{1f680}/build"),
+            some("caf\u{e9}/\u{1f680}/build")
+        );
+        assert_eq!(
+            spell("\u{1f680}/cafe\u{301}/build"),
+            some("\u{1f680}/caf\u{e9}/build")
+        );
+        assert_eq!(
+            spell("cafe\u{301}/\u{20000}/build"),
+            some("caf\u{e9}/\u{20000}/build")
+        );
+        assert_eq!(
+            spell("cafe\u{301}/\u{65e5}/build"),
+            some("caf\u{e9}/\u{65e5}/build")
+        );
+        assert_eq!(spell("caf\u{e9}/\u{1f680}/build"), None, "already Git's");
+        assert_eq!(spell("\u{1f680}/build"), None);
+        assert_eq!(spell("build"), None);
+        assert_eq!(git_spelling(Path::new("/elsewhere/a"), root), None);
+    }
+
+    /// A folder below a decomposed name and an emoji name is the bucket of
+    /// Git's spelling of it: the walk sizes it and finds the environment
+    /// file inside.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_bucket_in_gits_spelling_is_found_below_a_refused_name() {
+        let root = scratch("spelling");
+        let w = root.join("w");
+        let layouts = [
+            ("cafe\u{301}/\u{1f680}", "caf\u{e9}/\u{1f680}"),
+            ("\u{1f680}/cafe\u{301}", "\u{1f680}/caf\u{e9}"),
+        ];
+        for (disk, _) in layouts {
+            let build = w.join(disk).join("build");
+            fs::create_dir_all(&build).unwrap();
+            fs::write(build.join("out.o"), "o").unwrap();
+            fs::write(build.join(".env"), "SECRET=1\n").unwrap();
+        }
+        let buckets: Vec<Bucket> = layouts
+            .iter()
+            .map(|(_, git)| Bucket {
+                rel: Path::new(git).join("build"),
+                expand: false,
+            })
+            .collect();
+        let usage = measure(&w, &buckets, &|_| true, &|_| false, &[]).unwrap();
+        for ((disk, _), b) in layouts.iter().zip(&usage.buckets) {
+            assert!(b.seen, "{disk}/build is its bucket");
+            assert_eq!((b.files, b.bytes), (2, 10), "{disk}/build");
+            assert_eq!(
+                b.env_file.as_deref(),
+                Some(format!("{disk}/build/.env").as_str())
+            );
+        }
         fs::remove_dir_all(&root).unwrap();
     }
 

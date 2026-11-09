@@ -1520,6 +1520,70 @@ fi
 layout_removed ignored-nfc-folder-path-rule 'caf*/\n' \
     "mkdir -p '$nfc/sub' && echo notes >'$nfc/sub/notes.txt'" --regenerable "$nfc/sub/*.txt"
 
+# 12b. An ignored `build/` below two tracked folders: `café`, stored
+# decomposed, and an emoji, which Apple's converter refuses. Git spells each
+# name on its own, `café` precomposed and the emoji as stored, and so does
+# the walk: the entry has its size, and the `.env` in it keeps the
+# worktree, in either order of the two folders. Without the `.env` it is
+# removed. Only macOS precomposes, so the cases run there alone, on a file
+# system that keeps a name as written (APFS) or stores it decomposed (HFS+).
+emoji=$(printf '\360\237\232\200')
+mixed_names() { # NAME PARENT-PATH(of café, may be empty) CHILD-PATH(below café, may be empty) env|none
+    name=$1
+    local up=$2 down=$3 kind=$4 tracked disk entry before
+    tracked=${up:+$up/}$nfc${down:+/$down}
+    disk=${up:+$up/}$nfd${down:+/$down}
+    entry=$tracked/build/
+    if [ "$(uname -s)" != Darwin ]; then
+        echo "skip $name: only Git on macOS precomposes names"
+        return
+    fi
+    if [ "$kind" = none ] && [ -n "$partial_probe" ]; then
+        skip_partial "$name"
+        return
+    fi
+    make_repo
+    printf 'build/\n' >>"$repo/.git/info/exclude"
+    setup mkdir -p "$wt/$tracked"
+    echo k >"$wt/$tracked/keep.txt"
+    setup git -C "$wt" add -A
+    setup git -C "$wt" commit -qm names
+    w_sha=$(git -C "$repo" rev-parse w) || exit 2
+    # A rename through another name stores `café` decomposed.
+    setup mv "$wt/${up:+$up/}$nfc" "$wt/${up:+$up/}rename.tmp"
+    setup mv "$wt/${up:+$up/}rename.tmp" "$wt/${up:+$up/}$nfd"
+    if [ "$(git -C "$wt" config core.precomposeunicode)" != true ] ||
+        ! (cd "$wt" && find . -name 'cafe*' | grep -q .); then
+        echo "skip $name: Git does not precompose here, or the file system keeps no decomposed name"
+        return
+    fi
+    setup mkdir "$wt/$disk/build"
+    printf 'o' >"$wt/$disk/build/out.o"
+    [ "$kind" = none ] || printf 'SECRET=1\n' >"$wt/$disk/build/.env"
+    before=$(sums "$wt")
+    run remove --yes --json "$wt"
+    if [ "$kind" = none ]; then
+        if [ "$status" != 0 ]; then fail "exit $status, want 0 (failing checks: $(failing_checks 0))"
+        elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+        elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
+        elif [ -e "$wt" ] || registered "$wt"; then fail "the worktree is still there"
+        elif common_ok; then ok; fi
+        return
+    fi
+    if [ "$status" != 3 ]; then fail "exit $status, want 3"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), want refused"
+    elif [ "$(failing_checks 0)" != "$(want_failing ignored)" ]; then fail "failing checks: $(failing_checks 0), want $(want_failing ignored)"
+    elif ! jq -e --arg p "$entry" '[.results[0].worktree.ignored[] | select(.path == $p)] == [{"path": $p, "regenerable": false, "files": 2, "bytes": 10}]' "$out" >/dev/null; then
+        fail "ignored entries: $(jq -c '.results[0].worktree.ignored' "$out"), want $entry with 2 files and 10 bytes, not regenerable"
+    elif ! jq -e '.results[0].worktree.checks[] | select(.id == "ignored") | .detail | contains("is an environment file no rule names")' "$out" >/dev/null; then
+        fail "the ignored check does not name the environment file: $(jq -c '.results[0].worktree.checks[] | select(.id == "ignored")' "$out")"
+    elif untouched "$before"; then ok; fi
+}
+mixed_names ignored-mixed-names-env '' "$emoji" env
+mixed_names ignored-mixed-names-env-swapped "$emoji" '' env
+mixed_names ignored-mixed-names-clean '' "$emoji" none
+
 # 13. Untracked folders that hold only ignored entries: residue lists them
 # again with one `git status --ignored=traditional` limited to them, not
 # the whole worktree (#120). The oracle is Git's own full traditional list,

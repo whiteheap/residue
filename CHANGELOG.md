@@ -3,10 +3,14 @@
 ## Unreleased
 
 - **A running `watch` on macOS and the BSDs no longer runs out of open files.** kqueue holds an open file for each folder `watch` watches, and launchd starts a service with a limit of 256. With many branch folders under `refs/remotes`, the watches took them all, and every pass after that failed with `could not start: Too many open files`, so automatic cleanup stopped and removed nothing. `watch` now raises its limit on open files and keeps 128 of it free for the Git and residue each pass starts.
+- **On macOS, residue spells each name in a path as Git does.** Git precomposes each name on its own and keeps a name it cannot convert, such as one with an emoji, as stored. residue now does the same, name by name, so its walk measures an ignored folder below such names.
+- **An ignored entry the walk did not reach is not judged.** A rule that matches it no longer makes it regenerable: the `ignored` check is `unknown` (`the walk did not reach it`), which keeps the worktree.
+- **For scripts and integrations:** such an entry is `"regenerable": false`, with `files` and `bytes` null as before, and the `ignored` check's `status` is `unknown`.
 
 ### Details
 
 - `Events::room` (kqueue): the soft `RLIMIT_NOFILE` is raised toward the hard limit, at most 10,240 (`OPEN_MAX` on macOS), and the watches stop 128 below it, as well as at `MAX_WATCHES`. inotify watches hold no open file and are unchanged. Tests: `events::tests` and `.github/watch-smoke.sh` scenario 11, a running watch under `ulimit -n 256` with 302 folders to watch, which removes a worktree whose upstream is pruned.
+- `fsinfo::git_path` converts each name that holds a non-ASCII byte with Apple's `iconv` from UTF-8-MAC to UTF-8 on its own, keeps a name the conversion refuses or leaves alone, and gives the path as bytes, so the bucket lookup matches Git's path byte for byte. `inspect::judge` calls an entry `unknown` when the walk did not reach it or could not run, before the environment-file check. Tests: `fsinfo::tests::each_name_is_spelled_on_its_own_and_a_refused_one_is_kept`, `fsinfo::tests::git_spells_a_path_name_by_name_with_apples_converter` and `fsinfo::tests::a_bucket_in_gits_spelling_is_found_below_a_refused_name` (macOS), `inspect::tests::an_ignored_entry_the_walk_did_not_reach_is_not_judged`, and `scripts/contract-check.sh` section 12b, `ignored-mixed-names-env`, `ignored-mixed-names-env-swapped` and `ignored-mixed-names-clean` (macOS; skipped by name elsewhere).
 
 ## 0.0.12 (2026-11-09)
 
