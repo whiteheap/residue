@@ -46,11 +46,16 @@ case $work in
 *) echo "contract-check: unexpected scratch directory $work" >&2; exit 2 ;;
 esac
 # Each sleep a scenario starts to hold a worktree is listed in $holders, so
-# an early exit stops it too.
+# an early exit stops it too. Only a holder still running as a job of this
+# shell is signalled: once bash has reaped one, by `wait` or on its own, its
+# PID may already belong to another process.
 holders=
 stop_holders() {
-    local pid
-    for pid in $holders; do kill "$pid" 2>/dev/null; done
+    local pid running
+    running=" $(jobs -pr | tr '\n' ' ') "
+    for pid in $holders; do
+        case $running in *" $pid "*) kill "$pid" 2>/dev/null ;; esac
+    done
 }
 trap 'stop_holders; rm -rf -- "$work"' EXIT
 
@@ -1357,6 +1362,7 @@ if [ "$(uname -s)" = Linux ]; then
     mapped=$wt_real/node_modules/libmapped.so
     (cd "$work" && LD_PRELOAD=$mapped exec sleep 300) >/dev/null 2>&1 &
     holder=$!
+    holders="$holders $holder"
     for ((i = 0; i < 100; i++)); do
         grep -qF "$mapped" "/proc/$holder/maps" 2>/dev/null && break
         sleep 0.1
