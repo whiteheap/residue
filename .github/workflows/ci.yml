@@ -177,7 +177,10 @@ jobs:
 
   # illumos (OmniOS) reads /proc/<pid>/path. It runs the build, the smoke
   # test, the contract check and the recovery check as root and as an
-  # ordinary user. Not the
+  # ordinary user. Root's contract check runs in /tmp, a tmpfs, and the
+  # user's in their home, on ZFS: the two update the path the kernel keeps
+  # for an open file differently. `df -n` shows each filesystem in the
+  # log. Not the
   # watch smoke test: illumos has no inotify or kqueue, so a running watch
   # wakes on its five-minute timer, past that test's two-minute limit. Not
   # the race check: illumos script(1) cannot run a command, and the base
@@ -201,9 +204,11 @@ jobs:
             rustc --version
             cargo build --locked --release
             sh .github/smoke.sh ./target/release/residue
+            df -n /tmp
             bash scripts/contract-check.sh ./target/release/residue
             bash scripts/recovery-check.sh ./target/release/residue
             useradd -m -d /export/home/smoke -s /bin/sh smoke
+            df -n /export/home/smoke
             su smoke -c "HOME=/export/home/smoke sh $PWD/.github/smoke.sh $PWD/target/release/residue"
-            su smoke -c "HOME=/export/home/smoke bash $PWD/scripts/contract-check.sh $PWD/target/release/residue"
+            su smoke -c "HOME=/export/home/smoke TMPDIR=/export/home/smoke bash $PWD/scripts/contract-check.sh $PWD/target/release/residue"
             su smoke -c "HOME=/export/home/smoke bash $PWD/scripts/recovery-check.sh $PWD/target/release/residue"
