@@ -2486,5 +2486,68 @@ elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), 
 elif [ "$(jq -r --arg plan "$plan" '.plan == $plan and .expected_plan == $plan' "$out")" != true ]; then fail "plan $(jq -r .plan "$out"), want $plan"
 elif untouched "$before"; then ok; fi
 
+# 19. macOS: residue in a sandbox that lets it list every process but
+# inspect only its own (Seatbelt, `sandbox-exec`), the shape a coding
+# agent's command sandbox can have. lsof there lists only the sandbox's
+# processes and still exits 0. A sleep outside the sandbox works in w:
+# outside, w is in_use by it; inside, its activity must be unknown
+# (probe_failed), naming what lsof did not list, and `remove --yes` must
+# keep w, never take it as not_observed.
+sandboxed_case() {
+    name=activity-sandboxed
+    make_repo
+    local before holder i busy explain_status outside real=$bin listed
+    local profile=$work/$name.sb
+    printf '%s\n' '(version 1)' '(allow default)' '(deny process-info*)' \
+        '(allow process-info-listpids)' '(allow process-info* (target same-sandbox))' >"$profile"
+    if ! sandbox-exec -f "$profile" /usr/bin/true 2>/dev/null; then
+        echo "skip $name: sandbox-exec cannot apply a profile here (already in a sandbox?)"
+        return
+    fi
+    before=$(sums "$wt")
+    (cd "$wt/sub" && exec sleep 300) >/dev/null 2>&1 &
+    holder=$!
+    holders="$holders $holder"
+    for ((i = 0; i < 100; i++)); do
+        case $(ps -o comm= -p "$holder" 2>/dev/null) in *sleep) break ;; esac
+        sleep 0.1
+    done
+    # What lsof lists from inside the sandbox, as residue runs it.
+    listed=$(cd / && sandbox-exec -f "$profile" /usr/sbin/lsof -n -P -F p 2>/dev/null | grep -c '^p')
+    run explain --json "$wt"
+    outside=$work/$name.outside
+    mv "$out" "$outside" || exit 2
+    bin=/usr/bin/sandbox-exec
+    run -f "$profile" "$real" explain --json "$wt"
+    explain_status=$status
+    busy=$work/$name.busy
+    mv "$out" "$busy" || exit 2
+    run -f "$profile" "$real" remove --yes --json --no-trash "$wt"
+    bin=$real
+    kill "$holder" 2>/dev/null
+    wait "$holder" 2>/dev/null
+    local hidden='.state == "unknown" and .reason == "probe_failed" and (.detail | startswith("lsof did not list"))'
+    if ! jq -e --argjson pid "$holder" '.worktree.activity.state == "in_use" and any(.worktree.activity.processes[]; .pid == $pid)' "$outside" >/dev/null; then
+        fail "outside the sandbox, with sleep[$holder] in it, explain says $(jq -c '.worktree.activity' "$outside")"
+    elif [ "$explain_status" != 0 ]; then fail "in the sandbox, explain exit $explain_status, want 0"
+    elif ! jq -e ".worktree.verdict == \"unknown\" and (.worktree.activity | $hidden) and (.activity.available == false)" "$busy" >/dev/null; then
+        fail "in the sandbox (pids lsof lists there: $listed), with sleep[$holder] in w, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$busy")"
+    elif [ "$status" != 3 ]; then fail "in the sandbox, remove --yes exit $status, want 3"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), want refused"
+    elif [ "$(failing_checks 0)" != activity ]; then fail "failing checks: $(failing_checks 0), want activity"
+    elif ! jq -e ".results[0].worktree.activity | $hidden" "$out" >/dev/null; then
+        fail "in the sandbox, remove's activity is $(jq -c '.results[0].worktree.activity' "$out")"
+    elif untouched "$before"; then
+        ok
+        echo "     pids lsof lists in the sandbox: $listed; $(jq -r '.worktree.activity.detail' "$busy")"
+    fi
+}
+if [ "$(uname -s)" = Darwin ] && [ -x /usr/bin/sandbox-exec ]; then
+    sandboxed_case
+else
+    echo "skip activity-sandboxed: it runs on macOS, with sandbox-exec"
+fi
+
 echo "contract-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]

@@ -10,10 +10,11 @@
 //! absence, so where it finds none the answer is `unknown`, which keeps the
 //! worktree. A file a process holds whose path the probe could not read
 //! (`Seen::unnamed`) is looked for in the directory by its inode, and where
-//! residue cannot look the answer is `unknown` too. `not_observed` is not
-//! proof of inactivity: processes owned by other users, in containers or on
-//! other machines are outside what a same-user probe can see, and a process
-//! can open the directory a moment later.
+//! residue cannot look the answer is `unknown` too. So is a running process
+//! of the user's that macOS's lsof did not list (`unlisted`). `not_observed`
+//! is not proof of inactivity: processes owned by other users, in
+//! containers or on other machines are outside what a same-user probe can
+//! see, and a process can open the directory a moment later.
 
 use std::borrow::Cow;
 use std::os::unix::ffi::OsStrExt;
@@ -457,8 +458,134 @@ mod lsof {
     }
 }
 
+/// The processes macOS's lsof did not list. lsof skips, without a word,
+/// every process it may not inspect: another user's, and, when residue
+/// runs in a sandbox that lets it list processes but inspect only its own,
+/// every process of yours outside that sandbox. It still exits 0. So the
+/// probe lists every process before lsof runs, and looks up each one lsof
+/// did not list once it is done (`hidden`). One that exited meanwhile is
+/// gone, and one that runs as another user is outside what a same-user
+/// probe reads, as on every platform. One that runs as your user, or whose
+/// user residue cannot read, is a process lsof could not see into, so
+/// activity is `unknown` (`probe_failed`), as on FreeBSD.
+#[cfg(any(target_os = "macos", test))]
+mod unlisted {
+    /// What residue reads of a process lsof did not list.
+    #[derive(Debug, PartialEq)]
+    pub enum Owner {
+        /// No such process, or a zombie, or one working its way through
+        /// exit(): none of these can use a worktree any more.
+        Gone,
+        /// It runs with this effective user, under this name.
+        Runs(u32, String),
+        /// It runs, and the kernel will not say whose it is.
+        Unread,
+    }
+
+    /// Why lsof's answer cannot show that no process of yours is using a
+    /// worktree, or `None` when it can. `listed` are the processes listed
+    /// before lsof ran, `printed` (sorted) those lsof printed, `me` is
+    /// residue, `euid` your user, and `owner` reads a process once lsof is
+    /// done. A process that started after the listing is not looked at:
+    /// lsof had not listed it either.
+    pub fn hidden(
+        listed: &[u32],
+        printed: &[u32],
+        me: u32,
+        euid: u32,
+        owner: impl Fn(u32) -> Owner,
+    ) -> Option<String> {
+        let mut yours: Vec<(u32, String)> = Vec::new();
+        let mut unread: Vec<u32> = Vec::new();
+        for &pid in listed {
+            if pid == me || printed.binary_search(&pid).is_ok() {
+                continue;
+            }
+            match owner(pid) {
+                Owner::Gone => {}
+                Owner::Runs(uid, _) if uid != euid => {}
+                Owner::Runs(_, command) => yours.push((pid, command)),
+                Owner::Unread => unread.push(pid),
+            }
+        }
+        let of_yours = match yours.as_slice() {
+            [] => None,
+            [(pid, command)] => Some(format!("{command}[{pid}], a running process of yours")),
+            [(pid, command), ..] => Some(format!(
+                "{} running processes of yours, such as {command}[{pid}]",
+                yours.len()
+            )),
+        };
+        let what = match (of_yours, unread.as_slice()) {
+            (None, []) => return None,
+            (Some(of_yours), []) => of_yours,
+            (Some(of_yours), more) => format!(
+                "{of_yours}, and {} whose user residue cannot read",
+                more.len()
+            ),
+            (None, [pid]) => format!("process {pid}, whose user residue cannot read"),
+            (None, [pid, ..]) => format!(
+                "{} running processes whose user residue cannot read, such as process {pid}",
+                unread.len()
+            ),
+        };
+        let them = if yours.len() + unread.len() == 1 {
+            "it"
+        } else {
+            "them"
+        };
+        Some(format!(
+            "lsof did not list {what}: a sandbox around residue may hide {them}"
+        ))
+    }
+
+    /// The length of `struct kinfo_proc` (`<sys/sysctl.h>`), which
+    /// `kern.proc.pid.PID` returns, and where its fields sit, the same on
+    /// arm64 and x86_64 (`offsetof` against the macOS 26 SDK): `kp_proc`'s
+    /// `p_flag`, `p_stat`, `p_pid` and `p_comm`, and `kp_eproc`'s
+    /// `e_ucred.cr_uid`, the effective user. The libc crate does not
+    /// declare the struct for macOS; the tests check these against this
+    /// process.
+    pub const KINFO_PROC: usize = 648;
+    const P_FLAG: usize = 32;
+    const P_STAT: usize = 36;
+    const P_PID: usize = 40;
+    const P_COMM: usize = 243;
+    const COMM_LEN: usize = 17;
+    const CR_UID: usize = 420;
+    /// `P_WEXIT` (`<sys/proc.h>`): working its way through exit().
+    const P_WEXIT: u32 = 0x2000;
+    /// `SZOMB` (`<sys/proc.h>`).
+    const SZOMB: u8 = 5;
+
+    /// The owner a `kern.proc.pid.PID` answer gives for `pid`: an empty
+    /// answer is a process that does not exist, and one of another length
+    /// or for another process is not read.
+    pub fn kinfo(answer: &[u8], pid: u32) -> Owner {
+        if answer.is_empty() {
+            return Owner::Gone;
+        }
+        let word = |at: usize| -> Option<u32> {
+            Some(u32::from_ne_bytes(answer.get(at..at + 4)?.try_into().ok()?))
+        };
+        if answer.len() != KINFO_PROC || word(P_PID) != Some(pid) {
+            return Owner::Unread;
+        }
+        let (Some(flag), Some(uid)) = (word(P_FLAG), word(CR_UID)) else {
+            return Owner::Unread;
+        };
+        if answer[P_STAT] == SZOMB || flag & P_WEXIT != 0 {
+            return Owner::Gone;
+        }
+        let comm = &answer[P_COMM..P_COMM + COMM_LEN];
+        let end = comm.iter().position(|b| *b == 0).unwrap_or(comm.len());
+        Owner::Runs(uid, String::from_utf8_lossy(&comm[..end]).into_owned())
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
+    use super::unlisted::{self, Owner};
     use super::{Seen, Snapshot, Use, unavailable};
     use crate::run::{self, RunError};
     use std::process::Command;
@@ -467,6 +594,26 @@ mod platform {
     const BACKEND: &str = "lsof";
 
     pub fn take() -> Snapshot {
+        // Every process, before lsof lists its own: one of yours that lsof
+        // then leaves out is one it could not see into (`unlisted`).
+        let Some(listed) = list_pids() else {
+            return unavailable(
+                BACKEND,
+                "probe_failed",
+                "residue could not list the running processes".into(),
+            );
+        };
+        let me = std::process::id();
+        if !listed.contains(&me) {
+            return unavailable(
+                BACKEND,
+                "probe_failed",
+                format!(
+                    "the kernel listed {} running processes and not residue itself, so the list is not whole",
+                    listed.len()
+                ),
+            );
+        }
         let mut cmd = Command::new("/usr/sbin/lsof");
         // -n -P: no DNS or port lookups. -F pcn: machine-readable fields for
         // pid, command and name; lsof adds the fd field on its own. lsof
@@ -504,6 +651,7 @@ mod platform {
         let mut pid: Option<u32> = None;
         let mut command = String::new();
         let mut inspected = 0;
+        let mut printed: Vec<u32> = Vec::new();
         // Whether lsof could read everything of the current process.
         let mut whole = false;
         for line in out.stdout.split(|b| *b == b'\n') {
@@ -526,6 +674,7 @@ mod platform {
                         inspected += 1;
                     }
                     pid = Some(p);
+                    printed.push(p);
                     command.clear();
                     whole = true;
                 }
@@ -553,18 +702,91 @@ mod platform {
         if pid.is_some() && whole {
             inspected += 1;
         }
+        printed.sort_unstable();
+        // SAFETY: geteuid only returns this process's effective user.
+        let euid = unsafe { libc::geteuid() };
+        if let Some(detail) = unlisted::hidden(&listed, &printed, me, euid, owner) {
+            return unavailable(BACKEND, "probe_failed", detail);
+        }
         Snapshot {
             backend: BACKEND,
             state: Ok(Seen {
                 uses,
                 inspected,
-                total: count_processes(),
+                total: Some(listed.len()),
                 limits: None,
                 spelling: Some(super::lsof::spell),
                 unnamed: Vec::new(),
             }),
         }
     }
+
+    /// Whose process `pid` is, read after lsof is done. First from
+    /// `proc_pidinfo(PROC_PIDT_SHORTBSDINFO)`, which xnu answers for any
+    /// user's process (`proc_pidinfo_internal` in `bsd/kern/proc_info.c`)
+    /// and a sandbox refuses with EPERM; no such process, a zombie
+    /// included, is ESRCH. Where it is refused, from `kern.proc.pid.PID`,
+    /// which a sandbox may still answer. Where both are refused, the
+    /// process runs and residue cannot tell whose it is.
+    fn owner(pid: u32) -> Owner {
+        let Ok(id) = libc::c_int::try_from(pid) else {
+            return Owner::Unread;
+        };
+        // SAFETY: a plain C struct of integers and byte arrays, for which
+        // all zeros is a valid value.
+        let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+        let size = size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+        // SAFETY: `info` is writable for `size` bytes, and the kernel
+        // writes at most `size`.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                id,
+                libc::PROC_PIDT_SHORTBSDINFO,
+                0,
+                (&raw mut info).cast(),
+                size,
+            )
+        };
+        if n == size && info.pbsi_pid == pid {
+            if info.pbsi_status == libc::SZOMB || info.pbsi_flags & PROC_FLAG_INEXIT != 0 {
+                return Owner::Gone;
+            }
+            let comm: Vec<u8> = info
+                .pbsi_comm
+                .iter()
+                .take_while(|c| **c != 0)
+                .map(|c| *c as u8)
+                .collect();
+            return Owner::Runs(info.pbsi_uid, String::from_utf8_lossy(&comm).into_owned());
+        }
+        if n <= 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return Owner::Gone;
+        }
+        let mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, id];
+        let mut answer = [0u8; unlisted::KINFO_PROC];
+        let mut len: libc::size_t = answer.len();
+        // SAFETY: `mib` holds 4 ints; `answer` is writable for `len` bytes
+        // and the kernel writes at most `len`; no new value is set.
+        let rc = unsafe {
+            libc::sysctl(
+                // macOS declares the name mutable; no kernel writes it.
+                mib.as_ptr().cast_mut(),
+                4,
+                answer.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return Owner::Unread;
+        }
+        unlisted::kinfo(&answer[..len.min(answer.len())], pid)
+    }
+
+    /// `PROC_FLAG_INEXIT` (`<sys/proc_info.h>`): working its way through
+    /// exit(). The libc crate does not define it.
+    const PROC_FLAG_INEXIT: u32 = 4;
 
     /// True for a name lsof prints in place of something it could not read,
     /// which could be a path inside a worktree. Apple's lsof (`lsof-76`,
@@ -590,14 +812,16 @@ mod platform {
         ERR2NM.iter().any(|prefix| name.starts_with(prefix)) && !name.ends_with(b": FD unavailable")
     }
 
-    /// The number of processes, to state how much lsof could see: every pid
-    /// the kernel lists, zombies and `kernel_task` (pid 0) included. That is
-    /// the number `ps -A` printed before, which lists itself and not pid 0.
+    /// Every pid the kernel lists, zombies and `kernel_task` (pid 0)
+    /// included; their number states how much lsof could see. That is the
+    /// number `ps -A` printed before, which lists itself and not pid 0.
     /// `proc_listallpids` writes at most the number of processes plus 20
     /// (`proc_listpids` in xnu's `bsd/kern/proc_info.c`) and returns how
     /// many pids it wrote (`libsyscall/wrappers/libproc/libproc.c`); a full
-    /// buffer may have been cut short, so it is asked again, larger.
-    fn count_processes() -> Option<usize> {
+    /// buffer may have been cut short, so it is asked again, larger. A
+    /// sandbox that refuses the list makes it return none, which the caller
+    /// tells by residue's own pid missing.
+    fn list_pids() -> Option<Vec<u32>> {
         // SAFETY: a null buffer of size 0 asks only for the number of pids
         // to make room for; nothing is written.
         let mut room = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
@@ -610,7 +834,12 @@ mod platform {
             let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
             let n = usize::try_from(n).ok()?;
             if n < len {
-                return Some(n);
+                pids.truncate(n);
+                return Some(
+                    pids.into_iter()
+                        .filter_map(|p| u32::try_from(p).ok())
+                        .collect(),
+                );
             }
             room = libc::c_int::try_from(len * 2).ok()?;
         }
@@ -619,7 +848,8 @@ mod platform {
 
     #[cfg(test)]
     mod tests {
-        use super::{count_processes, unread};
+        use super::super::unlisted::Owner;
+        use super::{list_pids, owner, unread};
 
         #[test]
         fn a_name_lsof_could_not_read_is_a_gap_and_a_closed_descriptor_is_not() {
@@ -646,8 +876,61 @@ mod platform {
         }
 
         #[test]
-        fn the_process_count_includes_this_process() {
-            assert!(count_processes().is_some_and(|n| n >= 1));
+        fn the_process_list_includes_this_process() {
+            assert!(list_pids().is_some_and(|pids| pids.contains(&std::process::id())));
+        }
+
+        #[test]
+        fn this_process_runs_as_this_user_and_no_process_has_an_impossible_pid() {
+            // SAFETY: geteuid only returns this process's effective user.
+            let euid = unsafe { libc::geteuid() };
+            match owner(std::process::id()) {
+                Owner::Runs(uid, name) => {
+                    assert_eq!(uid, euid);
+                    assert!(name.starts_with("residue"), "{name}");
+                }
+                other => panic!("{other:?}"),
+            }
+            // macOS gives no pid above 99,999 (`PID_MAX`).
+            assert_eq!(owner(99_999_999), Owner::Gone);
+        }
+
+        /// The offsets `unlisted::kinfo` reads, against this process's own
+        /// `kern.proc.pid.PID`.
+        #[test]
+        fn kinfo_proc_gives_this_process_its_user_and_name() {
+            use super::super::unlisted::{KINFO_PROC, kinfo};
+            let me = std::process::id();
+            let mib = [
+                libc::CTL_KERN,
+                libc::KERN_PROC,
+                libc::KERN_PROC_PID,
+                me as libc::c_int,
+            ];
+            let mut answer = [0u8; KINFO_PROC];
+            let mut len: libc::size_t = answer.len();
+            // SAFETY: as in `owner`.
+            let rc = unsafe {
+                libc::sysctl(
+                    mib.as_ptr().cast_mut(),
+                    4,
+                    answer.as_mut_ptr().cast(),
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!((rc, len), (0, KINFO_PROC));
+            // SAFETY: geteuid only returns this process's effective user.
+            let euid = unsafe { libc::geteuid() };
+            match kinfo(&answer, me) {
+                Owner::Runs(uid, name) => {
+                    assert_eq!(uid, euid);
+                    assert!(name.starts_with("residue"), "{name}");
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(kinfo(&answer, me + 1), Owner::Unread);
         }
     }
 }
@@ -1988,6 +2271,82 @@ mod tests {
     fn a_full_probe_finding_no_use_is_not_observed() {
         let e = snapshot(None).evidence(Path::new("/w/idle"), None);
         assert_eq!(e.code(), "not_observed");
+    }
+
+    /// The processes listed before lsof ran (1 to 8; residue is 2), each
+    /// one's owner once lsof is done, and those lsof printed.
+    fn hidden(printed: &[u32]) -> Option<String> {
+        use super::unlisted::{self, Owner};
+        let owner = |pid: u32| match pid {
+            1 => Owner::Runs(0, "launchd".into()),
+            3 => Owner::Runs(501, "zsh".into()),
+            4 => Owner::Gone,
+            5 => Owner::Runs(501, "node".into()),
+            6 => Owner::Unread,
+            7 => Owner::Unread,
+            _ => panic!("process {pid} was printed, or is residue, and must not be looked up"),
+        };
+        unlisted::hidden(&[1, 2, 3, 4, 5, 6, 7, 8], printed, 2, 501, owner)
+    }
+
+    #[test]
+    fn a_process_of_yours_lsof_did_not_list_fails_the_probe() {
+        assert_eq!(
+            hidden(&[5, 6, 7, 8]).as_deref(),
+            Some(
+                "lsof did not list zsh[3], a running process of yours: a sandbox around residue may hide it"
+            )
+        );
+        assert_eq!(
+            hidden(&[8]).as_deref(),
+            Some(
+                "lsof did not list 2 running processes of yours, such as zsh[3], and 2 whose user residue cannot read: a sandbox around residue may hide them"
+            )
+        );
+        assert_eq!(
+            hidden(&[3, 5, 6, 8]).as_deref(),
+            Some(
+                "lsof did not list process 7, whose user residue cannot read: a sandbox around residue may hide it"
+            )
+        );
+        assert_eq!(
+            hidden(&[3, 5, 8]).as_deref(),
+            Some(
+                "lsof did not list 2 running processes whose user residue cannot read, such as process 6: a sandbox around residue may hide them"
+            )
+        );
+    }
+
+    #[test]
+    fn another_users_process_or_one_that_exited_does_not() {
+        assert_eq!(hidden(&[3, 5, 6, 7, 8]), None);
+    }
+
+    #[test]
+    fn a_kinfo_proc_answer_gives_the_effective_user_and_name_of_a_running_process() {
+        use super::unlisted::{KINFO_PROC, Owner, kinfo};
+        let record = |pid: u32, flag: u32, stat: u8| {
+            let mut r = vec![0u8; KINFO_PROC];
+            r[32..36].copy_from_slice(&flag.to_ne_bytes());
+            r[36] = stat;
+            r[40..44].copy_from_slice(&pid.to_ne_bytes());
+            r[243..243 + 4].copy_from_slice(b"zsh\0");
+            r[420..424].copy_from_slice(&501u32.to_ne_bytes());
+            r
+        };
+        // SRUN, 2.
+        assert_eq!(
+            kinfo(&record(7, 0x4004, 2), 7),
+            Owner::Runs(501, "zsh".into())
+        );
+        // A zombie, and one in exit() (P_WEXIT).
+        assert_eq!(kinfo(&record(7, 0x4004, 5), 7), Owner::Gone);
+        assert_eq!(kinfo(&record(7, 0x2004, 2), 7), Owner::Gone);
+        // No such process: the kernel answers with no bytes.
+        assert_eq!(kinfo(&[], 7), Owner::Gone);
+        // Another process's record, or one of another length, is not read.
+        assert_eq!(kinfo(&record(8, 0x4004, 2), 7), Owner::Unread);
+        assert_eq!(kinfo(&record(7, 0x4004, 2)[..600], 7), Owner::Unread);
     }
 
     #[test]
