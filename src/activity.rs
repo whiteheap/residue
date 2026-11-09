@@ -657,6 +657,9 @@ mod platform {
         assert!(libc::KF_TYPE_VNODE == kinfo::TYPE_VNODE);
         assert!(libc::KF_TYPE_FIFO == kinfo::TYPE_FIFO);
         assert!(libc::KF_FD_TYPE_CWD == kinfo::FD_CWD);
+        // `KINFO_FILE_SIZE` in `<sys/user.h>`, which `RECORD` stands for.
+        #[cfg(target_arch = "x86_64")]
+        assert!(size_of::<libc::kinfo_file>() == 1392);
     };
 
     /// The most residue reads of one process's files: a record is 368
@@ -795,8 +798,16 @@ mod platform {
         TooLarge,
     }
 
+    /// The longest record the kernel writes: a whole `kinfo_file`, 1392
+    /// bytes, rounded up to 8 (`export_vnode_to_kinfo`, unpacked).
+    const RECORD: usize = size_of::<libc::kinfo_file>().next_multiple_of(8);
+
     /// `kern.proc.filedesc.<pid>` into `buf`, grown and asked again while
-    /// the kernel answers ENOMEM, its answer when the records do not fit.
+    /// the records may not have fit. FreeBSD 13 and later answer ENOMEM
+    /// then. FreeBSD 12 stops at the first record that does not fit and
+    /// answers success (`export_kinfo_to_sb` in its `kern_descrip.c`), so
+    /// an answer that ends less than one record short of the buffer may
+    /// have been cut, and is asked again too.
     fn read(pid: libc::c_int, buf: &mut Vec<u8>) -> Read {
         let mib = [
             libc::CTL_KERN,
@@ -819,11 +830,13 @@ mod platform {
                 )
             };
             if rc == 0 {
-                return Read::Got(len.min(buf.len()));
-            }
-            // Any other error is the process's: ESRCH, it exited; EPERM, the
-            // user may not inspect it.
-            if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOMEM) {
+                let len = len.min(buf.len());
+                if buf.len() - len >= RECORD {
+                    return Read::Got(len);
+                }
+            } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOMEM) {
+                // Any other error is the process's: ESRCH, it exited; EPERM,
+                // the user may not inspect it.
                 return Read::Skip;
             }
             if buf.len() >= MOST {
