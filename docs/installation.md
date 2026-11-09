@@ -28,6 +28,8 @@ It installs residue through the first channel that fits, or upgrades it when it 
 | Arch Linux, Omarchy | the signed pacman repository, as in [the pacman steps](#arch-linux-omarchy-and-other-arch-based-systems), then `pacman -Syu residue` | `pacman -Syu` |
 | macOS without Homebrew, FreeBSD, Alpine, Linux without root, or `--archive` | the release archive into `~/.local/bin` | running the script again |
 
+After an upgrade, automatic cleanup runs the new release within about six minutes ([After an upgrade](automation.md#after-an-upgrade)).
+
 A package repository needs root: the script uses it when it runs as root, when `sudo` works without a password, or when `sudo` can ask for yours on the terminal. Otherwise it falls back to the archive, which needs no root. On Arch, `pacman -Syu` upgrades the whole system, as Arch requires; with a terminal, pacman shows the transaction and asks first.
 
 Right after a release, its FreeBSD archives are still being built, usually for under half an hour. In that window the script installs the newest release that has this machine's archive, names both versions, and tells you to run it again later to update; the apt, dnf and pacman repositories serve the previous release in that window too. If it cannot tell which release that is, for example because GitHub's API did not answer, it stops and prints the command to install a release by its tag.
