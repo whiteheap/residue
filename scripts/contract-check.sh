@@ -1788,5 +1788,210 @@ held activity-cwd-emoji-above w cwd "$work/$(printf '\360\237\232\200')-repo"
 held activity-open-file-only w open "$work/$(printf 'na\303\257ve')-repo"
 held activity-open-file-moved moved open-then-move
 
+# 17. A probe names a path whole only below a length (PATH_LIMIT in
+# src/activity.rs): lsof on macOS prints a longer one cut short, Linux's
+# /proc names none at 4,096 bytes, and the BSDs' and illumos's kernels none
+# at 1,024. A worktree that holds a path that long is unknown (long_path),
+# with or without a process there, and never a candidate; a process the
+# probe does name is in_use. The long path is ignored folders below
+# node_modules/, made one at a time, since a system call takes no path that
+# long; the deepest is longer than both the limit and 1,024 bytes, so lsof
+# cuts it. A sleep holds it, then one in a shallow folder, then none. Once
+# the long folders are gone the worktree is a candidate again. FreeBSD's
+# kernel gives the deep sleep's folder by its filesystem and inode, which
+# the walk finds, so there it is in_use instead.
+long_path_case() {
+    name=activity-long-path
+    make_repo
+    local limit deep_at part parts=() i before holder shallow len
+    case $(uname -s) in
+    Darwin) limit=1004 ;;
+    Linux) limit=4096 ;;
+    *) limit=1024 ;;
+    esac
+    deep_at=$((limit > 1024 ? limit + 16 : 1024 + 16))
+    len=$(($(cd "$wt" && pwd -P | wc -c) - 1 + 13)) # "/node_modules"
+    while [ "$len" -lt "$deep_at" ]; do
+        i=$((deep_at - len - 1))
+        [ "$i" -gt 200 ] && i=200
+        [ "$i" -lt 1 ] && i=1
+        part=$(printf '%*s' "$i" '' | tr ' ' d)
+        parts+=("$part")
+        len=$((len + 1 + i))
+    done
+    (cd "$wt/node_modules" && for part in "${parts[@]}"; do mkdir "$part" && cd "$part" || exit 1; done && : >deep.js) || { echo "contract-check: setup failed in $name: the long folders" >&2; exit 2; }
+    before=$(sums "$wt")
+    (cd "$wt/node_modules" && for part in "${parts[@]}"; do cd "$part" || exit 1; done && exec sleep 300) >/dev/null 2>&1 &
+    holder=$!
+    holders="$holders $holder"
+    for ((i = 0; i < 100; i++)); do
+        case $(ps -o comm= -p "$holder" 2>/dev/null) in *sleep) break ;; esac
+        sleep 0.1
+    done
+    run explain --json "$wt"
+    mv "$out" "$work/$name.deep" || exit 2
+    local deep_status=$status
+    run remove --yes --json --no-trash "$wt"
+    kill "$holder" 2>/dev/null
+    wait "$holder" 2>/dev/null
+    local kept='(.state == "unknown" and .reason == "long_path") or (.state == "in_use" and any(.processes[]; .pid == $pid))'
+    if [ "$deep_status" != 0 ]; then fail "explain exit $deep_status, want 0"; return
+    elif ! jq -e --argjson pid "$holder" ".worktree.verdict != \"candidate\" and (.worktree.activity | $kept)" "$work/$name.deep" >/dev/null; then
+        fail "with sleep[$holder] at a path $deep_at bytes long, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$work/$name.deep"), want unknown (long_path)"; return
+    elif [ "$status" != 3 ]; then fail "remove --yes exit $status, want 3"; return
+    elif ! json_ok 1 || [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), want refused"; return
+    elif ! grep -qx activity <<<"$(failing_checks 0 | tr , '\n')"; then fail "failing checks: $(failing_checks 0), want activity among them"; return
+    elif ! untouched "$before"; then return
+    fi
+    (cd "$wt/node_modules/${parts[0]}" && exec sleep 300) >/dev/null 2>&1 &
+    shallow=$!
+    holders="$holders $shallow"
+    for ((i = 0; i < 100; i++)); do
+        case $(ps -o comm= -p "$shallow" 2>/dev/null) in *sleep) break ;; esac
+        sleep 0.1
+    done
+    run explain --json "$wt"
+    kill "$shallow" 2>/dev/null
+    wait "$shallow" 2>/dev/null
+    if ! jq -e --argjson pid "$shallow" '.worktree.activity | .state == "in_use" and any(.processes[]; .pid == $pid)' "$out" >/dev/null; then
+        fail "with sleep[$shallow] in a shallow folder, explain says $(jq -c '.worktree.activity' "$out"), want in_use"; return
+    fi
+    run explain --json "$wt"
+    if ! jq -e '.worktree.verdict != "candidate" and (.worktree.activity | .state == "unknown" and .reason == "long_path")' "$out" >/dev/null; then
+        fail "with no process there, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$out"), want unknown (long_path)"; return
+    fi
+    rm -rf -- "${wt:?}/node_modules/${parts[0]}"
+    run explain --json "$wt"
+    if ! jq -e '.worktree.verdict == "candidate" and .worktree.activity.state == "not_observed"' "$out" >/dev/null; then
+        fail "once the long folders are gone, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$out"), want candidate and not_observed"; return
+    fi
+    ok
+}
+if [ -z "$partial_probe" ]; then long_path_case; else skip_partial activity-long-path; fi
+
+# 17b. Moved aside to be deleted, a worktree's paths grow by as much as its
+# own: its hidden name, .NAME.residue-removing-PID, or its trash entry is
+# longer than its path. A worktree whose longest path is 10 bytes short of
+# the limit here reaches it there, so the plan keeps it as unknown
+# (long_path) and remove refuses it before it moves anything, rather than
+# moving it aside and back on every run.
+near_limit_case() {
+    name=activity-near-path-limit
+    make_repo
+    local limit target part parts=() i before len
+    case $(uname -s) in
+    Darwin) limit=1004 ;;
+    Linux) limit=4096 ;;
+    *) limit=1024 ;;
+    esac
+    # The folders end 8 bytes short of the target, for "/deep.js".
+    target=$((limit - 10 - 8))
+    len=$(($(cd "$wt" && pwd -P | wc -c) - 1 + 13)) # "/node_modules"
+    while [ "$len" -lt "$target" ]; do
+        i=$((target - len - 1))
+        [ "$i" -gt 200 ] && i=200
+        [ "$i" -lt 1 ] && i=1
+        part=$(printf '%*s' "$i" '' | tr ' ' d)
+        parts+=("$part")
+        len=$((len + 1 + i))
+    done
+    [ "$len" = "$target" ] || { echo "contract-check: setup failed in $name: the folders are $len bytes, want $target" >&2; exit 2; }
+    (cd "$wt/node_modules" && for part in "${parts[@]}"; do mkdir "$part" && cd "$part" || exit 1; done && : >deep.js) || { echo "contract-check: setup failed in $name: the long folders" >&2; exit 2; }
+    before=$(sums "$wt")
+    run explain --json "$wt"
+    if [ "$status" != 0 ]; then fail "explain exit $status, want 0"; return
+    elif ! jq -e '.worktree.verdict != "candidate" and (.worktree.activity | .state == "unknown" and .reason == "long_path" and (.detail | contains("where residue deletes it")))' "$out" >/dev/null; then
+        fail "with a path $((limit - 10)) bytes long, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$out"), want unknown (long_path) where residue deletes it"; return
+    fi
+    run remove --yes --json --no-trash "$wt"
+    if [ "$status" != 3 ]; then fail "remove --yes exit $status, want 3"; return
+    elif ! json_ok 1 || [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result): $(result 0 reason), want refused at the plan"; return
+    elif ! grep -qx activity <<<"$(failing_checks 0 | tr , '\n')"; then fail "failing checks: $(failing_checks 0), want activity among them"; return
+    elif ! untouched "$before"; then return
+    fi
+    ok
+}
+if [ -z "$partial_probe" ]; then near_limit_case; else skip_partial activity-near-path-limit; fi
+
+# 18. FreeBSD, as root, with an ordinary user named smoke (CI makes one):
+# with security.bsd.unprivileged_proc_debug at 0 the kernel shows that user
+# the files of none of their processes but residue's own, so a sleep of
+# theirs in a worktree cannot be seen, and its activity must be unknown
+# (probe_failed), never not_observed. With the setting as it was, the same
+# sleep is in_use. The setting is put back right after. That second run
+# also has processes of smoke's that the kernel shows to root alone,
+# whatever the setting: an ssh-agent, which turns tracing off (P2_NOTRACE),
+# and, where this machine's sshd takes a key, an SSH session to localhost,
+# whose process for the login changed its credentials without an exec
+# (P_SUGID). They are not inspected, as on Linux, so the sleep is still
+# in_use; the log prints their flags.
+proc_debug_case() {
+    name=activity-proc-debug-off
+    local was dir abs_bin on session='' login=''
+    was=$(sysctl -n security.bsd.unprivileged_proc_debug) || { fail "cannot read security.bsd.unprivileged_proc_debug"; return; }
+    abs_bin=$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")
+    dir=$work/$name
+    mkdir -p "$dir/home"
+    make_repo "$dir/repo"
+    # A sleep in w's sub/, and residue's explain of w, both as smoke.
+    cat >"$dir/explain.sh" <<SCRIPT
+cd '$wt/sub' || exit 2
+sleep 300 >/dev/null 2>&1 &
+held=\$!
+agent=
+if [ "\$1" = agent ]; then
+    eval "\$(ssh-agent -s)" >/dev/null || exit 2
+    agent=\$SSH_AGENT_PID
+    echo "ssh-agent[\$agent] flags \$(ps -o flags= -o flags2= -p "\$agent")" >'$dir/agent.flags'
+fi
+sleep 1
+HOME='$dir/home' NO_COLOR=1 LC_ALL=C '$abs_bin' explain --json '$wt'
+s=\$?
+kill "\$held" 2>/dev/null
+[ -z "\$agent" ] || kill "\$agent" 2>/dev/null
+exit "\$s"
+SCRIPT
+    chmod 711 "$work"
+    chown -R smoke "$dir"
+    out=$work/$name.out err=$work/$name.err
+    sysctl security.bsd.unprivileged_proc_debug=0 >/dev/null || { chmod 700 "$work"; fail "cannot set security.bsd.unprivileged_proc_debug"; return; }
+    su smoke -c "sh $dir/explain.sh" >"$out" 2>"$err"
+    sysctl security.bsd.unprivileged_proc_debug="$was" >/dev/null || fail "cannot put security.bsd.unprivileged_proc_debug back to $was"
+    # An SSH session as smoke, from a key made here, where sshd takes it.
+    if ssh-keygen -q -t ed25519 -N '' -f "$work/$name.key" &&
+        install -d -o smoke -m 700 ~smoke/.ssh &&
+        install -o smoke -m 600 "$work/$name.key.pub" ~smoke/.ssh/authorized_keys; then
+        ssh -n -i "$work/$name.key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            smoke@127.0.0.1 'sleep 120' >"$work/$name.ssh" 2>&1 &
+        session=$!
+        holders="$holders $session"
+        for ((i = 0; i < 100; i++)); do
+            login=$(ps -U smoke -o pid= -o comm= | while read -r pid comm; do [ "${comm#sshd}" = "$comm" ] || { echo "$pid" && break; }; done)
+            [ -n "$login" ] && break
+            kill -0 "$session" 2>/dev/null || break
+            sleep 0.1
+        done
+    fi
+    if [ -n "$login" ]; then
+        echo "     $(ps -o comm= -p "$login")[$login] flags $(ps -o flags= -o flags2= -p "$login")"
+    else
+        echo "     no SSH session as smoke: $(head -c 300 "$work/$name.ssh" 2>/dev/null)"
+    fi
+    on=$(su smoke -c "sh $dir/explain.sh agent" 2>&1)
+    [ -z "$session" ] || kill "$session" 2>/dev/null
+    echo "     $(cat "$dir/agent.flags" 2>/dev/null)"
+    chmod 700 "$work"
+    if ! jq -e '.worktree.verdict != "candidate" and (.worktree.activity | .state == "unknown" and .reason == "probe_failed" and (.detail | contains("security.bsd.unprivileged_proc_debug is 0")))' "$out" >/dev/null; then
+        fail "with the setting at 0, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$out" 2>&1)"
+    elif ! jq -e '.worktree.activity | .state == "in_use" and any(.processes[]; .command == "sleep")' <<<"$on" >/dev/null; then
+        fail "with the setting at $was, explain says: $(head -c 600 <<<"$on")"
+    else ok; fi
+}
+if [ "$(uname -s)" = FreeBSD ] && [ "$(id -u)" = 0 ] && id smoke >/dev/null 2>&1; then
+    proc_debug_case
+else
+    echo "skip activity-proc-debug-off: it runs on FreeBSD as root, with a user named smoke"
+fi
+
 echo "contract-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]

@@ -12,7 +12,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::activity::{Evidence, Snapshot};
-use crate::fsinfo::{self, Bucket, BucketUsage, Expansion, Usage};
+use crate::fsinfo::{self, Bucket, BucketUsage, Expansion, Reach, Usage};
 use crate::git::{self, Entry};
 use crate::policy::{GIT_CONFIG_KEY, Policy, RuleSource, Rules};
 
@@ -424,15 +424,23 @@ pub fn worktree(
     r.restored = crate::removed::marked(&identity.git_dir);
 
     check_lock(&mut r, entry);
-    check_activity(&mut r, &canonical, snapshot);
     // `git status` runs before the walk so the walk can size each ignored
-    // entry and judge the collapsed directories a path rule reaches into.
-    // The checks are still reported in their usual order.
+    // entry and judge the collapsed directories a path rule reaches into,
+    // and the activity check follows the walk, which tells it how long the
+    // worktree's paths are and which files the probe could not name lie
+    // inside it. The checks are still reported in their usual order.
     let mut status = git::status(&canonical);
     let hidden = status.as_mut().ok().and_then(|s| s.hidden.take());
     let repo = RepoRules::read(&canonical);
     let rules = policy.with(&repo.rules);
-    let (buckets, usage) = walk(&canonical, &mut status, &rules);
+    let (buckets, usage) = walk(&canonical, &mut status, &rules, &snapshot.wanted());
+    check_activity(
+        &mut r,
+        &canonical,
+        snapshot,
+        usage.as_ref().ok().map(|u| &u.reach),
+        crate::remove::deleted_at(&canonical, &identity.common_dir),
+    );
     r.last_change = last_change(&usage, &canonical, &identity.git_dir);
     r.fingerprint = match &status {
         Ok(s) => Fingerprint::of(entry.head.clone(), &identity.git_dir, s, &usage),
@@ -666,8 +674,16 @@ fn check_lock(r: &mut Report, entry: &Entry) {
     }
 }
 
-fn check_activity(r: &mut Report, dir: &Path, snapshot: &Snapshot) {
-    let evidence = snapshot.evidence(dir);
+/// `deleted_at` is the length of the longest path `dir` can have where
+/// residue deletes it (`remove::deleted_at`).
+fn check_activity(
+    r: &mut Report,
+    dir: &Path,
+    snapshot: &Snapshot,
+    reach: Option<&Reach>,
+    deleted_at: usize,
+) {
+    let evidence = snapshot.evidence_at(dir, reach, deleted_at);
     match &evidence {
         Evidence::InUse(procs) => {
             let names: Vec<String> = procs
@@ -1306,19 +1322,23 @@ pub fn all(jobs: &[Job], snapshot: &Snapshot, policy: &Policy) -> Vec<Report> {
 /// `--ignored=matching` list then loses the entries `--ignored=traditional`
 /// does not print, so every check judges the list it always judged (#83).
 /// When Git fails to answer for an entry, `status` becomes that error, as
-/// if `git status` had failed.
+/// if `git status` had failed. `wanted` is `Snapshot::wanted`.
 fn walk(
     dir: &Path,
     status: &mut Result<git::Status, String>,
     rules: &Rules,
+    wanted: &[(u64, u64)],
 ) -> (Vec<Bucket>, io::Result<Usage>) {
     let matcher = |rel: &str| rules.matches(rel);
     let named = |rel: &str| rules.names_file(rel);
     let Ok(listed) = status else {
-        return (Vec::new(), fsinfo::measure(dir, &[], &matcher, &named));
+        return (
+            Vec::new(),
+            fsinfo::measure(dir, &[], &matcher, &named, wanted),
+        );
     };
     let mut buckets = buckets_for(listed, rules);
-    let mut usage = fsinfo::measure(dir, &buckets, &matcher, &named);
+    let mut usage = fsinfo::measure(dir, &buckets, &matcher, &named, wanted);
     let settled = match &mut usage {
         Ok(usage) if listed.matching => drop_unlisted(dir, listed, &mut buckets, usage),
         _ => Ok(()),
@@ -1553,26 +1573,37 @@ impl Fingerprint {
     /// now (after a move, its new path), with `head` as Git lists it there.
     /// It refuses what `check_size` refuses, which the fingerprint does not
     /// hold: an entry the walk cannot read, a nested repository or a mount
-    /// point (#106). Each error is the reason, a whole sentence.
+    /// point (#106). Each error is the reason, a whole sentence. With it
+    /// comes what the walk reached, for the activity check (`wanted` is
+    /// `Snapshot::wanted`), when the walk ran.
     pub fn again(
         &self,
         dir: &Path,
         head: Option<String>,
         policy: &Policy,
-    ) -> Result<Fingerprint, String> {
+        wanted: &[(u64, u64)],
+    ) -> (Result<Fingerprint, String>, Option<Reach>) {
         let unmeasured = |e: String| format!("cannot measure it after moving it aside: {e}");
-        let mut status = Ok(git::status(dir).map_err(unmeasured)?);
+        let status = match git::status(dir) {
+            Ok(status) => status,
+            Err(e) => return (Err(unmeasured(e)), None),
+        };
+        let mut status = Ok(status);
         let repo = RepoRules::read(dir);
         if let Some((_, problem)) = &repo.problem {
-            return Err(unmeasured(problem.clone()));
+            return (Err(unmeasured(problem.clone())), None);
         }
         let rules = policy.with(&repo.rules);
-        let (_, usage) = walk(dir, &mut status, &rules);
+        let (_, usage) = walk(dir, &mut status, &rules, wanted);
+        let reach = usage.as_ref().ok().map(|u| u.reach.clone());
         if let Some(found) = usage.as_ref().ok().and_then(|u| found_after_move(dir, u)) {
-            return Err(found);
+            return (Err(found), reach);
         }
-        Fingerprint::of(head, &self.git_dir, &status.map_err(unmeasured)?, &usage)
-            .map_err(unmeasured)
+        let now = match status {
+            Ok(status) => Fingerprint::of(head, &self.git_dir, &status, &usage).map_err(unmeasured),
+            Err(e) => Err(unmeasured(e)),
+        };
+        (now, reach)
     }
 
     /// The first difference from `now`, as a sentence that names what
