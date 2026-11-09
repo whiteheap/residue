@@ -434,6 +434,12 @@ pub fn main(args: &[OsString]) -> u8 {
             return 2;
         }
     };
+    // Every pass runs `residue scan`, which refuses an old Git: refuse it
+    // here, once, before the lock, instead of failing every pass.
+    if let Err(message) = git::require_version() {
+        log(&message);
+        return 1;
+    }
     if let Err(message) = opts.use_default_roots("residue watch") {
         eprintln!("residue watch: {}", output::clean(&message));
         return 2;
@@ -517,13 +523,21 @@ pub fn main(args: &[OsString]) -> u8 {
                 },
             };
         }
-        let removed = act(&exe, &opts, &snap, &mut state);
+        let acted = act(&exe, &opts, &snap, &mut state);
         if opts.once {
+            // One line when the pass removes nothing, so a preview never
+            // ends in silence. Only here: the service would log it on
+            // every pass.
+            if acted.tried == 0 {
+                log(&nothing_to_remove(&opts, &snap, &filesystems(&snap)));
+            } else if acted.removed == 0 && !opts.dry_run {
+                log("no removal this pass: each worktree it tried was kept, as logged above");
+            }
             return 0;
         }
         // Removals change free space and verdicts: look again at once, but
         // not forever.
-        if removed > 0 && rescans_in_a_row < 3 {
+        if acted.removed > 0 && rescans_in_a_row < 3 {
             rescans_in_a_row += 1;
             continue;
         }
@@ -541,6 +555,56 @@ pub fn main(args: &[OsString]) -> u8 {
             &binary,
         );
     }
+}
+
+/// The line `watch --once` ends with when its pass handed nothing to a
+/// removal: why, in a few words. `filesystems` is `filesystems(snap)`. It
+/// never starts with "would remove", which a dry run prints for each
+/// worktree it would remove, and has no "removed ", which a removal's
+/// own line has (`.github/watch-smoke.sh` looks for it).
+fn nothing_to_remove(
+    opts: &Options,
+    snap: &Snapshot,
+    filesystems: &[(u64, String, u64, u64)],
+) -> String {
+    // The same with --dry-run and without: nothing was handed to a removal.
+    let lead = "nothing to remove now";
+    if snap.worktrees.is_empty() {
+        return format!("{lead}: no linked worktrees in {}", opts.shown_roots());
+    }
+    let landed = snap
+        .worktrees
+        .iter()
+        .filter(|w| w.upstream_gone && !w.restored)
+        .count();
+    let branch = match landed {
+        0 => "no branch has landed".to_string(),
+        1 => "1 worktree's branch landed, but a check keeps it".to_string(),
+        n => format!("{n} worktrees' branches landed, but checks keep them"),
+    };
+    let lowest = filesystems
+        .iter()
+        .map(|(_, sample, free, total)| (percent(*free, *total), sample))
+        .min_by(|a, b| a.0.total_cmp(&b.0));
+    let disk = match lowest {
+        None => "free space unknown".to_string(),
+        Some((pct, _)) if pct >= opts.min_free => format!(
+            "{} {pct:.0}% free (removes below {}%)",
+            if filesystems.len() == 1 {
+                "the disk is"
+            } else {
+                "every disk is at least"
+            },
+            opts.min_free
+        ),
+        Some((pct, sample)) => format!(
+            "{} is {pct:.1}% free, below {}%, but no candidate is unchanged for {}",
+            output::home(sample),
+            opts.min_free,
+            opts.idle.text
+        ),
+    };
+    format!("{lead}: {branch}, and {disk}")
 }
 
 /// What to do after a failed scan: `Some(code)` to exit with, or `None` to
@@ -632,12 +696,90 @@ struct State {
     /// logged when it changes and not on every wake.
     pressure_notes: HashMap<u64, String>,
     watch_limit_logged: bool,
+    /// What low-disk removals freed that free space does not show yet.
+    unseen: Unseen,
+}
+
+/// How long the bytes a low-disk removal freed count toward later low-disk
+/// passes on its filesystem while free space does not show them. A deleted
+/// file's blocks stay used while a filesystem snapshot holds them: on APFS,
+/// Time Machine's local snapshots, which macOS keeps up to 24 hours (and
+/// deletes sooner when space runs low); on Btrfs and ZFS, a snapshot tool's.
+/// Without this, every five-minute pass would see the same low free space
+/// and remove the next largest idle worktree. A day covers those
+/// snapshots; once it passes, the bytes no longer count, and a pass judges
+/// free space alone, as before.
+const UNSEEN_FOR: i64 = 24 * 60 * 60;
+/// `UNSEEN_FOR`, for the log.
+const UNSEEN_FOR_TEXT: &str = "24h";
+
+/// One low-disk removal on a filesystem: when, the free space the pass
+/// read before it, and the bytes the scan measured for what went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Freed {
+    at: i64,
+    free_before: u64,
+    bytes: u64,
+}
+
+/// What low-disk removals freed, by filesystem, that free space may not show
+/// yet. In memory only, like `watch`'s timers: a restarted watch judges free
+/// space alone. Its moves are `removed`, `waiting` (which also forgets the
+/// removals older than `UNSEEN_FOR`) and `clear`; nothing else changes it.
+#[derive(Default)]
+struct Unseen {
+    by_dev: HashMap<u64, Vec<Freed>>,
+}
+
+impl Unseen {
+    /// A low-disk pass on `dev` removed `bytes` at `at`, when `free_before`
+    /// was free.
+    fn removed(&mut self, dev: u64, at: i64, free_before: u64, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.by_dev.entry(dev).or_default().push(Freed {
+            at,
+            free_before,
+            bytes,
+        });
+    }
+
+    /// The bytes still to show up on `dev`, with `free` free at `now`: what
+    /// the removals of the last `UNSEEN_FOR` freed, less what free space has
+    /// gained since the first of them, never below zero. It only ever
+    /// lowers what a pass removes: free space that dropped since (new files)
+    /// leaves the gap that drop made, and a pass still removes for it.
+    fn waiting(&mut self, dev: u64, free: u64, now: i64) -> u64 {
+        let Some(list) = self.by_dev.get_mut(&dev) else {
+            return 0;
+        };
+        list.retain(|f| now - f.at < UNSEEN_FOR);
+        let Some(first) = list.first().copied() else {
+            self.by_dev.remove(&dev);
+            return 0;
+        };
+        let freed: u64 = list.iter().map(|f| f.bytes).sum();
+        let shown = free.saturating_sub(first.free_before);
+        freed.saturating_sub(shown)
+    }
+
+    /// Free space on `dev` is above `--min-free` again: what was waiting
+    /// showed up, or no longer matters.
+    fn clear(&mut self, dev: u64) {
+        self.by_dev.remove(&dev);
+    }
 }
 
 struct Worktree {
     path: String,
     verdict: String,
     upstream: Option<String>,
+    /// Its branch, short (`fix-login`), when it is on one.
+    branch: Option<String>,
+    /// Commits reachable from its HEAD but from no remote-tracking ref,
+    /// when the scan could count them. Removal keeps them on the branch.
+    local_commits: Option<u64>,
     /// Its upstream is a remote-tracking ref that is gone: the branch was
     /// deleted on a remote, as after a merged pull request.
     upstream_gone: bool,
@@ -687,6 +829,11 @@ fn scan(exe: &Path, opts: &Options) -> Result<Snapshot, ScanError> {
         Err(RunError::NotFound) => return Err(ScanError::Gone),
         Err(e) => return Err(ScanError::Failed(format!("residue scan: {e}"))),
     };
+    // A scan that failed says why on stderr, and its stdout is empty: log
+    // that alone, not a JSON error about the empty document.
+    if !out.status.success() {
+        return Err(ScanError::Failed(child_error("residue scan", &out)));
+    }
     let text = String::from_utf8_lossy(&out.stdout);
     let doc = jsonread::parse(&text).map_err(|e| {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -756,6 +903,14 @@ fn scan(exe: &Path, opts: &Options) -> Result<Snapshot, ScanError> {
                     .unwrap_or("")
                     .to_string(),
                 upstream: w.get("upstream").and_then(Value::str).map(str::to_string),
+                branch: w
+                    .get("branch")
+                    .and_then(Value::str)
+                    .map(|b| b.strip_prefix("refs/heads/").unwrap_or(b).to_string()),
+                local_commits: w
+                    .get("local_only_commits")
+                    .and_then(Value::i64)
+                    .and_then(|n| u64::try_from(n).ok()),
                 upstream_gone: w.get("upstream_gone").and_then(Value::bool) == Some(true)
                     && w.get("upstream_ref")
                         .and_then(Value::str)
@@ -777,6 +932,22 @@ fn scan(exe: &Path, opts: &Options) -> Result<Snapshot, ScanError> {
         }
     }
     Ok(snap)
+}
+
+/// Why a child that exited non-zero failed: its stderr, one line, or its
+/// exit status when it printed nothing there.
+fn child_error(what: &str, out: &run::Captured) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        format!("{what} exited with {}", out.status)
+    } else {
+        lines.join("; ")
+    }
 }
 
 /// Free and total bytes of the filesystem holding `path`.
@@ -814,9 +985,17 @@ fn percent(free: u64, total: u64) -> f64 {
     free as f64 * 100.0 / total as f64
 }
 
-fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> usize {
+/// What one pass of `act` did: how many worktrees it handed to a removal
+/// child (or, in a dry run, would have), and how many went.
+#[derive(Clone, Copy, Default)]
+struct Acted {
+    tried: usize,
+    removed: usize,
+}
+
+fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> Acted {
     let now = output::now();
-    let mut removed = 0;
+    let mut acted = Acted::default();
     // Worktrees already handed to a landed removal. If the child keeps one
     // (its upstream came back, say), this pass does not retry it as a
     // disk-pressure removal under another reason: the next scan judges
@@ -832,7 +1011,8 @@ fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> usize 
         tried.insert(&w.path);
     }
     if !landed.is_empty() {
-        removed += remove(
+        acted.tried += landed.len();
+        acted.removed += remove(
             exe,
             opts,
             &landed,
@@ -840,22 +1020,42 @@ fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> usize 
             /* require_upstream_gone */ true,
             |w| {
                 format!(
-                    "{} was deleted, unchanged for {}",
+                    "{} was deleted, unchanged for {}{}",
                     w.upstream.as_deref().unwrap_or("(unknown)"),
-                    opts.grace.text
+                    opts.grace.text,
+                    kept_commits(w)
                 )
             },
-        );
+        )
+        .count;
     }
 
     for (dev, sample, free, total) in filesystems(snap) {
         let pct = percent(free, total);
         if pct >= opts.min_free {
             state.pressure_notes.remove(&dev);
+            state.unseen.clear(dev);
             continue;
         }
         let target = (total as f64 * (opts.min_free + 5.0) / 100.0) as u64;
-        let mut need = target.saturating_sub(free);
+        // What removals of earlier passes freed and free space does not show
+        // yet counts as freed: only the rest of the gap is removed now.
+        let unseen = state.unseen.waiting(dev, free, now);
+        let mut need = target.saturating_sub(free).saturating_sub(unseen);
+        if need == 0 {
+            let note = format!(
+                "{}: {pct:.1}% free, below {}%; waiting for about {} that removals freed in the last {} to show up as free space (a filesystem snapshot can hold it)",
+                output::home(&sample),
+                opts.min_free,
+                output::bytes(unseen),
+                UNSEEN_FOR_TEXT
+            );
+            if state.pressure_notes.get(&dev) != Some(&note) {
+                log(&note);
+                state.pressure_notes.insert(dev, note);
+            }
+            continue;
+        }
         let mut eligible: Vec<&Worktree> = snap
             .worktrees
             .iter()
@@ -889,7 +1089,8 @@ fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> usize 
             continue;
         }
         state.pressure_notes.remove(&dev);
-        removed += remove(
+        acted.tried += chosen.len();
+        let gone = remove(
             exe,
             opts,
             &chosen,
@@ -902,14 +1103,37 @@ fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> usize 
                 )
             },
         );
+        acted.removed += gone.count;
+        state.unseen.removed(dev, now, free, gone.bytes);
     }
-    removed
+    acted
+}
+
+/// `; 3 commits on no remote-tracking ref stay on branch fix`, as the plan
+/// of `residue remove` says it, when the scan counted any.
+fn kept_commits(w: &Worktree) -> String {
+    match (w.local_commits, &w.branch) {
+        (Some(n @ 1..), Some(branch)) => format!(
+            "; {n} commit{} on no remote-tracking ref {} on branch {branch}",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "stays" } else { "stay" },
+        ),
+        _ => String::new(),
+    }
+}
+
+/// What a removal child removed: how many worktrees, and the reclaimable
+/// bytes the scan measured for them.
+#[derive(Clone, Copy, Default)]
+struct Gone {
+    count: usize,
+    bytes: u64,
 }
 
 /// Remove `worktrees` with `residue remove --yes --idle SPAN --no-trash`,
 /// plus `--only-if-upstream-gone` when they were chosen because their work
 /// landed, and log each result and each trash entry the run purged.
-/// Returns how many were removed.
+/// Returns how many were removed, and the bytes the scan measured for them.
 fn remove(
     exe: &Path,
     opts: &Options,
@@ -917,7 +1141,7 @@ fn remove(
     span: &Span,
     require_upstream_gone: bool,
     why: impl Fn(&Worktree) -> String,
-) -> usize {
+) -> Gone {
     if opts.dry_run {
         for w in worktrees {
             log(&format!(
@@ -927,7 +1151,7 @@ fn remove(
                 why(w)
             ));
         }
-        return 0;
+        return Gone::default();
     }
     let mut cmd = Command::new(exe);
     cmd.args([
@@ -960,11 +1184,20 @@ fn remove(
         Ok(out) => out,
         Err(e) => {
             log(&format!("residue remove: {e}"));
-            return 0;
+            return Gone::default();
         }
     };
     let doc = match jsonread::parse(&String::from_utf8_lossy(&out.stdout)) {
         Ok(doc) => doc,
+        // A run that failed before its document (an old Git, a bad option)
+        // says why on stderr alone.
+        Err(_) if !out.status.success() => {
+            log(&format!(
+                "removal failed: {}",
+                child_error("residue remove", &out)
+            ));
+            return Gone::default();
+        }
         Err(e) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             log(&format!(
@@ -972,10 +1205,10 @@ fn remove(
                 out.status,
                 stderr.lines().next().unwrap_or("")
             ));
-            return 0;
+            return Gone::default();
         }
     };
-    let mut removed = 0;
+    let mut gone = Gone::default();
     for result in doc.get("results").map(Value::items).unwrap_or(&[]) {
         let path = result.get("path").and_then(Value::str).unwrap_or("");
         let w = worktrees.iter().find(|w| w.path == path);
@@ -983,7 +1216,8 @@ fn remove(
         let reason = w.map(|w| why(w)).unwrap_or_default();
         match result.get("result").and_then(Value::str) {
             Some("removed") => {
-                removed += 1;
+                gone.count += 1;
+                gone.bytes += w.map_or(0, |w| w.bytes);
                 log(&format!(
                     "removed {} ({size}): {reason}{}",
                     output::home(path),
@@ -994,7 +1228,8 @@ fn remove(
             // trashes instead, the worktree is gone from its path all the
             // same, and the log says where it went.
             Some("trashed") => {
-                removed += 1;
+                gone.count += 1;
+                gone.bytes += w.map_or(0, |w| w.bytes);
                 let entry = result.get("trash_entry").and_then(Value::str).unwrap_or("");
                 log(&format!(
                     "moved {} to the trash ({size}): {reason}; restore: residue restore {}",
@@ -1086,7 +1321,7 @@ fn remove(
     if let Some(stats) = doc.get("stats") {
         log_freed(stats);
     }
-    removed
+    gone
 }
 
 /// What a removal child freed, and the total on this machine, from its
@@ -1637,5 +1872,121 @@ mod tests {
                 "HELP does not list ~/{name}"
             );
         }
+    }
+
+    fn worktree(path: &str) -> Worktree {
+        Worktree {
+            path: path.to_string(),
+            verdict: "keep".into(),
+            upstream: None,
+            branch: None,
+            local_commits: None,
+            upstream_gone: false,
+            last_change: Some(0),
+            bytes: 0,
+            waits_for_idle: false,
+            restored: false,
+            dev: Some(1),
+        }
+    }
+
+    /// A low-disk removal's bytes count until free space shows them, for
+    /// `UNSEEN_FOR` at most, and never more than the removal freed.
+    #[test]
+    fn unseen_counts_what_free_space_does_not_show_yet() {
+        const G: u64 = 1 << 30;
+        let mut unseen = Unseen::default();
+        assert_eq!(unseen.waiting(1, 10 * G, 0), 0);
+        unseen.removed(1, 100, 10 * G, 0);
+        assert_eq!(
+            unseen.waiting(1, 10 * G, 100),
+            0,
+            "nothing removed, nothing waits"
+        );
+        unseen.removed(1, 100, 10 * G, 4 * G);
+        // A snapshot holds it all, then half shows up, then all of it.
+        assert_eq!(unseen.waiting(1, 10 * G, 200), 4 * G);
+        assert_eq!(unseen.waiting(1, 12 * G, 300), 2 * G);
+        assert_eq!(unseen.waiting(1, 14 * G, 400), 0);
+        // New files filled the disk meanwhile: what waits is still at most
+        // what was removed, so the pass still removes for the new gap.
+        assert_eq!(unseen.waiting(1, 6 * G, 500), 4 * G);
+        // A second removal adds to it; another filesystem has its own.
+        unseen.removed(1, 600, 6 * G, 3 * G);
+        assert_eq!(unseen.waiting(1, 6 * G, 700), 7 * G);
+        assert_eq!(unseen.waiting(2, 6 * G, 700), 0);
+        // Past UNSEEN_FOR the first no longer counts, then neither does.
+        assert_eq!(unseen.waiting(1, 6 * G, 100 + UNSEEN_FOR), 3 * G);
+        assert_eq!(unseen.waiting(1, 6 * G, 600 + UNSEEN_FOR), 0);
+        assert!(unseen.by_dev.is_empty());
+        unseen.removed(1, 0, G, G);
+        unseen.clear(1);
+        assert_eq!(unseen.waiting(1, G, 1), 0);
+    }
+
+    #[test]
+    fn nothing_to_remove_says_why() {
+        let opts = options(&["/r"]);
+        let empty = Snapshot {
+            repos: Vec::new(),
+            worktrees: Vec::new(),
+        };
+        assert_eq!(
+            nothing_to_remove(&opts, &empty, &[]),
+            "nothing to remove now: no linked worktrees in /r"
+        );
+        let mut landed = worktree("/r/a");
+        landed.upstream_gone = true;
+        let snap = Snapshot {
+            repos: Vec::new(),
+            worktrees: vec![worktree("/r/b"), landed],
+        };
+        let fs = [(1, "/r/b".to_string(), 48, 100)];
+        assert_eq!(
+            nothing_to_remove(&opts, &snap, &fs),
+            "nothing to remove now: 1 worktree's branch landed, but a check keeps it, and the disk is 48% free (removes below 10%)"
+        );
+        let snap = Snapshot {
+            repos: Vec::new(),
+            worktrees: vec![worktree("/r/b")],
+        };
+        let low = [
+            (1, "/r/b".to_string(), 5, 100),
+            (2, "/s/c".to_string(), 50, 100),
+        ];
+        let mut real = opts.clone();
+        real.dry_run = false;
+        assert_eq!(
+            nothing_to_remove(&real, &snap, &low),
+            "nothing to remove now: no branch has landed, and /r/b is 5.0% free, below 10%, but no candidate is unchanged for 2d"
+        );
+        for line in [
+            nothing_to_remove(&opts, &snap, &fs),
+            nothing_to_remove(&opts, &empty, &[]),
+        ] {
+            assert!(
+                !line.starts_with("would remove") && !line.contains("removed "),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn kept_commits_follows_the_plan_wording() {
+        let mut w = worktree("/r/a");
+        assert_eq!(kept_commits(&w), "");
+        w.branch = Some("fix".into());
+        w.local_commits = Some(0);
+        assert_eq!(kept_commits(&w), "");
+        w.local_commits = Some(1);
+        assert_eq!(
+            kept_commits(&w),
+            "; 1 commit on no remote-tracking ref stays on branch fix"
+        );
+        w.local_commits = Some(3);
+        assert_eq!(
+            kept_commits(&w),
+            "; 3 commits on no remote-tracking ref stay on branch fix"
+        );
     }
 }
