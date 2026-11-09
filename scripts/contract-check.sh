@@ -1966,7 +1966,7 @@ SCRIPT
         session=$!
         holders="$holders $session"
         for ((i = 0; i < 100; i++)); do
-            login=$(ps -U smoke -o pid= -o comm= | while read -r pid comm; do case $comm in sshd*) echo "$pid" && break ;; esac; done)
+            login=$(ps -U smoke -o pid= -o comm= | while read -r pid comm; do [ "${comm#sshd}" = "$comm" ] || { echo "$pid" && break; }; done)
             [ -n "$login" ] && break
             kill -0 "$session" 2>/dev/null || break
             sleep 0.1
