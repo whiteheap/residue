@@ -572,8 +572,22 @@ fn unheld_others(
         }
     };
     let git_dir = git_dir_of(&item.common_dir, &named);
+    let wanted = snapshot.wanted();
     for dir in named.iter().copied().chain(git_dir.as_deref()) {
-        match snapshot.evidence(dir, None) {
+        // No walk sized this folder, so one runs here, as the plan's does:
+        // it says how long the paths inside it are, and which files the
+        // probe could not name lie inside it. A folder that is gone holds
+        // nothing.
+        let reach = match reach(dir, &wanted) {
+            Ok(reach) => reach,
+            Err(e) => {
+                return Err(format!(
+                    "the activity probe cannot show that no process is using {}: cannot walk it: {e}",
+                    dir.display()
+                ));
+            }
+        };
+        match snapshot.evidence(dir, reach.as_ref()) {
             Evidence::InUse(uses) => {
                 if let Some((pid, command)) = uses.into_iter().next() {
                     return Ok(Some(Unheld::Using(pid, command)));
@@ -592,6 +606,19 @@ fn unheld_others(
         }
     }
     Ok(None)
+}
+
+/// What a walk of `dir` reached (`fsinfo::Reach`), or `None` when `dir`
+/// is gone.
+fn reach(dir: &Path, wanted: &[(u64, u64)]) -> std::io::Result<Option<crate::fsinfo::Reach>> {
+    let walked = fs::canonicalize(dir).and_then(|canonical| {
+        crate::fsinfo::measure(&canonical, &[], &|_| false, &|_| false, wanted)
+    });
+    match walked {
+        Ok(usage) => Ok(Some(usage.reach)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Whether the live process `pid`, the one `record` names, may be the run

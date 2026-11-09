@@ -439,6 +439,7 @@ pub fn worktree(
         &canonical,
         snapshot,
         usage.as_ref().ok().map(|u| &u.reach),
+        crate::remove::deleted_at(&canonical, &identity.common_dir),
     );
     r.last_change = last_change(&usage, &canonical, &identity.git_dir);
     r.fingerprint = match &status {
@@ -673,8 +674,16 @@ fn check_lock(r: &mut Report, entry: &Entry) {
     }
 }
 
-fn check_activity(r: &mut Report, dir: &Path, snapshot: &Snapshot, reach: Option<&Reach>) {
-    let evidence = snapshot.evidence(dir, reach);
+/// `deleted_at` is the length of the longest path `dir` can have where
+/// residue deletes it (`remove::deleted_at`).
+fn check_activity(
+    r: &mut Report,
+    dir: &Path,
+    snapshot: &Snapshot,
+    reach: Option<&Reach>,
+    deleted_at: usize,
+) {
+    let evidence = snapshot.evidence_at(dir, reach, deleted_at);
     match &evidence {
         Evidence::InUse(procs) => {
             let names: Vec<String> = procs

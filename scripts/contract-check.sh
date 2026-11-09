@@ -1869,15 +1869,65 @@ long_path_case() {
 }
 if [ -z "$partial_probe" ]; then long_path_case; else skip_partial activity-long-path; fi
 
+# 17b. Moved aside to be deleted, a worktree's paths grow by as much as its
+# own: its hidden name, .NAME.residue-removing-PID, or its trash entry is
+# longer than its path. A worktree whose longest path is 10 bytes short of
+# the limit here reaches it there, so the plan keeps it as unknown
+# (long_path) and remove refuses it before it moves anything, rather than
+# moving it aside and back on every run.
+near_limit_case() {
+    name=activity-near-path-limit
+    make_repo
+    local limit target part parts=() i before len
+    case $(uname -s) in
+    Darwin) limit=1004 ;;
+    Linux) limit=4096 ;;
+    *) limit=1024 ;;
+    esac
+    # The folders end 8 bytes short of the target, for "/deep.js".
+    target=$((limit - 10 - 8))
+    len=$(($(cd "$wt" && pwd -P | wc -c) - 1 + 13)) # "/node_modules"
+    while [ "$len" -lt "$target" ]; do
+        i=$((target - len - 1))
+        [ "$i" -gt 200 ] && i=200
+        [ "$i" -lt 1 ] && i=1
+        part=$(printf '%*s' "$i" '' | tr ' ' d)
+        parts+=("$part")
+        len=$((len + 1 + i))
+    done
+    [ "$len" = "$target" ] || { echo "contract-check: setup failed in $name: the folders are $len bytes, want $target" >&2; exit 2; }
+    (cd "$wt/node_modules" && for part in "${parts[@]}"; do mkdir "$part" && cd "$part" || exit 1; done && : >deep.js) || { echo "contract-check: setup failed in $name: the long folders" >&2; exit 2; }
+    before=$(sums "$wt")
+    run explain --json "$wt"
+    if [ "$status" != 0 ]; then fail "explain exit $status, want 0"; return
+    elif ! jq -e '.worktree.verdict != "candidate" and (.worktree.activity | .state == "unknown" and .reason == "long_path" and (.detail | contains("where residue deletes it")))' "$out" >/dev/null; then
+        fail "with a path $((limit - 10)) bytes long, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$out"), want unknown (long_path) where residue deletes it"; return
+    fi
+    run remove --yes --json --no-trash "$wt"
+    if [ "$status" != 3 ]; then fail "remove --yes exit $status, want 3"; return
+    elif ! json_ok 1 || [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result): $(result 0 reason), want refused at the plan"; return
+    elif ! grep -qx activity <<<"$(failing_checks 0 | tr , '\n')"; then fail "failing checks: $(failing_checks 0), want activity among them"; return
+    elif ! untouched "$before"; then return
+    fi
+    ok
+}
+if [ -z "$partial_probe" ]; then near_limit_case; else skip_partial activity-near-path-limit; fi
+
 # 18. FreeBSD, as root, with an ordinary user named smoke (CI makes one):
 # with security.bsd.unprivileged_proc_debug at 0 the kernel shows that user
 # the files of none of their processes but residue's own, so a sleep of
 # theirs in a worktree cannot be seen, and its activity must be unknown
 # (probe_failed), never not_observed. With the setting as it was, the same
-# sleep is in_use. The setting is put back right after.
+# sleep is in_use. The setting is put back right after. That second run
+# also has processes of smoke's that the kernel shows to root alone,
+# whatever the setting: an ssh-agent, which turns tracing off (P2_NOTRACE),
+# and, where this machine's sshd takes a key, an SSH session to localhost,
+# whose process for the login changed its credentials without an exec
+# (P_SUGID). They are not inspected, as on Linux, so the sleep is still
+# in_use; the log prints their flags.
 proc_debug_case() {
     name=activity-proc-debug-off
-    local was dir abs_bin on
+    local was dir abs_bin on session='' login=''
     was=$(sysctl -n security.bsd.unprivileged_proc_debug) || { fail "cannot read security.bsd.unprivileged_proc_debug"; return; }
     abs_bin=$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")
     dir=$work/$name
@@ -1888,10 +1938,17 @@ proc_debug_case() {
 cd '$wt/sub' || exit 2
 sleep 300 >/dev/null 2>&1 &
 held=\$!
+agent=
+if [ "\$1" = agent ]; then
+    eval "\$(ssh-agent -s)" >/dev/null || exit 2
+    agent=\$SSH_AGENT_PID
+    echo "ssh-agent[\$agent] flags \$(ps -o flags= -o flags2= -p "\$agent")" >'$dir/agent.flags'
+fi
 sleep 1
 HOME='$dir/home' NO_COLOR=1 LC_ALL=C '$abs_bin' explain --json '$wt'
 s=\$?
 kill "\$held" 2>/dev/null
+[ -z "\$agent" ] || kill "\$agent" 2>/dev/null
 exit "\$s"
 SCRIPT
     chmod 711 "$work"
@@ -1900,7 +1957,29 @@ SCRIPT
     sysctl security.bsd.unprivileged_proc_debug=0 >/dev/null || { chmod 700 "$work"; fail "cannot set security.bsd.unprivileged_proc_debug"; return; }
     su smoke -c "sh $dir/explain.sh" >"$out" 2>"$err"
     sysctl security.bsd.unprivileged_proc_debug="$was" >/dev/null || fail "cannot put security.bsd.unprivileged_proc_debug back to $was"
-    on=$(su smoke -c "sh $dir/explain.sh" 2>&1)
+    # An SSH session as smoke, from a key made here, where sshd takes it.
+    if ssh-keygen -q -t ed25519 -N '' -f "$work/$name.key" &&
+        install -d -o smoke -m 700 ~smoke/.ssh &&
+        install -o smoke -m 600 "$work/$name.key.pub" ~smoke/.ssh/authorized_keys; then
+        ssh -n -i "$work/$name.key" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            smoke@127.0.0.1 'sleep 120' >"$work/$name.ssh" 2>&1 &
+        session=$!
+        holders="$holders $session"
+        for ((i = 0; i < 100; i++)); do
+            login=$(ps -U smoke -o pid= -o comm= | while read -r pid comm; do case $comm in sshd*) echo "$pid" && break ;; esac; done)
+            [ -n "$login" ] && break
+            kill -0 "$session" 2>/dev/null || break
+            sleep 0.1
+        done
+    fi
+    if [ -n "$login" ]; then
+        echo "     $(ps -o comm= -p "$login")[$login] flags $(ps -o flags= -o flags2= -p "$login")"
+    else
+        echo "     no SSH session as smoke: $(head -c 300 "$work/$name.ssh" 2>/dev/null)"
+    fi
+    on=$(su smoke -c "sh $dir/explain.sh agent" 2>&1)
+    [ -z "$session" ] || kill "$session" 2>/dev/null
+    echo "     $(cat "$dir/agent.flags" 2>/dev/null)"
     chmod 700 "$work"
     if ! jq -e '.worktree.verdict != "candidate" and (.worktree.activity | .state == "unknown" and .reason == "probe_failed" and (.detail | contains("security.bsd.unprivileged_proc_debug is 0")))' "$out" >/dev/null; then
         fail "with the setting at 0, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$out" 2>&1)"

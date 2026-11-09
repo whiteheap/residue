@@ -44,6 +44,26 @@ use crate::trash;
 pub const REMOVING: &str = "residue: removing";
 const ASIDE: &[u8] = b".residue-removing-";
 
+/// The length in bytes of the longest path the worktree at `original`
+/// (canonical) can have where residue deletes it, for the plan to hold
+/// the paths inside it against the activity probe's limit there
+/// (`Snapshot::evidence_at`). One in the trash is deleted where it is. Any
+/// other is moved first, to `.NAME.residue-removing-PID` beside it, a PID
+/// of up to ten digits, or with `--trash` to
+/// `COMMON_DIR/residue-trash/NAME-STAMP-N/NAME` (`trash::create`), and
+/// the longer of the two counts, whichever the run uses.
+pub fn deleted_at(original: &Path, common_dir: &Path) -> usize {
+    let len = original.as_os_str().len();
+    let trash = trash::root(common_dir);
+    if original.starts_with(&trash) {
+        return len;
+    }
+    let name = original.file_name().map_or(0, |n| n.len());
+    let aside = len + ".".len() + ASIDE.len() + u32::MAX.to_string().len();
+    let trashed = trash.as_os_str().len() + "/".len() + name + "-YYYYMMDDTHHMMSSZ-99/".len() + name;
+    aside.max(trashed)
+}
+
 /// `.NAME.residue-removing-PID` next to the worktree.
 fn aside_path(original: &Path) -> Option<PathBuf> {
     let mut name = OsString::from(".");
@@ -2531,5 +2551,30 @@ fn ages_text(mode: &Mode) -> String {
         Some(t) if t < mode.started - 86_400 => format!(" · ages as of {}", output::date(t)),
         Some(t) if t < mode.started => format!(" · ages as of {}", output::clock(t)),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    #[test]
+    fn a_worktree_is_deleted_at_its_hidden_name_or_its_trash_entry_whichever_is_longer() {
+        let common = Path::new("/r/.git");
+        let at = |original: &str| super::deleted_at(Path::new(original), common);
+        // Deep below a short trash: its hidden name is the longer.
+        assert_eq!(
+            at("/a/b/c/d/e/f/g/h/w"),
+            "/a/b/c/d/e/f/g/h/.w.residue-removing-4294967295".len()
+        );
+        // A long name: its trash entry, which holds the name twice.
+        let long = "n".repeat(40);
+        assert_eq!(
+            at(&format!("/r/.worktrees/{long}")),
+            format!("/r/.git/residue-trash/{long}-YYYYMMDDTHHMMSSZ-99/{long}").len()
+        );
+        // Already in the trash: the purge deletes it where it is.
+        let entry = "/r/.git/residue-trash/w-20261109T154958Z/w";
+        assert_eq!(at(entry), entry.len());
     }
 }

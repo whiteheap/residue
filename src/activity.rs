@@ -148,6 +148,15 @@ impl Snapshot {
     /// for by a walk of its own (`inodes_within`), and only `dir`'s own path
     /// is held against `PATH_LIMIT`.
     pub fn evidence(&self, dir: &Path, reach: Option<&Reach>) -> Evidence {
+        self.evidence_at(dir, reach, 0)
+    }
+
+    /// [`evidence`](Self::evidence) for a plan, where `deleted_at` is the
+    /// length of the longest path `dir` itself can have where residue
+    /// deletes it (`remove::deleted_at`): each path inside it is held
+    /// against `PATH_LIMIT` there too, so a worktree the plan lists as a
+    /// candidate is not one the check after the move then keeps.
+    pub fn evidence_at(&self, dir: &Path, reach: Option<&Reach>, deleted_at: usize) -> Evidence {
         let seen = match &self.state {
             Ok(seen) => seen,
             Err(unavailable) => return Evidence::Unknown(unavailable.clone()),
@@ -208,6 +217,17 @@ impl Snapshot {
                 reason: "long_path",
                 detail: format!(
                     "{} names a path whole only when it is shorter than {PATH_LIMIT} bytes, and a path here is {longest}, so it cannot show that no process is using it",
+                    self.backend
+                ),
+            });
+        }
+        // Moved aside, every path inside grows as much as `dir`'s own.
+        let there = longest + deleted_at.saturating_sub(raw.len());
+        if there >= PATH_LIMIT {
+            return Evidence::Unknown(Unavailable {
+                reason: "long_path",
+                detail: format!(
+                    "{} names a path whole only when it is shorter than {PATH_LIMIT} bytes, and a path here, {longest}, would be up to {there} where residue deletes it, so it cannot show that no process is using it there",
                     self.backend
                 ),
             });
@@ -853,10 +873,14 @@ mod maps {
 ///
 /// Both sysctls answer only for a process the user may debug (`p_candebug`
 /// in `sys/kern/kern_prot.c`). One that runs as another user is outside
-/// what a same-user probe reads, as on every platform. One that runs as
-/// this user and is refused anyway, with `security.bsd.unprivileged_proc_debug`
-/// at 0, or a process that denies tracing, makes the probe fail: residue
-/// cannot see the files of a process that could be using a worktree.
+/// what a same-user probe reads, as on every platform. So is one of this
+/// user's that the kernel shows to root alone, whatever the setting
+/// (`Listed::guarded`): the process sshd keeps for each login, ssh-agent,
+/// and init, as Linux's `/proc` hides a process that is not dumpable. Any
+/// other process of this user's that is refused, as every one is with
+/// `security.bsd.unprivileged_proc_debug` at 0, makes the probe fail:
+/// residue cannot see the files of a process that could be using a
+/// worktree.
 #[cfg(target_os = "freebsd")]
 mod platform {
     use super::{Seen, Snapshot, Unnamed, Use, kinfo, unavailable, vmentry};
@@ -889,6 +913,8 @@ mod platform {
         assert!(libc::KF_ATTR_VALID == kinfo::ATTR_VALID as libc::c_int);
         assert!(libc::KF_VTYPE_VNON == kinfo::VTYPE_NON);
         assert!(libc::KF_VTYPE_VBAD == kinfo::VTYPE_BAD);
+        assert!(libc::P_SUGID as u64 == super::P_SUGID);
+        assert!(libc::P2_NOTRACE as u64 == super::P2_NOTRACE);
         assert!(offset_of!(libc::kinfo_vmentry, kve_structsize) == 0);
         assert!(offset_of!(libc::kinfo_vmentry, kve_vn_fileid) == vmentry::FILEID);
         assert!(offset_of!(libc::kinfo_vmentry, kve_vn_type) == vmentry::VTYPE);
@@ -911,8 +937,11 @@ mod platform {
         // -A: every process. -ww: never cut a line to the terminal width.
         // uid, ruid, svuid: the effective, real and saved user, all three
         // of which the kernel compares to let this user read a process.
+        // flags, flags2: `ki_flag` and `ki_flag2`, which say whether the
+        // kernel shows it to root alone (`Listed::guarded`).
         cmd.args([
-            "-A", "-ww", "-o", "pid=", "-o", "uid=", "-o", "ruid=", "-o", "svuid=", "-o", "comm=",
+            "-A", "-ww", "-o", "pid=", "-o", "uid=", "-o", "ruid=", "-o", "svuid=", "-o", "flags=",
+            "-o", "flags2=", "-o", "comm=",
         ])
         .env("LC_ALL", "C");
         let out = match run::run(&mut cmd, Duration::from_secs(30), 64 << 20) {
@@ -987,14 +1016,19 @@ mod platform {
                     // inspect: outside what the probe reads, as `scope`
                     // says.
                     Read::Refused(libc::EPERM) if !ours => 0,
-                    // Your own process (EPERM), or one still in the middle
-                    // of an exec after `ask` asked again (EBUSY).
+                    // Your own process that the kernel shows to root alone,
+                    // whatever the setting: outside the probe too, as on
+                    // Linux.
+                    Read::Refused(libc::EPERM) if listed.guarded() => 0,
+                    // Any other process of yours (EPERM), or one still in
+                    // the middle of an exec after `ask` asked again
+                    // (EBUSY).
                     Read::Refused(errno) => {
                         let why = std::io::Error::from_raw_os_error(errno);
                         let name = String::from_utf8_lossy(listed.command);
                         let detail = if errno == libc::EPERM {
                             format!(
-                                "the kernel would not show the files of {name}[{pid}], which runs as your user ({why}): security.bsd.unprivileged_proc_debug is 0, or the process denies tracing"
+                                "the kernel would not show the files of {name}[{pid}], which runs as your user ({why}): security.bsd.unprivileged_proc_debug is 0, or its groups are not all yours"
                             )
                         } else {
                             format!("the kernel would not show the files of {name}[{pid}] ({why})")
@@ -1178,33 +1212,62 @@ mod platform {
     }
 }
 
-/// A line of `ps -o pid= -o uid= -o ruid= -o svuid= -o comm=`: four
-/// numbers, then the command, which may hold spaces.
+/// A line of `ps -o pid= -o uid= -o ruid= -o svuid= -o flags= -o flags2=
+/// -o comm=`: four decimal numbers, two hexadecimal ones, then the
+/// command, which may hold spaces.
 #[cfg(any(target_os = "freebsd", test))]
 struct Listed<'a> {
     pid: u32,
     /// Effective, real and saved user.
     uids: [u32; 3],
+    /// `ki_flag` and `ki_flag2` (`<sys/proc.h>`).
+    flags: u64,
+    flags2: u64,
     command: &'a [u8],
+}
+
+/// `P_SUGID`: the process's credentials changed since its last exec.
+#[cfg(any(target_os = "freebsd", test))]
+const P_SUGID: u64 = 0x100;
+/// `P2_NOTRACE`: the process denies tracing (procctl(2)
+/// `PROC_TRACE_CTL_DISABLE`).
+#[cfg(any(target_os = "freebsd", test))]
+const P2_NOTRACE: u64 = 0x2;
+
+#[cfg(any(target_os = "freebsd", test))]
+impl Listed<'_> {
+    /// Whether the kernel shows this process to root alone, however
+    /// `security.bsd.unprivileged_proc_debug` is set (`p_candebug`): its
+    /// credentials changed since its last exec, as the process sshd keeps
+    /// for each login has, it denies tracing, as ssh-agent does, or it is
+    /// init, which no one may trace while `kern.securelevel` is above 0.
+    fn guarded(&self) -> bool {
+        self.flags & P_SUGID != 0 || self.flags2 & P2_NOTRACE != 0 || self.pid == 1
+    }
 }
 
 #[cfg(any(target_os = "freebsd", test))]
 fn ps_line(line: &[u8]) -> Option<Listed<'_>> {
     let mut rest = line.trim_ascii();
-    let mut field = || {
+    let mut field = |radix: u32| {
         let end = rest
             .iter()
             .position(u8::is_ascii_whitespace)
             .unwrap_or(rest.len());
-        let number = std::str::from_utf8(&rest[..end]).ok()?.parse::<u32>().ok();
+        let word = std::str::from_utf8(&rest[..end]).ok()?;
         rest = rest[end..].trim_ascii_start();
-        number
+        u64::from_str_radix(word, radix).ok()
     };
-    let pid = field()?;
-    let uids = [field()?, field()?, field()?];
+    let mut id = || u32::try_from(field(10)?).ok();
+    let pid = id()?;
+    let uids = [id()?, id()?, id()?];
+    let flags = field(16)?;
+    let flags2 = field(16)?;
     Some(Listed {
         pid,
         uids,
+        flags,
+        flags2,
         command: rest,
     })
 }
@@ -2374,19 +2437,40 @@ mod tests {
     }
 
     #[test]
-    fn a_ps_line_gives_the_pid_the_three_users_and_the_command() {
-        let listed = super::ps_line(b"  812  1001  1001     0 my tool \n").unwrap();
+    fn a_ps_line_gives_the_pid_the_three_users_the_flags_and_the_command() {
+        let listed =
+            super::ps_line(b"  812  1001  1001     0 10004002 00000000 my tool \n").unwrap();
         assert_eq!(listed.pid, 812);
         assert_eq!(listed.uids, [1001, 1001, 0]);
+        assert_eq!((listed.flags, listed.flags2), (0x1000_4002, 0));
         assert_eq!(listed.command, b"my tool");
-        let listed = super::ps_line(b"1 0 0 0 init").unwrap();
+        let listed = super::ps_line(b"1 0 0 0 10004200 00000000 init").unwrap();
         assert_eq!(
             (listed.pid, listed.uids, listed.command),
             (1, [0; 3], &b"init"[..])
         );
-        assert!(super::ps_line(b"  812  1001  1001").is_none());
-        assert!(super::ps_line(b"  812  root  1001  1001 sh").is_none());
-        assert!(super::ps_line(b"  -1  0  0  0 sh").is_none());
+        assert!(super::ps_line(b"  812  1001  1001  1001 4002").is_none());
+        assert!(super::ps_line(b"  812  1001  1001  1001 4002 0x0 sh").is_none());
+        assert!(super::ps_line(b"  812  root  1001  1001 4002 0 sh").is_none());
+        assert!(super::ps_line(b"  -1  0  0  0 4002 0 sh").is_none());
+        assert!(super::ps_line(b"  4294967296  0  0  0 4002 0 sh").is_none());
+    }
+
+    #[test]
+    fn the_kernel_shows_a_process_that_changed_credentials_or_denies_tracing_to_root_alone() {
+        let guarded = |line: &[u8]| super::ps_line(line).unwrap().guarded();
+        // sshd's process for a login: P_SUGID.
+        assert!(guarded(
+            b"900 1001 1001 1001 10000100 00000000 sshd-session"
+        ));
+        // ssh-agent: P2_NOTRACE.
+        assert!(guarded(b"901 1001 1001 1001 10004000 00000002 ssh-agent"));
+        // init.
+        assert!(guarded(b"1 0 0 0 10004200 00000000 init"));
+        // An ordinary shell, and one that only asks for P2_NOTRACE on its
+        // next exec (P2_NOTRACE_EXEC).
+        assert!(!guarded(b"902 1001 1001 1001 10004002 00000000 sh"));
+        assert!(!guarded(b"903 1001 1001 1001 10004002 00000004 sh"));
     }
 
     #[test]
@@ -2475,6 +2559,22 @@ mod tests {
         let e = s.evidence(Path::new(&long), None);
         assert_eq!(e.code(), "unknown");
         // A use the probe did name is still a use.
+        // Where residue deletes it, the path is longer by as much as the
+        // directory's own: 5 bytes here.
+        let near = Some(reach(PATH_LIMIT - 5));
+        assert_eq!(
+            s.evidence_at(idle, near.as_ref(), idle.as_os_str().len() + 4)
+                .code(),
+            "not_observed"
+        );
+        let Evidence::Unknown(u) = s.evidence_at(idle, near.as_ref(), idle.as_os_str().len() + 5)
+        else {
+            panic!("a path that reaches PATH_LIMIT where residue deletes it must be unknown");
+        };
+        assert_eq!(u.reason, "long_path");
+        assert!(u.detail.contains(&format!(
+            "would be up to {PATH_LIMIT} where residue deletes it"
+        )));
         let e = s.evidence(Path::new("/w/busy"), Some(&reach(PATH_LIMIT * 2)));
         assert_eq!(e.code(), "in_use");
     }
