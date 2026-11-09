@@ -36,7 +36,7 @@ It installs residue and, on macOS and Linux, turns on [automatic cleanup](#autom
 
 <a id="prerequisites"></a>
 
-residue needs `git` 2.36 or later on `PATH`. Its release builds are made for macOS 11 or later on Apple silicon and 10.12 or later on Intel, Linux on x86_64 and arm64 (static, so no libc is needed), and FreeBSD 14; [Tested on](#tested-on) says which ones were run. Windows is not supported: [Windows and WSL](docs/installation.md#windows-and-wsl).
+residue needs `git` 2.36 or later on `PATH`. Its release builds are made for macOS 11 or later on Apple silicon and 10.12 or later on Intel, Linux on x86_64 and arm64 (static, so no libc is needed), and FreeBSD 14; [Tested on](#tested-on) says which ones were run. Windows is not supported; the install script stops there and points to WSL ([Windows and WSL](docs/installation.md#windows-and-wsl)).
 
 The install script above uses Homebrew on macOS, the signed apt, dnf or pacman repository on Linux, or else the checksum-verified release archive, so updates arrive with your other upgrades. Running it again upgrades. [Read the script](site/public/install.sh) first if you like; [its options and how to undo it](docs/installation.md#the-install-script) are in Install residue. Homebrew alone installs residue and leaves automatic cleanup off:
 
@@ -44,7 +44,7 @@ The install script above uses Homebrew on macOS, the signed apt, dnf or pacman r
 brew install whiteheap/tap/residue
 ```
 
-Debian 12 and Ubuntu 24.04 ship Git 2.36 or later; Ubuntu 22.04 ships 2.34, so add `ppa:git-core/ppa` there first. The apt, dnf and pacman repositories, the signing key's fingerprint, the release archives and building from source are in [Install residue](docs/installation.md). residue is not on crates.io, so `cargo install residue` does not install it; build a release from its tag instead: `cargo install --locked --git https://github.com/whiteheap/residue-cli --tag v0.0.11 residue`. On a Mac, the [Mac app](#mac-app) runs the same checks in a window.
+Debian 12 and Ubuntu 24.04 ship Git 2.36 or later; Ubuntu 22.04 ships 2.34, so add `ppa:git-core/ppa` there first; the install script stops before it changes anything and names that command. The apt, dnf and pacman repositories, the signing key's fingerprint, the release archives and building from source are in [Install residue](docs/installation.md). residue is not on crates.io, so `cargo install residue` does not install it; build a release from its tag instead: `cargo install --locked --git https://github.com/whiteheap/residue-cli --tag v0.0.11 residue`. On a Mac, the [Mac app](#mac-app) runs the same checks in a window.
 
 After an upgrade, automatic cleanup runs the new release on its own ([After an upgrade](docs/automation.md#after-an-upgrade)). To uninstall, run `residue service uninstall` before you remove the package: removed first, the service goes on restarting a binary that is gone. [Uninstall](docs/installation.md#uninstall) has the commands for each channel, the ones that stop the service once residue is already gone, and what residue leaves in your repositories.
 
@@ -57,7 +57,7 @@ Install it as a service, and residue cleans up on its own, in two cases only:
 
 Each removal runs `residue remove` with every one of its checks. These removals delete: they do not use the trash. Branches, commits and locked worktrees stay. Each removal leaves a record, so for 30 days `residue restore` brings the worktree back.
 
-See what it would remove first:
+See what it would remove first; when it would remove nothing, it says why:
 
 ```sh
 residue watch --once --dry-run
@@ -69,7 +69,7 @@ Then turn it on:
 residue service install
 ```
 
-That starts `residue watch` now and at every login, with launchd on macOS and systemd on Linux. It watches the usual code folders in your home folder that exist, such as `~/src`, `~/code` and `~/Work`, and prints which. If your code lives elsewhere, name its folder, which replaces the list: `residue service install ~/src`. `residue service status` shows what it runs, the folders it watches and what it freed in the last seven days, and `residue service uninstall` turns it off. `watch` runs only when you start it or install it as a service; `scan` never starts it.
+That starts `residue watch` now and at every login, with launchd on macOS and systemd on Linux. It watches the usual code folders in your home folder that exist, such as `~/src`, `~/code` and `~/Work`, and prints which, along with what it removes and how to preview it. If your code lives elsewhere, name its folder, which replaces the list: `residue service install ~/src`. `residue service status` shows what it runs, the folders it watches and what it freed in the last seven days, and `residue service uninstall` turns it off. `watch` runs only when you start it or install it as a service; `scan` never starts it.
 
 A paused agent often has no process inside its worktree, because its harness returns the shell to the main checkout between commands, and an editor window may hold no file open there either. Only the time without a change keeps such a worktree: an hour once its branch is gone, two days when the disk is low. Lock one you will come back to later than that:
 
@@ -110,7 +110,7 @@ residue remove --all --yes --idle 2d --keep-trash 7d ~/src
 
 residue deletes only what its checks show you can get back.
 
-- **Committed files and rebuildable output.** A worktree goes only when every tracked file is committed and every ignored entry matches a regenerable rule, such as `node_modules/`. A check residue cannot finish keeps it.
+- **Committed files and rebuildable output.** A worktree goes only when every tracked file is committed and every ignored entry matches a regenerable rule, such as `node_modules/`. An ignored `.env` keeps it, even inside `build/`. A check residue cannot finish keeps it.
 - **Branches, commits and the stash stay.** residue never deletes a branch, never kills a process, and never lifts a lock it did not set. Lock a worktree to keep it.
 - **What you saw, or nothing.** Right before each removal, residue runs every check again. Any change keeps the worktree, and the reason names it.
 - **A record to restore from.** Every removal leaves one, `watch`'s included: for 30 days, `residue restore` recreates the worktree at its path, on its branch and HEAD. Ignored files such as `node_modules/` are not kept; the project's install makes them again.
@@ -132,7 +132,7 @@ residue restore fix-login
 residue scan ~/src/app
 ```
 
-Replace the example path `~/src/app` with your repository's path. `scan` lists each linked worktree with its size, its verdict and the reason, and every directory is still there afterwards. With no path, it uses the current directory. A folder that is not inside a repository is searched four levels down, without following symbolic links or crossing filesystems, and without entering hidden directories, `node_modules`, `target` or `Library` ([Where a PATH applies](docs/reference.md#where-a-path-applies)).
+Replace the example path `~/src/app` with your repository's path. `scan` lists each linked worktree with its size, its verdict and the reason, and every directory is still there afterwards. With no path, it uses the current directory; from your home folder, it scans the usual code folders there and says which. A folder that is not inside a repository is searched four levels down, without following symbolic links or crossing filesystems, and without entering hidden directories, `node_modules`, `target` or `Library` ([Where a PATH applies](docs/reference.md#where-a-path-applies)).
 
 ```sh
 residue explain PATH
@@ -174,7 +174,7 @@ next: residue explain PATH  ·  residue remove PATH  ·  keep one: git worktree 
 
 ### What makes a worktree a candidate
 
-residue runs every check below on every linked worktree. A worktree is a **candidate** only when all of them pass. One failed check keeps it (**keep**). One check residue could not complete also keeps it (**unknown**). The main checkout is never a candidate.
+residue runs every check below on every linked worktree. A worktree is a **candidate** only when all of them pass. One failed check keeps it (**keep**). One check residue could not complete also keeps it (**unknown**). The main checkout is never a candidate. Neither is a bare repository's worktree on the branch its HEAD names, which is that layout's main checkout in all but name.
 
 | Check | Keeps the worktree when |
 | --- | --- |
@@ -188,7 +188,7 @@ residue runs every check below on every linked worktree. A worktree is a **candi
 | `ignored` | Any ignored entry matches no regenerable rule ([reference](docs/reference.md#the-regenerable-list)) |
 | `operation` | A rebase, merge, cherry-pick, revert or bisect is in progress |
 | `private_refs` | It has per-worktree refs (`refs/worktree/`, `refs/bisect/`, `refs/rewritten/`) |
-| `head` | HEAD is detached and no branch, tag or remote-tracking ref contains it |
+| `head` | HEAD is detached and no branch, tag or remote-tracking ref contains it, or the worktree is on the branch a bare repository's HEAD names |
 | `layout` | It has submodules or is a sparse checkout |
 | `nested_repo` | It contains a `.git` entry in any case, other than its own `.git` link: another repository or checkout, or files Git does not list |
 | `mount_point` | It contains a mount point |
@@ -219,7 +219,7 @@ Then it moves the worktree aside under a hidden name, writes its removal record,
 `residue remove` deletes the worktree directory with `git worktree remove`, without `--force`. That deletes:
 
 - the checked-out tracked files. Every one of them is committed, because the `tracked_changes` check passed.
-- the ignored entries the plan lists, with their file counts and sizes, for example `node_modules/ (41530 files, 816 MB)`. Every one of them matches a regenerable rule. A directory a rule matches goes with everything in it: an `.env` inside an ignored `build/` is not judged on its own.
+- the ignored entries the plan lists, with their file counts and sizes, for example `node_modules/ (41530 files, 816 MB)`. Every one of them matches a regenerable rule. A directory a rule matches goes with everything in it, except an environment file such as `build/.env`, which keeps the worktree unless a rule names that file itself ([the regenerable list](docs/reference.md#the-regenerable-list)).
 
 It keeps the branch, every commit, the stash, the Git LFS objects in the repository's shared Git directory, and every other worktree. residue never deletes a branch, never kills a process, and never lifts a lock it did not set. Before it deletes, it writes a removal record, so `residue restore` can recreate the worktree: see [Restore a removed worktree](#restore-a-removed-worktree).
 

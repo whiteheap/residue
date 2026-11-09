@@ -32,11 +32,13 @@ After an upgrade, automatic cleanup runs the new release within about six minute
 
 A package repository needs root: the script uses it when it runs as root, when `sudo` works without a password, or when `sudo` can ask for yours on the terminal. Otherwise it falls back to the archive, which needs no root. On Arch, `pacman -Syu` upgrades the whole system, as Arch requires; with a terminal, pacman shows the transaction and asks first.
 
+The script stops before it changes anything on Windows, where it points to [WSL](#windows-and-wsl), on a CPU residue has no build for, where it links to [building from source](#from-source), and without `curl`. On Debian and Ubuntu it also stops, before it asks for a password or writes under `/etc`, when apt offers a Git older than 2.36, as on Ubuntu 22.04, and names `sudo add-apt-repository ppa:git-core/ppa`.
+
 Right after a release, its FreeBSD archives are still being built, usually for under half an hour. In that window the script installs the newest release that has this machine's archive, names both versions, and tells you to run it again later to update; the apt, dnf and pacman repositories serve the previous release in that window too. If it cannot tell which release that is, for example because GitHub's API did not answer, it stops and prints the command to install a release by its tag.
 
-Then it runs `residue service install`, which starts `residue watch` now and at every login ([Automate cleanup](../README.md#automate-cleanup)). From 0.0.7 that needs no folder: it watches the usual code folders in your home folder. An older residue needs the folder that holds your repositories, so the script prints the command to run instead. A service you installed before is left as it is, with its own folders. On FreeBSD and other systems without launchd or systemd, the script says so and installs nothing more.
+Then it runs `residue service install`, which starts `residue watch` now and at every login ([Automate cleanup](../README.md#automate-cleanup)). From 0.0.7 that needs no folder: it watches the usual code folders in your home folder. An older residue needs the folder that holds your repositories, so the script prints the command to run instead. A service you installed before is left as it is, with its own folders. On FreeBSD and other systems without launchd or systemd, the script says so and installs nothing more. With a Git older than 2.36, it installs residue but leaves cleanup off, names the Git it found, and prints the command that turns cleanup on once Git is newer. When `residue service install` fails, the summary says to fix what it named and run it again.
 
-It ends with a summary: the version and path it installed, the channel and how updates arrive, whether cleanup is on, and how to undo it.
+It ends with a summary: the version and path it installed, the channel and how updates arrive, whether cleanup is on, and how to undo it. With cleanup on, it also says what cleanup removes, that it deletes without the trash, for how long `residue restore` brings a worktree back, and how to preview it.
 
 | Option | Effect |
 | --- | --- |
@@ -79,7 +81,7 @@ On Linux, add residue's signed package repository once, and your normal upgrades
 
 #### Debian and Ubuntu
 
-The package needs Git 2.36 or later: Debian 12 and Ubuntu 24.04 ship it. Ubuntu 22.04 ships Git 2.34, so add a newer Git there first with `sudo add-apt-repository ppa:git-core/ppa`.
+The package needs Git 2.36 or later: Debian 12 and Ubuntu 24.04 ship it. Ubuntu 22.04 ships Git 2.34, so add a newer Git there first with `sudo add-apt-repository ppa:git-core/ppa`. The install script checks this before it adds the repository.
 
 ```sh
 sudo install -d -m 0755 /etc/apt/keyrings
