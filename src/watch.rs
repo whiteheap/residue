@@ -604,17 +604,19 @@ fn nothing_to_remove(
     let disk = match lowest {
         None => "free space unknown".to_string(),
         Some((pct, _)) if pct >= opts.min_free => format!(
-            "{} {pct:.1}% free (removes below {}%)",
+            "{} {}% free (removes below {}%)",
             if filesystems.len() == 1 {
                 "the disk is"
             } else {
                 "every disk is at least"
             },
+            pct_text(pct, opts.min_free),
             opts.min_free
         ),
         Some((pct, sample)) => format!(
-            "{} is {pct:.1}% free, below {}%, but no candidate is unchanged for {}",
+            "{} is {}% free, below {}%, but no candidate is unchanged for {}",
             output::home(sample),
+            pct_text(pct, opts.min_free),
             opts.min_free,
             opts.idle.text
         ),
@@ -1099,6 +1101,23 @@ fn percent(free: u64, total: u64) -> f64 {
     free as f64 * 100.0 / total as f64
 }
 
+/// `pct` as text, to one decimal unless that would print it on the other
+/// side of `min_free`: 9.96 against 10 prints `9.96`, never `10.0`, beside
+/// "below 10%".
+fn pct_text(pct: f64, min_free: f64) -> String {
+    let below = pct < min_free;
+    for places in 1..=6 {
+        let text = format!("{pct:.places$}");
+        if text
+            .parse::<f64>()
+            .is_ok_and(|shown| (shown < min_free) == below)
+        {
+            return text;
+        }
+    }
+    pct.to_string()
+}
+
 /// What one pass of `act` did: how many worktrees it handed to a removal
 /// child (or, in a dry run, would have), and how many went.
 #[derive(Clone, Copy, Default)]
@@ -1151,6 +1170,7 @@ fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> Acted 
             state.unseen.clear(dev);
             continue;
         }
+        let shown = pct_text(pct, opts.min_free);
         let target = (total as f64 * (opts.min_free + 5.0) / 100.0) as u64;
         // What removals of earlier passes freed and free space does not show
         // yet counts as freed: only the rest of the gap is removed now.
@@ -1158,7 +1178,7 @@ fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> Acted 
         let mut need = target.saturating_sub(free).saturating_sub(unseen);
         if need == 0 {
             let note = format!(
-                "{}: {pct:.1}% free, below {}%; waiting for about {} that removals freed in the last {} to show up as free space (a filesystem snapshot can hold it)",
+                "{}: {shown}% free, below {}%; waiting for about {} that removals freed in the last {} to show up as free space (a filesystem snapshot can hold it)",
                 output::home(&sample),
                 opts.min_free,
                 output::bytes(unseen),
@@ -1191,7 +1211,7 @@ fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> Acted 
         }
         if chosen.is_empty() {
             let note = format!(
-                "{}: {pct:.1}% free, below {}%, and no candidate unchanged for {}",
+                "{}: {shown}% free, below {}%, and no candidate unchanged for {}",
                 output::home(&sample),
                 opts.min_free,
                 opts.idle.text
@@ -1212,7 +1232,7 @@ fn act(exe: &Path, opts: &Options, snap: &Snapshot, state: &mut State) -> Acted 
             /* require_upstream_gone */ false,
             |_| {
                 format!(
-                    "{pct:.1}% free, below {}%, unchanged for {}",
+                    "{shown}% free, below {}%, unchanged for {}",
                     opts.min_free, opts.idle.text
                 )
             },
@@ -1922,6 +1942,20 @@ mod tests {
             roots: roots.iter().map(PathBuf::from).collect(),
             default_roots: false,
         }
+    }
+
+    /// A free-space figure prints on the same side of `--min-free` as the
+    /// space itself, with one decimal when that is enough.
+    #[test]
+    fn pct_text_never_crosses_min_free() {
+        assert_eq!(pct_text(47.53, 10.0), "47.5");
+        assert_eq!(pct_text(9.94, 10.0), "9.9");
+        assert_eq!(pct_text(9.0, 10.0), "9.0");
+        assert_eq!(pct_text(10.0, 10.0), "10.0");
+        assert_eq!(pct_text(9.96, 10.0), "9.96");
+        assert_eq!(pct_text(9.9996, 10.0), "9.9996");
+        assert_eq!(pct_text(10.049, 10.04), "10.05");
+        assert_eq!(pct_text(9.999_999_99, 10.0), "9.99999999");
     }
 
     /// `service status` and a second `service install` read the roots back
