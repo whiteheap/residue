@@ -1699,20 +1699,24 @@ fi
 
 # 16. A process inside a worktree keeps it in use whatever bytes its path
 # holds, though a probe may print such a name escaped (lsof on macOS): é,
-# CJK and a backslash in the worktree's name, an emoji in a folder above
-# it, and a process whose only link is an open file in a worktree named
-# with ï. Each holder is a sleep. `explain` and `remove --yes` must keep the
-# worktree, untouched; once the sleep exits it is idle again, which shows
-# the use was the sleep's. On a partial probe, which reads no open files,
-# the open-file case is kept as unknown (partial_probe) instead.
-held() { # NAME WORKTREE-NAME cwd|open [REPO-DIR]
+# CJK and a backslash in the worktree's name (given by `git worktree
+# move`), an emoji in a folder above it, and a process whose only link is
+# an open file in a worktree below a folder named with ï. The last two are
+# not moved, so they test the bytes alone. Each holder is a sleep.
+# `explain` and `remove --yes` must keep the worktree, untouched; once the
+# sleep exits it is idle again, which shows the use was the sleep's. On a
+# partial probe, which reads no open files, the open-file case is kept as
+# unknown (partial_probe) instead.
+held() { # NAME WORKTREE-NAME|w cwd|open [REPO-DIR]
     name=$1
     make_repo "${4:-}"
     local dest=$repo/.worktrees/$2 before holder i busy explain_status
     local verdict=keep state=in_use
     if [ "$3" = open ] && [ -n "$partial_probe" ]; then verdict=unknown state=unknown; fi
-    setup git -C "$repo" worktree move "$wt" "$dest"
-    wt=$dest
+    if [ "$2" != w ]; then
+        setup git -C "$repo" worktree move "$wt" "$dest"
+        wt=$dest
+    fi
     before=$(sums "$wt")
     if [ "$3" = open ]; then
         (cd "$work" && exec sleep 300 3<"$wt/sub/file.txt") >/dev/null 2>&1 &
@@ -1760,8 +1764,8 @@ held() { # NAME WORKTREE-NAME cwd|open [REPO-DIR]
 held activity-cwd-accented "$(printf 'caf\303\251')" cwd
 held activity-cwd-cjk "$(printf '\346\274\242\345\255\227')" cwd
 held activity-cwd-backslash 'back\slash' cwd
-held activity-cwd-emoji-above w2 cwd "$work/$(printf '\360\237\232\200')-repo"
-held activity-open-file-only "$(printf 'na\303\257ve')" open
+held activity-cwd-emoji-above w cwd "$work/$(printf '\360\237\232\200')-repo"
+held activity-open-file-only w open "$work/$(printf 'na\303\257ve')-repo"
 
 echo "contract-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]
