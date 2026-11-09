@@ -350,7 +350,7 @@ A process residue could not read does not count as inspected, and the header say
 
 The named runs are in [Platforms and testing](docs/platforms-and-testing.md). That page is the record. It is not a promise about a platform it does not name.
 
-In short: CI runs the scripts listed there on every push, on macOS, Linux x86_64 and arm64, and in FreeBSD 14, NetBSD 10, OpenBSD 7.8 and DragonFly 6.4 virtual machines, as root and as an ordinary user; an OmniOS (illumos) virtual machine runs the smoke test and the contract and recovery checks. The newest release binary run by hand is 0.0.11 on macOS 26.3.1, Apple silicon; on Linux it is 0.0.5, on Ubuntu 24.04 arm64. The Intel macOS binary was built and not executed. Windows is not supported.
+In short: CI runs the scripts listed there on every push, on macOS, Ubuntu 24.04 and 26.04 (x86_64 and arm64), and in FreeBSD 14, NetBSD 10, OpenBSD 7.8 and DragonFly 6.4 virtual machines, as root and as an ordinary user; an OmniOS (illumos) virtual machine runs the smoke test and the contract and recovery checks. The newest release binary run by hand is 0.0.11 on macOS 26.3.1, Apple silicon; on Linux it is 0.0.5, on Ubuntu 24.04 arm64. The Intel macOS binary was built and not executed. Windows is not supported.
 
 ## Common questions
 
