@@ -123,7 +123,7 @@ A bug that [SECURITY.md](SECURITY.md) calls a security issue goes into a draft s
    git -C /tmp/residue-bin add PKGBUILD .SRCINFO
    git -C /tmp/residue-bin commit -m "Update to vX.Y.Z" && git -C /tmp/residue-bin push
    ```
-5. The Mac app bundles a residue-cli release, so it gets this one only through [residue-ui](https://github.com/whiteheap/residue-ui): there, a change bumps `sidecar.lock` to the new tag, and residue-ui releases on its own.
+6. The Mac app bundles a residue-cli release, so it gets this one only through [residue-ui](https://github.com/whiteheap/residue-ui): there, a change bumps `sidecar.lock` to the new tag, and residue-ui releases on its own.
 
 ### The package signing key
 
