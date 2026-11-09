@@ -3,13 +3,14 @@ name = "residue"
 version = "0.0.11"
 edition = "2024"
 rust-version = "1.85"
-description = "Find what coding agents left behind on disk, and remove a Git worktree only when nothing in it would be lost."
+description = "Reclaim your storage from Git worktrees, automatically and safely. residue removes a worktree only when nothing in it would be lost, whichever coding agent left it."
 license = "MIT"
 repository = "https://github.com/whiteheap/residue-cli"
+homepage = "https://residue.whiteheap.com"
 readme = "README.md"
 keywords = ["git", "worktree", "disk", "agents", "cli"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = [".github/"]
+include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/CHANGELOG.md", "/LICENSE", "/SECURITY.md"]
 
 [dependencies]
 libc = "0.2"
