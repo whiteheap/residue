@@ -11,7 +11,8 @@
 #      `fix` and keeps `wip` and `local`; the log says what it freed, and
 #      `residue stats` counts it under watch.
 #   3. A running watch notices `wip`'s upstream being deleted (a fetch
-#      --prune, no polling) and removes it within two minutes.
+#      --prune, no polling) and removes it within two minutes. It is then
+#      stopped between passes, so nothing it started runs during 4.
 #   4. --min-free 99.9 (disk pressure) removes the idle `local`.
 #   5. The removal child checks --only-if-upstream-gone itself, from fresh
 #      local refs: an upstream restored before it runs keeps the worktree,
@@ -52,7 +53,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/../scripts/partial-probe.sh"
 S=$(mktemp -d "${TMPDIR:-/tmp}/residue-watch.XXXXXX")
 watcher=
-trap 'if [ -n "$watcher" ]; then kill "$watcher" 2>/dev/null || true; wait "$watcher" 2>/dev/null || true; fi; rm -rf "$S"' EXIT
+trap 'if [ -n "$watcher" ]; then kill "$watcher" 2>/dev/null || true; kill -s CONT "$watcher" 2>/dev/null || true; wait "$watcher" 2>/dev/null || true; fi; rm -rf "$S"' EXIT
 # The lock of a real `residue service` is not touched, and the stats ledger
 # is the scratch home folder's, never the caller's.
 XDG_STATE_HOME="$S/state"
@@ -68,6 +69,35 @@ fail() {
   echo "watch-smoke: $1" >&2
   [ -f "$S/log" ] && cat "$S/log" >&2
   exit 1
+}
+
+# Stop the running watch between passes, as the release steps restart the
+# service: while `pgrep -P PID` prints nothing. watch runs each pass in a
+# child process and, right after a removal, starts the next one at once. A
+# SIGTERM to the watcher alone leaves that child running, and the next
+# command saw it, or its git, inside local and kept local as in use (#133).
+# launchd stops the job's process group and systemd the unit's control
+# group, so the service never leaves one behind. Stopped by SIGSTOP, the
+# watcher starts no child; once it has none, SIGTERM ends it with nothing
+# left.
+stop_watcher() {
+  n=0
+  while :; do
+    kill -s STOP "$watcher" 2> /dev/null || fail "the running watch exited before it was stopped"
+    kids=$(pgrep -P "$watcher") || [ $? = 1 ] || fail "pgrep -P $watcher failed"
+    [ -n "$kids" ] || break
+    kill -s CONT "$watcher"
+    n=$((n + 1))
+    [ "$n" -le 120 ] || fail "the running watch was still in a pass after 2 minutes: $kids"
+    sleep 1
+  done
+  # watch does not catch SIGTERM, so the stopped watcher ends without
+  # running again. On macOS it ends at once, and the shell can reap it
+  # before SIGCONT, which then finds no process.
+  kill "$watcher"
+  kill -s CONT "$watcher" 2> /dev/null || true
+  wait "$watcher" 2> /dev/null || true
+  watcher=
 }
 
 git init -q --bare -b main "$S/remote.git"
@@ -239,8 +269,7 @@ done
 for leftover in .worktrees/.*.residue-removing-*; do
   [ ! -e "$leftover" ] || fail "$leftover was left behind"
 done
-kill "$watcher" && wait "$watcher" 2> /dev/null || true
-watcher=
+stop_watcher
 [ -d .worktrees/local ] || fail "the running watch removed local"
 echo "watch-smoke: running watch removed wip after ${i}s"
 
