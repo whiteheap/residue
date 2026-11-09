@@ -54,10 +54,12 @@ jobs:
         run: bash scripts/recovery-check.sh target/release/residue
 
   # FreeBSD runs in a virtual machine. residue's probe there is the base
-  # system's ps and a kernel sysctl, so nothing beyond Rust and Git is
+  # system's ps and two kernel sysctls, so nothing beyond Rust and Git is
   # installed, plus bash for the race check. The smoke tests and the race
   # check run as root and as an ordinary user, who can inspect only their own
-  # processes.
+  # processes. The user exists before the root run, whose contract check
+  # turns security.bsd.unprivileged_proc_debug off for that user and back
+  # on. The log shows which filesystem the scratch folders are on.
   freebsd:
     name: freebsd-14
     runs-on: ubuntu-24.04
@@ -71,13 +73,16 @@ jobs:
           run: |
             freebsd-version
             rustc --version
+            mount -p
+            df -T /tmp "$PWD"
+            sysctl security.bsd.unprivileged_proc_debug
             cargo build --locked --release
+            pw useradd smoke -m
             sh .github/smoke.sh ./target/release/residue
             sh .github/watch-smoke.sh ./target/release/residue
             bash scripts/race-check.sh ./target/release/residue
             bash scripts/contract-check.sh ./target/release/residue
             bash scripts/recovery-check.sh ./target/release/residue
-            pw useradd smoke -m
             su smoke -c "sh $PWD/.github/smoke.sh $PWD/target/release/residue"
             su smoke -c "sh $PWD/.github/watch-smoke.sh $PWD/target/release/residue"
             su smoke -c "bash $PWD/scripts/race-check.sh $PWD/target/release/residue"

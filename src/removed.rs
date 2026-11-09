@@ -573,7 +573,7 @@ fn unheld_others(
     };
     let git_dir = git_dir_of(&item.common_dir, &named);
     for dir in named.iter().copied().chain(git_dir.as_deref()) {
-        match snapshot.evidence(dir) {
+        match snapshot.evidence(dir, None) {
             Evidence::InUse(uses) => {
                 if let Some((pid, command)) = uses.into_iter().next() {
                     return Ok(Some(Unheld::Using(pid, command)));
@@ -2054,7 +2054,18 @@ pub fn restore(item: &Item, to: Option<&Path>) -> Result<Restored, String> {
             restored
         }
         Some(registered) => move_back(item, record, registered, dest)?,
-        None => recreate(item, record, dest, &listed)?,
+        None => {
+            let mut restored = recreate(item, record, dest, &listed)?;
+            // A removal whose Git stopped partway, once it no longer listed
+            // the worktree, leaves what it did not delete aside, unlisted.
+            if record.aside != dest && fs::symlink_metadata(&record.aside).is_ok() {
+                restored.notes.push(format!(
+                    "what its removal did not delete is still at {}; residue leaves it there for you to look through and delete",
+                    record.aside.display()
+                ));
+            }
+            restored
+        }
     };
     let recreated = (registered.is_none() || purged) && !back;
     finish(item, record, &mut restored, &copies, recreated, back);

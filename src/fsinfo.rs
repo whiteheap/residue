@@ -97,6 +97,35 @@ pub struct Usage {
     pub mount_points: Vec<PathBuf>,
     /// One result per bucket passed to [`measure`], in the same order.
     pub buckets: Vec<BucketUsage>,
+    pub reach: Reach,
+}
+
+/// What the walk reached that the activity check judges with it
+/// (`activity::Snapshot::evidence`).
+#[derive(Clone, Default)]
+pub struct Reach {
+    /// The length in bytes of the longest path the walk listed, the root's
+    /// own included: a process probe names a path whole only up to a
+    /// limit.
+    pub longest: usize,
+    /// Each `(device, inode)` of the `wanted` list passed to [`measure`]
+    /// that the walk listed, the root included, in the order it found them.
+    pub found: Vec<(u64, u64)>,
+    /// The first entry the walk could not read, with why: one of `wanted`
+    /// may lie behind it.
+    pub unread: Option<String>,
+}
+
+impl Reach {
+    fn note(&mut self, path: &Path, meta: &Stat, wanted: &[(u64, u64)]) {
+        self.longest = self.longest.max(path.as_os_str().len());
+        if !wanted.is_empty() {
+            let id = (meta.dev(), meta.ino());
+            if wanted.binary_search(&id).is_ok() && !self.found.contains(&id) {
+                self.found.push(id);
+            }
+        }
+    }
 }
 
 /// An ignored entry whose contents the walk attributes to it.
@@ -174,12 +203,15 @@ struct Place {
 /// Measures the worktree at `root`, which must be canonical
 /// (`git::canonical`): the walk refuses a symbolic link anywhere on it.
 /// `matches` is the rule matcher (`Rules::matches`), and `named` says
-/// whether a rule names a file itself (`Rules::names_file`).
+/// whether a rule names a file itself (`Rules::names_file`). `wanted` is a
+/// sorted list of `(device, inode)` pairs whose presence the walk reports
+/// in `Usage::reach` (`activity::Snapshot::wanted`).
 pub fn measure(
     root: &Path,
     buckets: &[Bucket],
     matches: &dyn Fn(&str) -> bool,
     named: &dyn Fn(&str) -> bool,
+    wanted: &[(u64, u64)],
 ) -> io::Result<Usage> {
     let (top, opened) = open_root(root)?;
     let device = top.dev();
@@ -187,6 +219,7 @@ pub fn measure(
         buckets: vec![BucketUsage::default(); buckets.len()],
         ..Usage::default()
     };
+    usage.reach.note(root, &top, wanted);
     let lookup: HashMap<PathBuf, usize> = buckets
         .iter()
         .enumerate()
@@ -271,6 +304,7 @@ pub fn measure(
                     continue;
                 }
             };
+            usage.reach.note(&path, &meta, wanted);
             // Any case of `.git`, at any level, as Git skips the name when
             // `core.ignorecase` is set, which hides the files inside from
             // `git status` (#102). Only the root's own link, named exactly
@@ -1301,6 +1335,7 @@ impl Usage {
         self.unreadable += 1;
         if self.first_error.is_none() {
             self.first_error = Some(format!("{}: {error}", path.display()));
+            self.reach.unread = self.first_error.clone();
         }
     }
 }
@@ -1502,7 +1537,7 @@ mod tests {
 
         // A worktree path with a symbolic link on it is refused whole.
         symlink(&w, root.join("link")).unwrap();
-        let Err(e) = measure(&root.join("link"), &[], &|_| false, &|_| false) else {
+        let Err(e) = measure(&root.join("link"), &[], &|_| false, &|_| false, &[]) else {
             panic!("the walk opened a worktree through a symbolic link");
         };
         assert!(e.to_string().contains("symbolic link"), "{e}");
@@ -1510,7 +1545,7 @@ mod tests {
         // The walk itself reads the link as one entry and nothing behind it.
         fs::remove_file(w.join("a")).unwrap();
         symlink(&elsewhere, w.join("a")).unwrap();
-        let usage = measure(&w, &[], &|_| false, &|_| false).unwrap();
+        let usage = measure(&w, &[], &|_| false, &|_| false, &[]).unwrap();
         assert_eq!(usage.entries, 2, "w and the link");
         assert!(usage.nested_repos.is_empty());
         assert_eq!(usage.unreadable, 0);
@@ -1555,7 +1590,7 @@ mod tests {
         }
         let mut repos = Vec::new();
         let entries = count(&w, &mut repos);
-        let usage = measure(&w, &[], &|_| false, &|_| false).unwrap();
+        let usage = measure(&w, &[], &|_| false, &|_| false, &[]).unwrap();
         assert_eq!(usage.unreadable, 0, "{:?}", usage.first_error);
         assert_eq!(usage.entries, entries);
         let mut found = usage.nested_repos.clone();
@@ -1632,7 +1667,7 @@ mod tests {
         let w = root.join("w");
         fs::create_dir_all(w.join("a")).unwrap();
         fs::set_permissions(&w, fs::Permissions::from_mode(0o311)).unwrap();
-        let usage = measure(&w, &[], &|_| false, &|_| false);
+        let usage = measure(&w, &[], &|_| false, &|_| false, &[]);
         fs::set_permissions(&w, fs::Permissions::from_mode(0o755)).unwrap();
         let usage = usage.unwrap();
         // SAFETY: geteuid only returns this process's effective user.
@@ -1683,7 +1718,7 @@ mod tests {
             expand: false,
         })
         .collect();
-        let usage = measure(&w, &buckets, &|_| true, &|rel| rel == "named/.env").unwrap();
+        let usage = measure(&w, &buckets, &|_| true, &|rel| rel == "named/.env", &[]).unwrap();
         let found: Vec<Option<&str>> = usage
             .buckets
             .iter()
@@ -1699,6 +1734,32 @@ mod tests {
             [None, None, None, None, None, None],
             "{found:?}"
         );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_walk_reports_its_longest_path_and_each_wanted_file_it_lists() {
+        let root = scratch("reach");
+        let w = root.join("w");
+        let deep = w.join("a").join("bb").join("ccc");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("file"), "x").unwrap();
+        fs::write(w.join("top"), "x").unwrap();
+        fs::write(root.join("outside"), "x").unwrap();
+        let inside = id(&deep, "file");
+        let outside = id(&root, "outside");
+        let mut wanted = vec![inside, outside];
+        wanted.sort_unstable();
+        let usage = measure(&w, &[], &|_| false, &|_| false, &wanted).unwrap();
+        assert_eq!(
+            usage.reach.longest,
+            deep.join("file").as_os_str().len(),
+            "the longest path is the deepest file's"
+        );
+        assert_eq!(usage.reach.found, vec![inside]);
+        let none = measure(&w, &[], &|_| false, &|_| false, &[]).unwrap();
+        assert!(none.reach.found.is_empty());
+        assert_eq!(none.reach.longest, usage.reach.longest);
         fs::remove_dir_all(&root).unwrap();
     }
 }

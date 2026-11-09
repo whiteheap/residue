@@ -20,15 +20,19 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+use crate::fsinfo::Reach;
+
 #[derive(Clone)]
 pub struct Unavailable {
     /// Stable reason code: `probe_missing`, `timeout`, `probe_failed`,
     /// `parse_error`, `unsupported`, `partial_probe` (the probe found no
     /// use but does not read open files, so it cannot show the directory
     /// is unused), `unmatchable_path` (the probe prints the paths it read
-    /// escaped, and residue cannot be sure how it prints this one), or
-    /// `unnamed_file` (a process holds a file whose path the probe could
-    /// not read, and residue could not look for it in the directory).
+    /// escaped, and residue cannot be sure how it prints this one),
+    /// `long_path` (a path in the directory is as long as the probe names
+    /// whole, `PATH_LIMIT`, or longer), or `unnamed_file` (a process holds a
+    /// file whose path the probe could not read, and residue could not look
+    /// for it in the directory).
     pub reason: &'static str,
     pub detail: String,
 }
@@ -38,6 +42,27 @@ pub struct Use {
     pub command: String,
     pub path: Vec<u8>,
 }
+
+/// The length in bytes of the longest path the backend names whole. A
+/// longer one is cut or left out, so a directory that holds one is
+/// `unknown` (`long_path`), never `not_observed`.
+///
+/// - macOS: lsof prints a working directory or open file of 1,024 bytes or
+///   more cut to its trailing components (`MAXPATHLEN`, measured on macOS
+///   26.3.1). The limit is 20 bytes lower, the length of
+///   `/System/Volumes/Data`, so it holds whichever spelling of a firmlinked
+///   path the kernel gives.
+/// - Linux: a readlink of `/proc/PID/cwd` or `fd/N` fails for a path of
+///   `PATH_MAX`, 4,096 bytes, or more (`d_path` into a page,
+///   `do_proc_readlink` in `fs/proc/base.c`).
+/// - FreeBSD, NetBSD, OpenBSD, DragonFly and illumos: the kernel names a
+///   path into a buffer of `MAXPATHLEN`, 1,024 bytes, with its NUL.
+#[cfg(target_os = "macos")]
+pub const PATH_LIMIT: usize = 1024 - "/System/Volumes/Data".len();
+#[cfg(target_os = "linux")]
+pub const PATH_LIMIT: usize = 4096;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub const PATH_LIMIT: usize = 1024;
 
 pub struct Seen {
     pub uses: Vec<Use>,
@@ -59,13 +84,14 @@ pub struct Seen {
     /// Files the backend saw a process hold but could not name. A
     /// directory holding one of them, found by its device and inode, is in
     /// use by that process; where residue cannot look, it is `unknown`
-    /// (`unnamed_file`), never `not_observed`. Only the illumos backend
-    /// fills it.
+    /// (`unnamed_file`), never `not_observed`. The illumos and FreeBSD
+    /// backends fill it.
     pub unnamed: Vec<Unnamed>,
 }
 
-/// A file a process holds whose path the backend could not read, such as
-/// one below a folder renamed after the kernel cached its path.
+/// A file a process holds whose path the backend could not read: on
+/// illumos one below a folder renamed after the kernel cached its path, on
+/// FreeBSD one the kernel's name cache does not hold.
 pub struct Unnamed {
     pub pid: u32,
     pub command: String,
@@ -104,18 +130,34 @@ impl Snapshot {
         platform::take()
     }
 
-    pub fn evidence(&self, dir: &Path) -> Evidence {
+    /// The `(device, inode)` of each file the snapshot holds unnamed, sorted
+    /// and once each, for the walk to look for (`fsinfo::measure`).
+    pub fn wanted(&self) -> Vec<(u64, u64)> {
+        let Ok(seen) = &self.state else {
+            return Vec::new();
+        };
+        let mut wanted: Vec<(u64, u64)> = seen.unnamed.iter().filter_map(|u| u.file).collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        wanted
+    }
+
+    /// Whether a process uses `dir`. `reach` is what the walk that sized
+    /// `dir` reached, when it ran: the unnamed files it found, and its
+    /// longest path. Without it, a file the probe could not name is looked
+    /// for by a walk of its own (`inodes_within`), and only `dir`'s own path
+    /// is held against `PATH_LIMIT`.
+    pub fn evidence(&self, dir: &Path, reach: Option<&Reach>) -> Evidence {
         let seen = match &self.state {
             Ok(seen) => seen,
             Err(unavailable) => return Evidence::Unknown(unavailable.clone()),
         };
-        let path = dir;
-        let dir = dir.as_os_str().as_bytes();
+        let raw = dir.as_os_str().as_bytes();
         // The directory as the backend writes the paths it read: a use is
         // inside it in that form exactly when it is inside it byte for byte.
-        let dir = match seen.spelling {
-            None => Cow::Borrowed(dir),
-            Some(spell) => match spell(dir) {
+        let spelled = match seen.spelling {
+            None => Cow::Borrowed(raw),
+            Some(spell) => match spell(raw) {
                 Some(spelled) => spelled,
                 None => {
                     return Evidence::Unknown(Unavailable {
@@ -132,14 +174,14 @@ impl Snapshot {
         let mut hits: Vec<(u32, String)> = Vec::new();
         for item in &seen.uses {
             if item.pid != me
-                && within(&item.path, &dir)
+                && within(&item.path, &spelled)
                 && !hits.iter().any(|(p, _)| *p == item.pid)
             {
                 hits.push((item.pid, item.command.clone()));
             }
         }
         if hits.is_empty() {
-            match self.unnamed_within(seen, path, me) {
+            match self.unnamed_within(seen, dir, reach, me) {
                 Ok(holders) => hits = holders,
                 Err(unavailable) => return Evidence::Unknown(unavailable),
             }
@@ -148,32 +190,44 @@ impl Snapshot {
             hits.sort();
             return Evidence::InUse(hits);
         }
-        match seen.limits {
-            None => Evidence::NotObserved,
+        if let Some(limits) = seen.limits {
             // Finding no use is evidence of no use only when the probe
             // reads open files too; this one does not, so it cannot show
             // that the directory is unused.
-            Some(limits) => Evidence::Unknown(Unavailable {
+            return Evidence::Unknown(Unavailable {
                 reason: "partial_probe",
                 detail: format!(
                     "{} reads {limits}, so it cannot show that no process is using it",
                     self.backend
                 ),
-            }),
+            });
         }
+        let longest = reach.map_or(0, |r| r.longest).max(raw.len());
+        if longest >= PATH_LIMIT {
+            return Evidence::Unknown(Unavailable {
+                reason: "long_path",
+                detail: format!(
+                    "{} names a path whole only when it is shorter than {PATH_LIMIT} bytes, and a path here is {longest}, so it cannot show that no process is using it",
+                    self.backend
+                ),
+            });
+        }
+        Evidence::NotObserved
     }
 
     /// The other processes holding a file inside `dir` that the backend
-    /// could not name, found by the file's device and inode in `dir`
-    /// (`inodes_within`); or why residue cannot tell: it could not read
-    /// such a file's device and inode, `dir`'s, or all of `dir`. Nothing
-    /// is inside a directory that does not exist. `dir` is read only when
-    /// the snapshot holds such a file, and walked only when one is on its
-    /// filesystem.
+    /// could not name, found by the file's device and inode in `dir`: among
+    /// those the walk that sized `dir` listed (`reach`), or else by a walk
+    /// of its own (`inodes_within`). Or why residue cannot tell: it could
+    /// not read such a file's device and inode, `dir`'s, or all of `dir`.
+    /// Nothing is inside a directory that does not exist. `dir` is read
+    /// only when the snapshot holds such a file, and walked here only when
+    /// one is on its filesystem and no `reach` is given.
     fn unnamed_within(
         &self,
         seen: &Seen,
         dir: &Path,
+        reach: Option<&Reach>,
         me: u32,
     ) -> Result<Vec<(u32, String)>, Unavailable> {
         let others: Vec<&Unnamed> = seen.unnamed.iter().filter(|u| u.pid != me).collect();
@@ -216,7 +270,19 @@ impl Snapshot {
         let Some(first) = wanted.first() else {
             return Ok(Vec::new());
         };
-        let found = inodes_within(dir, &root, &inodes).map_err(|e| {
+        let walked = match reach {
+            Some(reach) => match &reach.unread {
+                Some(e) => Err(e.clone()),
+                None => Ok(reach
+                    .found
+                    .iter()
+                    .filter(|(device, _)| *device == root.dev())
+                    .map(|(_, inode)| *inode)
+                    .collect()),
+            },
+            None => inodes_within(dir, &root, &inodes),
+        };
+        let found = walked.map_err(|e| {
             unknown(
                 first,
                 format!("could not read all of this directory to look for it ({e})"),
@@ -772,16 +838,28 @@ mod maps {
 }
 
 /// FreeBSD: the process list from the base system's `ps`, then each
-/// process's working directory, executable and open files from the kernel,
-/// by the sysctl procstat(1) itself reads (`kern.proc.filedesc.<pid>`,
-/// kinfo_getfile(3)), which names each path byte for byte. procstat is not
-/// run: it prints a name through libxo, which in the C locale rewrites a
-/// character that is not ASCII and leaves out a name that is not UTF-8. A
-/// packaged lsof is not used either: on FreeBSD 14 it listed processes
-/// without resolving their working directories.
+/// process's working directory, executable and open files, and the files
+/// it maps, from the kernel, by the sysctls procstat(1) itself reads
+/// (`kern.proc.filedesc.<pid>`, kinfo_getfile(3), and
+/// `kern.proc.vmmap.<pid>`, kinfo_getvmmap(3)), which name each path byte
+/// for byte. procstat is not run: it prints a name through libxo, which in
+/// the C locale rewrites a character that is not ASCII and leaves out a
+/// name that is not UTF-8. A packaged lsof is not used either: on FreeBSD
+/// 14 it listed processes without resolving their working directories.
+///
+/// The kernel names a file from its name cache. A file it cannot name
+/// comes back with no path but with its filesystem and inode, and is kept
+/// in `Seen::unnamed` for the walk of each worktree to place.
+///
+/// Both sysctls answer only for a process the user may debug (`p_candebug`
+/// in `sys/kern/kern_prot.c`). One that runs as another user is outside
+/// what a same-user probe reads, as on every platform. One that runs as
+/// this user and is refused anyway, with `security.bsd.unprivileged_proc_debug`
+/// at 0, or a process that denies tracing, makes the probe fail: residue
+/// cannot see the files of a process that could be using a worktree.
 #[cfg(target_os = "freebsd")]
 mod platform {
-    use super::{Seen, Snapshot, Use, kinfo, unavailable};
+    use super::{Seen, Snapshot, Unnamed, Use, kinfo, unavailable, vmentry};
     use crate::run::{self, RunError};
     use std::mem::offset_of;
     use std::process::Command;
@@ -789,31 +867,54 @@ mod platform {
 
     const BACKEND: &str = "sysctl";
 
-    // `kinfo` reads records by these offsets and codes; the build fails if
-    // they ever differ from `<sys/user.h>` as the libc crate declares it.
+    // `kinfo` and `vmentry` read records by these offsets and codes; the
+    // build fails if they ever differ from `<sys/user.h>` as the libc crate
+    // declares it.
     const _: () = {
-        assert!(offset_of!(libc::kinfo_file, kf_structsize) == kinfo::STRUCTSIZE);
+        assert!(offset_of!(libc::kinfo_file, kf_structsize) == 0);
         assert!(offset_of!(libc::kinfo_file, kf_type) == kinfo::TYPE);
         assert!(offset_of!(libc::kinfo_file, kf_fd) == kinfo::FD);
+        // The libc crate leaves the union `kf_un` opaque. It starts after
+        // `kf_offset` and ends at `kf_status`, and its `kf_file` member
+        // holds `FILE_TYPE`, `FSID` and `FILEID` at the offsets
+        // `<sys/user.h>` gives them.
+        assert!(offset_of!(libc::kinfo_file, kf_offset) + 8 == kinfo::FILE_TYPE);
+        assert!(kinfo::FILEID + 8 <= kinfo::STATUS);
+        assert!(offset_of!(libc::kinfo_file, kf_status) == kinfo::STATUS);
         assert!(offset_of!(libc::kinfo_file, kf_path) == kinfo::PATH);
         assert!(size_of::<libc::c_int>() == 4);
         assert!(libc::KF_TYPE_VNODE == kinfo::TYPE_VNODE);
         assert!(libc::KF_TYPE_FIFO == kinfo::TYPE_FIFO);
         assert!(libc::KF_FD_TYPE_CWD == kinfo::FD_CWD);
-        // `KINFO_FILE_SIZE` in `<sys/user.h>`, which `RECORD` stands for.
+        assert!(libc::KF_ATTR_VALID == kinfo::ATTR_VALID as libc::c_int);
+        assert!(libc::KF_VTYPE_VNON == kinfo::VTYPE_NON);
+        assert!(libc::KF_VTYPE_VBAD == kinfo::VTYPE_BAD);
+        assert!(offset_of!(libc::kinfo_vmentry, kve_structsize) == 0);
+        assert!(offset_of!(libc::kinfo_vmentry, kve_vn_fileid) == vmentry::FILEID);
+        assert!(offset_of!(libc::kinfo_vmentry, kve_vn_type) == vmentry::VTYPE);
+        assert!(offset_of!(libc::kinfo_vmentry, kve_status) == vmentry::STATUS);
+        assert!(offset_of!(libc::kinfo_vmentry, kve_vn_fsid) == vmentry::FSID);
+        assert!(offset_of!(libc::kinfo_vmentry, kve_path) == vmentry::PATH);
+        // `KINFO_FILE_SIZE` and `KINFO_VMENTRY_SIZE` in `<sys/user.h>`.
         #[cfg(target_arch = "x86_64")]
         assert!(size_of::<libc::kinfo_file>() == 1392);
+        assert!(size_of::<libc::kinfo_vmentry>() == 1160);
     };
 
-    /// The most residue reads of one process's files: a record is 368
-    /// bytes and its path, so this is more than 100,000 open files.
+    /// The most residue reads of one process's files, or of its mappings:
+    /// a file's record is 368 bytes and its path, a mapping's 136 and its
+    /// path, so this is more than 100,000 of either.
     const MOST: usize = 64 << 20;
 
     pub fn take() -> Snapshot {
         let mut cmd = Command::new("/bin/ps");
         // -A: every process. -ww: never cut a line to the terminal width.
-        cmd.args(["-A", "-ww", "-o", "pid=", "-o", "comm="])
-            .env("LC_ALL", "C");
+        // uid, ruid, svuid: the effective, real and saved user, all three
+        // of which the kernel compares to let this user read a process.
+        cmd.args([
+            "-A", "-ww", "-o", "pid=", "-o", "uid=", "-o", "ruid=", "-o", "svuid=", "-o", "comm=",
+        ])
+        .env("LC_ALL", "C");
         let out = match run::run(&mut cmd, Duration::from_secs(30), 64 << 20) {
             Ok(out) => out,
             Err(RunError::NotFound) => {
@@ -837,56 +938,90 @@ mod platform {
                 format!("ps exited with {}: {first}", out.status),
             );
         }
+        // SAFETY: geteuid only returns this process's effective user.
+        let me = unsafe { libc::geteuid() };
         let mut uses = Vec::new();
+        let mut unnamed = Vec::new();
         let mut total = 0;
         let mut inspected = 0;
-        // Reused for every process, and grown when one has more files.
-        let mut buf = vec![0u8; 64 << 10];
+        // Reused for every process, and grown when one has more.
+        let mut files = vec![0u8; 64 << 10];
+        let mut maps = vec![0u8; 64 << 10];
         for line in out.stdout.split(|b| *b == b'\n') {
-            let line = line.trim_ascii();
-            if line.is_empty() {
+            if line.trim_ascii().is_empty() {
                 continue;
             }
-            let split = line
-                .iter()
-                .position(u8::is_ascii_whitespace)
-                .unwrap_or(line.len());
-            let pid = std::str::from_utf8(&line[..split])
-                .ok()
-                .and_then(|p| p.parse::<u32>().ok())
-                .and_then(|p| libc::c_int::try_from(p).ok().map(|c| (p, c)));
-            let Some((pid, mib_pid)) = pid else {
+            let Some(listed) = super::ps_line(line) else {
                 return unavailable(
                     BACKEND,
                     "parse_error",
                     format!(
                         "ps printed a line residue cannot read: {}",
-                        String::from_utf8_lossy(line)
+                        String::from_utf8_lossy(line.trim_ascii())
                     ),
                 );
             };
-            total += 1;
-            let len = match read(mib_pid, &mut buf) {
-                Read::Got(len) => len,
-                // Exited since ps listed it, or the user may not inspect it.
-                Read::Skip => continue,
-                Read::TooLarge => {
-                    return unavailable(
-                        BACKEND,
-                        "probe_failed",
-                        format!(
-                            "process {pid} has more open files than residue reads ({} MiB of them)",
-                            MOST >> 20
-                        ),
-                    );
-                }
+            let pid = listed.pid;
+            let Ok(mib_pid) = libc::c_int::try_from(pid) else {
+                return unavailable(
+                    BACKEND,
+                    "parse_error",
+                    format!("ps printed process {pid}, which no sysctl can name"),
+                );
             };
-            let command = String::from_utf8_lossy(line[split..].trim_ascii()).into_owned();
+            total += 1;
+            let ours = listed.uids == [me; 3];
+            let mut len = [0; 2];
+            for (n, (kind, buf, record)) in [
+                (libc::KERN_PROC_FILEDESC, &mut files, FILE_RECORD),
+                (libc::KERN_PROC_VMMAP, &mut maps, vmentry::RECORD),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                len[n] = match ask(kind, mib_pid, buf, record) {
+                    Read::Got(len) => len,
+                    // Exited since ps listed it.
+                    Read::Refused(libc::ESRCH) => 0,
+                    // Another user's process, which this user may not
+                    // inspect: outside what the probe reads, as `scope`
+                    // says.
+                    Read::Refused(libc::EPERM) if !ours => 0,
+                    // Your own process (EPERM), or one still in the middle
+                    // of an exec after `ask` asked again (EBUSY).
+                    Read::Refused(errno) => {
+                        let why = std::io::Error::from_raw_os_error(errno);
+                        let name = String::from_utf8_lossy(listed.command);
+                        let detail = if errno == libc::EPERM {
+                            format!(
+                                "the kernel would not show the files of {name}[{pid}], which runs as your user ({why}): security.bsd.unprivileged_proc_debug is 0, or the process denies tracing"
+                            )
+                        } else {
+                            format!("the kernel would not show the files of {name}[{pid}] ({why})")
+                        };
+                        return unavailable(BACKEND, "probe_failed", detail);
+                    }
+                    Read::TooLarge => {
+                        return unavailable(
+                            BACKEND,
+                            "probe_failed",
+                            format!(
+                                "process {pid} has more open or mapped files than residue reads ({} MiB of them)",
+                                MOST >> 20
+                            ),
+                        );
+                    }
+                };
+                if len[n] == 0 {
+                    break;
+                }
+            }
+            let command = String::from_utf8_lossy(listed.command).into_owned();
             // Inspected means the kernel named the process's working
             // directory; one it cannot name (a path not in its name cache)
             // comes back empty.
             let mut cwd = false;
-            for file in kinfo::Files::new(&buf[..len]) {
+            for file in kinfo::Files::new(&files[..len[0]]) {
                 let file = match file {
                     Ok(file) => file,
                     Err(what) => {
@@ -897,17 +1032,58 @@ mod platform {
                         );
                     }
                 };
-                let named = matches!(file.kind, kinfo::TYPE_VNODE | kinfo::TYPE_FIFO)
-                    && file.path.first() == Some(&b'/');
-                if !named {
+                if !matches!(file.kind, kinfo::TYPE_VNODE | kinfo::TYPE_FIFO) {
                     continue;
                 }
-                cwd |= file.fd == kinfo::FD_CWD;
-                uses.push(Use {
-                    pid,
-                    command: command.clone(),
-                    path: file.path.to_vec(),
-                });
+                if file.path.first() == Some(&b'/') {
+                    cwd |= file.fd == kinfo::FD_CWD;
+                    uses.push(Use {
+                        pid,
+                        command: command.clone(),
+                        path: file.path.to_vec(),
+                    });
+                } else if !matches!(file.vtype, kinfo::VTYPE_NON | kinfo::VTYPE_BAD) {
+                    unnamed.push(Unnamed {
+                        pid,
+                        command: command.clone(),
+                        file: file.id,
+                    });
+                }
+            }
+            let mut last: &[u8] = &[];
+            for map in vmentry::Mappings::new(&maps[..len[1]]) {
+                let map = match map {
+                    Ok(map) => map,
+                    Err(what) => {
+                        return unavailable(
+                            BACKEND,
+                            "parse_error",
+                            format!("kern.proc.vmmap for process {pid}: {what}"),
+                        );
+                    }
+                };
+                // A mapping with no file (anonymous memory, a device, shared
+                // memory), or a file the kernel let go of.
+                if matches!(map.vtype, kinfo::VTYPE_NON | kinfo::VTYPE_BAD) {
+                    continue;
+                }
+                if map.path.first() == Some(&b'/') {
+                    // A file is mapped in several pieces, one after another.
+                    if map.path != last {
+                        uses.push(Use {
+                            pid,
+                            command: command.clone(),
+                            path: map.path.to_vec(),
+                        });
+                        last = map.path;
+                    }
+                } else {
+                    unnamed.push(Unnamed {
+                        pid,
+                        command: command.clone(),
+                        file: map.id,
+                    });
+                }
             }
             if cwd {
                 inspected += 1;
@@ -926,11 +1102,11 @@ mod platform {
             backend: BACKEND,
             state: Ok(Seen {
                 uses,
+                unnamed,
                 inspected,
                 total: Some(total),
                 limits: None,
                 spelling: None,
-                unnamed: Vec::new(),
             }),
         }
     }
@@ -938,27 +1114,36 @@ mod platform {
     enum Read {
         /// The kernel wrote this many bytes of records into the buffer.
         Got(usize),
-        Skip,
+        /// The kernel refused, with this error.
+        Refused(i32),
         TooLarge,
     }
 
-    /// The longest record the kernel writes: a whole `kinfo_file`, 1392
-    /// bytes, rounded up to 8 (`export_vnode_to_kinfo`, unpacked).
-    const RECORD: usize = size_of::<libc::kinfo_file>().next_multiple_of(8);
+    /// The longest record `kern.proc.filedesc` writes: a whole
+    /// `kinfo_file`, 1392 bytes, rounded up to 8 (`export_vnode_to_kinfo`,
+    /// unpacked).
+    const FILE_RECORD: usize = size_of::<libc::kinfo_file>().next_multiple_of(8);
 
-    /// `kern.proc.filedesc.<pid>` into `buf`, grown and asked again while
-    /// the records may not have fit. FreeBSD 13 and later answer ENOMEM
-    /// then. FreeBSD 12 stops at the first record that does not fit and
-    /// answers success (`export_kinfo_to_sb` in its `kern_descrip.c`), so
-    /// an answer that ends less than one record short of the buffer may
-    /// have been cut, and is asked again too.
-    fn read(pid: libc::c_int, buf: &mut Vec<u8>) -> Read {
-        let mib = [
-            libc::CTL_KERN,
-            libc::KERN_PROC,
-            libc::KERN_PROC_FILEDESC,
-            pid,
-        ];
+    /// [`read`], asked once more 10 ms later when the process is in the
+    /// middle of an exec, the one refusal (EBUSY) that passes.
+    fn ask(kind: libc::c_int, pid: libc::c_int, buf: &mut Vec<u8>, record: usize) -> Read {
+        match read(kind, pid, buf, record) {
+            Read::Refused(libc::EBUSY) => {
+                std::thread::sleep(Duration::from_millis(10));
+                read(kind, pid, buf, record)
+            }
+            other => other,
+        }
+    }
+
+    /// `kern.proc.<kind>.<pid>` into `buf`, grown and asked again while the
+    /// records may not have fit. FreeBSD 13 and later answer ENOMEM then.
+    /// FreeBSD 12's `kern.proc.filedesc` stops at the first record that does
+    /// not fit and answers success (`export_kinfo_to_sb` in its
+    /// `kern_descrip.c`), so an answer that ends less than one `record`
+    /// short of the buffer may have been cut, and is asked again too.
+    fn read(kind: libc::c_int, pid: libc::c_int, buf: &mut Vec<u8>, record: usize) -> Read {
+        let mib = [libc::CTL_KERN, libc::KERN_PROC, kind, pid];
         loop {
             let mut len: libc::size_t = buf.len();
             // SAFETY: `mib` holds 4 ints; `buf` is writable for `len` bytes
@@ -975,13 +1160,14 @@ mod platform {
             };
             if rc == 0 {
                 let len = len.min(buf.len());
-                if buf.len() - len >= RECORD {
+                if buf.len() - len >= record {
                     return Read::Got(len);
                 }
-            } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOMEM) {
-                // Any other error is the process's: ESRCH, it exited; EPERM,
-                // the user may not inspect it.
-                return Read::Skip;
+            } else {
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                if errno != Some(libc::ENOMEM) {
+                    return Read::Refused(errno.unwrap_or(libc::EINVAL));
+                }
             }
             if buf.len() >= MOST {
                 return Read::TooLarge;
@@ -992,28 +1178,134 @@ mod platform {
     }
 }
 
+/// A line of `ps -o pid= -o uid= -o ruid= -o svuid= -o comm=`: four
+/// numbers, then the command, which may hold spaces.
+#[cfg(any(target_os = "freebsd", test))]
+struct Listed<'a> {
+    pid: u32,
+    /// Effective, real and saved user.
+    uids: [u32; 3],
+    command: &'a [u8],
+}
+
+#[cfg(any(target_os = "freebsd", test))]
+fn ps_line(line: &[u8]) -> Option<Listed<'_>> {
+    let mut rest = line.trim_ascii();
+    let mut field = || {
+        let end = rest
+            .iter()
+            .position(u8::is_ascii_whitespace)
+            .unwrap_or(rest.len());
+        let number = std::str::from_utf8(&rest[..end]).ok()?.parse::<u32>().ok();
+        rest = rest[end..].trim_ascii_start();
+        number
+    };
+    let pid = field()?;
+    let uids = [field()?, field()?, field()?];
+    Some(Listed {
+        pid,
+        uids,
+        command: rest,
+    })
+}
+
+/// The packed records both FreeBSD sysctls return: each record ends after
+/// its path's NUL, rounded up to 8 bytes, and its first int, its
+/// `structsize`, gives its length (`pack_kinfo` in
+/// `sys/kern/kern_descrip.c`, `kern_proc_vmmap_out` in
+/// `sys/kern/kern_proc.c`). A record of size 0 ends the list, as in
+/// libutil's kinfo_getfile(3), but only where nothing but zero bytes
+/// follows it: the kernel writes no such record, so one with more of the
+/// answer after it means the answer is not what residue reads.
+///
+/// Each item is a whole record and its path, without the NUL, or what is
+/// wrong with the answer, which ends the walk.
+#[cfg(any(target_os = "freebsd", test))]
+type Record<'a> = Result<(&'a [u8], &'a [u8]), &'static str>;
+
+#[cfg(any(target_os = "freebsd", test))]
+fn next_record<'a>(rest: &mut &'a [u8], path_at: usize) -> Option<Record<'a>> {
+    let all = *rest;
+    if all.is_empty() {
+        return None;
+    }
+    let size = int(all, 0).map(usize::try_from);
+    let size = match size {
+        Some(Ok(0)) => {
+            *rest = &[];
+            if all.iter().all(|b| *b == 0) {
+                return None;
+            }
+            return Some(Err("a record of size 0 is followed by more of the answer"));
+        }
+        Some(Ok(size)) if size > path_at && size <= all.len() => size,
+        _ => {
+            *rest = &[];
+            return Some(Err("a record's size does not fit the answer"));
+        }
+    };
+    *rest = &all[size..];
+    let name = &all[path_at..size];
+    let Some(end) = name.iter().position(|b| *b == 0) else {
+        *rest = &[];
+        return Some(Err("a record's path has no end"));
+    };
+    Some(Ok((&all[..size], &name[..end])))
+}
+
+#[cfg(any(target_os = "freebsd", test))]
+fn int(record: &[u8], at: usize) -> Option<i32> {
+    let bytes = record.get(at..at + 4)?;
+    Some(i32::from_ne_bytes(bytes.try_into().ok()?))
+}
+
+#[cfg(any(target_os = "freebsd", test))]
+fn u64_at(record: &[u8], at: usize) -> Option<u64> {
+    let bytes = record.get(at..at + 8)?;
+    Some(u64::from_ne_bytes(bytes.try_into().ok()?))
+}
+
+#[cfg(any(target_os = "freebsd", test))]
+fn u16_at(record: &[u8], at: usize) -> Option<u16> {
+    let bytes = record.get(at..at + 2)?;
+    Some(u16::from_ne_bytes(bytes.try_into().ok()?))
+}
+
 /// The records `kern.proc.filedesc.<pid>` returns on FreeBSD: one packed
 /// `struct kinfo_file` (`<sys/user.h>`) per file, the process's executable,
 /// controlling terminal, working directory, root and jail directories
-/// first, then each descriptor. Packed means each record ends after its
-/// path's NUL, rounded up to 8 bytes, and `kf_structsize` gives its length
-/// (`pack_kinfo` in `sys/kern/kern_descrip.c`). A record of size 0 ends the
-/// list, as in libutil's kinfo_getfile(3), but only where nothing but zero
-/// bytes follows it: the kernel writes no such record, so one with more of
-/// the answer after it means the answer is not what residue reads.
+/// first, then each descriptor ([`next_record`]).
 #[cfg(any(target_os = "freebsd", test))]
 mod kinfo {
-    pub const STRUCTSIZE: usize = 0;
+
     pub const TYPE: usize = 4;
     pub const FD: usize = 8;
+    /// `kf_un.kf_file`: the vnode's type, filesystem and inode.
+    pub const FILE_TYPE: usize = 32;
+    pub const FSID: usize = 288;
+    pub const FILEID: usize = 304;
+    pub const STATUS: usize = 336;
     pub const PATH: usize = 368;
     pub const TYPE_VNODE: i32 = 1;
     pub const TYPE_FIFO: i32 = 4;
     pub const FD_CWD: i32 = -1;
+    /// `kf_status` (and `kve_status`): the kernel read the file's
+    /// attributes, so its filesystem and inode are set.
+    pub const ATTR_VALID: u16 = 1;
+    /// `KF_VTYPE_VNON`: no vnode. `KF_VTYPE_VBAD`: a vnode the kernel let
+    /// go of, as a forced unmount does, which no file is behind.
+    pub const VTYPE_NON: i32 = 0;
+    pub const VTYPE_BAD: i32 = 8;
 
     pub struct File<'a> {
         pub kind: i32,
         pub fd: i32,
+        /// For a vnode or a FIFO, its type (`KF_VTYPE_*`).
+        pub vtype: i32,
+        /// For a vnode or a FIFO, `(kf_file_fsid, kf_file_fileid)`, which
+        /// are `stat`'s `(st_dev, st_ino)` (`vn_stat`), when the kernel read
+        /// its attributes.
+        pub id: Option<(u64, u64)>,
         /// Empty when the kernel cannot name the file.
         pub path: &'a [u8],
     }
@@ -1033,45 +1325,95 @@ mod kinfo {
         type Item = Result<File<'a>, &'static str>;
 
         fn next(&mut self) -> Option<Self::Item> {
-            let rest = self.rest;
-            if rest.is_empty() {
-                return None;
-            }
-            let size = int(rest, STRUCTSIZE).map(usize::try_from);
-            let size = match size {
-                Some(Ok(0)) => {
-                    self.rest = &[];
-                    if rest.iter().all(|b| *b == 0) {
-                        return None;
-                    }
-                    return Some(Err("a record of size 0 is followed by more of the answer"));
-                }
-                Some(Ok(size)) if size > PATH && size <= rest.len() => size,
-                _ => {
-                    self.rest = &[];
-                    return Some(Err("a record's size does not fit the answer"));
-                }
+            let (record, path) = match super::next_record(&mut self.rest, PATH)? {
+                Ok(found) => found,
+                Err(what) => return Some(Err(what)),
             };
-            self.rest = &rest[size..];
-            let (Some(kind), Some(fd)) = (int(rest, TYPE), int(rest, FD)) else {
+            let fields = (
+                super::int(record, TYPE),
+                super::int(record, FD),
+                super::int(record, FILE_TYPE),
+                super::u64_at(record, FSID),
+                super::u64_at(record, FILEID),
+                super::u16_at(record, STATUS),
+            );
+            let (Some(kind), Some(fd), Some(vtype), Some(fsid), Some(fileid), Some(status)) =
+                fields
+            else {
                 return Some(Err("a record is shorter than its fields"));
-            };
-            let name = &rest[PATH..size];
-            let Some(end) = name.iter().position(|b| *b == 0) else {
-                self.rest = &[];
-                return Some(Err("a record's path has no end"));
             };
             Some(Ok(File {
                 kind,
                 fd,
-                path: &name[..end],
+                vtype,
+                id: (status & ATTR_VALID != 0).then_some((fsid, fileid)),
+                path,
             }))
         }
     }
+}
 
-    fn int(record: &[u8], at: usize) -> Option<i32> {
-        let bytes = record.get(at..at + 4)?;
-        Some(i32::from_ne_bytes(bytes.try_into().ok()?))
+/// The records `kern.proc.vmmap.<pid>` returns on FreeBSD: one packed
+/// `struct kinfo_vmentry` (`<sys/user.h>`) per mapping of the process's
+/// memory ([`next_record`]). A mapping backed by a file carries its vnode's
+/// type, and its path and attributes as for an open file
+/// (`kern_proc_vmmap_out`).
+#[cfg(any(target_os = "freebsd", test))]
+mod vmentry {
+
+    pub const FILEID: usize = 32;
+    pub const VTYPE: usize = 68;
+    pub const STATUS: usize = 86;
+    pub const FSID: usize = 88;
+    pub const PATH: usize = 136;
+    /// `KINFO_VMENTRY_SIZE`: the longest record, unpacked.
+    pub const RECORD: usize = 1160;
+
+    pub struct Mapping<'a> {
+        /// The vnode's type (`KF_VTYPE_*`); `KF_VTYPE_VNON` when no file
+        /// backs the mapping.
+        pub vtype: i32,
+        /// `(kve_vn_fsid, kve_vn_fileid)` when the kernel read the file's
+        /// attributes.
+        pub id: Option<(u64, u64)>,
+        /// Empty when the kernel cannot name the file.
+        pub path: &'a [u8],
+    }
+
+    pub struct Mappings<'a> {
+        rest: &'a [u8],
+    }
+
+    impl<'a> Mappings<'a> {
+        pub fn new(records: &'a [u8]) -> Self {
+            Mappings { rest: records }
+        }
+    }
+
+    impl<'a> Iterator for Mappings<'a> {
+        /// A record, or what is wrong with the answer, which ends the walk.
+        type Item = Result<Mapping<'a>, &'static str>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let (record, path) = match super::next_record(&mut self.rest, PATH)? {
+                Ok(found) => found,
+                Err(what) => return Some(Err(what)),
+            };
+            let fields = (
+                super::int(record, VTYPE),
+                super::u64_at(record, FSID),
+                super::u64_at(record, FILEID),
+                super::u16_at(record, STATUS),
+            );
+            let (Some(vtype), Some(fsid), Some(fileid), Some(status)) = fields else {
+                return Some(Err("a record is shorter than its fields"));
+            };
+            Some(Ok(Mapping {
+                vtype,
+                id: (status & super::kinfo::ATTR_VALID != 0).then_some((fsid, fileid)),
+                path,
+            }))
+        }
     }
 }
 
@@ -1286,7 +1628,7 @@ mod platform {
 /// path until the folder's is rebuilt (`dirtopath`) and the file is looked
 /// up again. A path of `MAXPATHLEN` bytes or more fails too. So a link
 /// that fails can name a file inside any directory on its filesystem,
-/// and residue looks for it there by device and inode (`inodes_within`).
+/// and residue looks for it there by device and inode (`Snapshot::evidence`).
 ///
 /// Its device, inode and link count come from `fd/N`, `object/NAME` or the
 /// opened `cwd` (`platform::attributes`). A file whose link count is 0 is
@@ -1581,14 +1923,14 @@ mod tests {
 
     #[test]
     fn a_full_probe_finding_no_use_is_not_observed() {
-        let e = snapshot(None).evidence(Path::new("/w/idle"));
+        let e = snapshot(None).evidence(Path::new("/w/idle"), None);
         assert_eq!(e.code(), "not_observed");
     }
 
     #[test]
     fn a_partial_probe_finding_no_use_is_unknown() {
         let s = snapshot(Some("working directories only, not open files"));
-        let Evidence::Unknown(u) = s.evidence(Path::new("/w/idle")) else {
+        let Evidence::Unknown(u) = s.evidence(Path::new("/w/idle"), None) else {
             panic!("a partial probe with no use found must be unknown");
         };
         assert_eq!(u.reason, "partial_probe");
@@ -1601,7 +1943,8 @@ mod tests {
     #[test]
     fn a_use_is_in_use_with_either_probe() {
         for limits in [None, Some("working directories only, not open files")] {
-            let Evidence::InUse(procs) = snapshot(limits).evidence(Path::new("/w/busy")) else {
+            let Evidence::InUse(procs) = snapshot(limits).evidence(Path::new("/w/busy"), None)
+            else {
                 panic!("a use inside the directory must be in_use");
             };
             assert_eq!(procs, vec![(1, "sleep".to_string())]);
@@ -1647,13 +1990,13 @@ mod tests {
     fn an_unnamed_file_inside_the_directory_is_its_holders_use() {
         let (top, dir) = scratch("inside");
         let file = id(&dir.join("sub/file.txt"));
-        let Evidence::InUse(procs) = unnamed_snapshot(2, &[file]).evidence(&dir) else {
+        let Evidence::InUse(procs) = unnamed_snapshot(2, &[file]).evidence(&dir, None) else {
             panic!("an unnamed file inside the directory must be in_use");
         };
         assert_eq!(procs, vec![(2, "sleep".to_string())]);
         // The directory itself, held open, and one process listed once.
         let both = unnamed_snapshot(2, &[id(&dir), id(&dir.join("sub"))]);
-        let Evidence::InUse(procs) = both.evidence(&dir) else {
+        let Evidence::InUse(procs) = both.evidence(&dir, None) else {
             panic!("the directory held open must be in_use");
         };
         assert_eq!(procs, vec![(2, "sleep".to_string())]);
@@ -1665,17 +2008,17 @@ mod tests {
         let (top, dir) = scratch("outside");
         let outside = id(&top.join("outside.txt"));
         assert_eq!(
-            unnamed_snapshot(2, &[outside]).evidence(&dir).code(),
+            unnamed_snapshot(2, &[outside]).evidence(&dir, None).code(),
             "not_observed"
         );
         // On another filesystem it cannot be inside the directory.
         let (device, inode) = id(&dir.join("sub/file.txt")).unwrap();
         let other = unnamed_snapshot(2, &[Some((device.wrapping_add(1), inode))]);
-        assert_eq!(other.evidence(&dir).code(), "not_observed");
+        assert_eq!(other.evidence(&dir, None).code(), "not_observed");
         // A second name inside the directory is inside it.
         std::fs::hard_link(top.join("outside.txt"), dir.join("sub/link.txt")).unwrap();
         assert_eq!(
-            unnamed_snapshot(2, &[outside]).evidence(&dir).code(),
+            unnamed_snapshot(2, &[outside]).evidence(&dir, None).code(),
             "in_use"
         );
         std::fs::remove_dir_all(&top).unwrap();
@@ -1685,7 +2028,7 @@ mod tests {
     fn an_unnamed_file_residue_cannot_place_is_unknown() {
         use std::os::unix::fs::PermissionsExt;
         let (top, dir) = scratch("unread");
-        let Evidence::Unknown(u) = unnamed_snapshot(2, &[None]).evidence(&dir) else {
+        let Evidence::Unknown(u) = unnamed_snapshot(2, &[None]).evidence(&dir, None) else {
             panic!("an unnamed file residue cannot read must be unknown");
         };
         assert_eq!(u.reason, "unnamed_file");
@@ -1699,7 +2042,7 @@ mod tests {
         let sub = dir.join("sub");
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
         let unreadable = std::fs::read_dir(&sub).is_err();
-        let evidence = unnamed_snapshot(2, &[outside]).evidence(&dir);
+        let evidence = unnamed_snapshot(2, &[outside]).evidence(&dir, None);
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
         if unreadable {
             let Evidence::Unknown(u) = evidence else {
@@ -1719,12 +2062,12 @@ mod tests {
     fn a_use_outranks_an_unnamed_file_and_residues_own_do_not_count() {
         let (top, dir) = scratch("own");
         let mut s = unnamed_snapshot(std::process::id(), &[None]);
-        assert_eq!(s.evidence(&dir).code(), "not_observed");
+        assert_eq!(s.evidence(&dir, None).code(), "not_observed");
         if let Ok(seen) = &mut s.state {
             seen.unnamed[0].pid = 2;
             seen.uses[0].path = dir.as_os_str().as_encoded_bytes().to_vec();
         }
-        let Evidence::InUse(procs) = s.evidence(&dir) else {
+        let Evidence::InUse(procs) = s.evidence(&dir, None) else {
             panic!("a use inside the directory must be in_use");
         };
         assert_eq!(procs, vec![(1, "sleep".to_string())]);
@@ -1737,11 +2080,11 @@ mod tests {
         let file = id(&dir.join("sub/file.txt"));
         std::fs::remove_dir_all(&top).unwrap();
         assert_eq!(
-            unnamed_snapshot(2, &[file]).evidence(&dir).code(),
+            unnamed_snapshot(2, &[file]).evidence(&dir, None).code(),
             "not_observed"
         );
         assert_eq!(
-            unnamed_snapshot(2, &[None]).evidence(&dir).code(),
+            unnamed_snapshot(2, &[None]).evidence(&dir, None).code(),
             "not_observed"
         );
     }
@@ -1773,9 +2116,9 @@ mod tests {
     #[test]
     fn a_sibling_with_a_shared_prefix_is_not_a_use() {
         let s = snapshot(Some("working directories only, not open files"));
-        assert_eq!(s.evidence(Path::new("/w/bus")).code(), "unknown");
+        assert_eq!(s.evidence(Path::new("/w/bus"), None).code(), "unknown");
         assert_eq!(
-            snapshot(None).evidence(Path::new("/w/bus")).code(),
+            snapshot(None).evidence(Path::new("/w/bus"), None).code(),
             "not_observed"
         );
     }
@@ -1834,8 +2177,8 @@ mod tests {
                 unnamed: Vec::new(),
             }),
         };
-        assert_eq!(s.evidence(Path::new("/w/gone")).code(), "in_use");
-        assert_eq!(s.evidence(Path::new("/w/gon")).code(), "not_observed");
+        assert_eq!(s.evidence(Path::new("/w/gone"), None).code(), "in_use");
+        assert_eq!(s.evidence(Path::new("/w/gon"), None).code(), "not_observed");
     }
 
     #[test]
@@ -1901,34 +2244,149 @@ mod tests {
     #[test]
     fn an_escaped_use_is_a_use_of_the_directory_it_names() {
         let s = lsof_snapshot(&[b"/w/caf\\xc3\\xa9/src", b"/w/back\\\\slash"]);
-        assert_eq!(s.evidence(dir(b"/w/caf\xc3\xa9")).code(), "in_use");
-        assert_eq!(s.evidence(dir(b"/w/back\\slash")).code(), "in_use");
-        assert_eq!(s.evidence(dir(b"/w/caf")).code(), "not_observed");
-        assert_eq!(s.evidence(dir(b"/w/back")).code(), "not_observed");
-        assert_eq!(s.evidence(dir(b"/w/caf\xc3\xa9x")).code(), "not_observed");
+        assert_eq!(s.evidence(dir(b"/w/caf\xc3\xa9"), None).code(), "in_use");
+        assert_eq!(s.evidence(dir(b"/w/back\\slash"), None).code(), "in_use");
+        assert_eq!(s.evidence(dir(b"/w/caf"), None).code(), "not_observed");
+        assert_eq!(s.evidence(dir(b"/w/back"), None).code(), "not_observed");
+        assert_eq!(
+            s.evidence(dir(b"/w/caf\xc3\xa9x"), None).code(),
+            "not_observed"
+        );
     }
 
     #[test]
     fn a_directory_lsof_may_print_two_ways_is_unknown() {
         let s = lsof_snapshot(&[b"/w/busy"]);
-        let Evidence::Unknown(u) = s.evidence(dir(b"/w/\xff")) else {
+        let Evidence::Unknown(u) = s.evidence(dir(b"/w/\xff"), None) else {
             panic!("a path whose printed form is not confirmed must be unknown");
         };
         assert_eq!(u.reason, "unmatchable_path");
     }
 
-    /// Packed `kinfo_file` records as FreeBSD's kernel writes them: size,
-    /// type and fd, then the path at offset 368, NUL-ended and padded to 8.
-    fn kinfo_record(kind: i32, fd: i32, path: &[u8]) -> Vec<u8> {
-        use super::kinfo::{FD, PATH, STRUCTSIZE, TYPE};
-        let size = (PATH + path.len() + 1).next_multiple_of(8);
+    /// A parsed record: its vnode's type, filesystem and inode, and path.
+    type Parsed = (i32, Option<(u64, u64)>, Vec<u8>);
+
+    /// A packed record as FreeBSD's kernel writes one: its size first, the
+    /// `fields` at their offsets, then the path at `path_at`, NUL-ended
+    /// and padded to 8.
+    fn packed(path_at: usize, fields: &[(usize, &[u8])], path: &[u8]) -> Vec<u8> {
+        let size = (path_at + path.len() + 1).next_multiple_of(8);
         let mut r = vec![0u8; size];
-        let size = i32::try_from(size).unwrap();
-        r[STRUCTSIZE..STRUCTSIZE + 4].copy_from_slice(&size.to_ne_bytes());
-        r[TYPE..TYPE + 4].copy_from_slice(&kind.to_ne_bytes());
-        r[FD..FD + 4].copy_from_slice(&fd.to_ne_bytes());
-        r[PATH..PATH + path.len()].copy_from_slice(path);
+        r[..4].copy_from_slice(&i32::try_from(size).unwrap().to_ne_bytes());
+        for (at, bytes) in fields {
+            r[*at..*at + bytes.len()].copy_from_slice(bytes);
+        }
+        r[path_at..path_at + path.len()].copy_from_slice(path);
         r
+    }
+
+    /// A `kinfo_file` record for a regular file, with no attributes.
+    fn kinfo_record(kind: i32, fd: i32, path: &[u8]) -> Vec<u8> {
+        kinfo_file(kind, fd, 1, None, path)
+    }
+
+    /// A `kinfo_file` record: type, fd, the vnode's type and, when `id`
+    /// is set, its filesystem and inode with `KF_ATTR_VALID`.
+    fn kinfo_file(kind: i32, fd: i32, vtype: i32, id: Option<(u64, u64)>, path: &[u8]) -> Vec<u8> {
+        use super::kinfo::{ATTR_VALID, FD, FILE_TYPE, FILEID, FSID, PATH, STATUS, TYPE};
+        let (fsid, fileid) = id.unwrap_or((7, 7));
+        let status = if id.is_some() { ATTR_VALID } else { 0 };
+        packed(
+            PATH,
+            &[
+                (TYPE, &kind.to_ne_bytes()),
+                (FD, &fd.to_ne_bytes()),
+                (FILE_TYPE, &vtype.to_ne_bytes()),
+                (FSID, &fsid.to_ne_bytes()),
+                (FILEID, &fileid.to_ne_bytes()),
+                (STATUS, &status.to_ne_bytes()),
+            ],
+            path,
+        )
+    }
+
+    /// A packed `kinfo_vmentry` record for a mapping.
+    fn vmentry_record(vtype: i32, id: Option<(u64, u64)>, path: &[u8]) -> Vec<u8> {
+        use super::vmentry::{FILEID, FSID, PATH, STATUS, VTYPE};
+        let (fsid, fileid) = id.unwrap_or((7, 7));
+        let status = u16::from(id.is_some());
+        packed(
+            PATH,
+            &[
+                (VTYPE, &vtype.to_ne_bytes()),
+                (FSID, &fsid.to_ne_bytes()),
+                (FILEID, &fileid.to_ne_bytes()),
+                (STATUS, &status.to_ne_bytes()),
+            ],
+            path,
+        )
+    }
+
+    #[test]
+    fn kinfo_records_give_each_file_by_filesystem_and_inode() {
+        use super::kinfo::{Files, TYPE_VNODE, VTYPE_BAD};
+        let mut buf = kinfo_file(TYPE_VNODE, 3, 1, Some((0x1_0000_0002, 42)), b"/w/a");
+        buf.extend(kinfo_file(TYPE_VNODE, 4, 1, Some((9, u64::MAX)), b""));
+        buf.extend(kinfo_file(TYPE_VNODE, 5, VTYPE_BAD, None, b""));
+        let files: Vec<Parsed> = Files::new(&buf)
+            .map(|f| f.map(|f| (f.vtype, f.id, f.path.to_vec())))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            files,
+            vec![
+                (1, Some((0x1_0000_0002, 42)), b"/w/a".to_vec()),
+                (1, Some((9, u64::MAX)), Vec::new()),
+                (VTYPE_BAD, None, Vec::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn vmentry_records_give_each_mapping_and_its_file() {
+        use super::kinfo::VTYPE_NON;
+        use super::vmentry::{Mappings, RECORD};
+        // The longest path the kernel writes, 1,023 bytes, fills a whole record.
+        assert_eq!(vmentry_record(1, None, &[b'a'; 1023]).len(), RECORD);
+        let mut buf = vmentry_record(VTYPE_NON, None, b"");
+        buf.extend(vmentry_record(1, Some((5, 6)), b"/w/lib/x.so"));
+        buf.extend(vmentry_record(1, Some((5, 7)), b""));
+        buf.extend(vmentry_record(1, None, b"/w/caf\xc3\xa9 \xff"));
+        let maps: Vec<Parsed> = Mappings::new(&buf)
+            .map(|m| m.map(|m| (m.vtype, m.id, m.path.to_vec())))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            maps,
+            vec![
+                (VTYPE_NON, None, Vec::new()),
+                (1, Some((5, 6)), b"/w/lib/x.so".to_vec()),
+                (1, Some((5, 7)), Vec::new()),
+                (1, None, b"/w/caf\xc3\xa9 \xff".to_vec()),
+            ]
+        );
+        // Cut short, or a size past the answer: an error, never a skip.
+        let last = |buf: &[u8]| Mappings::new(buf).last().map(|m| m.is_err());
+        assert_eq!(last(&buf[..buf.len() - 8]), Some(true));
+        let mut no_end = vmentry_record(1, None, b"/w/a");
+        no_end[super::vmentry::PATH..].fill(b'a');
+        assert_eq!(last(&no_end), Some(true));
+    }
+
+    #[test]
+    fn a_ps_line_gives_the_pid_the_three_users_and_the_command() {
+        let listed = super::ps_line(b"  812  1001  1001     0 my tool \n").unwrap();
+        assert_eq!(listed.pid, 812);
+        assert_eq!(listed.uids, [1001, 1001, 0]);
+        assert_eq!(listed.command, b"my tool");
+        let listed = super::ps_line(b"1 0 0 0 init").unwrap();
+        assert_eq!(
+            (listed.pid, listed.uids, listed.command),
+            (1, [0; 3], &b"init"[..])
+        );
+        assert!(super::ps_line(b"  812  1001  1001").is_none());
+        assert!(super::ps_line(b"  812  root  1001  1001 sh").is_none());
+        assert!(super::ps_line(b"  -1  0  0  0 sh").is_none());
     }
 
     #[test]
@@ -1989,5 +2447,103 @@ mod tests {
             path(b"7f00-7f01 r--p 00000000 08:01 7      /a  b \n"),
             Some(&b"/a  b "[..])
         );
+    }
+
+    #[test]
+    fn a_path_the_probe_cannot_name_whole_is_unknown() {
+        use super::{PATH_LIMIT, Reach};
+        let s = snapshot(None);
+        let reach = |longest| Reach {
+            longest,
+            ..Reach::default()
+        };
+        let idle = Path::new("/w/idle");
+        let at = |longest| s.evidence(idle, Some(&reach(longest)));
+        assert_eq!(at(PATH_LIMIT - 1).code(), "not_observed");
+        let Evidence::Unknown(u) = at(PATH_LIMIT) else {
+            panic!("a path of PATH_LIMIT bytes must be unknown");
+        };
+        assert_eq!(u.reason, "long_path");
+        assert_eq!(
+            u.detail,
+            format!(
+                "test names a path whole only when it is shorter than {PATH_LIMIT} bytes, and a path here is {PATH_LIMIT}, so it cannot show that no process is using it"
+            )
+        );
+        // The directory's own path counts without a walk.
+        let long = format!("/{}", "a".repeat(PATH_LIMIT));
+        let e = s.evidence(Path::new(&long), None);
+        assert_eq!(e.code(), "unknown");
+        // A use the probe did name is still a use.
+        let e = s.evidence(Path::new("/w/busy"), Some(&reach(PATH_LIMIT * 2)));
+        assert_eq!(e.code(), "in_use");
+    }
+
+    /// With the walk that sized the directory, an unnamed file is placed by
+    /// what that walk listed, and no second walk runs: inode 42 is not on
+    /// disk here, so only the walk's list can put it inside.
+    #[test]
+    fn an_unnamed_file_is_placed_by_the_walk_that_sized_the_directory() {
+        use super::Reach;
+        use std::os::unix::fs::MetadataExt;
+        let (top, dir) = scratch("walked");
+        let here = std::fs::metadata(&dir).unwrap().dev();
+        let walked = |found: Vec<(u64, u64)>, unread: Option<&str>| Reach {
+            longest: 1,
+            found,
+            unread: unread.map(String::from),
+        };
+        let code = |files: &[Option<(u64, u64)>], reach: &Reach| {
+            unnamed_snapshot(2, files)
+                .evidence(&dir, Some(reach))
+                .code()
+        };
+        let Evidence::InUse(procs) = unnamed_snapshot(2, &[Some((here, 42))])
+            .evidence(&dir, Some(&walked(vec![(here, 42)], None)))
+        else {
+            panic!("an unnamed file the walk listed must be in_use");
+        };
+        assert_eq!(procs, vec![(2, "sleep".to_string())]);
+        // On this filesystem but not in the walk's list: outside.
+        assert_eq!(
+            code(&[Some((here, 42))], &walked(Vec::new(), None)),
+            "not_observed"
+        );
+        // On another filesystem it cannot be inside.
+        assert_eq!(
+            code(
+                &[Some((here ^ 1, 42))],
+                &walked(Vec::new(), Some("x: denied"))
+            ),
+            "not_observed"
+        );
+        // A walk that could not read all of the directory cannot show it
+        // outside.
+        let Evidence::Unknown(u) = unnamed_snapshot(2, &[Some((here, 42))])
+            .evidence(&dir, Some(&walked(Vec::new(), Some("x: denied"))))
+        else {
+            panic!("an unnamed file behind what the walk could not read must be unknown");
+        };
+        assert_eq!(u.reason, "unnamed_file");
+        assert_eq!(
+            u.detail,
+            "test cannot give the path of a file process 2 (sleep) holds, and residue could not read all of this directory to look for it (x: denied), so it cannot show that no process is using it"
+        );
+        // One with no device and inode may be anywhere.
+        let Evidence::Unknown(u) =
+            unnamed_snapshot(2, &[None]).evidence(&dir, Some(&walked(vec![(here, 42)], None)))
+        else {
+            panic!("an unnamed file residue cannot place must be unknown");
+        };
+        assert_eq!(u.reason, "unnamed_file");
+        std::fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn the_walk_looks_for_each_unnamed_file_once() {
+        let s = unnamed_snapshot(2, &[Some((2, 9)), None, Some((1, 5)), Some((2, 9))]);
+        assert_eq!(s.wanted(), vec![(1, 5), (2, 9)]);
+        let failed = super::unavailable("test", "timeout", String::new());
+        assert!(failed.wanted().is_empty());
     }
 }

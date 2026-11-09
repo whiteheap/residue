@@ -43,6 +43,9 @@
 #                  so both have passed every check; the test releases one,
 #                  waits for it to finish, then releases the other (4, and
 #                  4b with --trash, where each made a trash entry first)
+#   open-before-move
+#                  at `worktree move ORIGINAL ASIDE`, start a sleep that
+#                  holds ORIGINAL/README.md open, then run the move (2f)
 #   part-remove-reflog, part-remove-head, part-remove-dotgit,
 #   part-remove-files
 #                  fail `worktree remove ASIDE` after deleting the
@@ -51,6 +54,11 @@
 #                  its ignored files: what Git's own remove leaves when it
 #                  stops at a file it cannot delete, or is killed during
 #                  the delete (5, 5b, 5c, 5e)
+#   part-remove-unlisted
+#                  fail `worktree remove ASIDE` after deleting all but an
+#                  ignored file of the checkout, then the worktree's Git
+#                  directory: what Git's own remove leaves when it cannot
+#                  delete a file, so Git no longer lists it (5g)
 #   hold-after     with a part-remove mode, hold the Git command after the
 #                  failed remove, so residue still runs (5d)
 #   hold-add      stop `residue restore` at its `git worktree add`, so a
@@ -199,6 +207,7 @@ cleanup() {
         kill_tree "$p"
     done
     [ -f "$work/held" ] && kill -TERM "$(cat "$work/held")" 2>/dev/null
+    [ -f "$work/opener" ] && kill "$(cat "$work/opener")" 2>/dev/null
     wait 2>/dev/null
     unmount_planted "${wt:-}/node_modules/mnt" || echo "recovery-check: could not unmount the scratch volume in $work" >&2
     chmod -R u+rwx -- "$work" 2>/dev/null # scenario 2d's unreadable folder
@@ -298,6 +307,13 @@ case " \$* " in
         *part-remove-head*) rm -f "\$gd/HEAD" ;;
         *part-remove-dotgit*) rm -f "\$last/.git" ;;
         *part-remove-files*) rm -f "\$last/node_modules/a.js" ;;
+        *part-remove-unlisted*)
+            # Git cannot delete one file, deletes the rest, then its own
+            # directory for the worktree anyway, as for a folder it may
+            # not write: it no longer lists the worktree.
+            rm -f "\$last/README.md" "\$last/.gitignore" "\$last/.git"
+            rm -rf "\$gd"
+            ;;
         esac
         : >"\$work/part-done"
         echo "error: recovery-check: the remove stops part way on purpose" >&2
@@ -335,6 +351,14 @@ case " \$* " in
     *)
         case "\$last \$mode" in
         *residue-removing-*hold-move* | */residue-trash/*hold-move*) hold "move-\$PPID" ;;
+        *residue-removing-*open-before-move*)
+            # After every check, a process opens a file at the top of the
+            # worktree, which it then holds under the hidden name.
+            if [ ! -e "\$work/opener" ]; then
+                sleep 300 3<"\$second/README.md" >/dev/null 2>&1 &
+                echo \$! >"\$work/opener"
+            fi
+            ;;
         esac
         ;;
     esac
@@ -632,9 +656,9 @@ if [ -n "$partial_probe" ]; then
         killed-unheld-git unheld-finished-record unheld-reused-pid purge-killed-unheld-git restore-locks-unlocked \
         restore-lifts-its-lock old-damaged-record restore-opens-no-fifo restore-unlock-raced \
         remove-fails-part-way-reflog remove-fails-part-way-head remove-fails-part-way-dotgit remove-fails-part-way-running \
-        remove-fails-part-way-files \
+        remove-fails-part-way-files remove-fails-unlisted \
         nested-repo-after-move mount-after-move unreadable-after-move private-ref-after-move bisect-after-move \
-        restore-to-other-fs stale-no-index leftover-dotgit-kept restore-forget-race forget-restore-race \
+        opened-before-move restore-to-other-fs stale-no-index leftover-dotgit-kept restore-forget-race forget-restore-race \
         forget-before-restore-reads restore-forget-race-reftable stale-names-repair gone-aside-no-record \
         stale-keeps-reflog stale-keeps-reflog-reftable stale-keeps-same-name stale-locked-no-remove move-back-guard \
         restore-raced-git-dir restore-move-stops-after-rename noflock-recreate noflock-kept; do
@@ -1222,6 +1246,35 @@ for kind in private-ref bisect; do
     elif [ "$kind" = bisect ] && { [ ! -e "$repo/.git/worktrees/w/BISECT_LOG" ] || [ "$(git -C "$wt" rev-parse -q --verify refs/bisect/bad)" != "$w_sha" ]; }; then fail "w's bisect is gone"
     elif common_ok; then ok "$(jq -r '.results[0].reason' "$out")"; fi
 done
+
+# --- 2f. A process opens a file of the worktree right before the move ------
+# After every check of the plan, a sleep opens README.md, then residue
+# moves w aside. The check after the move must see the sleep, which holds
+# the file under the hidden name, and put w back with the file. Where
+# FreeBSD's kernel gives the file by its filesystem and inode instead of
+# a path, the walk of the moved worktree finds it, so it is a use there
+# too.
+name=opened-before-move
+make_repo
+echo open-before-move >"$work/mode"
+start "" remove --yes --json "$wt"
+finish "$pid"
+opener=$(cat "$work/opener" 2>/dev/null)
+out=$work/$name.out
+reason=$(jq -r '.results[0].reason' "$out")
+if [ -z "$opener" ]; then fail "no sleep opened README.md before the move"
+elif [ "$status" != 3 ]; then fail "exit $status, want 3: $(outcome)"
+elif [ "$(jq -r '.results[0].result' "$out")" != skipped ]; then fail "result $(outcome), want skipped"
+elif [ "$reason" != "in use by sleep[$opener] after residue moved it aside; it is back in place" ]; then fail "reason: $reason"
+elif [ "$(record "$wt")" != registered ]; then fail "at its original path Git has: $(record "$wt")"
+elif [ -n "$(asides)" ]; then fail "a moved-aside directory is left: $(asides)"
+elif [ "$(sums "$wt")" != "$w_sum" ]; then fail "the worktree's files changed"
+elif [ "$(records)" != "0 records, 0 refs" ]; then fail "removal records: $(records), want 0 records, 0 refs"
+elif common_ok; then ok "$reason"; fi
+if [ -n "$opener" ]; then
+    kill "$opener" 2>/dev/null
+    rm -f "$work/opener"
+fi
 
 # --- 3. The check after the move fails, and so does the move back ----------
 name=move-back-fails
@@ -2369,6 +2422,35 @@ if part_remove_ok "part of its files may be gone: " "$(grep -v '^\./node_modules
     elif ! jq -e '.restore.notes | any(contains("if its removal had started deleting, part of it is gone"))' "$work/$name.out-restore" >/dev/null; then fail "restore does not say part of it may be gone: $(jq -c '.restore.notes' "$work/$name.out-restore")"
     elif [ "$(sums "$wt")" != "$(grep -v '^\./node_modules/' <<<"$w_sum")" ]; then fail "the restored worktree's tracked files changed"
     else ok "the record stays though Git lists w with its Git directory whole, and restore moves it back"; fi
+fi
+
+# 5g: Git's remove cannot delete one file, deletes the rest, then its own
+# directory for the worktree, so it no longer lists w (Git does this for a
+# folder it may not write). No move brings w back: the reason must say what
+# is left where, give the record's restore and no move back, and restore
+# must recreate w on its branch with its reflog, and say what is left.
+name=remove-fails-unlisted
+part_remove part-remove-unlisted
+main=$(cd "$repo" && pwd -P)
+if [ "$status" != 3 ]; then fail "exit $status, want 3"
+elif [ "$(jq -r '.results[0].result' "$out")" != failed ]; then fail "result $(jq -r '.results[0].result' "$out"), want failed"
+elif ! grep -qF "Git no longer lists it, so part of it is gone, and what Git did not delete is still at $aside; its removal record keeps its HEAD and reflog: residue restore $main/.git/residue-removed/" <<<"$reason"; then fail "reason: $reason"
+elif grep -qE "Recover with: |could not move it back" <<<"$reason"; then fail "it gives a move back as the recovery: $reason"
+elif [ -z "$aside" ] || [ "$(record "$aside")" != unregistered ]; then fail "want what is left at the moved-aside path, which Git does not list: ${aside:-none}"
+elif [ "$(sums "$aside")" != "$(grep '^\./node_modules/' <<<"$w_sum")" ]; then fail "what is left differs from the one file Git did not delete"
+elif [ "$(records)" != "1 records, 2 refs" ]; then fail "removal records: $(records), want 1 records, 2 refs"
+elif ! git -C "$repo" cat-file -e "$lone^{commit}" 2>/dev/null; then fail "git gc lost the commit only its HEAD reflog held"
+else
+    restore_w
+    if [ "$restored" != 0 ]; then fail "restore exited $restored: $(cat "$work/$name.err-restore")"
+    elif [ "$(jq -r '.restore.checkout' "$work/$name.out-restore")" != checked_out_branch ]; then fail "checkout $(jq -r '.restore.checkout' "$work/$name.out-restore"), want checked_out_branch"
+    elif [ "$(record "$wt")" != registered ]; then fail "at its path Git has: $(record "$wt")"
+    elif ! grep -qx "$lone" <<<"$(git -C "$wt" reflog --format=%H)"; then fail "the restored worktree's reflog does not name the commit only its HEAD reflog held"
+    elif [ "$(sums "$wt")" != "$(grep -v '^\./node_modules/' <<<"$w_sum")" ]; then fail "the recreated worktree's tracked files differ"
+    elif ! jq -e --arg at "$aside" '.restore.notes | any(. == "what its removal did not delete is still at \($at); residue leaves it there for you to look through and delete")' "$work/$name.out-restore" >/dev/null; then fail "restore does not say what is left where: $(jq -c '.restore.notes' "$work/$name.out-restore")"
+    elif [ "$(sums "$aside")" != "$(grep '^\./node_modules/' <<<"$w_sum")" ]; then fail "restore changed what is left at the moved-aside path"
+    elif [ "$(records)" != "0 records, 0 refs" ]; then fail "after restore: $(records), want 0 records, 0 refs"
+    elif common_ok; then ok "the reason gives what is left and the record's restore, and restore recreates it and says what is left"; fi
 fi
 
 # --- 5f. A record restore with --to on another filesystem -------------------

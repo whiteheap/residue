@@ -1529,8 +1529,10 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
         since,
     };
     let at_dest = standing(&written, &main, &[&dest], Some(&files));
-    if let Standing::Lacking(..) = at_dest {
-        return settle(&written, at_dest, None, Outcome::Failed(e));
+    match at_dest {
+        Standing::Lacking(..) => return settle(&written, at_dest, None, Outcome::Failed(e)),
+        Standing::Unlisted => return unlisted(&written, &dest, &e),
+        Standing::Whole(_) | Standing::Unknown(_) => {}
     }
     let measured_whole = matches!(at_dest, Standing::Whole(_));
     let outcome = match moved.put_back(false, &e) {
@@ -1688,7 +1690,11 @@ fn standing<'a>(
         let Some(files) = files else {
             return Standing::Whole(at);
         };
-        return match files.planned.again(at, entry.head.clone(), files.policy) {
+        return match files
+            .planned
+            .again(at, entry.head.clone(), files.policy, &[])
+            .0
+        {
             Ok(now) => match files.planned.changed(&now, files.since) {
                 None => Standing::Whole(at),
                 Some(why) => Standing::Lacking(at, format!("part of its files may be gone: {why}")),
@@ -1745,6 +1751,30 @@ fn settle(
         Outcome::Failed(why) => Outcome::Failed(with_note(why, &note)),
         other => other,
     }
+}
+
+/// After a `git worktree remove` that failed once Git had deleted its own
+/// directory for the worktree, which it does even when it could not delete
+/// every file: Git no longer lists it, so no `git worktree move` brings it
+/// back, and what Git did not delete stays under the hidden name. The
+/// removal record stays, and the reason ends with its restore, as for a
+/// worktree Git deleted part of (`settle`): that restore recreates the
+/// worktree at its original path, and says what is left at the hidden one.
+fn unlisted(written: &removed::Written, dest: &Path, e: &str) -> Outcome {
+    let left = match fs::symlink_metadata(dest) {
+        Ok(_) => format!("what Git did not delete is still at {}", dest.display()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            format!("nothing of it is left at {}", dest.display())
+        }
+        Err(err) => format!(
+            "residue cannot tell what is left at {} ({err})",
+            dest.display()
+        ),
+    };
+    Outcome::Failed(format!(
+        "{e}; Git no longer lists it, so part of it is gone, and {left}; its removal record keeps its HEAD and reflog: residue restore {}",
+        output::shell(&written.dir)
+    ))
 }
 
 /// Where the line that recovers a worktree residue could not move back
@@ -1842,8 +1872,17 @@ fn verify_moved(
     if let Err(Outcome::Skipped(why)) = compare_entry(&before.entry, &judged, since) {
         return Err(why);
     }
+    let planned = before
+        .fingerprint
+        .as_ref()
+        .map_err(|e| format!("residue could not record what the plan showed: {e}"))?;
+    // The snapshot is taken before the walk, as the plan's was, and read
+    // after it: the walk at the new path says how long the worktree's
+    // paths are now and which files the probe could not name lie inside
+    // it. A use the probe saw still comes first among the reasons.
     let snapshot = Snapshot::take();
-    match snapshot.evidence(dest) {
+    let (now, reach) = planned.again(dest, listed.head.clone(), policy, &snapshot.wanted());
+    match snapshot.evidence(dest, reach.as_ref()) {
         Evidence::NotObserved => {}
         Evidence::InUse(procs) => {
             let names: Vec<String> = procs
@@ -1862,11 +1901,7 @@ fn verify_moved(
             ));
         }
     }
-    let planned = before
-        .fingerprint
-        .as_ref()
-        .map_err(|e| format!("residue could not record what the plan showed: {e}"))?;
-    let now = planned.again(dest, listed.head.clone(), policy)?;
+    let now = now?;
     if let Some(why) = planned.changed(&now, since) {
         return Err(why);
     }
