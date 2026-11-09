@@ -2419,7 +2419,7 @@ else
             restored=$status
             if [ "$restored" != 1 ]; then fail "restore --to on another filesystem exited $restored, want 1"
             elif [ -e "$other/a/b" ]; then fail "the refused restore made folders on the other filesystem: $(find "$other/a" | sed "s#$other#OTHER#g" | tr '\n' ' ')"
-            elif ! grep -qF "$other/a is on another filesystem than " "$work/$name.err.r"; then fail "restore does not say the nearest folder of the destination is on another filesystem: $(cat "$work/$name.err.r")"
+            elif ! grep -qF "$(cd "$other" && pwd -P)/a is on another filesystem than " "$work/$name.err.r"; then fail "restore does not say the nearest folder of the destination is on another filesystem: $(cat "$work/$name.err.r")"
             elif [ "$(record "$aside")" != registered ] || [ "$(records)" != "1 records, 2 refs" ]; then fail "the refused restore changed w or its record: $(record "$aside"), $(records)"
             elif common_ok; then ok "restore refuses a --to on another filesystem before it makes any folder there"; fi
         fi
@@ -3018,6 +3018,9 @@ else
         setup git -C "$p" commit -q --allow-empty -m "on-$b"
         eval "want_$b=\$(git -C \"\$repo\" rev-parse \"\$b\")" || exit 2
     done
+    # residue names each path as the system resolves it, such as
+    # /private/var for /var on macOS.
+    wts=$(cd "$repo/.worktrees" && pwd -P) || exit 2
     : >"$work/mode"
     for b in d g r b k; do
         setup "$bin" remove --yes --json "$repo/.worktrees/$b"
@@ -3031,8 +3034,8 @@ else
     wrong=
     n=0
     for b in d g r b k t; do
-        p=$repo/.worktrees/$b rec=$(record_of "$b")
-        [ "$b" = t ] && p=$repo/.worktrees/$tab rec=$(record_of t_x)
+        p=$repo/.worktrees/$b pc=$wts/$b rec=$(record_of "$b")
+        [ "$b" = t ] && p=$repo/.worktrees/$tab pc=$wts/$tab rec=$(record_of t_x)
         (cd "$repo" && nf restore "$rec") >"$work/$name.out-$b" 2>&1
         st=$?
         line=$(sed -n 's/.*recreates the worktree by hand: \(.*\); the record still keeps .*/\1/p' "$work/$name.out-$b")
@@ -3043,8 +3046,8 @@ else
             [ "$words" = "$first" ] || wrong+=" $b: $sh splits the line into other words: $words;"
         done
         case $first in
-        "[test][!][-e][$p]"*"[git][-C]["*"][worktree][add]"*"[$p]"*) ;;
-        *) wrong+=" $b: the line does not guard and name $p as one word: $first;" ;;
+        "[test][!][-e][$pc]"*"[git][-C]["*"][worktree][add]"*"[$pc]"*) ;;
+        *) wrong+=" $b: the line does not guard and name $pc as one word: $first;" ;;
         esac
         # Each line runs for real in one shell, in turn.
         sh=${shells[$((n % ${#shells[@]}))]}
