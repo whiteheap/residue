@@ -228,6 +228,30 @@ jobs:
             test ! -e /etc/apt/sources.list.d/residue.list
             test ! -e /etc/apt/keyrings/residue.gpg
           '
+      # A user whose sudo asks for a password, on a terminal (-t): the Git
+      # refusal must come before the prompt. A prompt would wait for a
+      # password until timeout ends it with 124.
+      - name: Ubuntu 22.04, apt offers Git 2.34, no sudo prompt first
+        run: |
+          docker run --rm -t -v "$PWD/site/public:/s:ro" ubuntu:22.04 sh -c '
+            set -eu
+            apt-get -q update > /dev/null
+            DEBIAN_FRONTEND=noninteractive apt-get -q install -y curl ca-certificates sudo > /dev/null
+            useradd -m -G sudo tester
+            echo tester:not-typed | chpasswd
+            as_tester() { setpriv --reuid=tester --regid=tester --init-groups env HOME=/home/tester USER=tester "$@"; }
+            if as_tester sudo -n true 2> /dev/null; then exit 1; fi
+            as_tester sh -c "(exec < /dev/tty)"
+            set +e
+            timeout 60 setpriv --reuid=tester --regid=tester --init-groups env HOME=/home/tester USER=tester sh /s/install.sh < /dev/null > /tmp/user.log 2>&1
+            status=$?
+            set -e
+            cat /tmp/user.log
+            test "$status" = 1
+            grep -q "^install.sh: apt offers Git 1:2.34" /tmp/user.log
+            if grep -q "sudo asks for your password" /tmp/user.log; then exit 1; fi
+            test ! -e /etc/apt/sources.list.d/residue.list
+          '
       - name: Ubuntu 22.04 with Git 2.34, the archive
         run: |
           docker run --rm -v "$PWD/site/public:/s:ro" ubuntu:22.04 sh -c '

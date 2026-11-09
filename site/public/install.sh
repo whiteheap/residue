@@ -126,7 +126,9 @@ parse_args() {
 }
 
 # Root, passwordless sudo, or sudo that may ask for a password on the
-# terminal. Sets $sudo; fails when none of them works.
+# terminal. Sets $sudo; fails when none of them works. $1, when given, runs
+# right before the password prompt: a check that needs no root, so a refusal
+# comes before the user types a password.
 can_root() {
   sudo=
   [ "$(id -u)" = 0 ] && return 0
@@ -135,6 +137,7 @@ can_root() {
   [ "$dry_run" = 1 ] && return 0
   sudo -n true 2>/dev/null && return 0
   has_tty || return 1
+  [ -z "${1:-}" ] || "$1"
   say "sudo asks for your password to add residue's package repository."
   sudo -v
 }
@@ -147,7 +150,7 @@ choose_channel() {
     Darwin) has brew && channel=brew ;;
     Linux)
       if has brew && brew list --formula whiteheap/tap/residue >/dev/null 2>&1; then channel=brew
-      elif has apt-get && can_root; then channel=apt
+      elif has apt-get && can_root apt_git_ok; then channel=apt
       elif has dnf && can_root; then channel=dnf
       elif has pacman && can_root; then channel=pacman
       fi ;;
@@ -165,8 +168,9 @@ install_brew() {
 
 # The package depends on git (>= 1:2.36), so on a release whose apt offers an
 # older Git (Ubuntu 22.04 has 2.34) apt-get would stop after the repository
-# is added. Stop before anything under /etc instead. With no package lists
-# yet there is no candidate to read, and apt-get decides.
+# is added. Stop before anything under /etc instead, and before sudo asks
+# for a password (`can_root apt_git_ok`): it needs no root. With no package
+# lists yet there is no candidate to read, and apt-get decides.
 apt_git_ok() {
   cand=$(apt-cache policy git 2>/dev/null | sed -n 's/^ *Candidate: *//p')
   case $cand in '' | '(none)') return 0 ;; esac
