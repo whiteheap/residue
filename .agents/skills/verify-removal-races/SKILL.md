@@ -117,7 +117,7 @@ Run the check for a change to any function in this table, or for one that adds a
 | `SRecreate` | `removed.rs` `recreate` |
 | `TReport`, `SReport` | `restore.rs` `command`, the `restored ...` line and its notes, `removed::PURGE_STOPPED`, also for a purge's record whose worktree is already back (`removed.rs` `restore`) |
 
-Sync commit: the commit that fixed #135 to #139 (#147). The model was last confirmed to describe the code there, on 2026-11-09. Of the commits after `0ad6ec7`, only `083816d` (#150) changed the code above before it: `watch` exits between passes for an upgrade, when no child runs, and starts and stops a remove run as before. Move it forward only after you confirm, for each covered function a change touched, that the model still describes it. `git log --format='%h %s' 0ad6ec7.. -- src/hold.rs src/process.rs src/remove.rs src/trash.rs src/removed.rs src/restore.rs src/git.rs src/run.rs src/watch.rs` lists the changes; read each one after that fix.
+Sync commit: `6394300`, the commit that fixed #135 to #139 (#147). The model was last confirmed to describe the code there, on 2026-11-09. Move it forward only after you confirm, for each covered function a change touched, that the model still describes it. `git log --format='%h %s' 6394300.. -- src/hold.rs src/process.rs src/remove.rs src/trash.rs src/removed.rs src/restore.rs src/git.rs src/run.rs src/watch.rs` lists the changes; read each one after that fix.
 
 ## Read a result
 

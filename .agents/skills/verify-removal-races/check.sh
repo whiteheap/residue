@@ -93,11 +93,11 @@ setup_tools() {
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/residue-tla.XXXXXX")
 trap 'rm -rf "$work"' EXIT
-# TLC looks up this machine's name once per run. On macOS, a name that is
-# not in /etc/hosts makes Java wait 5 s for that lookup (5.7 s against
-# 0.9 s for one run of this model, measured 2026-11-09 on an M-series Mac).
-# A hosts file read only by this JVM answers it at once.
-printf '127.0.0.1 localhost %s\n' "$(hostname)" > "$work/hosts"
+# TLC exports its fingerprint set over RMI, and RMI looks up this machine's
+# name once per run unless java.rmi.server.hostname is set. On macOS, a
+# name that is not in /etc/hosts makes that lookup wait 5 s (5.6 s against
+# 0.6 s for one run of this model, measured 2026-11-09 on an M-series Mac).
+# RMI's documented setting for the address answers it at once.
 
 rules="TypeOK NotDeletedOnceBack OnlyCheckedStateDeleted ReflogCommitsKept RestoreTellsTheTruth OnlyOwnLocksLifted RecordDroppedOnlyWhenWhole"
 
@@ -122,7 +122,7 @@ tlc() { # START FAULTS OFF AFTER OLD LATE BROKEN RULES...
     for r in "$@"; do echo "  $r"; done
   } > "$dir/run.cfg"
   local code=0
-  (cd "$dir" && "$java" -XX:+UseParallelGC -Djdk.net.hosts.file="$work/hosts" \
+  (cd "$dir" && "$java" -XX:+UseParallelGC -Djava.rmi.server.hostname=127.0.0.1 \
     -cp "$jar" tlc2.TLC -workers 1 -fp 0 \
     -config run.cfg -metadir "$dir/states" Removal.tla > tlc.out 2>&1) || code=$?
   local out=$dir/tlc.out
