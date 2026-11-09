@@ -20,6 +20,7 @@ One static page that introduces residue and sends readers to the [README](../REA
 | `public/_headers` | Response headers: Content Security Policy, `nosniff`, no framing, referrer and permissions policies, `text/plain` for `install.sh`, `charset=utf-8` for every `.txt` file, a year with `immutable` for `style.css`, `hero.js` and the fonts, whose every reference carries a version (see "Versions"), and a one-day `max-age` for the drawings, which change rarely. The pages keep Cloudflare's default, `max-age=0, must-revalidate`. Cloudflare applies it and does not serve it. HSTS comes from the zone instead (see "HTTPS") |
 | `public/_redirects` | Redirects: `/download/macos` to `residue-macos.dmg` in the newest [residue-ui release](https://github.com/whiteheap/residue-ui/releases/latest), whose name never changes. residue-cli's releases carried it only from 0.0.8 to 0.0.10. Cloudflare applies it and does not serve it; `check.sh` accepts a link to a redirect's source |
 | `wrangler.jsonc` | The Worker: assets only, no Worker script, `public/` as the only upload, 404 page, the Custom Domain `residue.whiteheap.com`, workers.dev and preview URLs off |
+| `package.json`, `package-lock.json` | Wrangler 4.158.0, the deploy tool, and every package it loads, each pinned by version and hash. The deploy runs it with the token in its environment, so a package that changed upstream must never reach it: install with `npm ci --ignore-scripts`, which takes exactly the lock and runs no install script, and run `node_modules/.bin/wrangler`. To update Wrangler, run `npm install --save-exact --ignore-scripts wrangler@VERSION` here and review the lock's diff in the pull request |
 | `check.sh` | The static checks below |
 | `fonts.sh` | Cuts the two fonts again, after a change brings a character they lack (see "Fonts"). No check or deploy runs it |
 | `smoke.sh` | The live check after a deploy: every served file matches `public/`, byte for byte, with the 404 page, the exact CSP header from `_headers`, the zone's HSTS header, the type of the script and the fonts (with `nosniff`, a wrong type would block them), of the text files, the sitemap and the images, each redirect's code and destination, and a 200 for each named search and AI crawler. Each versioned URL the pages and `style.css` name serves its file with the year's `Cache-Control`, and the page keeps the default. It asks for `*/*`, because Cloudflare adds its Web Analytics script to the HTML it sends a browser. Reads only |
@@ -72,7 +73,8 @@ To see the page as Cloudflare would serve it, with the headers and the 404 page,
 
 ```sh
 cd site
-WRANGLER_SEND_METRICS=false npx --yes wrangler@4.158.0 dev --local --port 8799
+npm ci --ignore-scripts
+WRANGLER_SEND_METRICS=false node_modules/.bin/wrangler dev --local --port 8799
 curl -sI http://127.0.0.1:8799/          # 200, with the headers from public/_headers
 curl -sI http://127.0.0.1:8799/missing   # 404, the body is public/404.html
 sh smoke.sh http://127.0.0.1:8799        # the live checks, against this server
@@ -84,7 +86,7 @@ Then look at it at a phone width and a desktop width, with reduced motion on, an
 
 A change to `site/` deploys itself when it lands on `main`: merging the pull request is the approval. The maintainer approved the site on 2026-11-07 and, the same day, asked for every change to deploy this way.
 
-`.github/workflows/site.yml` runs `check.sh` on every pull request that touches `site/`, `README.md` or `docs/assets/`. On a push to `main` that touches `site/`, it runs `check.sh` again, deploys `site/public` with Wrangler under the message `site at SHORT_SHA`, and runs `smoke.sh` against https://residue.whiteheap.com, which waits up to a minute for every served file to match this commit byte for byte and for the 404 page, the Content Security Policy header and the zone's HSTS header. A failed deploy or smoke fails the run, and GitHub notifies whoever merged. The run's log has the Cloudflare version ID. Deploys run one at a time: a newer one waits for the one in flight, and of several waiting only the newest runs.
+`.github/workflows/site.yml` runs `check.sh` on every pull request that touches `site/`, `README.md` or `docs/assets/`, then installs the locked Wrangler and runs `wrangler deploy --dry-run`, which builds the upload and sends nothing. On a push to `main` that touches `site/`, it runs both again, installs the locked Wrangler with `npm ci --ignore-scripts` in a step without the token, deploys `site/public` with it under the message `site at SHORT_SHA`, and runs `smoke.sh` against https://residue.whiteheap.com, which waits up to a minute for every served file to match this commit byte for byte and for the 404 page, the Content Security Policy header and the zone's HSTS header. A failed deploy or smoke fails the run, and GitHub notifies whoever merged. The run's log has the Cloudflare version ID. Deploys run one at a time: a newer one waits for the one in flight, and of several waiting only the newest runs.
 
 Cloudflare documents that "requests to static assets are free and unlimited" and that storing assets has no additional cost ([billing and limitations](https://developers.cloudflare.com/workers/static-assets/billing-and-limitations/)). This Worker has no script and no `run_worker_first`, so every request, the 404 page included, is answered from the assets and none runs Worker code. That statement covers this static page only: not a custom domain's registration, not Workers Builds, not any later dynamic feature.
 
@@ -108,10 +110,11 @@ When the workflow cannot run, deploy from a clean checkout of `main` with your o
 
 ```sh
 cd site
-npx --yes wrangler@4.158.0 login
-npx --yes wrangler@4.158.0 whoami
+npm ci --ignore-scripts
+node_modules/.bin/wrangler login
+node_modules/.bin/wrangler whoami
 sh check.sh
-npx --yes wrangler@4.158.0 deploy --message "site at $(git rev-parse --short HEAD)"
+node_modules/.bin/wrangler deploy --message "site at $(git rev-parse --short HEAD)"
 sh smoke.sh
 ```
 
@@ -139,13 +142,13 @@ http:// answers with a 301 to https://. The whiteheap.com zone's HSTS setting (S
 
 ## Roll back or take it down
 
-The usual way back is a revert on `main`: it deploys like any other change. Each deploy is also a Cloudflare version that holds its assets, so you can go back to one at once:
+The usual way back is a revert on `main`: it deploys like any other change. Each deploy is also a Cloudflare version that holds its assets, so you can go back to one at once, from `site/` after `npm ci --ignore-scripts`:
 
 ```sh
-npx --yes wrangler@4.158.0 versions list --name residue
-npx --yes wrangler@4.158.0 rollback VERSION_ID --name residue --message "why"
+node_modules/.bin/wrangler versions list --name residue
+node_modules/.bin/wrangler rollback VERSION_ID --name residue --message "why"
 ```
 
 The next push to `main` that touches `site/` deploys over a rollback, so revert the change on `main` too.
 
-To take the site down, remove `residue.whiteheap.com` from the Worker's Settings > Domains & Routes in the Cloudflare dashboard, and the `routes` entry from `wrangler.jsonc` so the next deploy does not attach it again, or delete the Worker with `npx --yes wrangler@4.158.0 delete residue` and remove `.github/workflows/site.yml`. Either takes the site away from every reader, so it waits for the maintainer's word.
+To take the site down, remove `residue.whiteheap.com` from the Worker's Settings > Domains & Routes in the Cloudflare dashboard, and the `routes` entry from `wrangler.jsonc` so the next deploy does not attach it again, or delete the Worker with `node_modules/.bin/wrangler delete residue` and remove `.github/workflows/site.yml`. Either takes the site away from every reader, so it waits for the maintainer's word.
