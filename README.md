@@ -325,39 +325,9 @@ The launchd plist, the systemd unit and timer, how to stop them, and the sweep's
 
 ## Mac app
 
-The Mac app is residue in a window. It lists the linked worktrees under your code folders with their size and verdict, shows why each one is kept, moves the ones that can go to the trash, restores them, shows what residue has freed, and turns automatic cleanup on or off. Every check, size and removal comes from the residue binary inside the app, from the residue-cli release the app was built with.
+The Mac app, [residue-ui](https://github.com/whiteheap/residue-ui), is residue in a window: it lists the linked worktrees under your code folders with their size and verdict, moves the ones that can go to the trash once you confirm, restores them, and turns automatic cleanup on or off. Every check, size and removal comes from the residue inside it, and its automatic cleanup is the same service as [Automate cleanup](#automate-cleanup), which deletes without the trash.
 
-<p>
-<img src="docs/screenshots/worktrees.png" width="830" alt="The Worktrees screen: a line that says automatic cleanup freed about 70.3 MB, 1 worktree, since the app was last open, with a link to Freed. Below it, 1.3 GB reclaimable, 6 of 11 worktrees can go, about 975 MB freed in the last 7 days. A treemap sizes each worktree by the space removing it frees, grouped by repository: white for can go, gray for kept, hatched for unknown. Below it, each worktree's checks and verdict.">
-</p>
-
-<p>
-<img src="docs/screenshots/freed.png" width="830" alt="The Freed screen: 975 MB freed in the last 7 days, 2.1 GB in the last 30, 5.9 GB all time and 215 MB since the app was last open, a column for each of the last 12 weeks, the space each command freed (residue watch, residue remove --all and residue remove by hand), and the space freed in each repository, most first.">
-</p>
-
-Both screenshots show example repositories and a made-up history of removals. The Restore screen, with its trash entries and removal records: [docs/screenshots/restore.png](docs/screenshots/restore.png).
-
-Download [residue-macos.dmg](https://residue.whiteheap.com/download/macos), open it, and drag residue to Applications. This is 0.0.10's, the last residue-cli release that has it; from 0.0.11 on, the app releases from [residue-ui](https://github.com/whiteheap/residue-ui/releases). It needs macOS 13 or later, and runs natively on Apple silicon and Intel.
-
-### First launch
-
-The app is signed ad hoc, not with an Apple Developer ID, and it is not notarized yet. macOS blocks it the first time you open it. To open it once, and from then on like any other app:
-
-1. Open residue from Applications. macOS says it could not verify the app. Click **Done**.
-2. Open **System Settings > Privacy & Security**, scroll down to **Security**, and click **Open Anyway** next to the message about residue. The button is there for about an hour after you tried to open the app.
-3. macOS asks again: click **Open**, and enter your login password if it asks.
-
-Control-click > Open no longer skips this step: since macOS 15, Apple requires the Privacy & Security setting. Apple's own steps: [Open a Mac app from an unknown developer](https://support.apple.com/guide/mac-help/open-a-mac-app-from-an-unknown-developer-mh40616/mac) and [Safely open apps on your Mac](https://support.apple.com/en-us/102445). The DMG is in [0.0.10's](https://github.com/whiteheap/residue-cli/releases/tag/v0.0.10) `SHA256SUMS` and has a build-provenance attestation, like the archives: `gh attestation verify residue-macos.dmg --repo whiteheap/residue`, the repository's name when 0.0.10 was built.
-
-### What the app runs
-
-- **Removal** always uses the trash (`residue remove --trash`), and nothing moves until you confirm the plan residue shows: the worktrees it moves, the trash entries older than 7 days it purges, and the removal records it forgets, each older than both 30 days and the `--keep-removed` it was written with. The branch and its commits always stay.
-- **Restore** is `residue restore`, and it lists the trash and the removal records, newest first. A trashed worktree comes back with every file until a later removal or automatic cleanup in that repository purges it. The purge, and every deletion by automatic cleanup, leaves a removal record, and Restore recreates the worktree from it on its branch and HEAD until a later removal forgets the record. No run forgets one before the `--keep-removed` it was written with: 30 days for the app's removals, the service's for automatic cleanup. Each record's row gives the date it lasts until, at least. Its ignored files, such as `node_modules/`, do not come back, and the record's row names them before you click: [Restore a removed worktree](#restore-a-removed-worktree).
-- **Freed** is `residue stats --json`: what residue freed on this machine in the last 7 and 30 days, all time and since the app was last open, each of the last 12 weeks, by command and by repository. When automatic cleanup freed space while the app was closed, the Worktrees screen opens with how much. Each size is the estimate residue measured before the removal: [How much space it freed](#how-much-space-it-freed).
-- **Automatic cleanup** is `residue service install FOLDERS` and `residue service uninstall`: the same `com.whiteheap.residue.watch` service as [Automate cleanup](#automate-cleanup), so the app shows a service you installed from a terminal, and the other way round. It deletes instead of using the trash; the app says so before you turn it on. Saving other folders keeps the service's options as written, including ones the app does not know. Preview runs one pass the way the saved service would, with `--dry-run`, fetching first unless the service sets `--no-fetch`.
-- The service records the binary that installed it, so the app never installs it from the copy inside the app. It uses a `residue` you installed that is at least as new as the app's, such as `/opt/homebrew/bin/residue`, or else a copy at `~/Library/Application Support/com.whiteheap.residue/bin/residue`, which stays when the app moves or is deleted. The Automatic cleanup screen shows which binary the service runs and the command that turns it off from a terminal. Deleting the app leaves the service running.
-
-Building and changing the app: [residue-ui](https://github.com/whiteheap/residue-ui).
+Download [residue-macos.dmg](https://residue.whiteheap.com/download/macos), open it, and drag residue to Applications. It needs macOS 13 or later, on Apple silicon or Intel. It is not notarized yet, so macOS blocks the first launch: [First launch](https://github.com/whiteheap/residue-ui#first-launch) has the steps. residue-ui's README has the rest: [Install](https://github.com/whiteheap/residue-ui#install), [Screens](https://github.com/whiteheap/residue-ui#screens), [What the app runs](https://github.com/whiteheap/residue-ui#what-the-app-runs), [Check a download](https://github.com/whiteheap/residue-ui#check-a-download) and [Uninstall](https://github.com/whiteheap/residue-ui#uninstall).
 
 ## Reference
 
