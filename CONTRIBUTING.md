@@ -52,6 +52,7 @@ sh .github/watch-smoke.sh ./target/release/residue
 bash scripts/race-check.sh
 bash scripts/contract-check.sh
 bash scripts/recovery-check.sh
+sudo bash scripts/contained-check.sh   # Linux and FreeBSD, as root
 ```
 
 `cargo test` runs the in-crate tests: checks of private code, such as the verdict fold in `src/inspect.rs` on synthetic data, and the size walk in `src/fsinfo.rs` and the stats ledger in `src/stats.rs` on scratch folders in the system's temporary directory. None of them runs Git. The shell scripts run the release binary against real Git repositories and processes. They test different things and neither replaces the other. CI runs `cargo test` on macOS and both Linux runners, and the shell scripts there and in the FreeBSD, NetBSD, OpenBSD, DragonFly and illumos virtual machines. On NetBSD, OpenBSD and DragonFly nothing is a removal candidate (their probe does not read open files), so the scripts skip every case that expects a removal or a prompt, by name, and check that the clean worktree is kept as `unknown` instead; `scripts/partial-probe.sh` holds that gate. A case you add that expects a removal needs the same gate.
@@ -117,13 +118,13 @@ If your change touches the Linux side (`/proc`, the musl build, file ownership),
 ```sh
 rustup target add aarch64-unknown-linux-musl
 cargo zigbuild --locked --release --target aarch64-unknown-linux-musl
-docker run --rm -it \
+docker run --rm -it --pid=host \
   -v "$PWD/target/aarch64-unknown-linux-musl/release/residue:/usr/local/bin/residue:ro" \
   -v "$HOME/scratch.sh:/scratch.sh:ro" \
   ubuntu:24.04 bash
 ```
 
-Inside the container, run as a non-root user, because the activity probe only sees processes the current user can read:
+`--pid=host` lets residue see every process of the Docker machine: in a PID namespace of its own it cannot see the processes outside the container, so it keeps every worktree as `unknown` (`hidden_processes`). Inside the container, run as a non-root user, because the activity probe only sees processes the current user can read:
 
 ```sh
 apt-get update && apt-get install -y git

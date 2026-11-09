@@ -31,9 +31,11 @@ pub struct Unavailable {
     /// is unused), `unmatchable_path` (the probe prints the paths it read
     /// escaped, and residue cannot be sure how it prints this one),
     /// `long_path` (a path in the directory is as long as the probe names
-    /// whole, `PATH_LIMIT`, or longer), or `unnamed_file` (a process holds a
+    /// whole, `PATH_LIMIT`, or longer), `unnamed_file` (a process holds a
     /// file whose path the probe could not read, and residue could not look
-    /// for it in the directory).
+    /// for it in the directory), or `hidden_processes` (residue runs where
+    /// processes of yours can be hidden from it, `Seen::hidden`, and found
+    /// no use).
     pub reason: &'static str,
     pub detail: String,
 }
@@ -88,6 +90,37 @@ pub struct Seen {
     /// (`unnamed_file`), never `not_observed`. The illumos and FreeBSD
     /// backends fill it.
     pub unnamed: Vec<Unnamed>,
+    /// Set when residue runs where processes of yours can be hidden from
+    /// the probe: inside a container (a PID namespace of its own) or under
+    /// a `/proc` with `hidepid` on Linux, a jail on FreeBSD, a non-global
+    /// zone on illumos. A directory with a use is `in_use`, and one without
+    /// is `unknown` (`hidden_processes`), never `not_observed`: a process
+    /// outside can be using it.
+    pub hidden: Option<Hidden>,
+}
+
+/// Where residue runs, when processes of yours can be hidden from it there.
+pub struct Hidden {
+    /// For the header (`Snapshot::scope`): "inside a container".
+    pub short: String,
+    /// Why, in words, for each worktree it keeps.
+    pub detail: String,
+}
+
+impl Hidden {
+    /// Residue runs inside `place`, which shows it only the processes in it.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "illumos",
+        test
+    ))]
+    fn inside(short: &str, place: &str) -> Hidden {
+        Hidden {
+            short: short.to_string(),
+            detail: format!("residue runs {place}, so it cannot see processes outside it"),
+        }
+    }
 }
 
 /// A file a process holds whose path the backend could not read: on
@@ -212,6 +245,13 @@ impl Snapshot {
                 ),
             });
         }
+        if let Some(hidden) = &seen.hidden {
+            // A process outside what residue can see may be using it.
+            return Evidence::Unknown(Unavailable {
+                reason: "hidden_processes",
+                detail: hidden.detail.clone(),
+            });
+        }
         let longest = reach.map_or(0, |r| r.longest).max(raw.len());
         if longest >= PATH_LIMIT {
             return Evidence::Unknown(Unavailable {
@@ -334,6 +374,10 @@ impl Snapshot {
                 if let Some(limits) = seen.limits {
                     text.push_str(", ");
                     text.push_str(limits);
+                }
+                if let Some(hidden) = &seen.hidden {
+                    text.push_str(", ");
+                    text.push_str(&hidden.short);
                 }
                 text
             }
@@ -717,6 +761,7 @@ mod platform {
                 limits: None,
                 spelling: Some(super::lsof::spell),
                 unnamed: Vec::new(),
+                hidden: None,
             }),
         }
     }
@@ -937,13 +982,33 @@ mod platform {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::{Seen, Snapshot, Use, maps, unavailable};
+    use super::{Hidden, Seen, Snapshot, Use, maps, procview, unavailable};
     use std::fs;
+    use std::io::ErrorKind;
     use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
 
     const BACKEND: &str = "procfs";
 
     pub fn take() -> Snapshot {
+        let status = match fs::read_to_string("/proc/self/status") {
+            Ok(status) => status,
+            Err(e) => {
+                return unavailable(
+                    BACKEND,
+                    "probe_failed",
+                    format!("residue could not read /proc/self/status ({e})"),
+                );
+            }
+        };
+        let hidden = match hidden(&status) {
+            Ok(hidden) => hidden,
+            Err(detail) => return unavailable(BACKEND, "probe_failed", detail),
+        };
+        let me = procview::Creds::read(&status);
+        // SAFETY: geteuid only returns this process's effective user.
+        let euid = unsafe { libc::geteuid() };
         let listing = match fs::read_dir("/proc") {
             Ok(listing) => listing,
             Err(e) => return unavailable(BACKEND, "probe_missing", format!("/proc: {e}")),
@@ -978,6 +1043,8 @@ mod platform {
                     paths.push(target.into_os_string().into_vec());
                 }
             }
+            // Why the kernel refused to show this process's files, if it did.
+            let mut refused: Option<std::io::Error> = None;
             let fds_read = match fs::read_dir(base.join("fd")) {
                 Ok(fds) => {
                     for fd in fds.flatten() {
@@ -988,14 +1055,24 @@ mod platform {
                     }
                     true
                 }
-                Err(_) => false,
+                Err(e) => {
+                    if e.kind() == ErrorKind::PermissionDenied {
+                        refused = Some(e);
+                    }
+                    false
+                }
             };
             // Mapped files: a shared library or native module loaded from a
             // worktree, or a file a process maps and then closes (Git's
             // index), holds no descriptor and no working directory there.
             let maps_read = match maps::read(&base.join("maps"), &mut paths) {
                 Ok(()) => true,
-                Err(maps::Error::Unreadable) => false,
+                Err(maps::Error::Unreadable(e)) => {
+                    if e.kind() == ErrorKind::PermissionDenied {
+                        refused = refused.or(Some(e));
+                    }
+                    false
+                }
                 Err(maps::Error::TooLarge) => {
                     return unavailable(
                         BACKEND,
@@ -1015,9 +1092,24 @@ mod platform {
                 command: command.clone(),
                 path,
             }));
+            // A process of yours that the kernel refuses to show: residue
+            // cannot see whether it is using a worktree.
+            let refused_for = refused
+                .filter(|_| yours(&base, euid))
+                .and_then(|error| Some((error, refusal(&base, &me)?)));
+            if let Some((error, why)) = refused_for {
+                return unavailable(
+                    BACKEND,
+                    "probe_failed",
+                    format!(
+                        "the kernel would not show the files of {command}[{pid}], which runs as your user ({error}): {why}"
+                    ),
+                );
+            }
             // Inspected means residue read the process's open files and its
-            // mapped files. One it cannot read (another user's, or one that
-            // exited) is not counted; what was read of it still counts as use.
+            // mapped files. One it cannot read (another user's, one of yours
+            // that is not dumpable, or one that exited) is not counted; what
+            // was read of it still counts as use.
             if fds_read && maps_read {
                 inspected += 1;
             }
@@ -1031,8 +1123,213 @@ mod platform {
                 limits: None,
                 spelling: None,
                 unnamed: Vec::new(),
+                hidden,
             }),
         }
+    }
+
+    /// Whether the process at `base` runs as `euid` and is dumpable. The
+    /// kernel gives `/proc/PID/status` the process's effective user as its
+    /// owner, or root when the process is not dumpable (`task_dump_owner` in
+    /// `fs/proc/base.c`), as a process that changed its user, ran a setuid
+    /// program or turned dumping off (ssh-agent) is. Such a process of
+    /// yours the kernel shows to root alone, and it is not inspected, as on
+    /// FreeBSD. One that exited is not yours either.
+    fn yours(base: &Path, euid: u32) -> bool {
+        fs::metadata(base.join("status")).is_ok_and(|meta| meta.uid() == euid)
+    }
+
+    /// Why the kernel refused residue a dumpable process of yours at `base`
+    /// (`procview::refusal`, from its `status`), or `None` when it holds
+    /// capabilities residue lacks, or exited.
+    fn refusal(base: &Path, me: &procview::Creds) -> Option<&'static str> {
+        match fs::read_to_string(base.join("status")) {
+            Ok(status) => procview::refusal(&procview::Creds::read(&status), me),
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
+            Err(_) => Some(procview::UNSURE),
+        }
+    }
+
+    /// Where residue runs, when the `/proc` it reads can hide processes of
+    /// yours (`procview`), or why residue cannot tell. `status` is residue's
+    /// own `/proc/self/status`.
+    fn hidden(status: &str) -> Result<Option<Hidden>, String> {
+        let ns = fs::metadata("/proc/self/ns/pid").map(|meta| meta.ino());
+        if procview::own_namespace(&ns, procview::nspid(status))? {
+            return Ok(Some(Hidden::inside(
+                "inside a container",
+                "inside a container (a PID namespace of its own)",
+            )));
+        }
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo")
+            .map_err(|e| format!("residue could not read /proc/self/mountinfo ({e})"))?;
+        Ok(procview::hidepid(&mountinfo, &groups()).map(|value| Hidden {
+            short: format!("/proc hidepid={value}"),
+            detail: format!(
+                "/proc is mounted with hidepid={value}, which hides the processes residue may not inspect, some of yours among them, so it cannot see every process of yours"
+            ),
+        }))
+    }
+
+    /// residue's effective group and its supplementary groups: a member of
+    /// a `/proc`'s `gid=` group sees every process whatever its `hidepid`.
+    fn groups() -> Vec<u32> {
+        // SAFETY: getegid only returns this process's effective group.
+        let mut groups = vec![unsafe { libc::getegid() }];
+        // SAFETY: a count of 0 asks only for the number of groups.
+        let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        if let Ok(len) = usize::try_from(n) {
+            let mut more: Vec<libc::gid_t> = vec![0; len];
+            // SAFETY: `more` has room for `n` groups.
+            let got = unsafe { libc::getgroups(n, more.as_mut_ptr()) };
+            if let Ok(got) = usize::try_from(got) {
+                more.truncate(got);
+                groups.extend(more);
+            }
+        }
+        groups
+    }
+}
+
+/// Linux: whether the `/proc` residue reads shows every process. A `/proc`
+/// shows the processes of the PID namespace of whoever mounted it, so in a
+/// container with a PID namespace of its own, the processes outside are
+/// not there. The initial PID namespace is the one whose inode number the
+/// kernel fixes (`PROC_PID_INIT_INO`); `NSpid` in `/proc/self/status` lists
+/// one PID for each namespace from the one of this `/proc` down to
+/// residue's own (proc(5)), so more than one means a namespace below. A
+/// `/proc` mounted with `hidepid` hides each process residue may not
+/// inspect, and a process of yours running with another group, which
+/// residue may not inspect either, is then not listed at all.
+#[cfg(any(target_os = "linux", test))]
+mod procview {
+    /// `PROC_PID_INIT_INO` (`include/linux/proc_ns.h`), the same since
+    /// Linux 3.8: `/proc/self/ns/pid` names `pid:[4026531836]` outside any
+    /// container.
+    pub const PID_INIT_INO: u64 = 0xEFFF_FFFC;
+
+    /// A process's credentials, from its `/proc/PID/status` (proc(5)):
+    /// real, effective, saved and filesystem user and group, and its
+    /// permitted and effective capabilities.
+    #[derive(Debug, Default, PartialEq)]
+    pub struct Creds {
+        pub uid: Option<[u32; 4]>,
+        pub gid: Option<[u32; 4]>,
+        pub cap_permitted: Option<u64>,
+        pub cap_effective: Option<u64>,
+    }
+
+    impl Creds {
+        pub fn read(status: &str) -> Creds {
+            let ids = |name: &str| -> Option<[u32; 4]> {
+                let mut ids = field(status, name)?
+                    .split_whitespace()
+                    .map(|n| n.parse().ok());
+                Some([ids.next()??, ids.next()??, ids.next()??, ids.next()??])
+            };
+            let caps = |name: &str| u64::from_str_radix(field(status, name)?.trim(), 16).ok();
+            Creds {
+                uid: ids("Uid:"),
+                gid: ids("Gid:"),
+                cap_permitted: caps("CapPrm:"),
+                cap_effective: caps("CapEff:"),
+            }
+        }
+    }
+
+    fn field<'a>(status: &'a str, name: &str) -> Option<&'a str> {
+        status.lines().find_map(|line| line.strip_prefix(name))
+    }
+
+    /// The reason given when residue cannot read what the kernel checked.
+    pub const UNSURE: &str = "residue could not read why";
+
+    /// Why the kernel refuses `me` the files of a dumpable process of
+    /// yours whose credentials are `them`, by the checks it makes
+    /// (`__ptrace_may_access` in `kernel/ptrace.c`, `cap_ptrace_access_check`
+    /// in `security/commoncap.c`), or `None` when the process holds
+    /// permitted capabilities residue does not have in effect: the kernel
+    /// shows such a process only to one with them, as root, so it is not
+    /// inspected, as one that is not dumpable is not (systemd's user
+    /// manager can be one). Its user and group ids must all be residue's;
+    /// when they are, what refused is a sandbox or security module around
+    /// residue (Landlock, AppArmor, SELinux).
+    pub fn refusal(them: &Creds, me: &Creds) -> Option<&'static str> {
+        if let (Some(theirs), Some(mine)) = (them.cap_permitted, me.cap_effective) {
+            if theirs & !mine != 0 {
+                return None;
+            }
+        }
+        let (Some(their_uids), Some(my_uids), Some(their_gids), Some(my_gids)) =
+            (them.uid, me.uid, them.gid, me.gid)
+        else {
+            return Some(UNSURE);
+        };
+        // The kernel compares residue's filesystem ids with the process's
+        // real, effective and saved ones.
+        if their_uids[..3].iter().any(|uid| *uid != my_uids[3]) {
+            Some("its user ids are not all yours")
+        } else if their_gids[..3].iter().any(|gid| *gid != my_gids[3]) {
+            Some("it runs with a group that is not yours")
+        } else {
+            Some("a sandbox or security module around residue refuses it")
+        }
+    }
+
+    /// The number of PIDs on the `NSpid:` line of a `/proc/PID/status`, or
+    /// `None` without the line (Linux before 4.1, or one built without PID
+    /// namespaces).
+    pub fn nspid(status: &str) -> Option<usize> {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("NSpid:"))
+            .map(|pids| pids.split_whitespace().count())
+    }
+
+    /// Whether residue runs in a PID namespace other than the initial one,
+    /// from the inode of `/proc/self/ns/pid` and `nspid`, or why residue
+    /// cannot tell. With neither, the kernel has no PID namespaces.
+    pub fn own_namespace(ns: &std::io::Result<u64>, nspid: Option<usize>) -> Result<bool, String> {
+        match (ns, nspid) {
+            (_, Some(n)) if n > 1 => Ok(true),
+            (Ok(inode), _) => Ok(*inode != PID_INIT_INO),
+            (Err(e), None) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            (Err(e), _) => Err(format!(
+                "residue cannot read which PID namespace it runs in (/proc/self/ns/pid: {e}), so it cannot tell whether it sees every process"
+            )),
+        }
+    }
+
+    /// The `hidepid` of the mount at `/proc` in a `/proc/self/mountinfo`
+    /// (proc(5)), when it hides processes from residue: any value but `0`
+    /// or `off`, unless one of `groups` is the mount's `gid=`, whose members
+    /// see every process. Of several mounts at `/proc`, the last is on top.
+    pub fn hidepid(mountinfo: &str, groups: &[u32]) -> Option<String> {
+        let options = mountinfo.lines().rev().find_map(|line| {
+            // ID PARENT MAJ:MIN ROOT MOUNTPOINT OPTIONS [OPTIONAL...] - TYPE SOURCE SUPER
+            let (mount, fs) = line.split_once(" - ")?;
+            let mut mount = mount.split(' ');
+            let point = mount.nth(4)?;
+            let mount_options = mount.next()?;
+            let mut fs = fs.split(' ');
+            let kind = fs.next()?;
+            let super_options = fs.nth(1)?;
+            (point == "/proc" && kind == "proc").then(|| format!("{mount_options},{super_options}"))
+        })?;
+        let mut hide = None;
+        let mut gid = None;
+        for option in options.split(',') {
+            if let Some(value) = option.strip_prefix("hidepid=") {
+                hide = Some(value);
+            } else if let Some(value) = option.strip_prefix("gid=") {
+                gid = value.parse::<u32>().ok();
+            }
+        }
+        let hide = hide.filter(|value| !matches!(*value, "0" | "off"))?;
+        if gid.is_some_and(|gid| groups.contains(&gid)) {
+            return None;
+        }
+        Some(hide.to_string())
     }
 }
 
@@ -1067,16 +1364,16 @@ mod maps {
     pub const CAP: u64 = 64 << 20;
 
     pub enum Error {
-        /// Not opened, or a read failed: another user's process, or one that
-        /// exited.
-        Unreadable,
+        /// Not opened, or a read failed, with this error: another user's
+        /// process, one that exited, or one the kernel refuses to show.
+        Unreadable(std::io::Error),
         /// Longer than `CAP`: what is past it was not read.
         TooLarge,
     }
 
     /// Adds the path of every file `file` maps to `paths`.
     pub fn read(file: &Path, paths: &mut Vec<Vec<u8>>) -> Result<(), Error> {
-        let file = std::fs::File::open(file).map_err(|_| Error::Unreadable)?;
+        let file = std::fs::File::open(file).map_err(Error::Unreadable)?;
         let mut reader = BufReader::with_capacity(64 << 10, file.take(CAP + 1));
         let mut line = Vec::new();
         let mut read: u64 = 0;
@@ -1085,7 +1382,7 @@ mod maps {
             match reader.read_until(b'\n', &mut line) {
                 Ok(0) => return Ok(()),
                 Ok(n) => read += n as u64,
-                Err(_) => return Err(Error::Unreadable),
+                Err(e) => return Err(Error::Unreadable(e)),
             }
             if read > CAP {
                 return Err(Error::TooLarge);
@@ -1166,7 +1463,7 @@ mod maps {
 /// worktree.
 #[cfg(target_os = "freebsd")]
 mod platform {
-    use super::{Seen, Snapshot, Unnamed, Use, kinfo, unavailable, vmentry};
+    use super::{Hidden, Seen, Snapshot, Unnamed, Use, kinfo, unavailable, vmentry};
     use crate::run::{self, RunError};
     use std::mem::offset_of;
     use std::process::Command;
@@ -1216,6 +1513,11 @@ mod platform {
     const MOST: usize = 64 << 20;
 
     pub fn take() -> Snapshot {
+        let hidden = match super::jailed(jailed()) {
+            Ok(false) => None,
+            Ok(true) => Some(Hidden::inside("inside a jail", "inside a jail")),
+            Err(detail) => return unavailable(BACKEND, "probe_failed", detail),
+        };
         let mut cmd = Command::new("/bin/ps");
         // -A: every process. -ww: never cut a line to the terminal width.
         // uid, ruid, svuid: the effective, real and saved user, all three
@@ -1424,8 +1726,31 @@ mod platform {
                 total: Some(total),
                 limits: None,
                 spelling: None,
+                hidden,
             }),
         }
+    }
+
+    /// `security.jail.jailed`: 1 inside a jail (jail(8)).
+    fn jailed() -> std::io::Result<libc::c_int> {
+        let mut jailed: libc::c_int = 0;
+        let mut len: libc::size_t = size_of::<libc::c_int>();
+        // SAFETY: the name is NUL-terminated; `jailed` is writable for
+        // `len` bytes and the kernel writes at most `len`; no new value is
+        // set.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"security.jail.jailed".as_ptr(),
+                (&raw mut jailed).cast(),
+                &mut len,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(jailed)
     }
 
     enum Read {
@@ -1492,6 +1817,21 @@ mod platform {
             let grown = (buf.len() * 2).min(MOST);
             buf.resize(grown, 0);
         }
+    }
+}
+
+/// Whether residue runs in a FreeBSD jail, from `security.jail.jailed`, or
+/// why it cannot tell. A jail shows a process only the processes in it, and
+/// a process outside can share its files (a jail's root is a folder of the
+/// host's, and nullfs mounts more), so a worktree there is never shown
+/// unused.
+#[cfg(any(target_os = "freebsd", test))]
+fn jailed(answer: std::io::Result<i32>) -> Result<bool, String> {
+    match answer {
+        Ok(jailed) => Ok(jailed != 0),
+        Err(e) => Err(format!(
+            "residue cannot read security.jail.jailed ({e}), so it cannot tell whether it runs in a jail, which would hide the processes outside it"
+        )),
     }
 }
 
@@ -1885,6 +2225,7 @@ mod platform {
                 limits: Some(LIMITS),
                 spelling: None,
                 unnamed: Vec::new(),
+                hidden: None,
             }),
         }
     }
@@ -2037,6 +2378,17 @@ mod unnamed {
     }
 }
 
+/// Whether residue runs in a non-global zone (`GLOBAL_ZONEID` is 0,
+/// `<zone.h>`). A zone shows a process only the processes in it, and a
+/// process in the global zone can share its files: the zone's root is a
+/// folder of the global zone's, and a `lofs` mount (zonecfg(8)) puts any
+/// other folder of the global zone inside it. So a worktree there is never
+/// shown unused.
+#[cfg(any(target_os = "illumos", test))]
+fn in_zone(zone: i32) -> bool {
+    zone != 0
+}
+
 /// illumos: `/proc/<pid>/path/`, which holds a link for the working
 /// directory (`cwd`), for each open file descriptor and for each mapped
 /// object (`a.out`, the executable), each naming the file's path when the
@@ -2046,7 +2398,7 @@ mod unnamed {
 #[cfg(target_os = "illumos")]
 mod platform {
     use super::unnamed::{Held, Stand};
-    use super::{Seen, Snapshot, Unnamed, Use, unavailable};
+    use super::{Hidden, Seen, Snapshot, Unnamed, Use, unavailable};
     use std::ffi::OsStr;
     use std::fs;
     use std::io::{self, ErrorKind};
@@ -2062,7 +2414,14 @@ mod platform {
     const PSINFO_FNAME: usize = 136;
     const PRFNSZ: usize = 16;
 
+    unsafe extern "C" {
+        /// zone(5), in libc (`<zone.h>`): the zone this process runs in.
+        safe fn getzoneid() -> libc::zoneid_t;
+    }
+
     pub fn take() -> Snapshot {
+        let hidden = super::in_zone(getzoneid())
+            .then(|| Hidden::inside("inside a non-global zone", "inside a non-global zone"));
         let listing = match fs::read_dir("/proc") {
             Ok(listing) => listing,
             Err(e) => return unavailable(BACKEND, "probe_missing", format!("/proc: {e}")),
@@ -2166,6 +2525,7 @@ mod platform {
                 limits: None,
                 spelling: None,
                 unnamed,
+                hidden,
             }),
         }
     }
@@ -2263,6 +2623,7 @@ mod tests {
                 limits,
                 spelling: None,
                 unnamed: Vec::new(),
+                hidden: None,
             }),
         }
     }
@@ -2271,6 +2632,184 @@ mod tests {
     fn a_full_probe_finding_no_use_is_not_observed() {
         let e = snapshot(None).evidence(Path::new("/w/idle"), None);
         assert_eq!(e.code(), "not_observed");
+    }
+
+    #[test]
+    fn where_processes_can_be_hidden_a_use_is_in_use_and_none_is_unknown() {
+        let mut s = snapshot(None);
+        if let Ok(seen) = &mut s.state {
+            seen.hidden = Some(super::Hidden::inside("inside a jail", "inside a jail"));
+        }
+        let Evidence::Unknown(u) = s.evidence(Path::new("/w/idle"), None) else {
+            panic!("no use found where processes can be hidden must be unknown");
+        };
+        assert_eq!(u.reason, "hidden_processes");
+        assert_eq!(
+            u.detail,
+            "residue runs inside a jail, so it cannot see processes outside it"
+        );
+        assert_eq!(s.evidence(Path::new("/w/busy"), None).code(), "in_use");
+        assert_eq!(
+            s.scope(),
+            "test inspected 1 of 1 running processes, inside a jail"
+        );
+    }
+
+    /// `NSpid` and `/proc/self/ns/pid` as Docker 29 on Linux 7.0 gave them.
+    #[test]
+    fn a_pid_namespace_other_than_the_initial_one_is_a_container() {
+        use super::procview::{PID_INIT_INO, nspid, own_namespace};
+        use std::io::{Error, ErrorKind};
+        let status = |line: &str| format!("Name:\tsh\nTgid:\t8\n{line}\nNSpgid:\t1\n");
+        assert_eq!(nspid(&status("NSpid:\t8")), Some(1));
+        assert_eq!(nspid(&status("NSpid:\t95644\t3")), Some(2));
+        assert_eq!(nspid("Name:\tsh\nPid:\t8\n"), None);
+        let ns = |inode: u64| -> std::io::Result<u64> { Ok(inode) };
+        // `docker run --pid=host`: the initial namespace.
+        assert_eq!(own_namespace(&ns(PID_INIT_INO), Some(1)), Ok(false));
+        assert_eq!(PID_INIT_INO, 4_026_531_836);
+        // `docker run`, and `unshare --pid --fork --mount-proc`: one PID,
+        // in a namespace of its own, whose /proc shows only it.
+        assert_eq!(own_namespace(&ns(4_026_532_557), Some(1)), Ok(true));
+        // `unshare --pid --fork` under the host's /proc: two PIDs.
+        assert_eq!(own_namespace(&ns(4_026_532_689), Some(2)), Ok(true));
+        assert_eq!(
+            own_namespace(&Err(Error::from(ErrorKind::PermissionDenied)), Some(2)),
+            Ok(true)
+        );
+        // A kernel without PID namespaces has neither.
+        assert_eq!(
+            own_namespace(&Err(Error::from(ErrorKind::NotFound)), None),
+            Ok(false)
+        );
+        // Anything else residue cannot tell.
+        for (error, nspid) in [
+            (ErrorKind::PermissionDenied, None),
+            (ErrorKind::PermissionDenied, Some(1)),
+            (ErrorKind::NotFound, Some(1)),
+        ] {
+            let told = own_namespace(&Err(Error::from(error)), nspid);
+            assert!(
+                told.as_ref().is_err_and(|e| e.starts_with(
+                    "residue cannot read which PID namespace it runs in (/proc/self/ns/pid: "
+                )),
+                "{told:?}"
+            );
+        }
+    }
+
+    /// `/proc/PID/status` lines, as Linux 7.0 prints them.
+    fn creds(uid: [u32; 4], gid: [u32; 4], prm: u64, eff: u64) -> super::procview::Creds {
+        let line = |ids: [u32; 4]| ids.map(|id| id.to_string()).join("\t");
+        super::procview::Creds::read(&format!(
+            "Name:\tsleep\nUid:\t{}\nGid:\t{}\nCapInh:\t0000000000000000\nCapPrm:\t{prm:016x}\nCapEff:\t{eff:016x}\n",
+            line(uid),
+            line(gid)
+        ))
+    }
+
+    #[test]
+    fn a_refused_process_of_yours_fails_the_probe_unless_it_holds_capabilities_residue_lacks() {
+        use super::procview::{Creds, UNSURE, refusal};
+        let me = creds([1001; 4], [1001; 4], 0, 0);
+        assert_eq!(me.uid, Some([1001; 4]));
+        assert_eq!(me.cap_effective, Some(0));
+        // A user manager that holds CAP_WAKE_ALARM (bit 35): the kernel
+        // shows it only to a process with that capability.
+        assert_eq!(
+            refusal(&creds([1001; 4], [1001; 4], 1 << 35, 1 << 35), &me),
+            None
+        );
+        // Started with `sg`: another of your groups.
+        assert_eq!(
+            refusal(&creds([1001; 4], [100; 4], 0, 0), &me),
+            Some("it runs with a group that is not yours")
+        );
+        // A saved user id that is not yours.
+        assert_eq!(
+            refusal(&creds([1001, 1001, 0, 1001], [1001; 4], 0, 0), &me),
+            Some("its user ids are not all yours")
+        );
+        // Every id and no capability: a sandbox around residue (Landlock).
+        assert_eq!(
+            refusal(&creds([1001; 4], [1001; 4], 0, 0), &me),
+            Some("a sandbox or security module around residue refuses it")
+        );
+        // root with every capability in effect holds what the process does.
+        let root = creds([0; 4], [0; 4], 0x1ff_ffff_ffff, 0x1ff_ffff_ffff);
+        assert_eq!(
+            refusal(&creds([0; 4], [0; 4], 1 << 35, 1 << 35), &root),
+            Some("a sandbox or security module around residue refuses it")
+        );
+        assert_eq!(refusal(&Creds::read("Name:\tsleep\n"), &me), Some(UNSURE));
+    }
+
+    #[test]
+    fn a_proc_mounted_with_hidepid_hides_processes_unless_residue_is_in_its_group() {
+        use super::procview::hidepid;
+        let info = |proc: &str| {
+            format!(
+                "22 1 0:21 / /sys rw,nosuid shared:7 - sysfs sysfs rw\n\
+                 23 1 0:22 / /proc rw,nosuid,nodev,noexec,relatime shared:13 - proc proc {proc}\n\
+                 24 23 0:23 / /proc/sys/fs/binfmt_misc rw,relatime shared:14 - binfmt_misc binfmt_misc rw\n"
+            )
+        };
+        assert_eq!(hidepid(&info("rw"), &[1000]), None);
+        assert_eq!(hidepid(&info("rw,hidepid=0"), &[1000]), None);
+        assert_eq!(hidepid(&info("rw,hidepid=off"), &[1000]), None);
+        for value in ["1", "2", "4", "noaccess", "invisible", "ptraceable"] {
+            let proc = format!("rw,hidepid={value}");
+            assert_eq!(hidepid(&info(&proc), &[1000]).as_deref(), Some(value));
+        }
+        // A member of the mount's gid= group sees every process.
+        assert_eq!(
+            hidepid(&info("rw,hidepid=invisible,gid=27"), &[1000, 27]),
+            None
+        );
+        assert_eq!(
+            hidepid(&info("rw,hidepid=invisible,gid=27"), &[1000]).as_deref(),
+            Some("invisible")
+        );
+        // The mount on top of /proc is the one read: the last line.
+        let over = format!(
+            "{}25 23 0:24 / /proc rw,relatime - proc proc rw,hidepid=2\n",
+            info("rw")
+        );
+        assert_eq!(hidepid(&over, &[1000]).as_deref(), Some("2"));
+        let under = format!(
+            "{}25 1 0:24 / /proc rw,relatime - proc proc rw\n",
+            info("rw,hidepid=2")
+        );
+        assert_eq!(hidepid(&under, &[1000]), None);
+        // A /proc that is not procfs, or no /proc, hides nothing it can say.
+        assert_eq!(
+            hidepid("23 1 0:22 / /proc rw - tmpfs tmpfs rw,hidepid=2\n", &[1000]),
+            None
+        );
+        assert_eq!(hidepid("", &[1000]), None);
+    }
+
+    #[test]
+    fn a_freebsd_jail_and_an_illumos_zone_hide_the_processes_outside() {
+        assert_eq!(super::jailed(Ok(0)), Ok(false));
+        assert_eq!(super::jailed(Ok(1)), Ok(true));
+        let told = super::jailed(Err(std::io::Error::from_raw_os_error(1)));
+        assert!(
+            told.as_ref()
+                .is_err_and(|e| e.starts_with("residue cannot read security.jail.jailed (")),
+            "{told:?}"
+        );
+        assert!(!super::in_zone(0));
+        assert!(super::in_zone(3));
+    }
+
+    #[test]
+    fn maps_that_cannot_be_opened_say_why() {
+        let mut paths = Vec::new();
+        let read = super::maps::read(Path::new("/nonexistent/residue/maps"), &mut paths);
+        assert!(
+            matches!(read, Err(super::maps::Error::Unreadable(e)) if e.kind() == std::io::ErrorKind::NotFound)
+        );
     }
 
     /// The processes listed before lsof ran (1 to 8; residue is 2), each
@@ -2597,6 +3136,7 @@ mod tests {
                 limits: None,
                 spelling: None,
                 unnamed: Vec::new(),
+                hidden: None,
             }),
         };
         assert_eq!(s.evidence(Path::new("/w/gone"), None).code(), "in_use");
@@ -2654,6 +3194,7 @@ mod tests {
                 limits: None,
                 spelling: Some(super::lsof::spell),
                 unnamed: Vec::new(),
+                hidden: None,
             }),
         }
     }

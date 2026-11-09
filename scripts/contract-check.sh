@@ -2549,5 +2549,81 @@ else
     echo "skip activity-sandboxed: it runs on macOS, with sandbox-exec"
 fi
 
+# 20. Linux: a process of yours running with another of your groups, as
+# `sg` or `newgrp` leave a shell, is listed, but the kernel shows its files
+# only to a process with the same group, or to root. A sleep started that
+# way works in w: explain must say unknown (probe_failed), naming a process
+# of yours, and
+# `remove --yes` must keep w. Once the sleep exits, w is a candidate again,
+# so the failure was the sleep's. (In a PID namespace of its own residue
+# is unknown anyway: scripts/contained-check.sh.)
+other_group_case() {
+    name=activity-other-group
+    local group before holder job i
+    group=$(id -Gn | tr ' ' '\n' | grep -vxF "$(id -gn)" | head -n 1)
+    if [ "$(id -u)" = 0 ]; then
+        echo "skip $name: root may read every process"
+        return
+    elif ! command -v sg >/dev/null; then
+        echo "skip $name: no sg"
+        return
+    elif [ -z "$group" ]; then
+        echo "skip $name: $(id -un) is in no group but its own"
+        return
+    fi
+    make_repo
+    before=$(sums "$wt")
+    # sg may run the command in a child, so the sleep writes its own PID.
+    printf 'cd %q && echo $$ >%q && exec sleep 300\n' "$wt/sub" "$work/$name.pid" >"$work/$name.sh"
+    sg "$group" -c "exec sh $work/$name.sh" >/dev/null 2>&1 &
+    job=$!
+    holders="$holders $job"
+    holder=
+    for ((i = 0; i < 100; i++)); do
+        [ -s "$work/$name.pid" ] && holder=$(cat "$work/$name.pid")
+        if [ -n "$holder" ]; then
+            case $(ps -o comm= -p "$holder" 2>/dev/null) in *sleep) break ;; esac
+        fi
+        kill -0 "$job" 2>/dev/null || break
+        sleep 0.1
+    done
+    if [ -z "$holder" ] || [ "$(ps -o group= -p "$holder" 2>/dev/null | tr -d ' ')" != "$group" ]; then
+        echo "skip $name: sg $group did not start a sleep in group $group"
+        [ -z "$holder" ] || kill "$holder" 2>/dev/null
+        wait "$job" 2>/dev/null
+        return
+    fi
+    run explain --json "$wt"
+    local busy=$work/$name.busy explain_status=$status
+    mv "$out" "$busy" || exit 2
+    run remove --yes --json --no-trash "$wt"
+    kill "$holder" 2>/dev/null
+    wait "$job" 2>/dev/null
+    # The sleep, or the shell sg started for it, which runs with that group too.
+    local refused='.state == "unknown" and .reason == "probe_failed" and (.detail | test("^the kernel would not show the files of .*\\[[0-9]+\\], which runs as your user .*: it runs with a group that is not yours"))'
+    if [ "$explain_status" != 0 ]; then fail "explain exit $explain_status, want 0"
+    elif ! jq -e --arg pid "$holder" ".worktree.verdict == \"unknown\" and (.worktree.activity | $refused)" "$busy" >/dev/null; then
+        fail "with sleep[$holder] in w in group $group, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$busy")"
+    elif [ "$status" != 3 ]; then fail "remove --yes exit $status, want 3"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), want refused"
+    elif ! jq -e --arg pid "$holder" ".results[0].worktree.activity | $refused" "$out" >/dev/null; then
+        fail "remove's activity is $(jq -c '.results[0].worktree.activity' "$out")"
+    elif untouched "$before"; then
+        run explain --json "$wt"
+        if ! jq -e '.worktree.activity.state == "not_observed" and .worktree.verdict == "candidate"' "$out" >/dev/null; then
+            fail "after the sleep exited, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$out")"
+        else
+            ok
+            echo "     $(jq -r '.worktree.activity.detail' "$busy")"
+        fi
+    fi
+}
+if [ "$(uname -s)" = Linux ]; then
+    other_group_case
+else
+    echo "skip activity-other-group: it runs on Linux"
+fi
+
 echo "contract-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]
