@@ -584,6 +584,49 @@ grep -q "removed .*worktrees/control (.*): origin/control was deleted" "$S/log" 
 grep -q "back: Git lists it at .*worktrees/again again" "$S/restore9.out" || fail "9: the record does not read as back: $(cat "$S/restore9.out")"
 echo "watch-smoke: 9. a worktree back at its path without its marker; the landed rule kept it"
 
+# 11. A running watch whose open-file limit is 256, with more folders to
+# watch than that: 300 empty ones below refs/remotes/origin stand in for
+# many branch namespaces. kqueue holds an open file for each watched
+# folder, so the watches stay 128 below the limit and every pass can still
+# start Git and residue; it removes landed once its upstream is pruned.
+# inotify holds none. refs/remotes and refs/remotes/origin are watched
+# first, so the prune is seen however many folders are left out.
+many_case() {
+  git init -q --bare -b main "$S/many.git"
+  git clone -q "$S/many.git" "$S/many" 2> /dev/null
+  cd "$S/many"
+  git config user.email smoke@example.com
+  git config user.name smoke
+  echo hello > README.md
+  git add . && git commit -qm init && git push -q origin main
+  git worktree add -q "$S/many/.worktrees/landed" -b landed
+  (cd .worktrees/landed && echo landed >> README.md && git commit -qam landed && git push -q -u origin landed)
+  n=0
+  while [ "$n" -lt 300 ]; do
+    mkdir -p ".git/refs/remotes/origin/ns$n"
+    n=$((n + 1))
+  done
+  find "$S/many/.worktrees" "$S/many/.git/worktrees" -exec touch -t 202601010000 {} +
+  # dash, bash, ksh and the BSDs' sh all have ulimit -n.
+  # shellcheck disable=SC3045
+  (ulimit -n 256 && exec "$residue" watch --grace 1m --no-fetch "$S/many") 2> "$S/log" &
+  watcher=$!
+  sleep 5
+  git push -q origin --delete landed
+  git fetch -q --prune
+  find "$S/many/.worktrees" "$S/many/.git/worktrees" -exec touch -t 202601010000 {} +
+  i=0
+  until grep -q "removed .*worktrees/landed" "$S/log"; do
+    i=$((i + 1))
+    [ "$i" -le 120 ] || fail "11: with 256 open files and 302 folders to watch, the running watch did not remove landed within 2 minutes"
+    sleep 1
+  done
+  ! grep -q "Too many open files" "$S/log" || fail "11: the watch ran out of open files"
+  stop_watcher
+  echo "watch-smoke: 11. 256 open files, 302 folders to watch; removed landed after ${i}s"
+}
+
 fetch_case
 upgrade_case
+many_case
 echo "watch-smoke: ok"
