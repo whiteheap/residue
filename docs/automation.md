@@ -74,6 +74,16 @@ residue service uninstall
 
 A dry run still fetches; add `--no-fetch` to leave the refs alone too. The log is `~/Library/Logs/residue/watch.log` on macOS and `journalctl --user -u residue-watch` on Linux. After each removal it logs what the removal freed and the total for this machine, with the UTC date, like the log's own times. `residue service status` has a `freed:` line: what automatic cleanup freed in the last seven days and when it last removed a worktree, such as `freed: about 2.1 GB from 4 worktrees in the last 7 days; last removal 2026-11-07 04:12 +02:00 (5 hours ago)`. `residue stats` has the rest; [Stats](reference.md#stats) says how it is counted. A Linux user service stops when you log out unless you run `loginctl enable-linger "$USER"` once. On other systems, `residue service install` prints the `residue watch` command to run from your system's service manager. [Why `--idle` matters](#why---idle-matters) explains what counts as a change, and why a paused agent session needs a wait. If you would rather sweep at a fixed time, see [Run it on a schedule](#run-it-on-a-schedule).
 
+### After an upgrade
+
+The service runs the new release within about six minutes. Before each pass, and at least every five minutes while it waits, `watch` checks that the path the service starts still names the file it runs. Once an upgrade replaces that file, `watch` logs one line and exits 1 between passes, never during one, and launchd or systemd starts the new release:
+
+```text
+residue watch: a new residue is at /opt/homebrew/bin/residue, most likely an upgrade; exiting so the service manager starts the new one
+```
+
+Each start's first log line ends with the version, such as `· residue 0.0.11`. A `watch` that 0.0.10 or earlier started has no such check; on macOS it switches at its next start, such as your next login.
+
 ## Run it on a schedule
 
 A daily sweep keeps leaked worktrees from piling up:

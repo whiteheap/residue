@@ -39,11 +39,15 @@
 #   9. A worktree back at its path while its removal record lives, with no
 #      restored marker (a restore stopped after its `git worktree add`), is
 #      listed as back and never removed again because its work landed.
+#  10. Started by an absolute link, as a service starts it, a running watch
+#      exits 1 between passes once the link names another file, as
+#      `brew upgrade` leaves it, and says why, so the service manager
+#      starts the new release. Its first line ends with its version (#149).
 # Every branch stays, and nothing goes to the trash: watch deletes.
 # On NetBSD, OpenBSD and DragonFly (scripts/partial-probe.sh) no worktree
 # is a candidate: there it checks that every worktree is `unknown` for the
 # probe's reason and that dry, landed and disk-pressure runs remove none,
-# skips 1-6, 8 and 9 by name, and runs 7 expecting no removal.
+# skips 1-6, 8 and 9 by name, and runs 7 expecting no removal, and 10.
 set -eu
 
 residue=$1
@@ -195,6 +199,50 @@ fetch_case() {
   echo "watch-smoke: 7. watch without a ROOT fetched, pruned and kept what it should"
 }
 
+# 10. An upgrade ends a running watch between passes (#149).
+upgrade_case() {
+  U="$S/u10"
+  mkdir -p "$U/old" "$U/new" "$U/bin"
+  cp "$residue" "$U/old/residue"
+  cp "$residue" "$U/new/residue"
+  ln -s "$U/old/residue" "$U/bin/residue"
+  git init -q --bare -b main "$U/remote.git"
+  git clone -q "$U/remote.git" "$U/repo" 2> /dev/null
+  git -C "$U/repo" config user.email smoke@example.com
+  git -C "$U/repo" config user.name smoke
+  echo hello > "$U/repo/README.md"
+  git -C "$U/repo" add README.md
+  git -C "$U/repo" commit -qm init
+  git -C "$U/repo" push -q origin main
+  git -C "$U/repo" worktree add -q "$U/repo/.worktrees/w" -b w
+  version=$("$residue" --version)
+  "$U/bin/residue" watch --no-fetch --dry-run "$U" 2> "$S/log" &
+  watcher=$!
+  i=0
+  until grep -q "residue watch: watching .* · $version\$" "$S/log"; do
+    i=$((i + 1))
+    [ "$i" -le 60 ] || fail "10: the first line does not end with '· $version'"
+    sleep 1
+  done
+  # One rename points the link at the new file, as Homebrew's relink ends;
+  # `ln -sf` would leave a moment with no link, which reads as gone.
+  ln -s "$U/new/residue" "$U/bin/residue.next"
+  mv -f "$U/bin/residue.next" "$U/bin/residue"
+  # A ref change wakes it at once; with none it looks within five minutes.
+  git -C "$U/repo" push -q origin main:refs/heads/poke
+  i=0
+  until grep -q "residue watch: a new residue is at .*/u10/bin/residue, most likely an upgrade; exiting so the service manager starts the new one" "$S/log"; do
+    i=$((i + 1))
+    [ "$i" -le 180 ] || fail "10: watch did not say it saw the upgrade within 3 minutes"
+    sleep 1
+  done
+  st=0
+  wait "$watcher" || st=$?
+  watcher=
+  [ "$st" = 1 ] || fail "10: watch exited $st after the upgrade, not 1"
+  echo "watch-smoke: 10. an upgrade ended the running watch after ${i}s, exit 1"
+}
+
 # 1. fix landed; a dry run names it and removes nothing.
 git push -q origin --delete fix
 git fetch -q --prune
@@ -230,6 +278,7 @@ if [ -n "$partial_probe" ]; then
     skip_partial "$case"
   done
   fetch_case
+  upgrade_case
   echo "watch-smoke: ok (every worktree kept as activity unknown)"
   exit 0
 fi
@@ -536,4 +585,5 @@ grep -q "back: Git lists it at .*worktrees/again again" "$S/restore9.out" || fai
 echo "watch-smoke: 9. a worktree back at its path without its marker; the landed rule kept it"
 
 fetch_case
+upgrade_case
 echo "watch-smoke: ok"

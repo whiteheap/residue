@@ -1,4 +1,4 @@
-//! `.filter(|r| matches!(r.get("state").and_then(Value::str), Some("back" | "unknown")))esidue watch`: stay running and reclaim storage from linked worktrees
+//! `residue watch`: stay running and reclaim storage from linked worktrees
 //! when it is safe and worth it, reacting to events instead of a schedule.
 //!
 //! Two things lead to a removal. Work landed: a worktree's upstream branch
@@ -44,6 +44,11 @@
 //! `--idle`; a filesystem dropping below `--min-free` (free space is read
 //! every five minutes, as there is no event for it); and every six hours,
 //! to find repositories created under the roots since.
+//!
+//! An upgrade ends it between passes, so the service manager starts the new
+//! release (`Binary`, #149): before each scan, and at least every five
+//! minutes while it waits, it checks that the path it was started by still
+//! names the file it runs.
 //!
 //! Without a ROOT it watches `DEFAULT_ROOTS`, the usual code folders in the
 //! home folder that exist.
@@ -99,6 +104,7 @@ Removal:  every check of `residue remove`, then a removal record to restore from
 Trash:    not used; entries older than 7d are purged
 Kept:     branches and commits; a restored worktree, unless the disk is low
 Fetch:    never prompts, so one that needs a password fails and is logged
+Upgrade:  ends it between passes, so the service starts the new release
 Details:  https://github.com/whiteheap/residue-cli/blob/main/docs/automation.md
 ";
 
@@ -439,6 +445,7 @@ pub fn main(args: &[OsString]) -> u8 {
             return 1;
         }
     };
+    let binary = Binary::new(&exe);
     let _lock = match lock(&opts) {
         Ok(lock) => lock,
         Err(message) => {
@@ -448,7 +455,7 @@ pub fn main(args: &[OsString]) -> u8 {
     };
     // One line of labels and values; `residue watch --help` explains each.
     log(&format!(
-        "watching {} ({}{}) · removes: landed and unchanged {}, or below {}% free and unchanged {} · removal records: {} · fetch: {}{}",
+        "watching {} ({}{}) · removes: landed and unchanged {}, or below {}% free and unchanged {} · removal records: {} · fetch: {}{} · residue {}",
         opts.shown_roots(),
         events::BACKEND,
         if opts.default_roots {
@@ -468,7 +475,8 @@ pub fn main(args: &[OsString]) -> u8 {
             " · dry run: removes nothing"
         } else {
             ""
-        }
+        },
+        crate::commands::VERSION,
     ));
     let mut events = match Events::new() {
         Ok(events) => Some(events),
@@ -483,6 +491,13 @@ pub fn main(args: &[OsString]) -> u8 {
     let mut fetcher = Fetcher::new(opts.fetch_every.clone());
     let mut rescans_in_a_row = 0;
     loop {
+        // Between passes, never during one: no child is running here.
+        if let Some(why) = binary.replaced() {
+            log(&format!(
+                "{why}; exiting so the service manager starts the new one"
+            ));
+            return 1;
+        }
         let mut snap = match scan(&exe, &opts) {
             Ok(snap) => snap,
             Err(e) => match failed(e, opts.once) {
@@ -517,7 +532,14 @@ pub fn main(args: &[OsString]) -> u8 {
             arm(events, &snap, &mut state);
         }
         let deadline = next_deadline(&opts, &snap, output::now());
-        wait(events.as_mut(), &opts, &snap, deadline, &mut fetcher);
+        wait(
+            events.as_mut(),
+            &opts,
+            &snap,
+            deadline,
+            &mut fetcher,
+            &binary,
+        );
     }
 }
 
@@ -540,6 +562,60 @@ fn failed(error: ScanError, once: bool) -> Option<u8> {
             None
         }
     }
+}
+
+/// The binary this watch runs, to see an upgrade replace it (#149).
+///
+/// `path` is the path the service starts, `argv[0]`, when it is absolute
+/// and names the running file: under Homebrew that is the stable link,
+/// which `brew upgrade` points at the new version. Otherwise it is
+/// `current_exe()`, which on Linux is the file the link named at start, and
+/// which an apt, dnf or pacman upgrade replaces.
+struct Binary {
+    path: PathBuf,
+    /// The running file's device and inode, read at start. `None` when it
+    /// could not be read: then no upgrade is seen, as before #149.
+    running: Option<(u64, u64)>,
+}
+
+impl Binary {
+    fn new(exe: &Path) -> Binary {
+        // Linux names the running file in /proc, even once it is replaced.
+        let running = if cfg!(any(target_os = "linux", target_os = "android")) {
+            identity(Path::new("/proc/self/exe")).ok()
+        } else {
+            identity(exe).ok()
+        };
+        let path = std::env::args_os()
+            .next()
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute() && running.is_some() && identity(p).ok() == running)
+            .unwrap_or_else(|| exe.to_path_buf());
+        Binary { path, running }
+    }
+
+    /// Why to exit for a new release: `path` names another file, or none.
+    /// `None` while it names the running one, or when either cannot be
+    /// read. One `stat(2)`.
+    fn replaced(&self) -> Option<String> {
+        let running = self.running?;
+        match identity(&self.path) {
+            Ok(now) if now == running => None,
+            Ok(_) => Some(format!(
+                "a new residue is at {}, most likely an upgrade",
+                output::home(&self.path.to_string_lossy())
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Some("the residue binary is gone, most likely upgraded".to_string())
+            }
+            Err(_) => None,
+        }
+    }
+}
+
+/// The device and inode of the file `path` names, following links.
+fn identity(path: &Path) -> std::io::Result<(u64, u64)> {
+    std::fs::metadata(path).map(|m| (m.dev(), m.ino()))
 }
 
 fn log(message: &str) {
@@ -1176,6 +1252,7 @@ fn wait(
     snap: &Snapshot,
     deadline: Option<i64>,
     fetcher: &mut Fetcher,
+    binary: &Binary,
 ) {
     let started = Instant::now();
     let low_before: HashSet<u64> = filesystems(snap)
@@ -1184,6 +1261,10 @@ fn wait(
         .map(|(dev, ..)| dev)
         .collect();
     loop {
+        // An upgrade: the loop logs it and exits before the next scan.
+        if binary.replaced().is_some() {
+            return;
+        }
         let now = output::now();
         if deadline.is_some_and(|d| now >= d) {
             return;
