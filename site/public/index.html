@@ -102,7 +102,7 @@
             </div>
             <a class="install-source" href="/install.sh">read the script</a>
           </div>
-          <p class="install-note">Installs residue, and on macOS and Linux turns on <a href="#automatic-title">automatic cleanup</a>, which deletes worktrees that pass every check, without asking · install only: <code>curl -fsSL https://residue.whiteheap.com/install.sh | sh -s -- --no-service</code> · or Homebrew: <code>brew install whiteheap/tap/residue</code> · <a href="#mac-app">the Mac&nbsp;app</a> · <a href="https://github.com/whiteheap/residue-cli#install">other ways to install</a></p>
+          <p class="install-note">Installs residue, and on macOS and Linux turns on <a href="#automatic-title">automatic cleanup</a>, which deletes without asking · or Homebrew, without it: <code>brew install whiteheap/tap/residue</code> · <a href="#mac-app">the Mac&nbsp;app</a> · <a href="https://github.com/whiteheap/residue-cli#install">other ways to install</a></p>
         </div>
       </section>
 
@@ -120,6 +120,9 @@
           <p>Then turn it on:</p>
           <pre tabindex="0"><code>residue service install</code></pre>
           <p>That starts <code>residue watch</code> now and at every login, with launchd on macOS and systemd on Linux. It watches the usual code folders in your home folder that exist, such as <code>~/src</code>, <code>~/code</code> and <code>~/Work</code>, and prints which. If your code lives elsewhere, name its folder, which replaces the list: <code>residue service install ~/src</code>. <code>watch</code> runs only when you start it or install it as a service; <code>scan</code> never starts it.</p>
+          <p>The install script turns it on for you. To install without it:</p>
+          <pre tabindex="0"><code>curl -fsSL https://residue.whiteheap.com/install.sh | sh -s -- --no-service</code></pre>
+          <p>To turn it off later: <code>residue service uninstall</code>.</p>
           <p><a href="https://github.com/whiteheap/residue-cli#reclaim-storage-automatically">Reclaim storage automatically</a></p>
         </div>
       </section>
