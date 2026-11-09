@@ -1,6 +1,6 @@
 [package]
 name = "residue"
-version = "0.0.10"
+version = "0.0.11"
 edition = "2024"
 rust-version = "1.85"
 description = "Find what coding agents left behind on disk, and remove a Git worktree only when nothing in it would be lost."

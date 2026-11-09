@@ -1,6 +1,25 @@
 # Changelog
 
-## Unreleased
+## 0.0.11 (2026-11-09)
+
+Restores that wait until nothing may still delete the worktree, a confirmed plan that runs as shown, and the Mac app in its own repository.
+
+- **A restore waits until nothing may still delete the worktree.** A run that may delete a worktree holds its trash entry or removal record, and the Git it starts keeps that hold, so a restore refuses until the deletion has ended, also when residue was killed alone (#135, #136). A Git stopped partway keeps the removal record, and a restore after a stopped purge says what may be gone and puts back what it can (#137, #138). A restore lifts only a lock residue set (#139). A record from 0.0.10 or earlier, which has no hold, is checked for its run, its Git and any process using the worktree (#147).
+- **A removal skips a worktree that changed while residue moved it aside.** A Git operation such as a bisect, or a worktree-private ref, that started during the move now makes residue move the worktree back and keep it (#147).
+- **A confirmed plan runs as shown.** `remove --as-of TIME` measures every age at TIME, the plan's `generated_at`, so a run that confirms a plan purges and forgets only what had expired then (#151).
+- **After an upgrade**, automatic cleanup runs the new release on its own (#149).
+- **Faster** `explain`, `scan` and `remove` on a worktree with an untracked folder that holds only ignored files (#120).
+- **The Mac app moved.** It now releases from [whiteheap/residue-ui](https://github.com/whiteheap/residue-ui/releases), so this release has no `residue-macos.dmg`. This repository is now whiteheap/residue-cli (#127).
+- **Changes from 0.0.10:**
+  - A removal record has a `hold flock` line (#147).
+  - `scan --json` sets `removal_running`. It leaves `recovery` empty while a removal may still run or residue cannot tell (#136), and for a hidden worktree whose directory is gone and that no removal record names (#147).
+  - A move back in `recovery` starts with `test ! -e ORIGINAL && test ! -L ORIGINAL &&`. A word with a control character or a byte that is not UTF-8 is `"$(printf 'FMT')"`, which any POSIX sh runs, instead of `$'...'` (#147).
+  - `residue.remove/v1` adds `as_of` (#151).
+  - residue no longer suggests `git worktree prune`. For a worktree whose directory is gone, it names the repair or the mount, and names a `git worktree remove` only where a removal record keeps what that drops (#147).
+  - `residue restore` of a record whose branch another worktree has checked out recreates the worktree on `BRANCH-restored` instead of refusing. A record reads `back` when Git lists a worktree at its original path at the recorded HEAD, on any branch (#147).
+  - On a filesystem with no flock(2), such as some network mounts, residue removes and restores nothing there and says why (#147).
+
+### Details
 
 - After an upgrade, automatic cleanup runs the new release within about six minutes. Before each pass, and at least every five minutes while it waits, `watch` checks that the path the service starts still names the file it runs. Once an upgrade replaces that file, `watch` logs why and exits 1 between passes, and launchd or systemd starts the new release. Before, `watch` exited only when its file was gone, so on most installs it kept the old release's own loop until the service restarted; each pass already ran the new release. Each start's first log line now ends with the version, such as `· residue 0.0.11`. A `watch` that 0.0.10 or earlier started has no such check and switches at its next start, such as your next login. Tests: `.github/watch-smoke.sh` case 10 (#149).
 - The repository is now [whiteheap/residue-cli](https://github.com/whiteheap/residue-cli); links to github.com/whiteheap/residue redirect to it (#127).
