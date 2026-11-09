@@ -124,13 +124,19 @@ The macOS binaries need macOS 11 or later on Apple silicon and 10.12 or later on
 
 ### From source
 
-With Rust 1.85 or later:
+With Rust 1.85 or later, from [crates.io](https://crates.io/crates/residue), where each release from 0.0.12 on is published from its tag:
+
+```sh
+cargo install --locked residue
+```
+
+Run it again to upgrade. Or build a release from its tag:
 
 ```sh
 cargo install --locked --git https://github.com/whiteheap/residue-cli --tag v0.0.12 residue
 ```
 
-The last word is the package name. Cargo searches the whole repository for packages, and from 0.0.8 to 0.0.10 the repository also held the Mac app's, so at those tags `cargo install` without the name stops with "multiple packages with binaries found". residue is not on crates.io, so `cargo install residue` does not install it.
+The last word is the package name. Cargo searches the whole repository for packages, and from 0.0.8 to 0.0.10 the repository also held the Mac app's, so at those tags `cargo install` without the name stops with "multiple packages with binaries found".
 
 residue needs `git` 2.36 or later on `PATH`.
 
