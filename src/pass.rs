@@ -6,7 +6,8 @@
 //! worktrees the scan found, how many were candidates, changed within
 //! `--grace`, or kept and by which checks, what the pass handed to a
 //! removal, the free space of the fullest filesystem, and when the next
-//! pass can come. When the scan failed, it holds why instead.
+//! pass can come. When the scan failed, it holds why instead. Either way
+//! it names each ROOT the pass skipped and why (#201).
 //! `residue service status` shows it in two lines and `residue stats
 //! --json` as `watch_pass`, so a watch that waits and one that is stuck do
 //! not look the same.
@@ -41,8 +42,9 @@ const FORMAT: i64 = 1;
 pub const STALE_AFTER: i64 = 7 * 60 * 60;
 /// `STALE_AFTER`'s six hours, for the text that explains it.
 const PASSES_EVERY: &str = "6 hours";
-/// A record is under 2 KB; a reader stops at this, so nothing at the path
-/// can make it read without end.
+/// A record is under 2 KB, plus two paths for each ROOT the pass skipped; a
+/// reader stops at this, so nothing at the path can make it read without
+/// end. One longer is an error `service status` shows, never a record.
 const READ_MAX: u64 = 64 * 1024;
 
 /// One pass of a running `watch`.
@@ -61,6 +63,42 @@ pub struct Pass {
     pub fetch_every: Option<String>,
     /// What the scan found and the pass did, or why the scan failed.
     pub outcome: Result<Seen, String>,
+    /// The ROOTs the pass left out of its scan (`watch::live_roots`), in
+    /// the order `watch` was given them. Kept apart from `outcome`: a pass
+    /// skips them before its scan, whether that scan then fails or not. A
+    /// record written before this field reads as none.
+    pub skipped_roots: Vec<Skipped>,
+}
+
+/// A ROOT a pass skipped, and why.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Skipped {
+    /// The ROOT as `watch` started with it, canonical then.
+    pub root: PathBuf,
+    pub why: Skip,
+}
+
+/// Why a pass skipped a ROOT: it no longer canonicalizes to itself.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Skip {
+    /// A folder on its path became a symbolic link or was renamed: the
+    /// ROOT's canonical path now.
+    LeadsTo(PathBuf),
+    /// It cannot be canonicalized, such as when it is gone: the error.
+    Unreachable(String),
+}
+
+impl Skip {
+    /// `it now leads to ~/Other`, or `it cannot be reached (WHY)`: the
+    /// words the log and `service status` share.
+    pub fn text(&self) -> String {
+        match self {
+            Skip::LeadsTo(other) => {
+                format!("it now leads to {}", output::home(&other.to_string_lossy()))
+            }
+            Skip::Unreachable(e) => format!("it cannot be reached ({e})"),
+        }
+    }
 }
 
 /// What a pass found and did.
@@ -174,11 +212,18 @@ impl Pass {
         }
     }
 
-    /// The two lines `residue service status` shows: what the pass found
-    /// and did, then what the next pass waits for. One line for a failed
-    /// scan.
+    /// The lines `residue service status` shows: what the pass found and
+    /// did, one line for each ROOT it skipped, then what the next pass
+    /// waits for. A failed scan has no last line.
     #[cfg(any(target_os = "macos", target_os = "linux", test))]
     pub fn status_lines(&self, now: i64) -> Vec<String> {
+        let skipped = self.skipped_roots.iter().map(|s| {
+            format!(
+                "skipped {}: {}",
+                output::home(&s.root.to_string_lossy()),
+                s.why.text()
+            )
+        });
         let when = format!(
             "{} ({}{})",
             output::date(self.at),
@@ -191,7 +236,11 @@ impl Pass {
         );
         let seen = match &self.outcome {
             Ok(seen) => seen,
-            Err(message) => return vec![format!("last pass: {when}: the scan failed: {message}")],
+            Err(message) => {
+                let mut lines = vec![format!("last pass: {when}: the scan failed: {message}")];
+                lines.extend(skipped);
+                return lines;
+            }
         };
         let acted = match (seen.tried, self.dry_run) {
             (0, false) => String::new(),
@@ -226,14 +275,14 @@ impl Pass {
         } else {
             format!("{}, or {last}", waits.join(", "))
         };
-        vec![
-            format!(
-                "last pass: {when}, {}; {}{acted}",
-                self.counts(seen),
-                self.disk(seen)
-            ),
-            format!("next pass: when {waits}"),
-        ]
+        let mut lines = vec![format!(
+            "last pass: {when}, {}; {}{acted}",
+            self.counts(seen),
+            self.disk(seen)
+        )];
+        lines.extend(skipped);
+        lines.push(format!("next pass: when {waits}"));
+        lines
     }
 
     pub fn stale(&self, now: i64) -> bool {
@@ -300,6 +349,25 @@ impl Pass {
             ),
             ("next_deadline_at", time(seen.and_then(|s| s.next_deadline))),
             ("next_fetch_at", time(seen.and_then(|s| s.next_fetch))),
+            (
+                "skipped_roots",
+                Json::Arr(
+                    self.skipped_roots
+                        .iter()
+                        .map(|s| {
+                            let (leads_to, error) = match &s.why {
+                                Skip::LeadsTo(other) => (Json::path(other), Json::Null),
+                                Skip::Unreachable(e) => (Json::Null, Json::str(e.clone())),
+                            };
+                            Json::Obj(vec![
+                                ("root", Json::path(&s.root)),
+                                ("leads_to", leads_to),
+                                ("error", error),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
         ]
     }
 
@@ -330,6 +398,24 @@ impl Pass {
                 .ok_or_else(|| missing(key))
         };
         let at = time("at")?.ok_or_else(|| missing("at"))?;
+        // Absent from a record written before it (#201): none skipped.
+        let mut skipped_roots = Vec::new();
+        for item in doc.get("skipped_roots").map(Value::items).unwrap_or(&[]) {
+            let text = |key: &str| item.get(key).and_then(Value::str);
+            let null = |key: &str| matches!(item.get(key), Some(Value::Null));
+            let why = match (text("leads_to"), text("error")) {
+                (Some(other), None) if null("error") => Skip::LeadsTo(PathBuf::from(other)),
+                (None, Some(e)) if null("leads_to") => Skip::Unreachable(e.to_string()),
+                _ => return Err(missing("skipped_roots")),
+            };
+            match text("root") {
+                Some(root) => skipped_roots.push(Skipped {
+                    root: PathBuf::from(root),
+                    why,
+                }),
+                None => return Err(missing("skipped_roots")),
+            }
+        }
         let outcome = match str_of("scan_error") {
             Some(message) => Err(message),
             None => {
@@ -379,6 +465,7 @@ impl Pass {
                 .ok_or_else(|| missing("min_free_percent"))?,
             fetch_every: str_of("fetch_every"),
             outcome,
+            skipped_roots,
         })
     }
 }
@@ -538,7 +625,21 @@ mod tests {
             min_free: 10.0,
             fetch_every: Some("30m".into()),
             outcome: Ok(seen),
+            skipped_roots: Vec::new(),
         }
+    }
+
+    fn skipped() -> Vec<Skipped> {
+        vec![
+            Skipped {
+                root: PathBuf::from("/src/B"),
+                why: Skip::LeadsTo(PathBuf::from("/Volumes/Backup/B")),
+            },
+            Skipped {
+                root: PathBuf::from("/src/C"),
+                why: Skip::Unreachable("No such file or directory (os error 2)".into()),
+            },
+        ]
     }
 
     fn seen() -> Seen {
@@ -580,13 +681,46 @@ mod tests {
         assert_eq!(read_at(&path).unwrap(), Some(first));
         let mut failed = pass(seen());
         failed.outcome = Err("residue scan: timed out".into());
+        failed.skipped_roots = skipped();
+        // A folder name may hold any byte but NUL and `/`.
+        failed.skipped_roots.push(Skipped {
+            root: PathBuf::from("/src/a\nlog: \"b\"\t\u{1b}[31m"),
+            why: Skip::LeadsTo(PathBuf::from("/x\\y")),
+        });
         write_at(&path, &failed).unwrap();
         assert_eq!(read_at(&path).unwrap(), Some(failed));
+        let mut skipping = pass(seen());
+        skipping.skipped_roots = skipped();
+        write_at(&path, &skipping).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.ends_with(
+                ",\"skipped_roots\":[{\"root\":\"/src/B\",\"leads_to\":\"/Volumes/Backup/B\",\"error\":null},{\"root\":\"/src/C\",\"leads_to\":null,\"error\":\"No such file or directory (os error 2)\"}]}\n"
+            ),
+            "skipped_roots is not the last field: {text}"
+        );
+        assert_eq!(read_at(&path).unwrap(), Some(skipping));
         let names: Vec<String> = fs::read_dir(path.parent().unwrap())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec![FILE.to_string()], "a staged file was left");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The record as the release before `skipped_roots` (#197) wrote it:
+    /// still read, with no ROOT skipped.
+    const BEFORE_SKIPPED_ROOTS: &str = "{\"v\":1,\"at\":\"2026-11-10T18:40:00Z\",\"pid\":4242,\"dry_run\":false,\"grace\":\"1h\",\"idle\":\"2d\",\"min_free_percent\":10,\"fetch_every\":\"30m\",\"scan_error\":null,\"worktrees\":23,\"candidates\":1,\"changed_within_grace\":0,\"kept\":22,\"kept_by\":[{\"check\":\"ignored\",\"worktrees\":13},{\"check\":\"activity\",\"worktrees\":7},{\"check\":\"untracked\",\"worktrees\":2}],\"tried\":0,\"removed\":0,\"filesystems\":1,\"free_bytes\":41875931136,\"total_bytes\":107374182400,\"free_percent\":39,\"next_deadline_at\":null,\"next_fetch_at\":\"2026-11-10T19:10:00Z\"}\n";
+
+    #[test]
+    fn a_record_without_skipped_roots_reads_as_none_skipped() {
+        let dir = scratch("before-skipped-roots");
+        let path = dir.join(FILE);
+        fs::write(&path, BEFORE_SKIPPED_ROOTS).unwrap();
+        let read = read_at(&path).unwrap().unwrap();
+        assert_eq!(read.skipped_roots, Vec::new());
+        assert_eq!(read.outcome.as_ref().map(|s| s.worktrees), Ok(23));
+        assert_eq!(read.status_lines(read.at).len(), 2);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -596,13 +730,20 @@ mod tests {
     fn a_record_that_cannot_be_read_is_an_error() {
         let dir = scratch("unreadable");
         let path = dir.join(FILE);
+        let damaged = |entry: &str| {
+            BEFORE_SKIPPED_ROOTS.replace("}\n", &format!(",\"skipped_roots\":[{entry}]}}\n"))
+        };
         for text in [
-            "",
-            "{\"v\":1",
-            "{\"v\":2,\"at\":\"2026-11-10T00:00:00Z\"}",
-            "{\"v\":1}",
+            "".to_string(),
+            "{\"v\":1".to_string(),
+            "{\"v\":2,\"at\":\"2026-11-10T00:00:00Z\"}".to_string(),
+            "{\"v\":1}".to_string(),
+            damaged("{\"root\":\"/a\",\"leads_to\":null,\"error\":null}"),
+            damaged("{\"root\":\"/a\",\"leads_to\":\"/b\",\"error\":\"x\"}"),
+            damaged("{\"leads_to\":\"/b\",\"error\":null}"),
+            damaged("{\"root\":\"/a\",\"leads_to\":\"/b\"}"),
         ] {
-            fs::write(&path, text).unwrap();
+            fs::write(&path, &text).unwrap();
             assert!(read_at(&path).is_err(), "read {text:?} as a record");
         }
         fs::remove_file(&path).unwrap();
@@ -715,5 +856,31 @@ mod tests {
             lines[1],
             "next pass: when a branch lands (after your own git fetch --prune; --no-fetch), or the disk drops below 10%"
         );
+    }
+
+    /// Each ROOT a pass skipped is one line under `last pass:`, before
+    /// `next pass:`, also after a failed scan.
+    #[test]
+    fn status_names_each_skipped_root() {
+        let mut p = pass(seen());
+        p.skipped_roots = skipped();
+        let lines = p.status_lines(p.at);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].starts_with("last pass: "), "{}", lines[0]);
+        assert_eq!(
+            lines[1],
+            "skipped /src/B: it now leads to /Volumes/Backup/B"
+        );
+        assert_eq!(
+            lines[2],
+            "skipped /src/C: it cannot be reached (No such file or directory (os error 2))"
+        );
+        assert!(lines[3].starts_with("next pass: "), "{}", lines[3]);
+        p.outcome = Err("residue scan: timed out".into());
+        let lines = p.status_lines(p.at);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].ends_with(": the scan failed: residue scan: timed out"));
+        assert!(lines[1].starts_with("skipped /src/B: "));
+        assert!(lines[2].starts_with("skipped /src/C: "));
     }
 }
