@@ -200,6 +200,17 @@ jobs:
             sh /s/install.sh --no-service > /tmp/again.log 2>&1 || { cat /tmp/again.log; exit 1; }
             tail -5 /tmp/again.log
           "
+      # A full disk while install.sh writes /etc/pacman.conf, on the edit path
+      # and on a fresh install: .github/pacman-siglevel-check.sh puts /etc on a
+      # small tmpfs, so this container alone may mount (SYS_ADMIN, and no
+      # AppArmor profile, which would refuse the mount).
+      - name: pacman.conf on a full disk
+        if: matrix.channel == 'pacman'
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+            -v "$PWD/site/public:/s:ro" -v "$PWD/.github:/g:ro" "$IMAGE" sh /g/pacman-siglevel-check.sh full /s/install.sh
 
   freebsd:
     runs-on: ubuntu-24.04

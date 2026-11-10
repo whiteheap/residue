@@ -4,6 +4,7 @@
 #
 #   sh pacman-siglevel-check.sh seed               # before install.sh first runs
 #   sh pacman-siglevel-check.sh check INSTALL_SH   # after its dry run and first run
+#   sh pacman-siglevel-check.sh full INSTALL_SH    # alone, in a container that may mount
 #
 # seed adds a [residue] section as an older install.sh and the docs wrote it,
 # with no SigLevel. check then shows, as pacman-conf reads each file:
@@ -19,8 +20,12 @@
 #   old section gets SIGLEVEL with every other repository's SigLevel the same;
 # - pacman takes an unsigned residue.db under the old section and refuses it
 #   under the new one;
-# - a fresh install writes the section with SIGLEVEL.
-# The dry run's output is in /tmp/dry.log.
+# - a fresh install writes the section with SIGLEVEL, keeping a backup.
+# The dry run's output is in /tmp/dry.log. full puts /etc on a small tmpfs
+# and fills it right before install.sh writes pacman.conf: on the edit path
+# and on a fresh install, with no page free and with one, the script stops,
+# says pacman.conf is unchanged and offers no restore, and pacman.conf is as
+# it was, with no backup or new file left.
 set -eu
 
 conf=/etc/pacman.conf
@@ -58,8 +63,47 @@ case ${1:-} in
     cp "$conf" /tmp/pacman.conf.old
     exit 0 ;;
   check) install=$2 ;;
-  *) fail "usage: $0 seed | check INSTALL_SH" ;;
+  full) install=$2 ;;
+  *) fail "usage: $0 seed | check INSTALL_SH | full INSTALL_SH" ;;
 esac
+
+if [ "$1" = full ]; then
+  pacman-key --init > /dev/null 2>&1
+  pacman-key --populate archlinux > /dev/null 2>&1
+  if ! { cp -a /etc /root/etc && mount -t tmpfs -o size=64m tmpfs /etc && cp -a /root/etc/. /etc/; }; then
+    fail "could not put /etc on a tmpfs"
+  fi
+  # install.sh writes pacman.conf right after its last pacman-key: this one
+  # then fills /etc, leaving $FREE pages free.
+  cat > /usr/local/bin/pacman-key <<'WRAP'
+#!/bin/sh
+/usr/bin/pacman-key "$@" || exit
+if [ "$1" = --lsign-key ]; then
+  i=0; while [ "$i" -lt "$FREE" ]; do head -c 4096 /dev/zero > "/etc/zz-free-$i"; i=$((i + 1)); done
+  dd if=/dev/zero of=/etc/zz-fill bs=4096 2> /dev/null
+  rm -f /etc/zz-free-*
+fi
+WRAP
+  chmod +x /usr/local/bin/pacman-key
+  cp "$conf" /tmp/pacman.conf.image
+  for free in 0 1; do
+    for path in edit fresh; do
+      cp /tmp/pacman.conf.image "$conf"
+      # shellcheck disable=SC2016 # $arch is pacman's.
+      [ "$path" = fresh ] || printf '\n[residue]\nServer = https://whiteheap.github.io/residue/arch/$arch\n' >> "$conf"
+      before=$(sum "$conf")
+      if FREE=$free sh "$install" --no-service > /tmp/full.log 2>&1; then cat /tmp/full.log; fail "$path, $free page free: install.sh did not stop"; fi
+      rm -f /etc/zz-*
+      grep -q 'could not write /etc/pacman.conf, .* so it is unchanged' /tmp/full.log || { cat /tmp/full.log; fail "$path, $free page free: it stopped for another reason"; }
+      if grep -q 'Put it back' /tmp/full.log; then cat /tmp/full.log; fail "$path, $free page free: it offered a restore"; fi
+      [ "$(sum "$conf")" = "$before" ] || fail "$path, $free page free: pacman.conf changed"
+      if ls /etc/pacman.conf.residue-* 2> /dev/null; then fail "$path, $free page free: a backup or new file was left"; fi
+      pacman-conf --repo-list > /dev/null || fail "$path, $free page free: pacman cannot read pacman.conf"
+      echo "ok: $path, $free page free: install.sh stops, pacman.conf is as it was, and nothing is left"
+    done
+  done
+  exit 0
+fi
 
 # shellcheck disable=SC2016 # $arch is pacman's.
 server='Server = https://whiteheap.github.io/residue/arch/$arch'
@@ -152,5 +196,10 @@ echo "ok: pacman takes the unsigned residue.db under the old section and refuses
 cp /tmp/pacman.conf.stock "$conf"
 run /tmp/fresh.log
 grep -A1 '^\[residue\]$' "$conf" | grep -qxF "$siglevel" || fail "a fresh install wrote [residue] without $siglevel"
-if grep -q '^+ add ' /tmp/fresh.log; then fail "a fresh install edited the section instead of writing it"; fi
-echo "ok: a fresh install writes [residue] with $siglevel"
+grep -qF "+ add residue's section at the end of $conf" /tmp/fresh.log || fail "a fresh install did not say what it added"
+fresh_bak=$(sed -n 's/.* the file as it is now is kept as //p' /tmp/fresh.log)
+if [ -z "$fresh_bak" ] || [ "$(sum "$fresh_bak")" != "$(sum /tmp/pacman.conf.stock)" ]; then
+  fail "a fresh install kept no backup of the file as it was"
+fi
+[ "$(sigs "$conf")" = "$(sigs /tmp/pacman.conf.stock)" ] || fail "a fresh install changed another SigLevel"
+echo "ok: a fresh install writes [residue] with $siglevel, and $fresh_bak keeps the file as it was"

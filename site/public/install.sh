@@ -224,11 +224,7 @@ install_pacman() {
   [ "$dry_run" = 1 ] || fetch_key "$PAGES/residue-signing-key.asc" "$tmp/residue.asc" "$KEY_ASC_SHA256"
   as_root pacman-key --add "$tmp/residue.asc"
   as_root pacman-key --lsign-key "$KEY_FPR"
-  # shellcheck disable=SC2016 # $1 belongs to the inner sh.
-  case $plan in
-    append) as_root sh -c 'cat "$1" >>/etc/pacman.conf' sh "$tmp/residue.section" ;;
-    edit) add_siglevel ;;
-  esac
+  case $plan in append | edit) write_pacman_conf ;; esac
   # Arch supports only full upgrades, so this is `pacman -Syu`, as in the
   # docs. With a terminal, pacman shows the transaction and asks first.
   if [ "$dry_run" = 0 ] && has_tty; then
@@ -238,7 +234,7 @@ install_pacman() {
   fi
   bin=/usr/bin/residue
   updates="pacman -Syu"
-  undo="${sudo:+sudo }pacman -R residue, and remove the [residue] section from /etc/pacman.conf${edited:+ ($edited is that file as it was before residue added its SigLevel)}"
+  undo="${sudo:+sudo }pacman -R residue, and remove the [residue] section from /etc/pacman.conf${edited:+ ($edited is that file as it was before install.sh changed it)}"
 }
 
 # What to do about the [residue] section of /etc/pacman.conf. Sets $plan:
@@ -251,13 +247,14 @@ install_pacman() {
 # anything changes.
 pacman_plan() {
   plan=keep edited=
+  [ -r /etc/pacman.conf ] || die "/etc/pacman.conf is not readable by $(id -un), so install.sh cannot check it. Nothing was changed."
   stray=$(awk '{ s = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", s) }
     s ~ /^\[residue\]/ && s != "[residue]" { print s; exit }' /etc/pacman.conf)
   [ -z "$stray" ] || die "pacman does not read \"$stray\" in /etc/pacman.conf as a section: # starts a comment only at the start of a line. Make that line [residue], then run this again. Nothing was changed."
   headers=$(awk '{ s = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", s) } s == "[residue]" { n++ } END { print n + 0 }' /etc/pacman.conf)
   printf '\n[residue]\n%s\nServer = %s/arch/%sarch\n' "$SIGLEVEL" "$PAGES" '$' >"$tmp/residue.section"
   if ! has pacman-conf; then
-    if [ "$headers" = 0 ]; then plan=append
+    if [ "$headers" = 0 ]; then plan=append; cat /etc/pacman.conf "$tmp/residue.section" >"$tmp/pacman.conf"
     else note="this pacman has no pacman-conf to check /etc/pacman.conf with, so [residue] was left as it is. For pacman to require residue's database signature, add this line under [residue]: $SIGLEVEL"
     fi
     return 0
@@ -312,27 +309,37 @@ pacman_sigs() {
   done
 }
 
-# Put $tmp/pacman.conf, which pacman_plan checked, in place of
-# /etc/pacman.conf: a copy beside it renamed over it, so pacman never reads a
-# half-written file, with the mode and owner the file had. The file as it was
-# stays as PACMAN_BAK, or PACMAN_BAK.1 and so on, never over an older one.
-add_siglevel() {
-  conf=/etc/pacman.conf bak=$PACMAN_BAK n=0
+# Put $tmp/pacman.conf, the file pacman_plan checked with pacman-conf, in
+# place of /etc/pacman.conf, keeping the file as it was as PACMAN_BAK, or
+# PACMAN_BAK.1 and so on, never over an older one. The new file is written
+# beside it with its mode and owner, then renamed over it: pacman never reads
+# a half-written file, and a write that fails, as on a full disk, removes
+# what it wrote and leaves /etc/pacman.conf as it was. A link stays a link:
+# the file it points at is replaced, by a rename in that file's directory.
+write_pacman_conf() {
+  conf=/etc/pacman.conf real=/etc/pacman.conf bak=$PACMAN_BAK n=0
+  if [ -L "$conf" ]; then
+    real=$(readlink -f "$conf") || die "cannot tell what the link $conf points at. Nothing was changed."
+  fi
   while [ -e "$bak" ] || [ -L "$bak" ]; do n=$((n + 1)); bak=$PACMAN_BAK.$n; done
-  restore="${sudo:+sudo }cp -p $bak $conf"
   cp "$conf" "$tmp/pacman.conf.before"
-  say "+ add \"$SIGLEVEL\" under [residue] in $conf; the file as it is now is kept as $bak"
+  case $plan in
+    append) say "+ add residue's section at the end of $conf; the file as it is now is kept as $bak" ;;
+    edit) say "+ add \"$SIGLEVEL\" under [residue] in $conf; the file as it is now is kept as $bak" ;;
+  esac
+  [ "$real" = "$conf" ] || say "  ($conf is a link to $real, which is replaced; the link stays)"
   # shellcheck disable=SC2016 # $1 to $4 belong to the inner sh.
-  as_root sh -c 'cp -p "$1" "$2" && cp -p "$1" "$3" && cat "$4" >"$3" && mv -f "$3" "$1" || { rm -f "$3"; exit 1; }' \
-    sh "$conf" "$bak" "$conf.residue-new" "$tmp/pacman.conf" ||
-    die "could not write $conf. If it changed, put it back with: $restore"
+  as_root sh -c 'cp -p "$1" "$2" && cp -p "$1" "$3" && cat "$4" >"$3" && mv -f "$3" "$1" || { rm -f "$2" "$3"; exit 1; }' \
+    sh "$real" "$bak" "$real.residue-new" "$tmp/pacman.conf" ||
+    die "could not write $conf, as the error above says, so it is unchanged."
   edited=$bak
-  [ "$dry_run" = 0 ] || return 0
+  # A pacman before 5.1 has no pacman-conf to check with.
+  { [ "$dry_run" = 0 ] && has pacman-conf; } || return 0
   reads_as_intended "$tmp/pacman.conf.before" "$conf" && return 0
   # shellcheck disable=SC2016 # $1 to $3 belong to the inner sh.
-  as_root sh -c 'cp -p "$1" "$2" && mv -f "$2" "$3"' sh "$bak" "$conf.residue-new" "$conf" ||
-    die "pacman does not read the new $conf as intended, and putting it back failed. Put it back with: $restore"
-  die "pacman does not read the new $conf as intended, so it was put back from $bak. Add \"$SIGLEVEL\" under [residue] by hand."
+  as_root sh -c 'cp -p "$1" "$2" && mv -f "$2" "$3" || { rm -f "$2"; exit 1; }' sh "$bak" "$real.residue-new" "$real" ||
+    die "pacman does not read the new $conf as intended, and putting it back failed. Put it back with: ${sudo:+sudo }cp -p $bak $real"
+  die "pacman does not read the new $conf as intended, so it was put back from $bak. Add residue's section by hand, as docs/installation.md shows."
 }
 
 target() {
