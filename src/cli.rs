@@ -31,6 +31,8 @@ Options:
                            new entries keep it, and it cannot shorten their own
   --keep-removed DURATION  remove: keep removal records at least this long (30d)
   --as-of TIME             remove: judge ages at TIME, a plan's generated_at
+  --expect PLAN            remove --yes: act only while the plan is PLAN, as
+                           a run without --yes reported it; else exit 4
   --removal-reason REASON  remove: watch-landed or watch-low-disk (set by watch)
   --only-if-upstream-gone  remove: only if local refs show the upstream gone
   --to PATH                restore: put the worktree at PATH
@@ -55,7 +57,8 @@ Restore:       each deletion writes a removal record first; `residue restore`
                brings the worktree back for 30d, without its ignored files
 Rules:         ~/.config/residue/regenerable, one RULE per line
 Exit status:   0 ok, 1 error, 2 usage, 3 remove refused or skipped a path,
-               or could not purge an expired trash entry
+               or could not purge an expired trash entry, 4 remove --expect:
+               the plan changed, so nothing was done
 Details:       https://github.com/whiteheap/residue-cli#readme
 ";
 
@@ -128,6 +131,9 @@ pub struct Options {
     /// judges is measured at, such as the `generated_at` of the plan a
     /// person confirmed.
     pub as_of: Option<i64>,
+    /// `remove --yes --expect PLAN`: the `plan` a run without `--yes`
+    /// reported, which this run's plan must be before it acts.
+    pub expect: Option<String>,
     pub regenerable: Vec<String>,
     /// `--only-if-upstream-gone`: remove only worktrees whose branch has an
     /// upstream that the local refs show as gone, checked at the plan, right
@@ -289,6 +295,17 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
                         options.as_of = Some(as_of(&text["--as-of=".len()..])?);
                         continue;
                     }
+                    "--expect" => {
+                        let value = args.next().ok_or(
+                            "--expect needs a PLAN: the plan a `residue remove --json` without --yes reported",
+                        )?;
+                        set_expect(&mut options, &utf8(value, "--expect PLAN")?)?;
+                        continue;
+                    }
+                    _ if text.starts_with("--expect=") => {
+                        set_expect(&mut options, &text["--expect=".len()..])?;
+                        continue;
+                    }
                     "--removal-reason" => {
                         let value = args
                             .next()
@@ -370,6 +387,18 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
         if options.as_of.is_some() {
             return Err("--as-of applies only to `residue remove`".into());
         }
+        if options.expect.is_some() {
+            return Err(
+                "--expect applies only to `residue remove --yes` and `residue service install`"
+                    .into(),
+            );
+        }
+    }
+    if options.expect.is_some() && !options.yes {
+        return Err(
+            "--expect needs --yes: it names the plan a run without --yes reported, for the run that acts on it"
+                .into(),
+        );
     }
     if options.to.is_some() && kind != "restore" {
         return Err("--to applies only to `residue restore ENTRY`".into());
@@ -457,6 +486,20 @@ fn as_of(text: &str) -> Result<i64, String> {
     })
 }
 
+/// `--expect PLAN`: once, and 32 lowercase hex digits, as `plan` gives it.
+fn set_expect(options: &mut Options, text: &str) -> Result<(), String> {
+    if options.expect.is_some() {
+        return Err("--expect can be given once".into());
+    }
+    if !crate::fingerprint::is_fingerprint(text) {
+        return Err(format!(
+            "--expect {text:?}: use the plan a `residue remove --json` without --yes reported, 32 lowercase hex digits"
+        ));
+    }
+    options.expect = Some(text.to_string());
+    Ok(())
+}
+
 fn set_trash(options: &mut Options, value: bool) -> Result<(), String> {
     match options.trash {
         Some(old) if old != value => Err("--trash and --no-trash cannot both be given".into()),
@@ -536,6 +579,75 @@ mod tests {
             paths(parse(os(&["scan", "--json", "clean"]))),
             [PathBuf::from("clean")]
         );
+    }
+
+    /// `--expect PLAN` goes with `remove --yes`, once, with 32 lowercase hex
+    /// digits; anything else is a usage error and nothing runs.
+    #[test]
+    fn expect_takes_one_plan_for_remove_yes() {
+        let plan = "0123456789abcdef0123456789abcdef";
+        let os = |w: &[&str]| w.iter().map(OsString::from).collect::<Vec<_>>();
+        let expect = |w: &[&str]| match parse(os(w)) {
+            Ok(Command::Remove(o)) => o.expect,
+            Ok(_) => panic!("{w:?} is not a remove"),
+            Err(e) => panic!("{w:?}: {e}"),
+        };
+        assert_eq!(
+            expect(&["remove", "--yes", "--expect", plan, "w"]).as_deref(),
+            Some(plan)
+        );
+        let joined = format!("--expect={plan}");
+        assert_eq!(
+            expect(&["remove", "--all", "--yes", "--idle", "2d", &joined, "."]).as_deref(),
+            Some(plan)
+        );
+        assert_eq!(expect(&["remove", "--yes", "w"]), None);
+        let err = |w: &[&str]| match parse(os(w)) {
+            Err(e) => e,
+            Ok(_) => panic!("{w:?} was accepted"),
+        };
+        assert_eq!(
+            err(&["remove", "--expect", plan, "w"]),
+            "--expect needs --yes: it names the plan a run without --yes reported, for the run that acts on it"
+        );
+        for command in ["scan", "explain", "restore", "stats"] {
+            assert_eq!(
+                err(&[command, "--expect", plan]),
+                "--expect applies only to `residue remove --yes` and `residue service install`",
+                "{command}"
+            );
+        }
+        assert_eq!(
+            err(&["remove", "--yes", "--expect", plan, "--expect", plan, "w"]),
+            "--expect can be given once"
+        );
+        assert_eq!(
+            err(&["remove", "--yes", "w", "--expect"]),
+            "--expect needs a PLAN: the plan a `residue remove --json` without --yes reported"
+        );
+        let upper = plan.to_uppercase();
+        for bad in [
+            "",
+            "none",
+            upper.as_str(),
+            &plan[1..],
+            "0123456789abcdef0123456789abcdeg",
+        ] {
+            assert_eq!(
+                err(&["remove", "--yes", "--expect", bad, "w"]),
+                format!(
+                    "--expect {bad:?}: use the plan a `residue remove --json` without --yes reported, 32 lowercase hex digits"
+                )
+            );
+        }
+    }
+
+    /// Every help line fits in 80 columns.
+    #[test]
+    fn help_fits_80_columns() {
+        for line in HELP.lines() {
+            assert!(line.chars().count() <= 80, "{line}");
+        }
     }
 
     #[test]

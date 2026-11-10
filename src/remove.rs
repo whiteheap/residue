@@ -18,6 +18,12 @@
 //! What remains: from the last check to the end of the delete, a process
 //! that opens the hidden directory by its new name, or one the probe cannot
 //! see, can still write into it, and that write is deleted with it.
+//!
+//! Between two runs, one that shows the plan and one that confirms it, the
+//! plan's own fingerprint (`plan_of`, `fingerprint::plan`) ties the second
+//! to the first: under `--expect PLAN` the run compares it before it
+//! confirms or moves anything, and on any difference does nothing and
+//! exits 4.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -30,6 +36,7 @@ use crate::activity::{Evidence, Snapshot};
 use crate::cli::{Options, Span};
 use crate::commands::{self, Target, VERSION, fail, locate};
 use crate::discover::{self, Repo};
+use crate::fingerprint::{self, At, Does, Step, Was};
 use crate::git::{self, Entry};
 use crate::hold::{self, Taken};
 use crate::inspect::{self, Fingerprint, Kept, Report, Verdict};
@@ -705,6 +712,13 @@ pub fn remove(options: &Options) -> u8 {
     let forgettable: Vec<usize> = (0..forgets.len())
         .filter(|&i| forgets[i].outcome.is_none())
         .collect();
+    let pending = !ready.is_empty() || !purgeable.is_empty() || !forgettable.is_empty();
+    // The plan as `--expect` compares it, made before anything is confirmed
+    // or done: a run whose plan is not the one a person confirmed does
+    // nothing. Each worktree is still checked against this plan before it
+    // is moved, and again after.
+    let plan = plan_of(&items, &purges, &forgets, &mode);
+    let differs = options.expect.as_ref().is_some_and(|want| *want != plan);
     if !options.json {
         // The header names the one activity snapshot every check of the plan
         // used, as `scan` and `explain` do.
@@ -718,26 +732,32 @@ pub fn remove(options: &Options) -> u8 {
             )),
             plan_text(&items, &purges, &forgets, &errors, &mode, &places, &style)
         );
+        // What a person confirms, and what an `--expect` run compares.
+        if (pending && !options.yes) || options.expect.is_some() {
+            println!("{}", style.dim(&format!("plan: {plan}")));
+        }
     }
 
-    let mut declined: Option<String> = None;
-    let pending = !ready.is_empty() || !purgeable.is_empty() || !forgettable.is_empty();
-    if pending && !options.yes {
-        declined = match confirm(ready.len(), purgeable.len(), forgettable.len(), mode.trash) {
+    let declined: Option<String> = if differs {
+        Some(PLAN_DIFFERS.to_string())
+    } else if pending && !options.yes {
+        match confirm(ready.len(), purgeable.len(), forgettable.len(), mode.trash) {
             Ok(true) => None,
             Ok(false) => Some("not confirmed".to_string()),
             Err(e) => Some(e),
-        };
-        if let Some(why) = &declined {
-            for &i in &ready {
-                items[i].outcome = Some(Outcome::Skipped(why.clone()));
-            }
-            for &i in &purgeable {
-                purges[i].outcome = Some(Outcome::Skipped(why.clone()));
-            }
-            for &i in &forgettable {
-                forgets[i].outcome = Some(Outcome::Skipped(why.clone()));
-            }
+        }
+    } else {
+        None
+    };
+    if let Some(why) = &declined {
+        for &i in &ready {
+            items[i].outcome = Some(Outcome::Skipped(why.clone()));
+        }
+        for &i in &purgeable {
+            purges[i].outcome = Some(Outcome::Skipped(why.clone()));
+        }
+        for &i in &forgettable {
+            forgets[i].outcome = Some(Outcome::Skipped(why.clone()));
         }
     }
 
@@ -844,8 +864,16 @@ pub fn remove(options: &Options) -> u8 {
         // Added last, so every field before it keeps its place.
         if let Json::Obj(fields) = &mut doc {
             fields.push(("stats", run.json()));
+            fields.push(("plan", Json::str(plan.clone())));
+            fields.push((
+                "expected_plan",
+                Json::opt(options.expect.clone(), Json::Str),
+            ));
         }
         println!("{}", doc.render());
+    } else if differs {
+        println!("nothing removed: {PLAN_DIFFERS_TEXT}");
+        println!("next: if this plan is the one to run, run again with --expect {plan}");
     } else if declined.as_deref() == Some(NO_TERMINAL) {
         println!("{NO_TERMINAL_TEXT}");
     } else if let Some(why) = declined {
@@ -855,7 +883,102 @@ pub fn remove(options: &Options) -> u8 {
     } else if let Some(line) = run.text(&mode.keep.text) {
         println!("{line}");
     }
-    if done { 0 } else { 3 }
+    if differs {
+        fingerprint::CHANGED
+    } else if done {
+        0
+    } else {
+        3
+    }
+}
+
+/// Why a run under `--expect` whose plan is not that one does nothing: the
+/// JSON `reason` of each thing the plan would act on.
+const PLAN_DIFFERS: &str = "the plan is not the one --expect names: something changed since that plan was made, so nothing was removed, trashed, purged or forgotten";
+
+/// The same, as the line a text run ends with, after `nothing removed: `.
+const PLAN_DIFFERS_TEXT: &str =
+    "the plan is not the one --expect names; something changed since that plan was made";
+
+/// The plan's fingerprint (`fingerprint::plan`), before anything is
+/// confirmed or done: each PATH's result, or each worktree a sweep found,
+/// each trash entry and each removal record the plan lists, and what the
+/// plan does with each.
+fn plan_of(items: &[Item], purges: &[Purge], forgets: &[Forget], mode: &Mode) -> String {
+    fn listed(e: &Entry) -> At<'_> {
+        At {
+            branch: e.branch.as_deref(),
+            head: e.head.as_deref(),
+        }
+    }
+    let mut steps = Vec::new();
+    for item in items {
+        let does = match &item.outcome {
+            None if mode.trash => Does::Trash,
+            None => Does::Remove,
+            Some(Outcome::Invalid(_)) => Does::Invalid,
+            Some(_) => Does::Keep,
+        };
+        steps.push(match &item.target {
+            Some(t) => Step::Worktree {
+                path: &t.canonical,
+                repository: Some(&t.repo.common_dir),
+                does,
+                at: listed(&t.entry),
+            },
+            None => Step::Worktree {
+                path: &item.arg,
+                repository: None,
+                does,
+                at: At {
+                    branch: None,
+                    head: None,
+                },
+            },
+        });
+    }
+    for p in purges {
+        let does = match &p.outcome {
+            None if p.item.holds_only_record() => Does::Clear,
+            None => Does::Purge,
+            Some(_) => Does::Keep,
+        };
+        steps.push(Step::Trash {
+            entry: &p.item.dir,
+            does,
+            record: p.item.record.as_ref().ok().map(|r| Was {
+                original: &r.original,
+                at: At {
+                    branch: r.branch.as_deref(),
+                    head: r.head.as_deref(),
+                },
+                when: r.trashed,
+            }),
+            listed: p.item.registered.as_ref().map(listed),
+        });
+    }
+    for f in forgets {
+        let record = f.item.record.as_ref().ok();
+        let does = match (&f.outcome, record) {
+            (None, Some(_)) => Does::Forget,
+            (None, None) => Does::Clear,
+            (Some(_), _) => Does::Keep,
+        };
+        steps.push(Step::Record {
+            entry: &f.item.dir,
+            does,
+            record: record.map(|r| Was {
+                original: &r.original,
+                at: At {
+                    branch: r.branch.as_deref(),
+                    head: Some(&r.head),
+                },
+                when: r.removed,
+            }),
+            pinned: record.map_or_else(Vec::new, |r| r.kept.iter().map(String::as_str).collect()),
+        });
+    }
+    fingerprint::plan(&steps, mode.keep.seconds, mode.keep_removed.seconds)
 }
 
 /// The stats ledger's lines for what this run freed or moved: a deletion
@@ -2599,6 +2722,12 @@ fn json(
                 (
                     "worktree",
                     Json::opt(item.report.as_ref(), output::report_json),
+                ),
+                // Added after the others, so every field before it keeps its
+                // place.
+                (
+                    "repository",
+                    Json::opt(item.target.as_ref(), |t| Json::path(&t.repo.common_dir)),
                 ),
             ])
         })

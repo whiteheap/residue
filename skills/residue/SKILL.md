@@ -70,7 +70,9 @@ When the user asks you to clean up worktrees:
 
 1. Run `residue scan` in the repository, or `residue scan PATH` for a folder of repositories. It deletes nothing. It lists each linked worktree as `candidate`, `keep`, `unknown` or `stale`, with its size and what kept it.
 2. Show the user the candidates. A candidate can still belong to a paused session, so the user decides.
-3. Remove only the ones the user names, with `residue remove --yes --json PATH...`, and read the exit status as in step 4.
+3. Remove only the ones the user names, and only as the user saw them:
+   1. `residue remove --json PATH... </dev/null` prints the plan, with `plan` and `as_of`, removes nothing and exits 3: `results[].result` is `skipped` for each one it would remove, and any other value names one it keeps. Show the user both.
+   2. Once the user confirms, run `residue remove --yes --json --as-of AS_OF --expect PLAN PATH...` with that `as_of`, that `plan` and the same PATHs, and read the exit status as in step 4. `4` means something changed since that plan and nothing was removed: show the user the plan this run printed, and on a yes run it again with its `as_of` and `plan`.
 
 `residue explain PATH` shows every check for one worktree, and why it passed or failed. Run `residue remove --all`, `residue watch` or `residue service install` only when the user asks for that command.
 
