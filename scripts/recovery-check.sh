@@ -254,6 +254,9 @@ mkdir -p "$HOME" "$work/bin"
 git config --global user.name recovery-check
 git config --global user.email recovery-check@example.invalid
 git config --global init.defaultBranch main
+# No `git maintenance run --auto --detach` after a commit, which residue
+# would see as a use of the worktree (#180, #195).
+git config --global maintenance.auto false
 exec </dev/null
 
 # The wrapper. Its mode is the contents of $work/mode, so one script serves

@@ -82,6 +82,9 @@ XDG_STATE_HOME="$S/state"
 HOME="$S/home"
 export XDG_STATE_HOME HOME
 mkdir -p "$HOME"
+# No `git maintenance run --auto --detach` after a commit, which residue
+# would see as a use of the worktree (#180, #195).
+git config --global maintenance.auto false
 # Commits and reflog entries a week old.
 GIT_AUTHOR_DATE="2026-01-01T00:00:00Z"
 GIT_COMMITTER_DATE="2026-01-01T00:00:00Z"
