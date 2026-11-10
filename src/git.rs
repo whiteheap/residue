@@ -740,6 +740,23 @@ fn folder_and_ancestors(folder: &[u8]) -> impl Iterator<Item = &[u8]> {
 
 /// One `git status --porcelain=v1 -z` run with `ignored` as its
 /// `--ignored` mode.
+///
+/// Clean and process filters stay on (#189): they are how this answers
+/// right for Git LFS. Git runs a tracked file's `filter.NAME.clean` or
+/// `filter.NAME.process` when it has to read the file again: its size
+/// matches the index but another stat field does not (a touch, an edit
+/// that keeps the size), or the index is no newer than the file, to the
+/// second, as a fresh worktree's often is. residue never rewrites the index
+/// (`GIT_OPTIONAL_LOCKS=0`), so such an entry runs the filter on every
+/// scan. With a valid index entry, or a file whose size changed, none runs.
+/// For Git LFS, the filter turns the file back into the pointer Git
+/// committed: with it off, a touched LFS file reads as modified, and
+/// `tracked_changes` keeps a worktree that is clean. Git has no setting
+/// that skips the filter and keeps that answer. The command comes from Git
+/// config files, never from the repository's tree (`.gitattributes` only
+/// names a driver) or the environment (`CONFIG_ENV`). textconv is a diff
+/// driver: status runs none. Measured with Git 2.50.1 and Git LFS 3.8.1;
+/// [`remove_worktree`]'s `git status` runs the same filters.
 fn status_with(dir: &Path, ignored: &str) -> Result<Status, String> {
     let out = git(
         dir,
@@ -952,7 +969,8 @@ fn config_values(exit: Exit, what: &str) -> Result<Vec<Vec<u8>>, String> {
 /// entries that name the worktree, and keeps them held while it deletes,
 /// also after residue has exited (`hold::pass_to`). fsmonitor and hooks are
 /// off, but every program Git starts inherits them too, the `git status`
-/// it runs first and that one's filter drivers among them, and one that
+/// it runs first and that one's filter drivers among them (they stay on,
+/// as in [`status_with`]), and one that
 /// outlives Git keeps them held: a restore then refuses, and says to look
 /// with `lsof`. A timeout kills Git, not its children.
 pub fn remove_worktree(main: &Path, worktree: &Path, holds: &[&Hold]) -> Result<(), String> {
