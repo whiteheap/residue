@@ -2395,6 +2395,144 @@ pub fn space(path: &Path) -> io::Result<Space> {
     })
 }
 
+/// What [`read_in`] found.
+pub enum Read {
+    /// No folder at the path: a name on it is missing or not a folder.
+    NoFolder,
+    /// The folder holds no entry by that name.
+    NoFile,
+    /// The file's bytes, and the folder's `(device, inode)`.
+    File(Vec<u8>, (u64, u64)),
+}
+
+/// Reads the regular file `name` in the folder `dir`, at most `limit`
+/// bytes, where `dir` comes from a file a cloned repository can hold (a
+/// worktree's Cargo config, `target_dir`). `dir` must be absolute, with no
+/// `.` or `..`. It opens `dir` from `/` one name at a time, never through a
+/// symbolic link, as the walk opens a worktree, and looks a name up only in
+/// a folder on one of `devices`, the filesystems the worktree's own path is
+/// on: a path from that file never makes residue look into another
+/// filesystem, which could wait on a network server or mount an
+/// automounted folder. `name` is opened only once lstat shows a regular
+/// file, so never a FIFO or a device.
+pub fn read_in(dir: &Path, name: &str, devices: &[u64], limit: usize) -> io::Result<Read> {
+    let mut names = Vec::new();
+    for part in dir.components() {
+        match part {
+            Component::RootDir => {}
+            Component::Normal(n) => names.push(n),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} is not a canonical path", dir.display()),
+                ));
+            }
+        }
+    }
+    if !dir.has_root() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not an absolute path", dir.display()),
+        ));
+    }
+    // SAFETY: open reads the NUL-terminated literal; the descriptor it
+    // returns is ours.
+    let fd = unsafe { libc::open(c"/".as_ptr(), ABOVE) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor is open and nothing else owns it.
+    let mut at = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut here = fstat(at.as_fd())?;
+    let mut reached = PathBuf::from("/");
+    let elsewhere = |path: &Path| {
+        at_path(
+            path,
+            io::Error::other(
+                "on another filesystem than the worktree's, which residue does not look into",
+            ),
+        )
+    };
+    for part in names {
+        if !devices.contains(&here.dev()) {
+            return Err(elsewhere(&reached));
+        }
+        reached.push(part);
+        let c = leaf(&reached).map_err(|e| at_path(&reached, e))?;
+        let next = match lstat_at(at.as_fd(), &c) {
+            Ok(next) => next,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Read::NoFolder),
+            Err(e) => return Err(at_path(&reached, e)),
+        };
+        if next.link {
+            return Err(at_path(
+                &reached,
+                io::Error::other("a symbolic link, which residue does not follow"),
+            ));
+        }
+        if !next.is_dir() {
+            return Ok(Read::NoFolder);
+        }
+        at = open_dir(at.as_fd(), &c, ABOVE).map_err(|e| at_path(&reached, e))?;
+        here = fstat(at.as_fd()).map_err(|e| at_path(&reached, e))?;
+        if (here.dev(), here.ino()) != (next.dev(), next.ino()) {
+            return Err(at_path(&reached, changed("another folder is in its place")));
+        }
+    }
+    if !devices.contains(&here.dev()) {
+        return Err(elsewhere(&reached));
+    }
+    let folder = (here.dev(), here.ino());
+    let path = reached.join(name);
+    let c = leaf(&path).map_err(|e| at_path(&path, e))?;
+    let meta = match lstat_at(at.as_fd(), &c) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Read::NoFile),
+        Err(e) => return Err(at_path(&path, e)),
+    };
+    if meta.link {
+        return Err(at_path(
+            &path,
+            io::Error::other("a symbolic link, which residue does not follow"),
+        ));
+    }
+    // A regular file: `file` counts a symbolic link too, refused above.
+    if !meta.is_file() {
+        return Err(at_path(&path, io::Error::other("not a regular file")));
+    }
+    // SAFETY: openat reads the NUL-terminated name, which outlives the
+    // call; the descriptor it returns is ours.
+    let fd = unsafe {
+        libc::openat(
+            at.as_raw_fd(),
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(at_path(&path, io::Error::last_os_error()));
+    }
+    // SAFETY: the descriptor is open and nothing else owns it.
+    let file = unsafe { OwnedFd::from_raw_fd(fd) };
+    let now = fstat(file.as_fd()).map_err(|e| at_path(&path, e))?;
+    if (now.dev(), now.ino()) != (meta.dev(), meta.ino()) {
+        return Err(at_path(&path, changed("another file is in its place")));
+    }
+    let mut bytes = Vec::new();
+    io::Read::read_to_end(
+        &mut io::Read::take(fs::File::from(file), limit as u64 + 1),
+        &mut bytes,
+    )
+    .map_err(|e| at_path(&path, e))?;
+    if bytes.len() > limit {
+        return Err(at_path(
+            &path,
+            io::Error::other(format!("larger than {limit} bytes")),
+        ));
+    }
+    Ok(Read::File(bytes, folder))
+}
+
 #[cfg(test)]
 mod tests {
     //! The walk's folder opens, on real folders in a temporary directory:

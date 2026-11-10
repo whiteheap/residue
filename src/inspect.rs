@@ -238,6 +238,11 @@ pub struct Report {
     /// An error when residue could not read the mark, which counts as
     /// marked for that rule.
     pub restored: Result<Option<crate::removed::Mark>, String>,
+    /// The Cargo build folder the worktree's own config names outside it,
+    /// which a removal leaves behind, or why residue could not read that
+    /// config (`target_dir::find`, #190). Never a check: it changes no
+    /// verdict. `explain` and `remove` measure it (`TargetDir::measure`).
+    pub target_dir: Option<crate::target_dir::TargetDir>,
 }
 
 impl Report {
@@ -257,6 +262,7 @@ impl Report {
             rule_sources: Vec::new(),
             fingerprint: Err("not measured".into()),
             restored: Ok(None),
+            target_dir: None,
         }
     }
 
@@ -299,6 +305,15 @@ impl Report {
             Verdict::Candidate
         };
         self
+    }
+
+    /// Measures the Cargo build folder the worktree names outside itself,
+    /// for `explain` and the `remove` plan; `scan` names it unmeasured. It
+    /// changes no check and no verdict.
+    pub fn measure_target_dir(&mut self, snapshot: &Snapshot) {
+        if let (Some(t), Some(dir)) = (self.target_dir.take(), self.canonical.as_deref()) {
+            self.target_dir = t.measure(dir, snapshot);
+        }
     }
 
     pub fn blocking(&self) -> impl Iterator<Item = &Check> {
@@ -459,6 +474,7 @@ pub fn worktree(
     }
     r.rule_sources = effective_sources(policy, repo.values);
     gather_facts(&mut r, entry, &canonical);
+    r.target_dir = crate::target_dir::find(&canonical);
     r.finish()
 }
 

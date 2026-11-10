@@ -198,6 +198,14 @@ residue runs every check below on every linked worktree. A worktree is a **candi
 
 Some facts never block, and residue reports each one separately instead of calling a worktree "safe": commits that are on the branch but on no remote-tracking ref, whether the branch's upstream is gone, the last change and what made it, and size. `scan` and `explain` do not fetch, so "local-only" means local-only as of the last fetch.
 
+A Cargo build folder that the worktree's own `.cargo/config.toml` puts outside it (`build.target-dir`) is not part of the worktree, and removing the worktree leaves it. `explain` and the `remove` plan name it and its size, and the removal line repeats it, for example:
+
+```text
+  left behind: /Users/me/build/fix-login, 2.1 GB (Cargo build folder from .cargo/config.toml, not removed)
+```
+
+residue measures that folder only when it holds the `CACHEDIR.TAG` Cargo writes, and deletes nothing more than before. Delete it yourself once no other checkout uses it. [For coding agents](docs/reference.md#for-coding-agents) has the JSON and what residue does not read.
+
 ## Remove a worktree
 
 A passing check is not a closed race. From the last check until Git finishes deleting, a process that opens the hidden path, or one the probe cannot see, can still write, and that write is deleted with the worktree. If residue is killed during `git worktree remove` itself, the directory may already be partial, and residue does not promise to roll that back.

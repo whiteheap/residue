@@ -560,13 +560,14 @@ pub fn explain(options: &Options) -> u8 {
     };
     let snapshot = Snapshot::take();
     let kept = Kept::of(&target.repo.main, &target.repo.common_dir);
-    let report = inspect::worktree(
+    let mut report = inspect::worktree(
         &target.entry,
         &target.repo.common_dir,
         &kept,
         &snapshot,
         &policy,
     );
+    report.measure_target_dir(&snapshot);
     if options.json {
         let doc = Json::Obj(vec![
             ("schema", Json::str(output::SCHEMA_EXPLAIN)),
@@ -743,6 +744,20 @@ pub fn explain_text(r: &Report, repo: &Repo, places: &Places, style: &Style) -> 
             "reclaimable leaves out hard links from outside; clones are not detected"
         };
         fact(&mut out, "", style.dim(caveat));
+    }
+    if let (Some(t), Some(dir)) = (&r.target_dir, &r.canonical) {
+        let config = output::target_dir_config(t, dir);
+        let text = match (&t.path, output::target_dir_phrase(t, places)) {
+            (Err(why), _) => format!("not known: residue could not read {config}: {}", clean(why)),
+            (Ok(path), None) => format!(
+                "{} is not there (build.target-dir in {config})",
+                places.show(path)
+            ),
+            (Ok(_), Some(phrase)) => format!(
+                "{phrase}; outside the worktree, so a removal leaves it (build.target-dir in {config})"
+            ),
+        };
+        fact(&mut out, "cargo build folder", text);
     }
     if !r.ignored.is_empty() {
         const SHOWN: usize = 8;

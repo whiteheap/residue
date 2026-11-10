@@ -27,6 +27,7 @@ mod restore;
 mod run;
 mod service;
 mod stats;
+mod target_dir;
 mod trash;
 mod watch;
 
