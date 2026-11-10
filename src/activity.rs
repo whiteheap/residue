@@ -526,19 +526,19 @@ mod unlisted {
         Unread,
     }
 
-    /// Why lsof's answer cannot show that no process of yours is using a
-    /// worktree, or `None` when it can. `listed` are the processes listed
-    /// before lsof ran, `printed` (sorted) those lsof printed, `me` is
-    /// residue, `euid` your user, and `owner` reads a process once lsof is
-    /// done. A process that started after the listing is not looked at:
-    /// lsof had not listed it either.
-    pub fn hidden(
+    /// The processes lsof did not print that may be yours: those of yours,
+    /// with their names, and those whose user residue cannot read. `listed`
+    /// are the processes listed before lsof ran, `printed` (sorted) those
+    /// lsof printed, `me` is residue, `euid` your user, and `owner` reads a
+    /// process once lsof is done. A process that started after the listing
+    /// is not looked at: lsof had not listed it either.
+    pub fn unseen(
         listed: &[u32],
         printed: &[u32],
         me: u32,
         euid: u32,
         owner: impl Fn(u32) -> Owner,
-    ) -> Option<String> {
+    ) -> (Vec<(u32, String)>, Vec<u32>) {
         let mut yours: Vec<(u32, String)> = Vec::new();
         let mut unread: Vec<u32> = Vec::new();
         for &pid in listed {
@@ -552,7 +552,13 @@ mod unlisted {
                 Owner::Unread => unread.push(pid),
             }
         }
-        let of_yours = match yours.as_slice() {
+        (yours, unread)
+    }
+
+    /// Why lsof's answer cannot show that no process of yours is using a
+    /// worktree, from what `unseen` found, or `None` when it can.
+    pub fn describe(yours: &[(u32, String)], unread: &[u32]) -> Option<String> {
+        let of_yours = match yours {
             [] => None,
             [(pid, command)] => Some(format!("{command}[{pid}], a running process of yours")),
             [(pid, command), ..] => Some(format!(
@@ -560,7 +566,7 @@ mod unlisted {
                 yours.len()
             )),
         };
-        let what = match (of_yours, unread.as_slice()) {
+        let what = match (of_yours, unread) {
             (None, []) => return None,
             (Some(of_yours), []) => of_yours,
             (Some(of_yours), more) => format!(
@@ -658,29 +664,9 @@ mod platform {
                 ),
             );
         }
-        let mut cmd = Command::new("/usr/sbin/lsof");
-        // -n -P: no DNS or port lookups. -F pcn: machine-readable fields for
-        // pid, command and name; lsof adds the fd field on its own. lsof
-        // lists itself too, so it runs in `/`: in residue's directory, its
-        // own row would mark the worktree residue runs in as in use by lsof.
-        // LC_ALL=C: it prints each byte of a name by itself, in the form
-        // `lsof::spell` writes a directory in.
-        cmd.args(["-n", "-P", "-F", "pcn"])
-            .env("LC_ALL", "C")
-            .current_dir("/");
-        let out = match run::run(&mut cmd, Duration::from_secs(30), 512 << 20) {
+        let out = match lsof(&[]) {
             Ok(out) => out,
-            Err(RunError::NotFound) => {
-                return unavailable(BACKEND, "probe_missing", "/usr/sbin/lsof not found".into());
-            }
-            Err(RunError::Timeout(d)) => {
-                return unavailable(
-                    BACKEND,
-                    "timeout",
-                    format!("lsof ran longer than {}s", d.as_secs()),
-                );
-            }
-            Err(e) => return unavailable(BACKEND, "probe_failed", format!("lsof: {e}")),
+            Err((reason, detail)) => return unavailable(BACKEND, reason, detail),
         };
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -691,14 +677,98 @@ mod platform {
                 format!("lsof exited with {}: {first}", out.status),
             );
         }
-        let mut uses = Vec::new();
+        let mut read = Read::default();
+        if let Err(detail) = parse(&out.stdout, &mut read) {
+            return unavailable(BACKEND, "parse_error", detail.into());
+        }
+        read.printed.sort_unstable();
+        // SAFETY: geteuid only returns this process's effective user.
+        let euid = unsafe { libc::geteuid() };
+        let (mut yours, mut unread) = unlisted::unseen(&listed, &read.printed, me, euid, owner);
+        if !yours.is_empty() || !unread.is_empty() {
+            // One that lsof read while it was starting, as one launchd
+            // spawns can be, is listed now: lsof is asked again for those
+            // alone. A sandbox hides them from this run too.
+            let pids: Vec<String> = yours
+                .iter()
+                .map(|(pid, _)| *pid)
+                .chain(unread.iter().copied())
+                .map(|pid| pid.to_string())
+                .collect();
+            // lsof exits 1 when a process it was asked for is gone.
+            if let Ok(out) = lsof(&["-p", &pids.join(",")])
+                .map_err(drop)
+                .and_then(|out| match out.status.code() {
+                    Some(0 | 1) => Ok(out),
+                    _ => Err(()),
+                })
+            {
+                if let Err(detail) = parse(&out.stdout, &mut read) {
+                    return unavailable(BACKEND, "parse_error", detail.into());
+                }
+                read.printed.sort_unstable();
+                (yours, unread) = unlisted::unseen(&listed, &read.printed, me, euid, owner);
+            }
+        }
+        if let Some(detail) = unlisted::describe(&yours, &unread) {
+            return unavailable(BACKEND, "probe_failed", detail);
+        }
+        Snapshot {
+            backend: BACKEND,
+            state: Ok(Seen {
+                uses: read.uses,
+                inspected: read.inspected,
+                total: Some(listed.len()),
+                limits: None,
+                spelling: Some(super::lsof::spell),
+                unnamed: Vec::new(),
+                hidden: None,
+            }),
+        }
+    }
+
+    /// What residue read from lsof's answers.
+    #[derive(Default)]
+    struct Read {
+        uses: Vec<Use>,
+        /// Every process lsof printed.
+        printed: Vec<u32>,
+        /// Those whose working directory and files lsof read whole.
+        inspected: usize,
+    }
+
+    /// One run of lsof, with `more` arguments, or the reason and detail to
+    /// give when it could not run.
+    fn lsof(more: &[&str]) -> Result<run::Captured, (&'static str, String)> {
+        let mut cmd = Command::new("/usr/sbin/lsof");
+        // -n -P: no DNS or port lookups. -F pcn: machine-readable fields for
+        // pid, command and name; lsof adds the fd field on its own. lsof
+        // lists itself too, so it runs in `/`: in residue's directory, its
+        // own row would mark the worktree residue runs in as in use by lsof.
+        // LC_ALL=C: it prints each byte of a name by itself, in the form
+        // `lsof::spell` writes a directory in.
+        cmd.args(["-n", "-P", "-F", "pcn"])
+            .args(more)
+            .env("LC_ALL", "C")
+            .current_dir("/");
+        match run::run(&mut cmd, Duration::from_secs(30), 512 << 20) {
+            Ok(out) => Ok(out),
+            Err(RunError::NotFound) => Err(("probe_missing", "/usr/sbin/lsof not found".into())),
+            Err(RunError::Timeout(d)) => {
+                Err(("timeout", format!("lsof ran longer than {}s", d.as_secs())))
+            }
+            Err(e) => Err(("probe_failed", format!("lsof: {e}"))),
+        }
+    }
+
+    /// Adds what an answer of lsof's `-F pcn` holds to `read`, or says why
+    /// residue cannot read it.
+    fn parse(stdout: &[u8], read: &mut Read) -> Result<(), &'static str> {
         let mut pid: Option<u32> = None;
         let mut command = String::new();
-        let mut inspected = 0;
-        let mut printed: Vec<u32> = Vec::new();
         // Whether lsof could read everything of the current process.
         let mut whole = false;
-        for line in out.stdout.split(|b| *b == b'\n') {
+        for line in stdout.split(|b| *b == b'\n') {
             let Some((&field, value)) = line.split_first() else {
                 continue;
             };
@@ -708,17 +778,13 @@ mod platform {
                         .ok()
                         .and_then(|v| v.parse::<u32>().ok());
                     let Some(p) = parsed else {
-                        return unavailable(
-                            BACKEND,
-                            "parse_error",
-                            "lsof printed a process id residue cannot read".into(),
-                        );
+                        return Err("lsof printed a process id residue cannot read");
                     };
                     if pid.is_some() && whole {
-                        inspected += 1;
+                        read.inspected += 1;
                     }
                     pid = Some(p);
-                    printed.push(p);
+                    read.printed.push(p);
                     command.clear();
                     whole = true;
                 }
@@ -727,13 +793,9 @@ mod platform {
                 // it back is ambiguous, writing a directory that way is not.
                 b'n' if value.first() == Some(&b'/') => {
                     let Some(p) = pid else {
-                        return unavailable(
-                            BACKEND,
-                            "parse_error",
-                            "lsof printed a file before its process".into(),
-                        );
+                        return Err("lsof printed a file before its process");
                     };
-                    uses.push(Use {
+                    read.uses.push(Use {
                         pid: p,
                         command: command.clone(),
                         path: value.to_vec(),
@@ -744,26 +806,9 @@ mod platform {
             }
         }
         if pid.is_some() && whole {
-            inspected += 1;
+            read.inspected += 1;
         }
-        printed.sort_unstable();
-        // SAFETY: geteuid only returns this process's effective user.
-        let euid = unsafe { libc::geteuid() };
-        if let Some(detail) = unlisted::hidden(&listed, &printed, me, euid, owner) {
-            return unavailable(BACKEND, "probe_failed", detail);
-        }
-        Snapshot {
-            backend: BACKEND,
-            state: Ok(Seen {
-                uses,
-                inspected,
-                total: Some(listed.len()),
-                limits: None,
-                spelling: Some(super::lsof::spell),
-                unnamed: Vec::new(),
-                hidden: None,
-            }),
-        }
+        Ok(())
     }
 
     /// Whose process `pid` is, read after lsof is done. First from
@@ -894,7 +939,26 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::super::unlisted::Owner;
-        use super::{list_pids, owner, unread};
+        use super::{Read, list_pids, owner, parse, unread};
+
+        /// The second answer, for the processes the first left out, adds to
+        /// what the first gave.
+        #[test]
+        fn a_second_lsof_answer_adds_to_the_first() {
+            let mut read = Read::default();
+            assert!(parse(b"p10\ncsleep\nfcwd\nn/w/a\n", &mut read).is_ok());
+            assert!(parse(b"p11\ncnode\nfcwd\nn/w/b\np12\nccat\nfcwd\nncwd info error: Operation not permitted\n", &mut read).is_ok());
+            assert_eq!(read.printed, [10, 11, 12]);
+            assert_eq!(read.inspected, 2);
+            let uses: Vec<(u32, &[u8])> = read
+                .uses
+                .iter()
+                .map(|u| (u.pid, u.path.as_slice()))
+                .collect();
+            assert_eq!(uses, [(10, &b"/w/a"[..]), (11, &b"/w/b"[..])]);
+            assert!(parse(b"n/w/c\n", &mut Read::default()).is_err());
+            assert!(parse(b"pten\n", &mut Read::default()).is_err());
+        }
 
         #[test]
         fn a_name_lsof_could_not_read_is_a_gap_and_a_closed_descriptor_is_not() {
@@ -2825,7 +2889,8 @@ mod tests {
             7 => Owner::Unread,
             _ => panic!("process {pid} was printed, or is residue, and must not be looked up"),
         };
-        unlisted::hidden(&[1, 2, 3, 4, 5, 6, 7, 8], printed, 2, 501, owner)
+        let (yours, unread) = unlisted::unseen(&[1, 2, 3, 4, 5, 6, 7, 8], printed, 2, 501, owner);
+        unlisted::describe(&yours, &unread)
     }
 
     #[test]
