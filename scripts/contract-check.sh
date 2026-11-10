@@ -2486,5 +2486,203 @@ elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), 
 elif [ "$(jq -r --arg plan "$plan" '.plan == $plan and .expected_plan == $plan' "$out")" != true ]; then fail "plan $(jq -r .plan "$out"), want $plan"
 elif untouched "$before"; then ok; fi
 
+# 20. macOS: residue in a sandbox that lets it list every process but
+# inspect only its own (Seatbelt, `sandbox-exec`), the shape a coding
+# agent's command sandbox can have. lsof there lists only the sandbox's
+# processes and still exits 0. A sleep outside the sandbox works in w:
+# outside, w is in_use by it; inside, its activity must be unknown
+# (probe_failed), naming what lsof did not list, and `remove --yes` must
+# keep w, never take it as not_observed.
+sandboxed_case() {
+    name=activity-sandboxed
+    make_repo
+    local before holder i busy explain_status outside real=$bin listed
+    local profile=$work/$name.sb
+    printf '%s\n' '(version 1)' '(allow default)' '(deny process-info*)' \
+        '(allow process-info-listpids)' '(allow process-info* (target same-sandbox))' >"$profile"
+    if ! sandbox-exec -f "$profile" /usr/bin/true 2>/dev/null; then
+        echo "skip $name: sandbox-exec cannot apply a profile here (already in a sandbox?)"
+        return
+    fi
+    before=$(sums "$wt")
+    (cd "$wt/sub" && exec sleep 300) >/dev/null 2>&1 &
+    holder=$!
+    holders="$holders $holder"
+    for ((i = 0; i < 100; i++)); do
+        case $(ps -o comm= -p "$holder" 2>/dev/null) in *sleep) break ;; esac
+        sleep 0.1
+    done
+    # What lsof lists from inside the sandbox, as residue runs it.
+    listed=$(cd / && sandbox-exec -f "$profile" /usr/sbin/lsof -n -P -F p 2>/dev/null | grep -c '^p')
+    run explain --json "$wt"
+    outside=$work/$name.outside
+    mv "$out" "$outside" || exit 2
+    bin=/usr/bin/sandbox-exec
+    run -f "$profile" "$real" explain --json "$wt"
+    explain_status=$status
+    busy=$work/$name.busy
+    mv "$out" "$busy" || exit 2
+    run -f "$profile" "$real" remove --yes --json --no-trash "$wt"
+    bin=$real
+    kill "$holder" 2>/dev/null
+    wait "$holder" 2>/dev/null
+    local hidden='.state == "unknown" and .reason == "probe_failed" and (.detail | startswith("lsof did not list"))'
+    if ! jq -e --argjson pid "$holder" '.worktree.activity.state == "in_use" and any(.worktree.activity.processes[]; .pid == $pid)' "$outside" >/dev/null; then
+        fail "outside the sandbox, with sleep[$holder] in it, explain says $(jq -c '.worktree.activity' "$outside")"
+    elif [ "$explain_status" != 0 ]; then fail "in the sandbox, explain exit $explain_status, want 0"
+    elif ! jq -e ".worktree.verdict == \"unknown\" and (.worktree.activity | $hidden) and (.activity.available == false)" "$busy" >/dev/null; then
+        fail "in the sandbox (pids lsof lists there: $listed), with sleep[$holder] in w, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$busy")"
+    elif [ "$status" != 3 ]; then fail "in the sandbox, remove --yes exit $status, want 3"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), want refused"
+    elif [ "$(failing_checks 0)" != activity ]; then fail "failing checks: $(failing_checks 0), want activity"
+    elif ! jq -e ".results[0].worktree.activity | $hidden" "$out" >/dev/null; then
+        fail "in the sandbox, remove's activity is $(jq -c '.results[0].worktree.activity' "$out")"
+    elif untouched "$before"; then
+        ok
+        echo "     pids lsof lists in the sandbox: $listed; $(jq -r '.worktree.activity.detail' "$busy")"
+    fi
+}
+if [ "$(uname -s)" = Darwin ] && [ -x /usr/bin/sandbox-exec ]; then
+    sandboxed_case
+else
+    echo "skip activity-sandboxed: it runs on macOS, with sandbox-exec"
+fi
+
+# 20b. macOS: residue in a sandbox that lets it list and inspect every
+# process but read the files only of its own (it denies
+# `process-info-pidfdinfo` outside the sandbox). lsof lists a process
+# outside and prints `FD info error` in place of its files. A sleep outside
+# with a file open in w and its working directory elsewhere: outside, w is
+# in_use by it; inside, its activity must be unknown (probe_failed), and
+# `remove --yes` must keep w.
+sandboxed_files_case() {
+    name=activity-sandboxed-files
+    make_repo
+    local before holder i explain_status outside busy real=$bin
+    local profile=$work/$name.sb
+    printf '%s\n' '(version 1)' '(allow default)' '(deny process-info-pidfdinfo)' \
+        '(allow process-info-pidfdinfo (target same-sandbox))' >"$profile"
+    if ! sandbox-exec -f "$profile" /usr/bin/true 2>/dev/null; then
+        echo "skip $name: sandbox-exec cannot apply a profile here (already in a sandbox?)"
+        return
+    fi
+    before=$(sums "$wt")
+    (cd "$work" && exec sleep 300 3<"$wt/sub/file.txt") >/dev/null 2>&1 &
+    holder=$!
+    holders="$holders $holder"
+    for ((i = 0; i < 100; i++)); do
+        case $(ps -o comm= -p "$holder" 2>/dev/null) in *sleep) break ;; esac
+        sleep 0.1
+    done
+    run explain --json "$wt"
+    outside=$work/$name.outside
+    mv "$out" "$outside" || exit 2
+    bin=/usr/bin/sandbox-exec
+    run -f "$profile" "$real" explain --json "$wt"
+    explain_status=$status
+    busy=$work/$name.busy
+    mv "$out" "$busy" || exit 2
+    run -f "$profile" "$real" remove --yes --json --no-trash "$wt"
+    bin=$real
+    kill "$holder" 2>/dev/null
+    wait "$holder" 2>/dev/null
+    local gap='.state == "unknown" and .reason == "probe_failed" and (.detail | startswith("lsof could not read every file of"))'
+    if ! jq -e --argjson pid "$holder" '.worktree.activity.state == "in_use" and any(.worktree.activity.processes[]; .pid == $pid)' "$outside" >/dev/null; then
+        fail "outside the sandbox, with sleep[$holder] holding a file in w, explain says $(jq -c '.worktree.activity' "$outside")"
+    elif [ "$explain_status" != 0 ]; then fail "in the sandbox, explain exit $explain_status, want 0"
+    elif ! jq -e ".worktree.verdict == \"unknown\" and (.worktree.activity | $gap)" "$busy" >/dev/null; then
+        fail "in the sandbox, with sleep[$holder] holding a file in w, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$busy")"
+    elif [ "$status" != 3 ]; then fail "in the sandbox, remove --yes exit $status, want 3"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), want refused"
+    elif [ "$(failing_checks 0)" != activity ]; then fail "failing checks: $(failing_checks 0), want activity"
+    elif untouched "$before"; then
+        ok
+        echo "     $(jq -r '.worktree.activity.detail' "$busy" | cut -c1-200)"
+    fi
+}
+if [ "$(uname -s)" = Darwin ] && [ -x /usr/bin/sandbox-exec ]; then
+    sandboxed_files_case
+else
+    echo "skip activity-sandboxed-files: it runs on macOS, with sandbox-exec"
+fi
+
+# 21. Linux: a process of yours running with another of your groups, as
+# `sg` or `newgrp` leave a shell, is listed, but the kernel shows its files
+# only to a process with the same group, or to root. A sleep started that
+# way works in w: explain must say unknown (probe_failed), naming a process
+# of yours, and
+# `remove --yes` must keep w. Once the sleep exits, w is a candidate again,
+# so the failure was the sleep's. (In a PID namespace of its own residue
+# is unknown anyway: scripts/contained-check.sh.)
+other_group_case() {
+    name=activity-other-group
+    local group before holder job i
+    group=$(id -Gn | tr ' ' '\n' | grep -vxF "$(id -gn)" | head -n 1)
+    if [ "$(id -u)" = 0 ]; then
+        echo "skip $name: root may read every process"
+        return
+    elif ! command -v sg >/dev/null; then
+        echo "skip $name: no sg"
+        return
+    elif [ -z "$group" ]; then
+        echo "skip $name: $(id -un) is in no group but its own"
+        return
+    fi
+    make_repo
+    before=$(sums "$wt")
+    # sg may run the command in a child, so the sleep writes its own PID.
+    printf 'cd %q && echo $$ >%q && exec sleep 300\n' "$wt/sub" "$work/$name.pid" >"$work/$name.sh"
+    sg "$group" -c "exec sh $work/$name.sh" >/dev/null 2>&1 &
+    job=$!
+    holders="$holders $job"
+    holder=
+    for ((i = 0; i < 100; i++)); do
+        [ -s "$work/$name.pid" ] && holder=$(cat "$work/$name.pid")
+        if [ -n "$holder" ]; then
+            case $(ps -o comm= -p "$holder" 2>/dev/null) in *sleep) break ;; esac
+        fi
+        kill -0 "$job" 2>/dev/null || break
+        sleep 0.1
+    done
+    if [ -z "$holder" ] || [ "$(ps -o group= -p "$holder" 2>/dev/null | tr -d ' ')" != "$group" ]; then
+        echo "skip $name: sg $group did not start a sleep in group $group"
+        [ -z "$holder" ] || kill "$holder" 2>/dev/null
+        wait "$job" 2>/dev/null
+        return
+    fi
+    run explain --json "$wt"
+    local busy=$work/$name.busy explain_status=$status
+    mv "$out" "$busy" || exit 2
+    run remove --yes --json --no-trash "$wt"
+    kill "$holder" 2>/dev/null
+    wait "$job" 2>/dev/null
+    # The sleep, or the shell sg started for it, which runs with that group too.
+    local refused='.state == "unknown" and .reason == "probe_failed" and (.detail | test("^the kernel would not show the files of .*\\[[0-9]+\\], which runs as your user .*: it runs with a group that is not yours"))'
+    if [ "$explain_status" != 0 ]; then fail "explain exit $explain_status, want 0"
+    elif ! jq -e --arg pid "$holder" ".worktree.verdict == \"unknown\" and (.worktree.activity | $refused)" "$busy" >/dev/null; then
+        fail "with sleep[$holder] in w in group $group, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$busy")"
+    elif [ "$status" != 3 ]; then fail "remove --yes exit $status, want 3"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), want refused"
+    elif ! jq -e --arg pid "$holder" ".results[0].worktree.activity | $refused" "$out" >/dev/null; then
+        fail "remove's activity is $(jq -c '.results[0].worktree.activity' "$out")"
+    elif untouched "$before"; then
+        run explain --json "$wt"
+        if ! jq -e '.worktree.activity.state == "not_observed" and .worktree.verdict == "candidate"' "$out" >/dev/null; then
+            fail "after the sleep exited, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$out")"
+        else
+            ok
+            echo "     $(jq -r '.worktree.activity.detail' "$busy")"
+        fi
+    fi
+}
+if [ "$(uname -s)" = Linux ]; then
+    other_group_case
+else
+    echo "skip activity-other-group: it runs on Linux"
+fi
+
 echo "contract-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]
