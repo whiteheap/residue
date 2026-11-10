@@ -51,6 +51,9 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_CONFIG GIT_CONFIG_
 mkdir -p "$HOME"
 git config --global user.name contained-check
 git config --global user.email contained-check@example.invalid
+# No `git maintenance run --auto --detach` after a commit, which residue
+# would see as a use of the worktree (#180, #195).
+git config --global maintenance.auto false
 # root reads the repository of the user sudo ran this for (activity-hidepid).
 git config --global --add safe.directory '*'
 exec </dev/null
@@ -283,7 +286,7 @@ hidepid_case() {
     setup as_user git init -q "$dir/repo"
     echo hi >"$dir/repo/a.txt" && chown "$uid:$gid" "$dir/repo/a.txt"
     setup as_user git -C "$dir/repo" add a.txt
-    setup as_user git -C "$dir/repo" -c user.name=c -c user.email=c@example.invalid commit -qm init
+    setup as_user git -C "$dir/repo" -c user.name=c -c user.email=c@example.invalid -c maintenance.auto=false commit -qm init
     setup as_user git -C "$dir/repo" worktree add -q "$dir/repo/w" -b w
     local hide='mount -t proc -o hidepid=invisible proc /proc && exec "$@"'
     unshare --mount --propagation private sh -c "$hide" sh setpriv --reuid="$uid" --regid="$gid" --init-groups env HOME="$dir" "$bin" explain --json "$dir/repo/w" >"$dir.user" 2>"$dir.err"

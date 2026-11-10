@@ -30,6 +30,9 @@ HOME="$S/home"
 XDG_STATE_HOME="$S/home/.local/state"
 export HOME XDG_STATE_HOME
 mkdir -p "$HOME"
+# No `git maintenance run --auto --detach` after a commit, which residue
+# would see as a use of the worktree (#180, #195).
+git config --global maintenance.auto false
 
 git init -q -b main "$S/app"
 cd "$S/app"

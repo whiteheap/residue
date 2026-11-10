@@ -48,6 +48,9 @@ mkdir -p "$HOME"
 git config --global user.name race-check
 git config --global user.email race-check@example.invalid
 git config --global init.defaultBranch main
+# No `git maintenance run --auto --detach` after a commit, which residue
+# would see as a use of the worktree (#180, #195).
+git config --global maintenance.auto false
 
 failures=0
 passes=0
