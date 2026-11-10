@@ -1284,9 +1284,9 @@ mod statx {
         Untried,
         /// statx is there: an error from it is that entry's.
         Works,
-        /// statx is not there: the probe failed with `ENOSYS` (Linux before
-        /// 4.11) or `EPERM` (a seccomp filter that refuses it). The walk
-        /// uses fstatat and the mount table.
+        /// statx is not there: the probe failed, with `ENOSYS` (Linux before
+        /// 4.11), `EPERM` (a seccomp filter that refuses it) or any other
+        /// error. The walk uses fstatat and the mount table.
         Missing,
     }
 
@@ -1306,8 +1306,10 @@ mod statx {
     /// `ENOSYS`), and leaves that entry unreadable.
     pub fn next(state: State, outcome: Outcome) -> State {
         match (state, outcome) {
-            (State::Untried, Outcome::Done | Outcome::Other) => State::Works,
-            (State::Untried, Outcome::NoSys | Outcome::Perm) => State::Missing,
+            (State::Untried, Outcome::Done) => State::Works,
+            // A statx of `/` has no other way to fail, and fstatat is
+            // always right.
+            (State::Untried, Outcome::NoSys | Outcome::Perm | Outcome::Other) => State::Missing,
             (State::Works, Outcome::Done | Outcome::NoSys | Outcome::Perm | Outcome::Other) => {
                 State::Works
             }
@@ -1549,7 +1551,7 @@ mod table {
                                     Err(e) => e.to_string(),
                                 };
                                 return Err(format!(
-                                    "cannot tell what the lofs mount at {} shows: {}: {}; {}: {}",
+                                    "cannot tell what the lofs mount at {} shows: looking up {}: {}; looking up {}: {}",
                                     at.display(),
                                     source.display(),
                                     why(first),
@@ -1607,8 +1609,9 @@ mod table {
     /// tabs, what is mounted, the mount point, the type, the options and
     /// the time (mnttab(5)). mntfs writes them as they are, so a tab inside
     /// one makes the line, and the table, one residue cannot read. The
-    /// option `dev=` is the device in 32 bits (`cmpldev`), or `7fffffff`
-    /// where it does not fit.
+    /// option `dev=` is the device in 32 bits (`cmpldev`), or `ffffffff`,
+    /// `NODEV32`, where it does not fit (mntfs's comment says `7fffffff`,
+    /// which is taken as no device too).
     #[cfg(any(test, target_os = "illumos", target_os = "solaris"))]
     pub fn mnttab_line(line: &[u8]) -> Option<Line> {
         let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
@@ -1623,7 +1626,7 @@ mod table {
                 .split(|&b| b == b',')
                 .find_map(|o| o.strip_prefix(b"dev="))
                 .and_then(|hex| u32::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok())
-                .filter(|&d| d != 0x7fff_ffff)
+                .filter(|&d| d != 0xffff_ffff && d != 0x7fff_ffff)
                 // The 64-bit device: major above 32 bits, minor below.
                 .map(|d| (u64::from(d >> 18) << 32) | u64::from(d & 0x3_ffff));
             (special.to_vec(), dev)
@@ -2604,6 +2607,7 @@ swap\t/srv/rc/wt/a b\ttmpfs\txattr,dev=5000001\t1762700000
             Some((b"/srv/shared".to_vec(), Some((0x100 << 32) | 0x10002)))
         );
         for (options, dev) in [
+            ("dev=ffffffff", None),
             ("dev=7fffffff", None),
             ("rw,nosub", None),
             ("dev=zz", None),
@@ -2630,7 +2634,7 @@ swap\t/srv/rc/wt/a b\ttmpfs\txattr,dev=5000001\t1762700000
         let device = (7 << 32) | 3;
         let other = (7 << 32) | 4;
         let text = format!(
-            "/src/here\t/old/wt/build\tlofs\tdev={}\t0\n/src/far\t/x\tlofs\tdev={}\t0\n/src/unsaid\t/y\tlofs\tdev=7fffffff\t0\n/src/unsaid-far\t/z\tlofs\trw\t0\nswap\t/srv/rc/wt/t\ttmpfs\tdev={}\t0\n",
+            "/src/here\t/old/wt/build\tlofs\tdev={}\t0\n/src/far\t/x\tlofs\tdev={}\t0\n/src/unsaid\t/y\tlofs\tdev=ffffffff\t0\n/src/unsaid-far\t/z\tlofs\trw\t0\nswap\t/srv/rc/wt/t\ttmpfs\tdev={}\t0\n",
             dev(device),
             dev(other),
             dev(other)
@@ -2675,14 +2679,14 @@ swap\t/srv/rc/wt/a b\ttmpfs\txattr,dev=5000001\t1762700000
                 gone(),
                 gone(),
                 Err(
-                    "cannot tell what the lofs mount at /old/wt/build shows: /src/here: No such file or directory; /old/wt/build: No such file or directory",
+                    "cannot tell what the lofs mount at /old/wt/build shows: looking up /src/here: No such file or directory; looking up /old/wt/build: No such file or directory",
                 ),
             ),
             (
                 Ok((other, 1)),
                 Ok((other, 2)),
                 Err(
-                    "cannot tell what the lofs mount at /old/wt/build shows: /src/here: on another device; /old/wt/build: on another device",
+                    "cannot tell what the lofs mount at /old/wt/build shows: looking up /src/here: on another device; looking up /old/wt/build: on another device",
                 ),
             ),
         ] {
@@ -2836,17 +2840,17 @@ swap\t/srv/rc/wt/a b\ttmpfs\txattr,dev=5000001\t1762700000
         fs::remove_dir_all(&root).unwrap();
     }
 
-    /// statx is missing only when the probe, the first call, fails with
-    /// ENOSYS or EPERM. After it, any error is that entry's, ENOSYS and
-    /// EPERM included (a FUSE filesystem with no getattr answers ENOSYS),
-    /// and nothing moves the state again.
+    /// statx is missing when the probe, a statx of `/`, fails at all:
+    /// ENOSYS, EPERM or anything else. After a probe that worked, any error
+    /// is that entry's, ENOSYS and EPERM included (a FUSE filesystem with
+    /// no getattr answers ENOSYS), and nothing moves the state again.
     #[cfg(target_os = "linux")]
     #[test]
     fn statx_is_missing_only_when_its_probe_is_refused() {
         use super::statx::{Outcome, State, next};
         let all = [Outcome::Done, Outcome::NoSys, Outcome::Perm, Outcome::Other];
         assert_eq!(next(State::Untried, Outcome::Done), State::Works);
-        assert_eq!(next(State::Untried, Outcome::Other), State::Works);
+        assert_eq!(next(State::Untried, Outcome::Other), State::Missing);
         assert_eq!(next(State::Untried, Outcome::NoSys), State::Missing);
         assert_eq!(next(State::Untried, Outcome::Perm), State::Missing);
         assert_eq!(next(State::Works, Outcome::NoSys), State::Works);

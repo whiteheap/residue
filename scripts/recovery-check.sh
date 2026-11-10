@@ -1276,7 +1276,18 @@ fi
 # where the system can (FreeBSD's nullfs from 14): mount_point keeps it.
 # 2e4 mounts a folder, then renames w with `git worktree move`: a mount
 # table that keeps the path a mount had (illumos) names the old one, and
-# mount_point must still keep w at its new path.
+# mount_point must still keep w at its new path. On illumos the case first
+# checks that /etc/mnttab names the old path and not the new, so it is the
+# lookup of the lofs mount's source that keeps w. Elsewhere it passes
+# through the ordinary checks: Linux's mount ID and mountinfo follow the
+# rename, and FreeBSD's nullfs has a device of its own.
+in_mnttab() { # PATH: whether illumos's /etc/mnttab names PATH as a mount point
+    local point
+    while IFS=$'\t' read -r _ point _; do
+        [ "$point" = "$1" ] && return 0
+    done </etc/mnttab
+    return 1
+}
 planted_at() { # [REL]: where the mount is now, at its path or where a removal moved w
     local d rel=${1:-node_modules/mnt}
     for d in "$wt/$rel" "$repo"/.worktrees/.*.residue-removing-*/"$rel"; do
@@ -1320,9 +1331,15 @@ else
     mkdir "$from" "$wt/node_modules/mnt" && echo kept >"$from/kept.txt" || exit 2
     echo "$wt/node_modules/mnt" >"$work/mounted-at"
     bind_mount "$from" "$wt/node_modules/mnt" || { echo "recovery-check: setup failed in $name: $bind_how mount" >&2; exit 2; }
+    old_at=$wt/node_modules/mnt
     setup git -C "$repo" worktree move "$wt" "$repo/.worktrees/moved"
     wt=$repo/.worktrees/moved
     echo "$wt/node_modules/mnt" >"$work/mounted-at"
+    stale=yes
+    if [ "$(uname -s)" = SunOS ]; then
+        in_mnttab "$old_at" || stale="/etc/mnttab does not name $old_at"
+        ! in_mnttab "$wt/node_modules/mnt" || stale="/etc/mnttab names the new path $wt/node_modules/mnt"
+    fi
     : >"$work/mode"
     "$bin" explain --json "$wt" >"$work/$name.out-explain" 2>"$work/$name.err-explain"
     start "" remove --yes --json "$wt"
@@ -1332,6 +1349,7 @@ else
     unmounted=$?
     block=$(jq -r '.worktree.checks[] | select(.id == "mount_point") | .status' "$work/$name.out-explain")
     if [ "$kept" != kept ]; then fail "the file in the folder mounted inside the moved w is gone; residue: $(outcome)"
+    elif [ "$stale" != yes ]; then fail "the case did not run with a stale mount table: $stale"
     elif [ "$block" != block ]; then fail "explain: mount_point is '$block', want block"
     elif [ "$status" != 3 ]; then fail "exit $status, want 3"
     elif [ "$(jq -r '.results[0].result' "$work/$name.out")" != refused ]; then fail "result $(outcome), want refused"

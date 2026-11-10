@@ -7,6 +7,10 @@
  *
  * A seccomp filter written out, so it needs no library: cc -O2 -o nostatx
  * nostatx.c. It checks that statx fails before it runs COMMAND.
+ *
+ * EPERM also breaks coreutils `ls`, which reports statx's EPERM as an
+ * error, so the recovery check's Git wrapper, which residue's children run
+ * under the same filter, cannot work under it; CI uses ENOSYS.
  */
 #include <errno.h>
 #include <fcntl.h>
