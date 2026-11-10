@@ -36,7 +36,7 @@ It takes the options of residue watch, below, and one of its own:
 /// The exit status of `service install --expect` when the service is not
 /// the one it names: nothing was written.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-const CHANGED: u8 = 4;
+const CHANGED: u8 = crate::fingerprint::CHANGED;
 
 /// The launchd label on macOS.
 #[cfg(target_os = "macos")]
@@ -246,7 +246,7 @@ impl Expect {
         if text == "none" {
             return Ok(Expect::None);
         }
-        if text.len() == 32 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        if crate::fingerprint::is_fingerprint(text) {
             return Ok(Expect::Fingerprint(text.to_string()));
         }
         Err(format!(
@@ -336,22 +336,14 @@ impl Seen {
 /// runs as. So it names the service and the residue that would replace it,
 /// and only the release that printed it can match it.
 ///
-/// FNV-1a, 128 bits, over each part with its length: a check against change
-/// by accident, not a secret. Whoever can write the file can change the
-/// service anyway.
+/// `fingerprint::Hasher`: FNV-1a, 128 bits, over each part with its length,
+/// a check against change by accident, not a secret. Whoever can write the
+/// file can change the service anyway.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn fingerprint(seen: &Seen, release: &str) -> String {
     use std::os::unix::ffi::OsStrExt;
-    const BASIS: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
-    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
-    let mut hash = BASIS;
-    let mut part = |bytes: &[u8]| {
-        for b in (bytes.len() as u64).to_le_bytes().iter().chain(bytes) {
-            hash ^= u128::from(*b);
-            hash = hash.wrapping_mul(PRIME);
-        }
-    };
-    part(b"residue service fingerprint");
+    let mut hash = crate::fingerprint::Hasher::start(b"residue service fingerprint");
+    let mut part = |bytes: &[u8]| hash.part(bytes);
     part(release.as_bytes());
     part(match seen.loaded {
         Some(true) => b"loaded",
@@ -372,7 +364,7 @@ fn fingerprint(seen: &Seen, release: &str) -> String {
         }
         None => part(b"no binary"),
     }
-    format!("{hash:032x}")
+    hash.hex()
 }
 
 /// Whether `seen` is the service `expect` names, to an install by `release`.
@@ -1576,6 +1568,26 @@ mod tests {
                 assert_ne!(a, b, "{what} and {other}");
             }
         }
+    }
+
+    /// The fingerprint `service status` printed before `fingerprint::Hasher`
+    /// took over the hash is the one it prints now: the Mac app passes it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn fingerprint_is_unchanged() {
+        assert_eq!(
+            fingerprint(&installed(), RELEASE),
+            "f4e4989bb9a72db8de1e168008b8ad33"
+        );
+        let none = Seen {
+            loaded: None,
+            file: None,
+            binary: None,
+        };
+        assert_eq!(
+            fingerprint(&none, RELEASE),
+            "cd127761c2dcd6d6564aeb6f8e5d5858"
+        );
     }
 
     /// `--expect none` holds only with no file and nothing loaded, and a

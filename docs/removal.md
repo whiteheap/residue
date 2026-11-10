@@ -12,6 +12,8 @@ skipped .worktrees/big: node_modules/ changed since you confirmed (1,204 -> 1,38
 
 residue deletes what you saw, or nothing. With `--yes` there is no prompt, so the reason says `changed since the plan`.
 
+A program that shows the plan in one run and removes in a second once you confirm passes the first run's `plan` to the second as `--expect`. Before the second run moves anything, it makes its own plan and compares. When a worktree at a PATH moved to another branch or HEAD, another worktree took its path, or it would purge or forget a trash entry or removal record the plan did not show, it removes nothing and exits 4, and the program shows the new plan ([reference](reference.md#for-coding-agents)). Without `--expect`, the second run acts on what it finds at each PATH, when every check passes.
+
 ## The move aside, and the window that remains
 
 Then residue moves the worktree aside with `git worktree move`, to a hidden sibling named `.NAME.residue-removing-PID`, and locks it. The move is one rename on the same filesystem; a worktree that is a mount point is skipped, never copied. After the move, nothing can reach the worktree by its old path, so residue checks once more at the new path: a new process snapshot must see nobody inside it, the record must still match, no merge, rebase, bisect or other Git operation may have started in it, it must have no worktree-private refs, and the worktree must hold no `.git` entry but its own, no mount point and nothing residue cannot read. Only then does `git worktree remove` delete it. If anything differs, residue moves the worktree back, unlocks it, and the reason ends with `it is back in place`.

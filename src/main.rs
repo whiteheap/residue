@@ -10,6 +10,7 @@ mod cli;
 mod commands;
 mod discover;
 mod events;
+mod fingerprint;
 mod fsinfo;
 mod git;
 mod hold;

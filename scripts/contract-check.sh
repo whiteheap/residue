@@ -432,6 +432,13 @@ usage usage-removal-reason-unknown remove --yes --removal-reason sweep "$work/x"
 usage usage-to-without-entry restore --to "$work/x"
 usage usage-as-of-not-remove scan --as-of 2026-11-09T00:00:00Z "$work/x"
 usage usage-as-of-invalid remove --yes --as-of yesterday "$work/x"
+some_plan=0123456789abcdef0123456789abcdef
+usage usage-expect-without-yes remove --json --expect "$some_plan" "$work/x"
+usage usage-expect-not-remove scan --expect "$some_plan" "$work/x"
+usage usage-expect-twice remove --yes --expect "$some_plan" --expect "$some_plan" "$work/x"
+usage usage-expect-uppercase remove --yes --expect 0123456789ABCDEF0123456789ABCDEF "$work/x"
+usage usage-expect-short remove --yes --expect 0123456789abcdef "$work/x"
+usage usage-expect-no-value remove --yes "$work/x" --expect
 
 # 8. Removal records: every removal writes one before it deletes, and
 # `residue restore` recreates the worktree from it. A record that cannot be
@@ -2259,6 +2266,225 @@ if [ "$(uname -s)" = FreeBSD ] && [ "$(id -u)" = 0 ] && id smoke >/dev/null 2>&1
 else
     echo "skip activity-proc-debug-off: it runs on FreeBSD as root, with a user named smoke"
 fi
+
+# 19. --expect PLAN: a run that confirms a plan acts only while its own
+# plan, made before it moves anything, is that one. Each case shows a plan
+# with `remove --trash --json` and no --yes, changes something or nothing,
+# then runs the same command with --yes --as-of GENERATED_AT --expect PLAN.
+# The fixture is as_of_fixture's: an expired trash entry and an expired
+# removal record that every plan here lists, so a run that does nothing is
+# seen to purge and forget nothing too.
+
+# The plan: sets $plan and $gen from a run without --yes.
+expect_preview() { # PATH...
+    run remove --trash --json --keep-trash 1m --keep-removed 1m "$@"
+    plan=$(jq -r .plan "$out") gen=$(jq -r .generated_at "$out")
+    if [ "$status" != 3 ] || [ "${#plan}" != 32 ] || [ -n "$(printf %s "$plan" | tr -d 0-9a-f)" ]; then
+        echo "contract-check: setup failed in $name: the plan run exited $status with plan $plan" >&2
+        exit 2
+    fi
+}
+
+# The run that confirms it.
+expect_confirm() { # PATH...
+    run remove --trash --json --keep-trash 1m --keep-removed 1m --yes --as-of "$gen" --expect "$plan" "$@"
+}
+
+# An expired trash entry ($entry, holding t) and an expired removal record
+# ($rec) beside w and u, both unchanged since well before any plan, as is
+# Git's list of worktrees: a change to it in the plan's second would leave
+# the record for a later run (--as-of). Each WORKTREE named is added first.
+expect_fixture() { # [WORKTREE...]
+    make_repo
+    as_of_fixture 1767225600 2026-01-01T00:00:00Z
+    local add
+    for add in "$@"; do
+        setup git -C "$repo" worktree add -q "$repo/.worktrees/$add" -b "$add"
+    done
+    touch -t 202512310000 "$entry" "$rec" "$repo/.git/worktrees" || exit 2
+}
+
+# The run did nothing because its plan is not $plan: exit 4, and its
+# document gives its own plan, and says so for each thing it would act on.
+expect_differs() { # N-RESULTS
+    if [ "$status" != 4 ]; then
+        fail "exit $status, want 4"
+        return 1
+    fi
+    json_ok "$1" || {
+        fail "stdout is not one valid remove document with $1 results"
+        return 1
+    }
+    jq -e --arg plan "$plan" '
+        .expected_plan == $plan and .plan != $plan and (.plan | test("^[0-9a-f]{32}$"))
+        and all(.results[], .purged[], .forgotten[]; .result as $r | ["removed", "trashed", "purged", "forgotten"] | index([$r]) == null)
+        and any(.results[], .purged[], .forgotten[]; .result == "skipped" and (.reason | startswith("the plan is not the one --expect names")))
+    ' "$out" >/dev/null || {
+        fail "the document does not say the plan differs: $(jq -c '{plan, expected_plan, results: [(.results[], .purged[], .forgotten[]) | [.result, .reason]]}' "$out")"
+        return 1
+    }
+}
+
+# Nothing was removed, moved aside, trashed, purged or forgotten: w has the
+# same bytes and Git lists it at its path, the trash holds only $entry,
+# which still holds t, the removal record and its ref are there, and u is
+# untouched.
+expect_nothing_done() { # BEFORE-SUMS-OF-W
+    registered "$wt" || {
+        fail "w is no longer registered"
+        return 1
+    }
+    [ "$(sums "$wt")" = "$1" ] || {
+        fail "w's files changed"
+        return 1
+    }
+    registered "$repo/.worktrees/u" && [ "$(sums "$repo/.worktrees/u")" = "$u_sum" ] || {
+        fail "the unrelated worktree u changed"
+        return 1
+    }
+    [ "$(ls -A "$repo/.git/residue-trash")" = "$(basename "$entry")" ] && registered "$entry/t" || {
+        fail "the trash holds $(ls -A "$repo/.git/residue-trash" | tr '\n' ' '), not only $(basename "$entry") with t in it"
+        return 1
+    }
+    [ -f "$rec/info" ] && git -C "$repo" rev-parse -q --verify "refs/residue/removed/$(basename "$rec")" >/dev/null || {
+        fail "the removal record or its ref is gone"
+        return 1
+    }
+    local leftover
+    for leftover in "$repo"/.worktrees/.*.residue-removing-*; do
+        [ ! -e "$leftover" ] || {
+            fail "$leftover was left behind"
+            return 1
+        }
+    done
+}
+
+if [ -z "$partial_probe" ]; then
+    # The plan, confirmed with its PATHs in the other order: w and v go to
+    # the trash, the entry is purged and the record forgotten. The text
+    # plan ends with the same `plan:` line.
+    name=expect-matches
+    expect_fixture v
+    run remove --trash --keep-trash 1m --keep-removed 1m "$wt" "$repo/.worktrees/v"
+    text_plan=$(sed -n 's/^plan: //p' "$out")
+    expect_preview "$wt" "$repo/.worktrees/v"
+    common=$(cd "$repo/.git" && pwd -P)
+    expect_confirm "$repo/.worktrees/v" "$wt"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif ! json_ok 2; then fail "stdout is not one valid remove document with 2 results"
+    elif [ "$text_plan" != "$plan" ]; then fail "the text plan says plan: $text_plan, the JSON $plan"
+    elif ! jq -e --arg plan "$plan" --arg common "$common" '
+        .plan == $plan and .expected_plan == $plan
+        and ([.results[] | .result + " " + .repository] | unique) == ["trashed " + $common]
+        and [.purged[].result] == ["purged"] and [.forgotten[].result] == ["forgotten"]
+    ' "$out" >/dev/null; then fail "results: $(jq -c '{plan, expected_plan, r: [.results[] | [.result, .repository]], p: [.purged[].result], f: [.forgotten[].result]}' "$out")"
+    elif [ -e "$wt" ] || [ -e "$repo/.worktrees/v" ]; then fail "w or v is still at its path"
+    elif [ -e "$entry" ] || [ -e "$rec" ]; then fail "the trash entry or the removal record is still on disk"
+    elif ! registered "$repo/.worktrees/u" || [ "$(sums "$repo/.worktrees/u")" != "$u_sum" ]; then fail "the unrelated worktree u changed"
+    else ok; fi
+
+    # w switched to another branch after the plan: exit 4, nothing done.
+    # The plan that run reported, made at its as_of, confirmed in turn,
+    # runs.
+    name=expect-branch-switched
+    expect_fixture
+    expect_preview "$wt"
+    setup git -C "$wt" checkout -q -b other
+    before=$(sums "$wt")
+    expect_confirm "$wt"
+    if expect_differs 1 && expect_nothing_done "$before"; then
+        plan=$(jq -r .plan "$out") gen=$(jq -r .as_of "$out")
+        expect_confirm "$wt"
+        if [ "$status" != 0 ]; then fail "the plan it reported, confirmed: exit $status, want 0"
+        elif [ "$(jq -r '[.results[].result, .purged[].result, .forgotten[].result] | join(",")' "$out")" != trashed,purged,forgotten ]; then
+            fail "the plan it reported, confirmed: $(jq -c '[.results[].result, .purged[].result, .forgotten[].result]' "$out")"
+        elif [ -e "$wt" ]; then fail "the plan it reported, confirmed: w is still at its path"
+        else ok; fi
+    fi
+
+    # w's HEAD moved on the same branch after the plan: exit 4, nothing
+    # done.
+    name=expect-head-moved
+    expect_fixture
+    expect_preview "$wt"
+    setup git -C "$wt" commit -q --allow-empty -m more
+    before=$(sums "$wt")
+    expect_confirm "$wt"
+    expect_differs 1 && expect_nothing_done "$before" && ok
+
+    # w removed by hand and another repository's worktree added at its
+    # path, on a branch of the same name: exit 4, and the new worktree,
+    # the trash entry and the removal record stay as they are.
+    name=expect-recreated
+    expect_fixture
+    expect_preview "$wt"
+    setup git -C "$repo" worktree remove "$wt"
+    other=$work/$name-other
+    setup git init -q "$other"
+    echo other >"$other/README.md"
+    setup git -C "$other" add .
+    setup git -C "$other" commit -qm other
+    setup git -C "$other" worktree add -q "$wt" -b w
+    before=$(sums "$wt")
+    expect_confirm "$wt"
+    if ! expect_differs 1; then :
+    elif ! git -C "$other" worktree list --porcelain | grep -qxF "worktree $(cd "$wt" && pwd -P)"; then fail "the other repository no longer lists its worktree"
+    elif [ "$(sums "$wt")" != "$before" ]; then fail "the new worktree's files changed"
+    elif [ ! -f "$rec/info" ] || ! registered "$entry/t"; then fail "the trash entry or the removal record changed"
+    else ok; fi
+
+    # An expired trash entry that appears after the plan, unchanged since
+    # before the plan's time, is one this run would purge: exit 4, nothing
+    # done. Once its directory changed after that time, --as-of leaves it
+    # for a later run, the plan is the one confirmed, and w goes.
+    name=expect-trash-appeared
+    make_repo
+    expect_preview "$wt"
+    setup git -C "$repo" worktree add -q "$repo/.worktrees/t" -b t
+    run remove --yes --json --trash --keep-trash 1m "$repo/.worktrees/t"
+    entry=$(result 0 trash_entry)
+    [ "$status" = 0 ] && [ -d "$entry" ] || { echo "contract-check: setup failed in $name: remove --trash t exit $status" >&2; exit 2; }
+    sed "s/^trashed [0-9]* .*/trashed 1767225600 2026-01-01T00:00:00Z/" "$entry/info" >"$work/$name.info" && cat "$work/$name.info" >"$entry/info" || exit 2
+    touch -t 202512310000 "$entry" || exit 2
+    before=$(sums "$wt")
+    expect_confirm "$wt"
+    if ! expect_differs 1; then :
+    elif [ "$(jq -r '[.purged[] | .result + " " + .entry.entry] | join(",")' "$out")" != "skipped $(basename "$entry")" ]; then fail "purged: $(jq -c '[.purged[] | [.result, .entry.entry]]' "$out")"
+    elif ! registered "$wt" || [ "$(sums "$wt")" != "$before" ]; then fail "w changed"
+    elif ! registered "$entry/t"; then fail "the trash entry's worktree is gone"
+    else
+        touch "$entry" || exit 2
+        expect_confirm "$wt"
+        if [ "$status" != 0 ]; then fail "once the entry changed after the plan: exit $status, want 0"
+        elif [ "$(jq -r '[.results[].result] | join(",")' "$out"),$(jq -r '.purged | length' "$out")" != trashed,0 ]; then
+            fail "once the entry changed after the plan: $(jq -c '{r: [.results[].result], purged}' "$out")"
+        elif ! registered "$entry/t"; then fail "once the entry changed after the plan, it was purged"
+        else ok; fi
+    fi
+else
+    skip_partial expect-matches
+    skip_partial expect-branch-switched
+    skip_partial expect-head-moved
+    skip_partial expect-recreated
+    skip_partial expect-trash-appeared
+fi
+
+# A worktree the plan keeps counts only as kept: its branch changed after
+# the plan, and the plan is the same, so the run goes on and refuses it
+# (exit 3, not 4). On a partial probe it is kept as unknown, the same way.
+name=expect-kept-unchanged
+make_repo
+echo notes >"$wt/notes.md"
+run remove --json "$wt"
+plan=$(jq -r .plan "$out")
+setup git -C "$wt" checkout -q -b other
+before=$(sums "$wt")
+run remove --yes --json --expect "$plan" "$wt"
+if [ "$status" != 3 ]; then fail "exit $status, want 3"
+elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), want refused"
+elif [ "$(jq -r --arg plan "$plan" '.plan == $plan and .expected_plan == $plan' "$out")" != true ]; then fail "plan $(jq -r .plan "$out"), want $plan"
+elif untouched "$before"; then ok; fi
 
 echo "contract-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]
