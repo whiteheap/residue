@@ -1895,17 +1895,18 @@ impl Fetcher {
                 Ok(git::Fetched {
                     skipped: None,
                     reaching,
+                    symbolic,
                 }) => {
                     let key = (repo.common_dir.clone(), remote.clone());
                     if self.failing.remove(&key).is_some() {
                         log(&format!("fetch of {remote} in {shown} works again"));
                     }
-                    if reaching.is_empty() {
+                    if reaching.is_empty() && symbolic.is_empty() {
                         self.leaving_out.remove(&key);
                     } else {
                         let note = format!(
                             "fetch of {remote} in {shown} leaves out {}",
-                            reaching_text(&reaching)
+                            left_out_text(&reaching, &symbolic)
                         );
                         if self.leaving_out.get(&key) != Some(&note) {
                             log(&note);
@@ -1917,6 +1918,7 @@ impl Fetcher {
                 Ok(git::Fetched {
                     skipped: Some(skip),
                     reaching,
+                    symbolic,
                 }) => {
                     let why = match skip {
                         git::Skip::NoRemoteTrackingRefspec => {
@@ -1924,7 +1926,11 @@ impl Fetcher {
                         }
                         git::Skip::OtherRemotesRefs => format!(
                             "each of its fetch refspecs into refs/remotes/ also stores into another remote's refs: {}",
-                            reaching_text(&reaching)
+                            left_out_text(&reaching, &symbolic)
+                        ),
+                        git::Skip::LeftOut => format!(
+                            "each of its fetch refspecs into refs/remotes/ is left out: {}",
+                            left_out_text(&reaching, &symbolic)
                         ),
                     };
                     self.failed(
@@ -1975,13 +1981,20 @@ impl Fetcher {
     }
 }
 
-/// The refspecs a fetch left out, each with the other remote whose refs
-/// it also stores into: `+refs/heads/*:refs/remotes/up/* (remote up's
-/// refs)`, joined by `, `.
-fn reaching_text(reaching: &[(String, String)]) -> String {
+/// The refspecs a fetch left out, each with why: the other remote whose
+/// refs it also stores into, `+refs/heads/*:refs/remotes/up/* (remote up's
+/// refs)`, or a destination that is a symbolic ref,
+/// `+refs/heads/topic:refs/remotes/origin/topic (its destination is a
+/// symbolic ref)`; joined by `, `.
+fn left_out_text(reaching: &[(String, String)], symbolic: &[String]) -> String {
     reaching
         .iter()
         .map(|(spec, other)| format!("{spec} (remote {other}'s refs)"))
+        .chain(
+            symbolic
+                .iter()
+                .map(|spec| format!("{spec} (its destination is a symbolic ref)")),
+        )
         .collect::<Vec<_>>()
         .join(", ")
 }

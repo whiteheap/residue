@@ -54,7 +54,8 @@
 #      OTHER keeps its upstream; with remotes origin and origin/fork,
 #      neither is fetched; each is logged once. A symbolic ref under
 #      refs/remotes/ that names a local branch stays, and the branch does
-#      not move: Git stores nothing through one.
+#      not move: Git stores nothing through one for a refspec with a `*`,
+#      and a refspec with no `*` onto it is left out, logged once.
 # Every branch stays, and nothing goes to the trash: watch deletes.
 # On NetBSD, OpenBSD and DragonFly (scripts/partial-probe.sh) no worktree
 # is a candidate: there it checks that every worktree is `unknown` for the
@@ -304,6 +305,9 @@ refspec_case() {
   git -C "$R/linked" push -q origin main:refs/heads/old
   git -C "$R/linked" branch -q side
   git -C "$R/linked" symbolic-ref refs/remotes/origin/topic refs/heads/side
+  # Beside the clone's glob, a refspec with no `*` onto that symbolic ref:
+  # Git would store the remote's topic through it, into side.
+  git -C "$R/linked" config --add remote.origin.fetch '+refs/heads/topic:refs/remotes/origin/topic'
   side=$(git -C "$R/linked" rev-parse side)
   git -C "$R/linked.git" update-ref refs/heads/topic \
     "$(git -C "$R/linked.git" -c user.name=smoke -c user.email=smoke@example.com commit-tree -p main -m topic 'main^{tree}')"
@@ -348,6 +352,8 @@ refspec_case() {
     [ "$(git -C "$R/linked" rev-parse side)" = "$side" ] || fail "12: $1 moved the local branch side in linked"
     [ "$(git -C "$R/linked" symbolic-ref -q refs/remotes/origin/topic)" = refs/heads/side ] \
       || fail "12: $1 changed the symbolic ref origin/topic in linked"
+    [ "$(grep -c "fetch of origin in .*/r12/linked leaves out +refs/heads/topic:refs/remotes/origin/topic (its destination is a symbolic ref)" "$S/log")" = 1 ] \
+      || fail "12: $1 did not log once that origin's refspec onto a symbolic ref is left out in linked"
     ! git -C "$R/linked" rev-parse -q --verify refs/remotes/origin/old > /dev/null \
       || fail "12: $1 did not fetch and prune origin in linked"
   }
