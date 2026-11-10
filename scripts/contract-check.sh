@@ -3246,7 +3246,7 @@ target_fixture() { # CONFIG-TEXT TAG(cargo|other|none)
     w_sha=$(git -C "$repo" rev-parse w) || exit 2
     build=$work/$name-build
     mkdir -p "$build"
-    head -c 100000 /dev/zero >"$build/blob"
+    dd if=/dev/zero of="$build/blob" bs=1000 count=100 2>/dev/null
     case $2 in
     cargo) printf '%s\n' "$cargo_tag" >"$build/CACHEDIR.TAG" ;;
     other) printf 'Signature: 8a477f597d28d172789f06886806bc55\n# another tool\n' >"$build/CACHEDIR.TAG" ;;
@@ -3336,7 +3336,7 @@ target_explain '$t.state == "not_read" and $t.path == null and ($t.config_error 
 # Arrays nested 100,000 deep: not read, where a reader that recurses
 # without a limit runs the stack out and stops every scan of the repository.
 name=target-dir-nested
-target_fixture "a = $(head -c 100000 /dev/zero | tr '\0' '[')" cargo
+target_fixture "a = $(dd if=/dev/zero bs=1000 count=100 2>/dev/null | tr '\0' '[')" cargo
 target_explain '$t.state == "not_read" and ($t.config_error | test("deep"))'
 
 name=target-dir-include
