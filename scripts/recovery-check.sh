@@ -1274,9 +1274,12 @@ fi
 # after the move must refuse and put w back. In both, the folder's file
 # must survive. 2e3 mounts a file over an ignored file before the plan,
 # where the system can (FreeBSD's nullfs from 14): mount_point keeps it.
+# 2e4 mounts a folder, then renames w with `git worktree move`: a mount
+# table that keeps the path a mount had (illumos) names the old one, and
+# mount_point must still keep w at its new path.
 planted_at() { # [REL]: where the mount is now, at its path or where a removal moved w
     local d rel=${1:-node_modules/mnt}
-    for d in "$wt/$rel" "$repo"/.worktrees/.w.residue-removing-*/"$rel"; do
+    for d in "$wt/$rel" "$repo"/.worktrees/.*.residue-removing-*/"$rel"; do
         [ -e "$d" ] && { echo "$d"; return; }
     done
 }
@@ -1308,9 +1311,40 @@ else
     elif common_ok; then ok "$(jq -r '.worktree.checks[] | select(.id == "mount_point") | .detail' "$work/$name.out-explain")"; fi
 fi
 
-name=bind-mount-file
+name=bind-mount-moved
 if [ -z "$bind_how" ]; then
     echo "skip $name: $bind_skip"
+else
+    make_repo
+    from=$work/$name-outside
+    mkdir "$from" "$wt/node_modules/mnt" && echo kept >"$from/kept.txt" || exit 2
+    echo "$wt/node_modules/mnt" >"$work/mounted-at"
+    bind_mount "$from" "$wt/node_modules/mnt" || { echo "recovery-check: setup failed in $name: $bind_how mount" >&2; exit 2; }
+    setup git -C "$repo" worktree move "$wt" "$repo/.worktrees/moved"
+    wt=$repo/.worktrees/moved
+    echo "$wt/node_modules/mnt" >"$work/mounted-at"
+    : >"$work/mode"
+    "$bin" explain --json "$wt" >"$work/$name.out-explain" 2>"$work/$name.err-explain"
+    start "" remove --yes --json "$wt"
+    finish "$pid"
+    kept=$(cat "$from/kept.txt" 2>/dev/null)
+    unmount_planted "$(planted_at)"
+    unmounted=$?
+    block=$(jq -r '.worktree.checks[] | select(.id == "mount_point") | .status' "$work/$name.out-explain")
+    if [ "$kept" != kept ]; then fail "the file in the folder mounted inside the moved w is gone; residue: $(outcome)"
+    elif [ "$block" != block ]; then fail "explain: mount_point is '$block', want block"
+    elif [ "$status" != 3 ]; then fail "exit $status, want 3"
+    elif [ "$(jq -r '.results[0].result' "$work/$name.out")" != refused ]; then fail "result $(outcome), want refused"
+    elif [ "$unmounted" != 0 ]; then fail "the mount did not go within 10 s"
+    elif [ "$(record "$wt")" != registered ]; then fail "at its new path Git has: $(record "$wt")"
+    elif [ "$(records)" != "0 records, 0 refs" ]; then fail "removal records: $(records), want 0 records, 0 refs"
+    elif [ "$(sums "$wt")" != "$w_sum" ]; then fail "w's files changed"
+    elif common_ok; then ok "after git worktree move: $(jq -r '.worktree.checks[] | select(.id == "mount_point") | .detail' "$work/$name.out-explain")"; fi
+fi
+
+name=bind-mount-file
+if [ -z "$bind_how" ]; then
+    echo "skip $name: ${bind_skip/a folder/a file}"
 else
     make_repo
     from=$work/$name-outside.js

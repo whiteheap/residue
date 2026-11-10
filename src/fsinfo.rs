@@ -276,7 +276,7 @@ impl Mounts {
             target_os = "illumos",
             target_os = "solaris"
         ))]
-        return table::read(root).map(Mounts::Table);
+        return table::read(root, top.dev()).map(Mounts::Table);
         #[cfg(not(any(
             target_os = "linux",
             target_os = "android",
@@ -577,6 +577,10 @@ fn measure_with(
                             display(new, root)
                         )
                     });
+                } else if after.roots.iter().any(|id| !table.roots.contains(id)) {
+                    usage.mounts_unknown.get_or_insert_with(|| {
+                        "a lofs mount on its device appeared while residue read it".to_string()
+                    });
                 }
             }
             Ok(_) => {}
@@ -795,26 +799,7 @@ fn leaf(path: &Path) -> io::Result<CString> {
 /// with its open, which can fail on its own: a worktree residue may look
 /// up but not read is still one entry, counted unreadable.
 fn open_root(root: &Path) -> io::Result<(Stat, io::Result<OwnedFd>)> {
-    let mut names = Vec::new();
-    for part in root.components() {
-        match part {
-            Component::RootDir => {}
-            Component::Normal(name) => names.push(name),
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{} is not a canonical path", root.display()),
-                ));
-            }
-        }
-    }
-    if !root.has_root() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} is not an absolute path", root.display()),
-        ));
-    }
-    let Some((last, above)) = names.split_last() else {
+    let Some((at, name)) = holder(root)? else {
         // SAFETY: open reads the NUL-terminated literal; the descriptor it
         // returns is ours.
         let fd = unsafe { libc::open(c"/".as_ptr(), DIR) };
@@ -825,7 +810,50 @@ fn open_root(root: &Path) -> io::Result<(Stat, io::Result<OwnedFd>)> {
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         return Ok((fstat(fd.as_fd())?, Ok(fd)));
     };
-    // SAFETY: as above.
+    // As its listing would show it, with its mount where the system gives one.
+    let top = lstat_at(at.as_fd(), &name).map_err(|e| at_path(root, e))?;
+    if top.link {
+        return Err(at_path(root, changed("it is a symbolic link now")));
+    }
+    if !top.is_dir() {
+        return Err(at_path(root, changed("it is not a folder now")));
+    }
+    Ok((top, open_listed(at.as_fd(), &name, (top.dev(), top.ino()))))
+}
+
+fn at_path(path: &Path, e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+}
+
+/// The folder that holds the last name of `path`, opened from `/` one name
+/// at a time, each relative to the folder before it and never through a
+/// symbolic link, with that name; `None` for `/` itself. `path` must be
+/// absolute and canonical.
+fn holder(path: &Path) -> io::Result<Option<(OwnedFd, CString)>> {
+    let mut names = Vec::new();
+    for part in path.components() {
+        match part {
+            Component::RootDir => {}
+            Component::Normal(name) => names.push(name),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} is not a canonical path", path.display()),
+                ));
+            }
+        }
+    }
+    if !path.has_root() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not an absolute path", path.display()),
+        ));
+    }
+    let Some((last, above)) = names.split_last() else {
+        return Ok(None);
+    };
+    // SAFETY: open reads the NUL-terminated literal; the descriptor it
+    // returns is ours.
     let fd = unsafe { libc::open(c"/".as_ptr(), ABOVE) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
@@ -833,9 +861,6 @@ fn open_root(root: &Path) -> io::Result<(Stat, io::Result<OwnedFd>)> {
     // SAFETY: the descriptor is open and nothing else owns it.
     let mut at = unsafe { OwnedFd::from_raw_fd(fd) };
     let mut reached = PathBuf::from("/");
-    let at_path = |reached: &Path, e: io::Error| {
-        io::Error::new(e.kind(), format!("{}: {e}", reached.display()))
-    };
     for name in above {
         reached.push(name);
         at = leaf(&reached)
@@ -844,15 +869,37 @@ fn open_root(root: &Path) -> io::Result<(Stat, io::Result<OwnedFd>)> {
     }
     reached.push(last);
     let name = leaf(&reached).map_err(|e| at_path(&reached, e))?;
-    // As its listing would show it, with its mount where the system gives one.
-    let top = lstat_at(at.as_fd(), &name).map_err(|e| at_path(&reached, e))?;
-    if top.link {
-        return Err(at_path(&reached, changed("it is a symbolic link now")));
+    Ok(Some((at, name)))
+}
+
+/// The lstat of the entry at `path`, looked up as the walk opens a
+/// worktree: from `/`, one name at a time, never through a symbolic link,
+/// the last name included. A symbolic link anywhere on it is an error.
+#[cfg(any(
+    test,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "illumos",
+    target_os = "solaris"
+))]
+fn lookup(path: &Path) -> io::Result<Stat> {
+    let Some((at, name)) = holder(path)? else {
+        // SAFETY: as in `holder`.
+        let fd = unsafe { libc::open(c"/".as_ptr(), DIR) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the descriptor is open and nothing else owns it.
+        return fstat(unsafe { OwnedFd::from_raw_fd(fd) }.as_fd());
+    };
+    let stat = lstat_at(at.as_fd(), &name).map_err(|e| at_path(path, e))?;
+    if stat.link {
+        return Err(at_path(
+            path,
+            io::Error::other("a symbolic link, which residue does not follow"),
+        ));
     }
-    if !top.is_dir() {
-        return Err(at_path(&reached, changed("it is not a folder now")));
-    }
-    Ok((top, open_listed(at.as_fd(), &name, (top.dev(), top.ino()))))
+    Ok(stat)
 }
 
 /// Opens a folder the walk listed, relative to the folder it was listed
@@ -1226,19 +1273,20 @@ mod statx {
     use std::ffi::CStr;
     use std::io;
     use std::os::fd::{AsRawFd, BorrowedFd};
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::OnceLock;
 
-    /// What residue knows of statx in this process. It only moves forward,
-    /// by [`next`].
+    /// What residue knows of statx in this process, settled once by a probe
+    /// ([`state`]) so that every walk in it, on any thread, lists the same
+    /// way.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum State {
-        /// No call has returned yet.
+        /// The probe has not run.
         Untried,
-        /// A call succeeded: statx is there, and an error is the entry's.
+        /// statx is there: an error from it is that entry's.
         Works,
-        /// statx is not there: `ENOSYS` (Linux before 4.11), or `EPERM`
-        /// before any call succeeded (a seccomp filter that refuses it).
-        /// The walk uses fstatat and the mount table.
+        /// statx is not there: the probe failed with `ENOSYS` (Linux before
+        /// 4.11) or `EPERM` (a seccomp filter that refuses it). The walk
+        /// uses fstatat and the mount table.
         Missing,
     }
 
@@ -1248,60 +1296,57 @@ mod statx {
         Done,
         NoSys,
         Perm,
-        /// Any other error, which is the entry's.
+        /// Any other error.
         Other,
     }
 
-    /// The state after a call that ended with `outcome`. An `EPERM` once
-    /// statx has worked is that entry's error, as an unreadable entry's.
+    /// The state after a call that ended with `outcome`. Only the probe,
+    /// from `Untried`, decides; after it, every error is the entry's,
+    /// `ENOSYS` and `EPERM` too (a FUSE filesystem with no getattr answers
+    /// `ENOSYS`), and leaves that entry unreadable.
     pub fn next(state: State, outcome: Outcome) -> State {
         match (state, outcome) {
+            (State::Untried, Outcome::Done | Outcome::Other) => State::Works,
+            (State::Untried, Outcome::NoSys | Outcome::Perm) => State::Missing,
+            (State::Works, Outcome::Done | Outcome::NoSys | Outcome::Perm | Outcome::Other) => {
+                State::Works
+            }
             (State::Missing, Outcome::Done | Outcome::NoSys | Outcome::Perm | Outcome::Other) => {
                 State::Missing
             }
-            (State::Untried | State::Works, Outcome::NoSys) => State::Missing,
-            (State::Untried, Outcome::Perm) => State::Missing,
-            (State::Works, Outcome::Perm) => State::Works,
-            (State::Untried | State::Works, Outcome::Done) => State::Works,
-            (State::Untried, Outcome::Other) => State::Untried,
-            (State::Works, Outcome::Other) => State::Works,
         }
     }
 
-    fn code(state: State) -> u8 {
-        match state {
-            State::Untried => 0,
-            State::Works => 1,
-            State::Missing => 2,
+    fn outcome(done: libc::c_long) -> Outcome {
+        if done == 0 {
+            return Outcome::Done;
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::ENOSYS) => Outcome::NoSys,
+            Some(libc::EPERM) => Outcome::Perm,
+            _ => Outcome::Other,
         }
     }
 
-    fn state(code: u8) -> State {
-        match code {
-            1 => State::Works,
-            2 => State::Missing,
-            _ => State::Untried,
-        }
-    }
-
-    static STATE: AtomicU8 = AtomicU8::new(0);
-
-    /// Moves the process's state by `outcome`, one compare-and-set at a
-    /// time, and returns the state the call is judged in.
-    fn record(outcome: Outcome) -> State {
-        let mut now = state(STATE.load(Ordering::Relaxed));
-        loop {
-            let to = next(now, outcome);
-            if to == now {
-                return to;
-            }
-            match STATE.compare_exchange(code(now), code(to), Ordering::Relaxed, Ordering::Relaxed)
-            {
-                Ok(_) => return to,
-                // Another walk moved it first: judge by where it is now.
-                Err(seen) => now = state(seen),
-            }
-        }
+    /// The process's state: the first caller runs the probe, a statx of `/`,
+    /// while any other waits for it.
+    fn state() -> State {
+        static STATE: OnceLock<State> = OnceLock::new();
+        *STATE.get_or_init(|| {
+            let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+            // SAFETY: as in `lstat`, with a NUL-terminated literal.
+            let done = unsafe {
+                libc::syscall(
+                    libc::SYS_statx,
+                    libc::AT_FDCWD,
+                    c"/".as_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT,
+                    MASK,
+                    &raw mut stx,
+                )
+            };
+            next(State::Untried, outcome(done))
+        })
     }
 
     /// What the walk reads: the type, links, inode, size, blocks and
@@ -1318,7 +1363,7 @@ mod statx {
     /// mount is `None` where the kernel gives none (before Linux 5.8) or
     /// gives 0 (qemu-user before 11).
     pub fn lstat(at: BorrowedFd, name: &CStr) -> Option<io::Result<Stat>> {
-        if state(STATE.load(Ordering::Relaxed)) == State::Missing {
+        if state() == State::Missing {
             return None;
         }
         // SAFETY: statx reads the NUL-terminated name, which outlives the
@@ -1336,18 +1381,8 @@ mod statx {
             )
         };
         if done != 0 {
-            let e = io::Error::last_os_error();
-            let outcome = match e.raw_os_error() {
-                Some(libc::ENOSYS) => Outcome::NoSys,
-                Some(libc::EPERM) => Outcome::Perm,
-                _ => Outcome::Other,
-            };
-            return match record(outcome) {
-                State::Missing => None,
-                State::Untried | State::Works => Some(Err(e)),
-            };
+            return Some(Err(io::Error::last_os_error()));
         }
-        record(Outcome::Done);
         Some(Ok(from(&stx)))
     }
 
@@ -1388,28 +1423,33 @@ mod statx {
 mod table {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
-    use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
 
-    /// One line of a mount table: where the mount is, and whether it is a
-    /// loopback mount (illumos lofs), which keeps the device of what it
-    /// shows.
+    /// One line of a mount table.
     pub struct Line {
+        /// Where the mount is, as the table says: the path it had when it
+        /// was mounted. A folder above it renamed since (`git worktree
+        /// move` renames one) leaves it there (illumos `vfs.c`).
         pub point: Vec<u8>,
-        pub lofs: bool,
+        /// A loopback mount (illumos lofs), which keeps the device of what
+        /// it shows: what it shows (the table's first field), and the
+        /// device it has, `None` where the table cannot give it.
+        pub lofs: Option<(Vec<u8>, Option<u64>)>,
     }
 
     /// What the walk takes from the table.
-    #[derive(Clone, Default)]
+    #[derive(Clone, Default, PartialEq, Eq, Debug)]
     pub struct Table {
         /// Each mount point strictly inside the worktree, sorted.
         pub inside: Vec<PathBuf>,
-        /// The device and inode of the root of each lofs mount, wherever it
-        /// is, sorted. A mount made on a folder that a lofs mount shows is
-        /// seen through the lofs mount too (`lo_lookup` calls `traverse`),
-        /// at a path the table does not list. An entry with one of these is
-        /// such a root, or the folder a lofs mount shows, which keeps its
-        /// worktree for nothing.
+        /// The device and inode of the root of each lofs mount on the
+        /// worktree's device, sorted. lofs gives the attributes of the folder
+        /// or file it shows, so they are its source's, wherever the mount is
+        /// now: a mount the table lists by an old path, and one made on a
+        /// folder that another lofs mount shows, which is seen through that
+        /// one (`lo_lookup` calls `traverse`) at a path the table does not
+        /// list. An entry with one of these is such a root, or the source
+        /// itself, which keeps its worktree for nothing.
         pub roots: Vec<(u64, u64)>,
     }
 
@@ -1433,14 +1473,14 @@ mod table {
     #[cfg(any(target_os = "illumos", target_os = "solaris"))]
     const LINE: fn(&[u8]) -> Option<Line> = mnttab_line;
 
-    /// The table for the worktree at `root`.
+    /// The table for the worktree at `root`, on `device`.
     #[cfg(any(
         target_os = "linux",
         target_os = "android",
         target_os = "illumos",
         target_os = "solaris"
     ))]
-    pub fn read(root: &Path) -> std::io::Result<Table> {
+    pub fn read(root: &Path, device: u64) -> std::io::Result<Table> {
         use std::io;
         let at = |e: io::Error| io::Error::new(e.kind(), format!("{TABLE}: {e}"));
         // Read until two reads agree: before Linux 5.8, a read of the
@@ -1452,7 +1492,9 @@ mod table {
                 let lines = lines(&now, LINE).ok_or_else(|| {
                     io::Error::other(format!("{TABLE}: a line residue cannot read"))
                 })?;
-                return Ok(table(lines, root));
+                let look = |path: &Path| super::lookup(path).map(|s| (s.dev(), s.ino()));
+                return table(lines, root, device, &look)
+                    .map_err(|e| io::Error::other(format!("{TABLE}: {e}")));
             }
             last = now;
         }
@@ -1470,19 +1512,53 @@ mod table {
             .collect()
     }
 
-    /// What `lines` give the walk of the worktree at `root`. Each lofs
-    /// mount point is looked up whole, which follows into the mount; one
-    /// residue cannot look up is left out, as the walk could not reach it
-    /// by that path either. Only lofs: any other mount has a device of its
-    /// own, and looking up every mount point would wait on each network
-    /// filesystem's server.
-    pub fn table(lines: Vec<Line>, root: &Path) -> Table {
+    /// What `lines` give the walk of the worktree at `root`, on `device`.
+    /// `look` gives the device and inode of a path, looked up without
+    /// following a symbolic link (`fsinfo::lookup`). Only the source of a
+    /// lofs mount on `device`, or one whose device the table does not give,
+    /// is looked up, and its mount point only where the source does not lead
+    /// to `device`: a lofs mount on another device is a mount point by its
+    /// device, and a lookup of a path on another filesystem could wait on a
+    /// network server or mount an automounted folder. A mount on `device`
+    /// that neither leads to is an `Err`: it could be inside the worktree.
+    pub fn table(
+        lines: Vec<Line>,
+        root: &Path,
+        device: u64,
+        look: &dyn Fn(&Path) -> std::io::Result<(u64, u64)>,
+    ) -> Result<Table, String> {
         let mut table = Table::default();
         for line in lines {
             let at = PathBuf::from(OsString::from_vec(line.point));
-            if line.lofs {
-                if let Ok(meta) = std::fs::metadata(&at) {
-                    table.roots.push((meta.dev(), meta.ino()));
+            if let Some((source, dev)) = line.lofs {
+                if dev.is_none_or(|d| d == device) {
+                    let source = PathBuf::from(OsString::from_vec(source));
+                    // The source, then the mount point, which shows it: in a
+                    // zone, a source in the global zone is not there to
+                    // look up.
+                    match look(&source) {
+                        Ok(id) if id.0 == device => table.roots.push(id),
+                        first => match look(&at) {
+                            Ok(id) if id.0 == device => table.roots.push(id),
+                            // A mount the table gives no device for, and
+                            // that is on another one.
+                            second if dev.is_none() && (first.is_ok() || second.is_ok()) => {}
+                            second => {
+                                let why = |r: std::io::Result<(u64, u64)>| match r {
+                                    Ok(_) => "on another device".to_string(),
+                                    Err(e) => e.to_string(),
+                                };
+                                return Err(format!(
+                                    "cannot tell what the lofs mount at {} shows: {}: {}; {}: {}",
+                                    at.display(),
+                                    source.display(),
+                                    why(first),
+                                    at.display(),
+                                    why(second)
+                                ));
+                            }
+                        },
+                    }
                 }
             }
             if at != root && at.starts_with(root) {
@@ -1493,7 +1569,7 @@ mod table {
         table.inside.dedup();
         table.roots.sort_unstable();
         table.roots.dedup();
-        table
+        Ok(table)
     }
 
     /// A line of Linux's `mountinfo`: the mount point is its fifth field,
@@ -1523,23 +1599,38 @@ mod table {
         }
         (out.first() == Some(&b'/')).then_some(Line {
             point: out,
-            lofs: false,
+            lofs: None,
         })
     }
 
     /// A line of illumos's `/etc/mnttab`: exactly five fields separated by
-    /// tabs, the mount point second and the type third (mnttab(5)). mntfs
-    /// writes them as they are, so a tab inside one makes the line, and the
-    /// table, one residue cannot read.
+    /// tabs, what is mounted, the mount point, the type, the options and
+    /// the time (mnttab(5)). mntfs writes them as they are, so a tab inside
+    /// one makes the line, and the table, one residue cannot read. The
+    /// option `dev=` is the device in 32 bits (`cmpldev`), or `7fffffff`
+    /// where it does not fit.
     #[cfg(any(test, target_os = "illumos", target_os = "solaris"))]
     pub fn mnttab_line(line: &[u8]) -> Option<Line> {
         let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
-        let [_, point, kind, _, _] = fields[..] else {
+        let [special, point, kind, options, _] = fields[..] else {
             return None;
         };
-        (point.first() == Some(&b'/')).then(|| Line {
+        if point.first() != Some(&b'/') {
+            return None;
+        }
+        let lofs = (kind == b"lofs").then(|| {
+            let dev = options
+                .split(|&b| b == b',')
+                .find_map(|o| o.strip_prefix(b"dev="))
+                .and_then(|hex| u32::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok())
+                .filter(|&d| d != 0x7fff_ffff)
+                // The 64-bit device: major above 32 bits, minor below.
+                .map(|d| (u64::from(d >> 18) << 32) | u64::from(d & 0x3_ffff));
+            (special.to_vec(), dev)
+        });
+        Some(Line {
             point: point.to_vec(),
-            lofs: kind == b"lofs",
+            lofs,
         })
     }
 }
@@ -2432,7 +2523,9 @@ mod tests {
         root: &Path,
         line: fn(&[u8]) -> Option<table::Line>,
     ) -> Option<Vec<PathBuf>> {
-        table::lines(text, line).map(|lines| table::table(lines, root).inside)
+        let none =
+            |_: &Path| -> std::io::Result<(u64, u64)> { panic!("no lofs source is looked up") };
+        table::lines(text, line).map(|lines| table::table(lines, root, 0, &none).unwrap().inside)
     }
 
     /// Both tables' lines, as Linux's mountinfo and illumos's mnttab write
@@ -2496,28 +2589,144 @@ swap\t/srv/rc/wt/a b\ttmpfs\txattr,dev=5000001\t1762700000
         }
     }
 
-    /// The root of each lofs mount the table lists, wherever it is, by its
-    /// device and inode: a folder the walk lists with them is a mount point
-    /// it reached through another lofs mount. A lofs mount point residue
-    /// cannot look up is left out, and other types are not looked up.
+    /// The `dev=` option of a mnttab line is the 32-bit device (`cmpldev`):
+    /// the walk turns it into the 64-bit one stat gives, major above 32
+    /// bits. `7fffffff`, a device that does not fit, and a line without the
+    /// option give none.
     #[test]
-    fn a_lofs_mount_counts_by_its_root_wherever_the_table_lists_it() {
-        use std::os::unix::fs::MetadataExt;
-        let root = scratch("lofs");
-        let shown = root.join("shown");
-        fs::create_dir_all(&shown).unwrap();
-        let meta = fs::metadata(&shown).unwrap();
-        let text = format!(
-            "/elsewhere\t{}\tlofs\tdev=1\t0\n/gone\t/no/such/folder\tlofs\tdev=1\t0\nswap\t{}\ttmpfs\tdev=2\t0\n",
-            shown.display(),
-            root.display()
+    fn a_mnttab_line_gives_its_lofs_source_and_device() {
+        let line =
+            table::mnttab_line(b"/srv/shared\t/srv/rc/wt/build\tlofs\trw,dev=4010002\t1762700000")
+                .unwrap();
+        assert_eq!(line.point, b"/srv/rc/wt/build");
+        assert_eq!(
+            line.lofs,
+            Some((b"/srv/shared".to_vec(), Some((0x100 << 32) | 0x10002)))
         );
+        for (options, dev) in [
+            ("dev=7fffffff", None),
+            ("rw,nosub", None),
+            ("dev=zz", None),
+            ("dev=5", Some(5)),
+        ] {
+            let text = format!("/a\t/b\tlofs\t{options}\t0");
+            let line = table::mnttab_line(text.as_bytes()).unwrap();
+            assert_eq!(line.lofs.unwrap().1, dev, "{options}");
+        }
+        let line = table::mnttab_line(b"swap\t/tmp\ttmpfs\tdev=5\t0").unwrap();
+        assert!(line.lofs.is_none(), "only lofs keeps the device");
+    }
+
+    /// Only the source of a lofs mount on the worktree's device, or of one
+    /// whose device the table does not give, is looked up, and its device
+    /// and inode are a mount's root wherever the mount point is now. A
+    /// source on the device that cannot be looked up, or that is on another
+    /// device now, makes the table one residue cannot use. A source the
+    /// table gives no device for that is on another device is left out.
+    #[test]
+    fn a_lofs_mount_on_the_worktrees_device_counts_by_its_source() {
+        use std::cell::RefCell;
+        let dev = |d: u64| format!("{:x}", ((d >> 32) << 18) | (d & 0x3_ffff));
+        let device = (7 << 32) | 3;
+        let other = (7 << 32) | 4;
+        let text = format!(
+            "/src/here\t/old/wt/build\tlofs\tdev={}\t0\n/src/far\t/x\tlofs\tdev={}\t0\n/src/unsaid\t/y\tlofs\tdev=7fffffff\t0\n/src/unsaid-far\t/z\tlofs\trw\t0\nswap\t/srv/rc/wt/t\ttmpfs\tdev={}\t0\n",
+            dev(device),
+            dev(other),
+            dev(other)
+        );
+        let looked = RefCell::new(Vec::new());
+        let look = |path: &Path| -> std::io::Result<(u64, u64)> {
+            looked.borrow_mut().push(path.to_path_buf());
+            match path.to_str().unwrap() {
+                "/src/here" => Ok((device, 11)),
+                "/src/unsaid" => Ok((device, 12)),
+                "/src/unsaid-far" => Ok((other, 13)),
+                "/z" => Ok((other, 14)),
+                _ => panic!("looked up {}", path.display()),
+            }
+        };
         let lines = table::lines(text.as_bytes(), table::mnttab_line).unwrap();
-        let t = table::table(lines, Path::new("/srv/rc/wt"));
-        assert_eq!(t.roots, [(meta.dev(), meta.ino())]);
-        assert!(t.inside.is_empty());
-        assert!(t.lists(Path::new("/srv/rc/wt/x"), (meta.dev(), meta.ino())));
-        assert!(!t.lists(Path::new("/srv/rc/wt/x"), (meta.dev(), meta.ino() + 1)));
+        let t = table::table(lines, Path::new("/srv/rc/wt"), device, &look).unwrap();
+        assert_eq!(
+            *looked.borrow(),
+            [
+                PathBuf::from("/src/here"),
+                PathBuf::from("/src/unsaid"),
+                PathBuf::from("/src/unsaid-far"),
+                PathBuf::from("/z")
+            ]
+        );
+        assert_eq!(t.roots, [(device, 11), (device, 12)]);
+        assert_eq!(t.inside, [PathBuf::from("/srv/rc/wt/t")]);
+        // The mount point the table names is stale; the walk finds the root
+        // at the folder's new path by its device and inode.
+        assert!(t.lists(Path::new("/new/wt/build"), (device, 11)));
+        assert!(!t.lists(Path::new("/new/wt/build"), (device, 14)));
+
+        // Where the source does not lead to the device, the mount point,
+        // which shows it, is looked up instead.
+        let text = format!("/src/here\t/old/wt/build\tlofs\tdev={}\t0\n", dev(device));
+        let gone = || Err(std::io::Error::other("No such file or directory"));
+        for (source, point, want) in [
+            (gone(), Ok((device, 21)), Ok(vec![(device, 21)])),
+            (Ok((other, 1)), Ok((device, 22)), Ok(vec![(device, 22)])),
+            (
+                gone(),
+                gone(),
+                Err(
+                    "cannot tell what the lofs mount at /old/wt/build shows: /src/here: No such file or directory; /old/wt/build: No such file or directory",
+                ),
+            ),
+            (
+                Ok((other, 1)),
+                Ok((other, 2)),
+                Err(
+                    "cannot tell what the lofs mount at /old/wt/build shows: /src/here: on another device; /old/wt/build: on another device",
+                ),
+            ),
+        ] {
+            let answers = RefCell::new(vec![point, source]);
+            let look = |_: &Path| answers.borrow_mut().pop().unwrap();
+            let lines = table::lines(text.as_bytes(), table::mnttab_line).unwrap();
+            let got = table::table(lines, Path::new("/srv/rc/wt"), device, &look).map(|t| t.roots);
+            assert_eq!(got, want.map_err(str::to_string));
+        }
+        // With no device in the table, a mount whose source and mount point
+        // lead elsewhere is on another device, and left out.
+        let answers = RefCell::new(vec![gone(), Ok((other, 1))]);
+        let look = |_: &Path| answers.borrow_mut().pop().unwrap();
+        let lines = table::lines(b"/src/x\t/y\tlofs\trw\t0\n", table::mnttab_line).unwrap();
+        assert_eq!(
+            table::table(lines, Path::new("/srv/rc/wt"), device, &look)
+                .unwrap()
+                .roots,
+            []
+        );
+    }
+
+    /// The lookup of a lofs source goes from `/` one name at a time and
+    /// never through a symbolic link, the last name included, and gives a
+    /// file as well as a folder.
+    #[test]
+    fn a_lofs_source_is_looked_up_without_following_links() {
+        use std::os::unix::fs::MetadataExt;
+        let root = scratch("source");
+        fs::create_dir_all(root.join("d")).unwrap();
+        fs::write(root.join("d").join("f"), "x").unwrap();
+        symlink(root.join("d"), root.join("l")).unwrap();
+        let file = super::lookup(&root.join("d").join("f")).unwrap();
+        let meta = fs::symlink_metadata(root.join("d").join("f")).unwrap();
+        assert_eq!((file.dev(), file.ino()), (meta.dev(), meta.ino()));
+        assert!(super::lookup(&root.join("d")).unwrap().is_dir());
+        for through in [root.join("l"), root.join("l").join("f")] {
+            let Err(e) = super::lookup(&through) else {
+                panic!("{through:?} was looked up through a symbolic link");
+            };
+            assert!(e.to_string().contains("symbolic link"), "{through:?}: {e}");
+        }
+        assert!(super::lookup(Path::new("relative")).is_err());
+        assert!(super::lookup(&root.join("d").join("..").join("d")).is_err());
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -2599,6 +2808,20 @@ swap\t/srv/rc/wt/a b\ttmpfs\txattr,dev=5000001\t1762700000
             Ok(Mounts::Table(listed.clone()))
         });
         assert_eq!(usage.mounts_unknown.as_deref(), Some("/etc/mnttab: gone"));
+        // A lofs mount on its device that the second read finds.
+        let reads = Cell::new(0);
+        let usage = walk(&|_| {
+            reads.set(reads.get() + 1);
+            let mut t = listed.clone();
+            if reads.get() > 1 {
+                t.roots.push((u64::MAX, u64::MAX));
+            }
+            Ok(Mounts::Table(t))
+        });
+        assert_eq!(
+            usage.mounts_unknown.as_deref(),
+            Some("a lofs mount on its device appeared while residue read it")
+        );
         // One that is gone by the second read is not new.
         let reads = Cell::new(0);
         let usage = walk(&|_| {
@@ -2613,32 +2836,29 @@ swap\t/srv/rc/wt/a b\ttmpfs\txattr,dev=5000001\t1762700000
         fs::remove_dir_all(&root).unwrap();
     }
 
-    /// statx is missing once it fails with ENOSYS, or with EPERM before any
-    /// call worked (a seccomp filter). Once a call worked, an EPERM is that
-    /// entry's error, and nothing brings statx back once it is missing.
+    /// statx is missing only when the probe, the first call, fails with
+    /// ENOSYS or EPERM. After it, any error is that entry's, ENOSYS and
+    /// EPERM included (a FUSE filesystem with no getattr answers ENOSYS),
+    /// and nothing moves the state again.
     #[cfg(target_os = "linux")]
     #[test]
-    fn statx_is_missing_only_when_the_kernel_or_a_filter_refuses_it() {
+    fn statx_is_missing_only_when_its_probe_is_refused() {
         use super::statx::{Outcome, State, next};
         let all = [Outcome::Done, Outcome::NoSys, Outcome::Perm, Outcome::Other];
         assert_eq!(next(State::Untried, Outcome::Done), State::Works);
+        assert_eq!(next(State::Untried, Outcome::Other), State::Works);
         assert_eq!(next(State::Untried, Outcome::NoSys), State::Missing);
         assert_eq!(next(State::Untried, Outcome::Perm), State::Missing);
-        assert_eq!(next(State::Untried, Outcome::Other), State::Untried);
-        assert_eq!(next(State::Works, Outcome::Done), State::Works);
+        assert_eq!(next(State::Works, Outcome::NoSys), State::Works);
         assert_eq!(next(State::Works, Outcome::Perm), State::Works);
-        assert_eq!(next(State::Works, Outcome::Other), State::Works);
-        assert_eq!(next(State::Works, Outcome::NoSys), State::Missing);
         for outcome in all {
+            assert_eq!(next(State::Works, outcome), State::Works);
             assert_eq!(next(State::Missing, outcome), State::Missing);
         }
-        // From any state, a run of outcomes never leaves Missing, and never
-        // reaches it by EPERM or another error once a call worked.
         for first in all {
             for then in all {
-                let after = next(next(State::Works, first), then);
-                let refused = matches!(first, Outcome::NoSys) || matches!(then, Outcome::NoSys);
-                assert_eq!(after == State::Missing, refused, "{first:?} then {then:?}");
+                let settled = next(State::Untried, first);
+                assert_eq!(next(settled, then), settled, "{first:?} then {then:?}");
             }
         }
     }
