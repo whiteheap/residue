@@ -1813,10 +1813,10 @@ pub fn create(
     ))
 }
 
-/// A directory's canonical path, device and inode; `None` when it cannot
-/// be read.
+/// A directory's canonical path (`git::canonical`, one spelling of a
+/// firmlinked one), device and inode; `None` when it cannot be read.
 fn dir_id(dir: &Path) -> Option<(PathBuf, u64, u64)> {
-    let path = fs::canonicalize(dir).ok()?;
+    let path = git::canonical(dir).ok()?;
     let meta = fs::metadata(&path).ok()?;
     meta.is_dir().then(|| (path, meta.dev(), meta.ino()))
 }
