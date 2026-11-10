@@ -3076,5 +3076,155 @@ else
     skip_partial git-redirect-all-removes
 fi
 
+# 23. macOS: Git records a worktree in the spelling it was added with, and
+# `/System/Volumes/Data/private/...` is the same folder as `/private/...`
+# through a firmlink (/usr/share/firmlinks), while Git's --show-toplevel
+# and lsof print the short spelling (#179). w is moved to the long
+# spelling of its own path, which Git then records. It is judged as w is
+# by either spelling; a sleep inside it, started through the long
+# spelling, keeps it in use; a checkout of another repository at that path
+# keeps it unknown at `identity`; a removal of it removes it with a record
+# that restores it, and the trash restores it too; a removal that cannot
+# write its record moves it back to the spelling Git recorded.
+
+# Is PATH, as `git worktree list` gives it, a worktree of $repo?
+listed_as() { # PATH
+    git -C "$repo" worktree list --porcelain -z | tr '\0' '\n' | grep -qxF "worktree $1"
+}
+# make_repo, then w recorded as $long. Returns 1 after a skip line when
+# the scratch directory has no such spelling (it is on another volume).
+make_firmlinked() { # NAME
+    name=$1
+    make_repo
+    local physical
+    physical=$(cd "$wt" && pwd -P) || exit 2
+    long=/System/Volumes/Data$physical
+    if [ "$(stat -f '%d %i' "$long" 2>/dev/null)" != "$(stat -f '%d %i' "$physical")" ]; then
+        echo "skip $name: $physical is not on the Data volume, so it has no /System/Volumes/Data spelling"
+        return 1
+    fi
+    setup git -C "$repo" worktree move "$wt" "$repo/.worktrees/w-short"
+    setup git -C "$repo" worktree move "$repo/.worktrees/w-short" "$long"
+    listed_as "$long" || { echo "contract-check: setup failed in $name: Git does not list w as $long" >&2; exit 2; }
+    short=$physical
+}
+firmlink_cases() {
+    local before holder i busy real
+    if make_firmlinked firmlink-judged; then
+        run explain --json "$long"
+        busy=$work/$name.long
+        mv "$out" "$busy" || exit 2
+        run explain --json "$wt"
+        if [ "$status" != 0 ]; then fail "explain of the short spelling: exit $status, want 0"
+        elif ! jq -e --arg short "$short" '.worktree | .verdict == "candidate" and .canonical_path == $short
+                and ([.checks[] | select(.id == "identity") | .status] == ["pass"])' "$busy" >/dev/null; then
+            fail "explain of the long spelling says $(jq -c '.worktree | [.verdict, .canonical_path, [.checks[] | select(.status != "pass")]]' "$busy")"
+        elif ! jq -e '.worktree.verdict == "candidate"' "$out" >/dev/null; then
+            fail "explain of the short spelling says $(jq -c '.worktree.verdict' "$out")"
+        elif ! listed_as "$long"; then fail "Git no longer lists w as $long"
+        elif common_ok; then ok; fi
+    fi
+
+    if make_firmlinked firmlink-in-use; then
+        before=$(sums "$long")
+        (cd "$long/sub" && exec sleep 300) >/dev/null 2>&1 &
+        holder=$!
+        holders="$holders $holder"
+        for ((i = 0; i < 100; i++)); do
+            case $(ps -o comm= -p "$holder" 2>/dev/null) in *sleep) break ;; esac
+            sleep 0.1
+        done
+        run explain --json "$long"
+        busy=$work/$name.busy
+        mv "$out" "$busy" || exit 2
+        run remove --yes --json --no-trash "$long"
+        kill "$holder" 2>/dev/null
+        wait "$holder" 2>/dev/null
+        if ! jq -e --argjson pid "$holder" '.worktree | .verdict == "keep" and .activity.state == "in_use"
+                and any(.activity.processes[]; .pid == $pid)' "$busy" >/dev/null; then
+            fail "with sleep[$holder] in it, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$busy")"
+        elif [ "$status" != 3 ]; then fail "remove --yes exit $status, want 3"
+        elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), want refused"
+        elif [ "$(failing_checks 0)" != activity ]; then fail "failing checks: $(failing_checks 0), want activity"
+        elif ! listed_as "$long"; then fail "Git no longer lists w as $long"
+        elif [ "$(sums "$long")" != "$before" ]; then fail "w's files changed"
+        elif common_ok; then ok; fi
+    fi
+
+    if make_firmlinked firmlink-other-checkout; then
+        real=$work/$name-w
+        setup mv "$short" "$real"
+        setup git init -q "$short"
+        echo other >"$short/other.txt"
+        setup git -C "$short" add other.txt
+        setup git -C "$short" commit -qm other
+        before=$(sums "$short")
+        run scan --json "$repo"
+        if [ "$status" != 0 ]; then fail "scan exit $status, want 0"
+        elif ! jq -e --arg long "$long" '[.repositories[].worktrees[] | select(.path == $long)] as $w
+                | ($w | length) == 1 and $w[0].verdict == "unknown"
+                and ([$w[0].checks[] | select(.status != "pass") | .id + " " + .status] == ["identity unknown"])
+                and ([$w[0].checks[] | select(.id == "identity") | .detail][0] | endswith("not the listed worktree"))' "$out" >/dev/null; then
+            fail "scan says $(jq -c --arg long "$long" '[.repositories[].worktrees[] | select(.path == $long) | [.verdict, [.checks[] | select(.status != "pass")]]]' "$out")"
+        elif [ "$(sums "$short")" != "$before" ]; then fail "the other checkout's files changed"
+        elif [ ! -f "$real/sub/file.txt" ]; then fail "w's files, moved away, are gone"
+        elif ! listed_as "$long"; then fail "Git no longer lists w as $long"
+        else ok; fi
+    fi
+
+    if make_firmlinked firmlink-removed; then
+        before=$(tracked)
+        run remove --yes --json --no-trash "$long"
+        if [ "$status" != 0 ]; then fail "exit $status, want 0 (failing checks: $(failing_checks 0))"
+        elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
+        elif [ -e "$short" ] || listed_as "$long" || listed_as "$short"; then fail "the worktree is still there"
+        elif [ "$(records)" != "1 records, 1 refs" ]; then fail "$(records), want 1 records, 1 refs"
+        else
+            run restore --json "$long"
+            if [ "$status" != 0 ]; then fail "restore: exit $status, want 0"
+            elif ! restore_ok removed checked_out_branch; then fail "stdout is not one restore document with checkout checked_out_branch"
+            elif ! registered "$wt"; then fail "Git does not list the restored worktree"
+            elif [ "$(tracked)" != "$before" ]; then fail "the restored files differ from w's"
+            elif [ "$(records)" != "0 records, 0 refs" ]; then fail "$(records) after the restore, want 0 records, 0 refs"
+            elif common_ok; then ok; fi
+        fi
+    fi
+
+    if make_firmlinked firmlink-trashed; then
+        before=$(sums "$long")
+        run remove --yes --json --trash "$long"
+        if [ "$status" != 0 ]; then fail "exit $status, want 0 (failing checks: $(failing_checks 0))"
+        elif [ "$(result 0 result)" != trashed ]; then fail "result $(result 0 result), want trashed"
+        elif [ -e "$short" ]; then fail "the worktree is still at its path"
+        else
+            run restore --json "$long"
+            if [ "$status" != 0 ]; then fail "restore: exit $status, want 0"
+            elif ! registered "$wt"; then fail "Git does not list the restored worktree"
+            elif [ "$(sums "$wt")" != "$before" ]; then fail "the restored files differ from w's"
+            elif common_ok; then ok; fi
+        fi
+    fi
+
+    if make_firmlinked firmlink-put-back; then
+        before=$(sums "$long")
+        echo in-the-way >"$repo/.git/residue-removed" || exit 2
+        run remove --yes --json --no-trash "$long"
+        rm -f "$repo/.git/residue-removed"
+        if [ "$status" != 3 ]; then fail "exit $status, want 3"
+        elif [ "$(result 0 result)" != skipped ]; then fail "result $(result 0 result), want skipped"
+        elif ! result 0 reason | grep -q "it is back in place"; then fail "reason: $(result 0 reason)"
+        elif ! listed_as "$long"; then fail "Git does not list w as $long, the spelling it recorded"
+        elif [ "$(sums "$long")" != "$before" ]; then fail "w's files changed"
+        elif common_ok; then ok; fi
+    fi
+}
+if [ "$(uname -s)" = Darwin ]; then
+    firmlink_cases
+else
+    for c in firmlink-judged firmlink-in-use firmlink-other-checkout firmlink-removed firmlink-trashed firmlink-put-back; do
+        echo "skip $c: only macOS has firmlinks"
+    done
+fi
+
 echo "contract-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]

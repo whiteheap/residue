@@ -376,8 +376,73 @@ pub fn common_dir(dir: &Path) -> Result<PathBuf, String> {
     canonical(&path_from(only))
 }
 
+/// `path` with no `.`, `..` or symbolic link, and in one spelling per
+/// folder, so two paths name the same folder when their canonical forms
+/// are equal.
+///
+/// On macOS, `/System/Volumes/Data/Users/me` and `/Users/me` are one folder
+/// through a firmlink, and realpath(3) keeps whichever spelling it is
+/// given. Git records a worktree in the spelling it was added with, but
+/// prints `--show-toplevel` and lsof prints a working directory in the
+/// kernel's, the short one. So a folder spelled through
+/// `/System/Volumes/Data` takes the kernel's spelling ([`firmlinked`]),
+/// and the identity check, the activity match and the paths residue moves
+/// a worktree to all read one spelling (#179).
 pub fn canonical(path: &Path) -> Result<PathBuf, String> {
-    std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))
+    let found = std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    #[cfg(target_os = "macos")]
+    if let Some(short) = firmlinked(&found) {
+        return Ok(short);
+    }
+    Ok(found)
+}
+
+/// Where macOS mounts the Data volume, which firmlinks join to the system
+/// volume's folders (`/usr/share/firmlinks`).
+#[cfg(target_os = "macos")]
+const DATA_VOLUME: &str = "/System/Volumes/Data";
+
+/// For `found`, a canonical path under [`DATA_VOLUME`], the spelling the
+/// kernel gives the same folder: `/Users/me/w` for
+/// `/System/Volumes/Data/Users/me/w`. It is read from the folder itself
+/// (fcntl `F_GETPATH`, which names a folder as getcwd(3) and lsof do) and
+/// taken only when it is canonical too and names the folder that is open,
+/// by device and inode; otherwise `None`, and `found` keeps its spelling.
+/// A path that is not a folder is not looked at.
+#[cfg(target_os = "macos")]
+fn firmlinked(found: &Path) -> Option<PathBuf> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::MetadataExt;
+    if !found.starts_with(DATA_VOLUME) || found == Path::new(DATA_VOLUME) {
+        return None;
+    }
+    let name = std::ffi::CString::new(found.as_os_str().as_bytes()).ok()?;
+    // O_EVTONLY opens a folder without read permission, and O_DIRECTORY
+    // with O_NOFOLLOW refuses anything else, a symbolic link included.
+    let flags = libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: open reads the NUL-terminated name; the descriptor it
+    // returns is ours.
+    let fd = unsafe { libc::open(name.as_ptr(), flags) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: the descriptor is open and nothing else owns it.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes at most PATH_MAX bytes, its NUL included,
+    // into the buffer, which holds that many.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } == -1 {
+        return None;
+    }
+    buf.truncate(buf.iter().position(|b| *b == 0)?);
+    let short = PathBuf::from(OsString::from_vec(buf));
+    if short == found || !short.is_absolute() {
+        return None;
+    }
+    let open = std::fs::File::from(fd).metadata().ok()?;
+    let there = std::fs::symlink_metadata(&short).ok()?;
+    let same = there.is_dir() && there.dev() == open.dev() && there.ino() == open.ino();
+    (same && std::fs::canonicalize(&short).ok()? == short).then_some(short)
 }
 
 pub struct Identity {
@@ -2190,6 +2255,44 @@ mod tests {
         assert!(!within_limit(&folders(MAX_LIMITED + 1, 10)));
         assert!(within_limit(&folders(1, MAX_LIMITED_BYTES)));
         assert!(!within_limit(&folders(2, MAX_LIMITED_BYTES / 2 + 1)));
+    }
+
+    /// A folder in the system's temporary directory, on the Data volume,
+    /// has the same canonical path by its `/System/Volumes/Data` spelling
+    /// as by its short one (#179). A file and a path outside the Data
+    /// volume keep the spelling realpath(3) gives.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_firmlinked_folder_has_one_canonical_path() {
+        use super::canonical;
+        use std::os::unix::fs::MetadataExt;
+        use std::path::{Path, PathBuf};
+        let dir = std::env::temp_dir().join(format!(
+            "residue-firmlink-{}-{}",
+            std::process::id(),
+            crate::output::now()
+        ));
+        std::fs::create_dir_all(dir.join("w")).unwrap();
+        std::fs::write(dir.join("w/file"), b"x").unwrap();
+        let short = std::fs::canonicalize(dir.join("w")).unwrap();
+        let long = PathBuf::from(format!("/System/Volumes/Data{}", short.display()));
+        let id = |p: &Path| std::fs::metadata(p).map(|m| (m.dev(), m.ino())).ok();
+        if id(&long).is_none() || id(&long) != id(&short) {
+            std::fs::remove_dir_all(&dir).unwrap();
+            eprintln!("skipped: {} is not on the Data volume", short.display());
+            return;
+        }
+        assert_eq!(canonical(&long).unwrap(), short);
+        assert_eq!(canonical(&short).unwrap(), short);
+        assert_eq!(canonical(&long.join(".")).unwrap(), short);
+        let file = long.join("file");
+        assert_eq!(canonical(&file).unwrap(), file);
+        assert_eq!(
+            canonical(Path::new("/System/Volumes/Data")).unwrap(),
+            Path::new("/System/Volumes/Data")
+        );
+        assert_eq!(canonical(Path::new("/")).unwrap(), Path::new("/"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 

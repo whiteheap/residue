@@ -1716,7 +1716,7 @@ fn is_back(worktree: &Value, back: &[PathBuf]) -> bool {
     let Some(path) = worktree.get("path").and_then(Value::str).map(Path::new) else {
         return false;
     };
-    back.iter().any(|b| b == path) || std::fs::canonicalize(path).is_ok_and(|p| back.contains(&p))
+    back.iter().any(|b| b == path) || git::canonical(path).is_ok_and(|p| back.contains(&p))
 }
 
 /// Watch what a fetch or prune changes in each repository: the directories

@@ -1658,14 +1658,19 @@ fn execute(item: &Item, policy: &Policy, mode: &Mode) -> Outcome {
         }
         (dest, None, REMOVING, None)
     };
+    // Git finds a worktree by the path it recorded, which on macOS can be
+    // spelled through /System/Volumes/Data where `original` is not
+    // (`git::canonical`), so it is moved from and back to that path. Its
+    // aside or trash path is spelled as `original`, which Git then records,
+    // and every check there matches the activity probe's spelling.
     let moved = Moved {
         main: &main,
         dest: &dest,
-        original,
+        original: &listed.path,
         reason,
         entry: entry.as_deref(),
     };
-    if let Err(e) = git::move_worktree(&main, original, &dest) {
+    if let Err(e) = git::move_worktree(&main, &listed.path, &dest) {
         return Outcome::Failed(moved.drop_entry(format!("could not move it aside: {e}")));
     }
     if let Err(e) = git::lock_worktree(&main, &dest, reason) {
