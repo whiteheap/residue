@@ -2174,3 +2174,125 @@ mod tests {
         assert!(!within_limit(&folders(2, MAX_LIMITED_BYTES / 2 + 1)));
     }
 }
+
+#[cfg(test)]
+mod hardening {
+    //! The hardening every Git query residue acts on runs with (#188), on
+    //! the `Command` that [`super::command`] builds, without running Git.
+    //! `CONFIG`, `REDIRECT_ENV` and `CONFIG_ENV` are the policy: these
+    //! tests read them, so an entry is added in one place. What real Git
+    //! does with a hook, an fsmonitor command, a redirect variable or
+    //! config from the environment while residue runs is checked by
+    //! `scripts/contract-check.sh` (section 22).
+
+    use super::{CONFIG, CONFIG_ENV, REDIRECT_ENV, command, command_keeping_config_env};
+    use std::collections::HashMap;
+    use std::ffi::OsStr;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn envs(cmd: &Command) -> HashMap<&OsStr, Option<&OsStr>> {
+        cmd.get_envs().collect()
+    }
+
+    /// `-C DIR`, then `-c SETTING` for every entry of `CONFIG`, in order.
+    fn assert_config_args(cmd: &Command) {
+        let args: Vec<&OsStr> = cmd.get_args().collect();
+        let mut want: Vec<&OsStr> = vec![OsStr::new("-C"), OsStr::new("/repo")];
+        for setting in CONFIG {
+            want.extend([OsStr::new("-c"), OsStr::new(setting)]);
+        }
+        assert_eq!(args, want);
+    }
+
+    #[test]
+    fn command_applies_every_setting_and_removes_every_variable() {
+        let cmd = command(OsStr::new("git"), Path::new("/repo"));
+        assert_config_args(&cmd);
+        let envs = envs(&cmd);
+        for var in REDIRECT_ENV.iter().chain(CONFIG_ENV) {
+            assert_eq!(
+                envs.get(OsStr::new(var)),
+                Some(&None),
+                "{var} is not removed"
+            );
+        }
+        assert_eq!(
+            envs.get(OsStr::new("GIT_OPTIONAL_LOCKS")),
+            Some(&Some(OsStr::new("0")))
+        );
+    }
+
+    /// The variant that only reports what the environment sets keeps
+    /// `CONFIG_ENV` and nothing else of the policy changes.
+    #[test]
+    fn the_reporting_command_keeps_only_config_from_the_environment() {
+        let cmd = command_keeping_config_env(OsStr::new("git"), Path::new("/repo"));
+        assert_config_args(&cmd);
+        let envs = envs(&cmd);
+        for var in REDIRECT_ENV {
+            assert_eq!(
+                envs.get(OsStr::new(var)),
+                Some(&None),
+                "{var} is not removed"
+            );
+        }
+        for var in CONFIG_ENV {
+            assert_eq!(envs.get(OsStr::new(var)), None, "{var} is removed");
+        }
+    }
+
+    /// The entries the threat model needs. Removing one fails here; adding
+    /// one to the lists needs no change.
+    #[test]
+    fn the_policy_turns_off_hooks_fsmonitor_redirects_and_environment_config() {
+        for setting in ["core.hooksPath=/dev/null", "core.fsmonitor=false"] {
+            assert!(CONFIG.contains(&setting), "CONFIG lacks {setting}");
+        }
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CONFIG",
+        ] {
+            assert!(REDIRECT_ENV.contains(&var), "REDIRECT_ENV lacks {var}");
+        }
+        for var in ["GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"] {
+            assert!(CONFIG_ENV.contains(&var), "CONFIG_ENV lacks {var}");
+        }
+    }
+
+    /// `command_keeping_config_env` is built on by `command` and called by
+    /// `environment_regenerable` alone, which only tells the user what the
+    /// environment sets. A query residue acts on never keeps that config.
+    #[test]
+    fn only_environment_regenerable_keeps_config_from_the_environment() {
+        let source = include_str!("git.rs");
+        let code = &source[..source.find("#[cfg(test)]").expect("a test module")];
+        let call = "command_keeping_config_env(";
+        let reporter = {
+            let start = code
+                .find("pub fn environment_regenerable(")
+                .expect("environment_regenerable");
+            let len = code[start..].find("\n}\n").expect("its end");
+            &code[start..start + len]
+        };
+        let builder = {
+            let start = code.find("\nfn command(").expect("command");
+            let len = code[start..].find("\n}\n").expect("its end");
+            &code[start..start + len]
+        };
+        let definition = code.matches("fn command_keeping_config_env(").count();
+        assert_eq!(definition, 1);
+        assert_eq!(builder.matches(call).count(), 1);
+        assert_eq!(reporter.matches(call).count(), 1);
+        assert_eq!(
+            code.matches(call).count(),
+            3,
+            "command_keeping_config_env is called outside command and environment_regenerable"
+        );
+    }
+}

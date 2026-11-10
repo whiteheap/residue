@@ -2691,5 +2691,250 @@ else
     echo "skip activity-other-group: it runs on Linux"
 fi
 
+# 22. Every Git query residue acts on runs with hooks and fsmonitor off, and
+# with no repository and no config from the environment (src/git.rs:
+# CONFIG, REDIRECT_ENV and CONFIG_ENV; #188). Each fixture is first shown to
+# work on this Git without residue: the hook or fsmonitor command runs, the
+# variable changes what `git status` says. Then scan, explain, remove and
+# restore must leave it unrun or unheard. src/git.rs's `hardening` tests
+# check that every entry of those lists is applied.
+
+# A hook under each name githooks(5) lists but git-p4's, and an fsmonitor
+# command (githooks' fsmonitor-watchman runs only as core.fsmonitor), in
+# DIR. Each appends a line to $ran when it runs, which it must not.
+spy_hooks() { # DIR
+    local hook
+    mkdir -p "$1"
+    for hook in applypatch-msg pre-applypatch post-applypatch pre-commit pre-merge-commit \
+        prepare-commit-msg commit-msg post-commit pre-rebase post-checkout post-merge pre-push \
+        pre-receive update proc-receive post-receive post-update reference-transaction \
+        push-to-checkout pre-auto-gc post-rewrite sendemail-validate post-index-change; do
+        printf '#!/bin/sh\necho "hook %s" >>"%s"\n' "$hook" "$ran" >"$1/$hook"
+        chmod +x "$1/$hook"
+    done
+    printf '#!/bin/sh\necho fsmonitor >>"%s"\nexit 1\n' "$ran" >"$spy_fsmonitor"
+    chmod +x "$spy_fsmonitor"
+}
+
+# What ran: "nothing", or the lines in $ran on one line.
+spied() {
+    if [ -s "$ran" ]; then sort -u "$ran" | paste -s -d ' ' -; else echo nothing; fi
+}
+
+# The hooks and fsmonitor command, configured through SOURCE: the
+# repository's own hooks folder and config, a user config file
+# (GIT_CONFIG_GLOBAL), GIT_CONFIG_COUNT or GIT_CONFIG_PARAMETERS. The
+# variables are exported only around residue's runs and the control.
+hooks_case() { # SOURCE
+    name=git-hooks-off-$1
+    make_repo
+    ran=$work/$name.ran spy_fsmonitor=$work/$name.fsmonitor
+    local hooks=$work/$name.hooks vars=() var
+    spy_hooks "$hooks"
+    case $1 in
+    repo)
+        cp "$hooks"/* "$repo/.git/hooks/" || exit 2
+        setup git -C "$repo" config core.fsmonitor "$spy_fsmonitor"
+        ;;
+    user)
+        printf '[user]\n\tname = contract-check\n\temail = contract-check@example.invalid\n[core]\n\thooksPath = %s\n\tfsmonitor = %s\n' \
+            "$hooks" "$spy_fsmonitor" >"$work/$name.gitconfig"
+        vars=("GIT_CONFIG_GLOBAL=$work/$name.gitconfig")
+        ;;
+    count)
+        vars=(GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=core.hooksPath "GIT_CONFIG_VALUE_0=$hooks"
+            GIT_CONFIG_KEY_1=core.fsmonitor "GIT_CONFIG_VALUE_1=$spy_fsmonitor")
+        ;;
+    params)
+        vars=("GIT_CONFIG_PARAMETERS='core.hookspath'='$hooks' 'core.fsmonitor'='$spy_fsmonitor'")
+        ;;
+    esac
+    # The control: on this Git, `status` runs the fsmonitor command and
+    # `update-ref`, which residue's removal records use, runs the
+    # reference-transaction hook.
+    rm -f "$ran"
+    env ${vars[@]+"${vars[@]}"} git -C "$wt" status --porcelain >/dev/null 2>&1
+    env ${vars[@]+"${vars[@]}"} git -C "$wt" update-ref refs/contract-check/spy HEAD >/dev/null 2>&1
+    env ${vars[@]+"${vars[@]}"} git -C "$wt" update-ref -d refs/contract-check/spy >/dev/null 2>&1
+    case $(spied) in
+    *fsmonitor*"hook reference-transaction"*) ;;
+    *)
+        echo "contract-check: setup failed in $name: without residue, Git ran $(spied), want the fsmonitor command and the reference-transaction hook" >&2
+        exit 2
+        ;;
+    esac
+    rm -f "$ran"
+    for var in ${vars[@]+"${vars[@]}"}; do export "${var?}"; done
+    run scan --json "$repo"
+    local scan_status=$status explain_status remove_status restore_status=skipped
+    run explain --json "$wt"
+    explain_status=$status
+    mv "$out" "$work/$name.explain" || exit 2
+    run remove --yes --json "$wt"
+    remove_status=$status
+    mv "$out" "$work/$name.remove" || exit 2
+    if [ -z "$partial_probe" ] && [ "$remove_status" = 0 ]; then
+        run restore --json "$wt"
+        restore_status=$status
+    fi
+    for var in ${vars[@]+"${vars[@]}"}; do unset "${var%%=*}"; done
+    local saw
+    saw=$(spied)
+    if [ "$saw" != nothing ]; then fail "residue's Git ran $saw"
+    elif [ "$scan_status" != 0 ]; then fail "scan exit $scan_status, want 0"
+    elif [ "$explain_status" != 0 ]; then fail "explain exit $explain_status, want 0"
+    elif [ -n "$partial_probe" ]; then
+        out=$work/$name.remove
+        if [ "$remove_status" != 3 ]; then fail "remove exit $remove_status, want 3"
+        elif ! partial_unknown 0; then fail "activity is not unknown (partial_probe): $(jq -c '.results[0].worktree.activity' "$out")"
+        elif [ "$(failing_checks 0)" != activity ]; then fail "failing checks: $(failing_checks 0), want activity"
+        elif common_ok; then ok; fi
+    elif ! jq -e '.worktree.verdict == "candidate"' "$work/$name.explain" >/dev/null; then fail "explain verdict $(jq -r .worktree.verdict "$work/$name.explain"), want candidate"
+    elif [ "$remove_status" != 0 ]; then out=$work/$name.remove; fail "remove exit $remove_status, want 0"
+    elif [ "$restore_status" != 0 ]; then fail "restore exit $restore_status, want 0"
+    elif ! restore_ok removed checked_out_branch; then fail "stdout is not one restore document with checkout checked_out_branch"
+    elif ! registered "$wt"; then fail "w is not registered after the restore"
+    elif common_ok; then ok; fi
+}
+for source in repo user count params; do hooks_case "$source"; done
+
+# Config from the environment that would make a dirty worktree look clean
+# if Git kept it: core.fileMode=false hides a mode change of a tracked file.
+# Through GIT_CONFIG_COUNT and GIT_CONFIG_PARAMETERS alike, w stays.
+filemode_case() { # count or params
+    name=git-env-config-filemode-$1
+    make_repo
+    local vars=() before var
+    case $1 in
+    count) vars=(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fileMode GIT_CONFIG_VALUE_0=false) ;;
+    params) vars=("GIT_CONFIG_PARAMETERS='core.filemode'='false'") ;;
+    esac
+    setup chmod +x "$wt/sub/file.txt"
+    before=$(sums "$wt")
+    if [ -z "$(git -C "$wt" status --porcelain)" ]; then
+        echo "skip $name: this filesystem does not keep the executable bit for Git (core.fileMode is false)"
+        return
+    fi
+    if [ -n "$(env "${vars[@]}" git -C "$wt" status --porcelain)" ]; then
+        echo "contract-check: setup failed in $name: core.fileMode=false from the environment did not hide the mode change from git status" >&2
+        exit 2
+    fi
+    for var in "${vars[@]}"; do export "${var?}"; done
+    run remove --yes --json "$wt"
+    for var in "${vars[@]}"; do unset "${var%%=*}"; done
+    if [ "$status" != 3 ]; then fail "exit $status, want 3"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), want refused"
+    elif [ "$(failing_checks 0)" != "$(want_failing tracked_changes)" ]; then fail "failing checks: $(failing_checks 0), want $(want_failing tracked_changes)"
+    elif [ ! -x "$wt/sub/file.txt" ]; then fail "sub/file.txt lost its executable bit"
+    elif untouched "$before"; then ok; fi
+}
+filemode_case count
+filemode_case params
+
+# residue.regenerable from the environment never widens what residue
+# deletes: GIT_CONFIG_COUNT, GIT_CONFIG_PARAMETERS and the legacy
+# GIT_CONFIG, which makes `git config` read one file, each name w's .env,
+# and w stays, kept by the ignored check, with the note on stderr.
+env_rule_case() { # count, params or file
+    name=git-env-config-regenerable-$1
+    make_repo
+    local vars=() before var
+    case $1 in
+    count) vars=(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=residue.regenerable GIT_CONFIG_VALUE_0=.env) ;;
+    params) vars=("GIT_CONFIG_PARAMETERS='residue.regenerable'='.env'") ;;
+    file)
+        printf '[residue]\n\tregenerable = .env\n' >"$work/$name.config"
+        vars=("GIT_CONFIG=$work/$name.config")
+        ;;
+    esac
+    echo 'TOKEN=1' >"$wt/.env"
+    before=$(sums "$wt")
+    if [ "$(env "${vars[@]}" git -C "$wt" config --get-all residue.regenerable)" != .env ]; then
+        echo "skip $name: this Git does not read residue.regenerable from $1, so there is nothing to ignore"
+        return
+    fi
+    for var in "${vars[@]}"; do export "${var?}"; done
+    run remove --yes --json "$wt"
+    for var in "${vars[@]}"; do unset "${var%%=*}"; done
+    if [ "$status" != 3 ]; then fail "exit $status, want 3"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), want refused"
+    elif [ "$(failing_checks 0)" != "$(want_failing ignored)" ]; then fail "failing checks: $(failing_checks 0), want $(want_failing ignored)"
+    elif [ "$(jq -r '.ignored_environment_rules | join(",")' "$out")" != .env ]; then fail "ignored_environment_rules: $(jq -c .ignored_environment_rules "$out")"
+    elif ! grep -q "residue: note: ignored residue.regenerable set through the environment" "$err"; then fail "no note on stderr"
+    elif untouched "$before"; then ok; fi
+}
+for source in count params file; do env_rule_case "$source"; done
+
+# A variable that points Git at another repository: a clean decoy, while w
+# holds an untracked file. Set alone, each changes what `git status` in w
+# says; residue still keeps w for the untracked file alone, and the decoy
+# is untouched.
+decoy_repo() {
+    decoy=$work/$name.decoy
+    setup git init -q "$decoy"
+    echo decoy >"$decoy/README.md"
+    setup git -C "$decoy" add .
+    setup git -C "$decoy" commit -qm decoy
+    decoy_sum=$(sums "$decoy") || exit 2
+    decoy_refs=$(git -C "$decoy" for-each-ref) || exit 2
+}
+decoy_ok() {
+    [ "$(sums "$decoy")" = "$decoy_sum" ] || { fail "the decoy repository's files changed"; return 1; }
+    [ "$(git -C "$decoy" for-each-ref)" = "$decoy_refs" ] || { fail "the decoy repository's refs changed: $(git -C "$decoy" for-each-ref)"; return 1; }
+}
+redirect_case() { # VARIABLE VALUE-UNDER-THE-DECOY
+    name=git-redirect-$1
+    make_repo
+    decoy_repo
+    local value=$decoy/$2 before baseline
+    echo notes >"$wt/notes.md"
+    before=$(sums "$wt")
+    baseline=$(git -C "$wt" status --porcelain 2>&1)
+    if [ "$(env "$1=$value" git -C "$wt" status --porcelain 2>&1)" = "$baseline" ]; then
+        echo "contract-check: setup failed in $name: $1 did not change what git status says in w" >&2
+        exit 2
+    fi
+    export "$1=$value"
+    run remove --yes --json "$wt"
+    unset "$1"
+    if [ "$status" != 3 ]; then fail "exit $status, want 3"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), want refused"
+    elif [ "$(failing_checks 0)" != "$(want_failing untracked)" ]; then fail "failing checks: $(failing_checks 0), want $(want_failing untracked)"
+    elif ! decoy_ok; then :
+    elif untouched "$before"; then ok; fi
+}
+redirect_case GIT_DIR .git
+redirect_case GIT_WORK_TREE ''
+redirect_case GIT_INDEX_FILE .git/index
+redirect_case GIT_COMMON_DIR .git
+redirect_case GIT_OBJECT_DIRECTORY .git/objects
+
+# Every redirect variable at once, on a clean w: residue removes w from
+# its own repository, the removal record and its ref are in that
+# repository, and the decoy has no new ref and the same files.
+if [ -z "$partial_probe" ]; then
+    name=git-redirect-all-removes
+    make_repo
+    decoy_repo
+    GIT_DIR=$decoy/.git GIT_WORK_TREE=$decoy GIT_INDEX_FILE=$decoy/.git/index \
+        GIT_COMMON_DIR=$decoy/.git GIT_OBJECT_DIRECTORY=$decoy/.git/objects \
+        GIT_ALTERNATE_OBJECT_DIRECTORIES=$decoy/.git/objects GIT_NAMESPACE=decoy \
+        GIT_PREFIX=sub/ GIT_CONFIG=$decoy/.git/config \
+        run remove --yes --json "$wt"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
+    elif [ -e "$wt" ]; then fail "w is still on disk"
+    elif registered "$wt"; then fail "w is still registered"
+    elif [ "$(records)" != "1 records, 1 refs" ]; then fail "$(records) in w's repository, want 1 records, 1 refs"
+    elif ! decoy_ok; then :
+    elif common_ok; then ok; fi
+else
+    skip_partial git-redirect-all-removes
+fi
+
 echo "contract-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]
