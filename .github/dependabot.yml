@@ -1,0 +1,38 @@
+# Keeps the pinned actions, the one crate and the site's Wrangler current: one
+# grouped pull request a week for each, which CI checks like any other. A
+# release must be a week old before it is proposed, and a major version comes
+# as its own pull request. Security updates are separate and are not delayed.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      crates:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # The site's deploy tool, from site/package-lock.json.
+  - package-ecosystem: npm
+    directory: /site
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      site:
+        patterns: ["*"]
+        update-types: [minor, patch]
