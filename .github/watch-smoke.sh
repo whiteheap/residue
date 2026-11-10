@@ -60,12 +60,15 @@
 #      worktree whose work landed: each pass skips that ROOT and logs it
 #      once, removes only what the other holds, and watches it again, and
 #      says so, once it is a folder again.
+#  15. The same ROOT, a link and then gone: the pass record names it and
+#      where it leads or why it cannot be reached, and `service status`
+#      has one line for it under `last pass:`, until it is a folder again.
 # Every branch stays, and nothing goes to the trash: watch deletes.
 # On NetBSD, OpenBSD and DragonFly (scripts/partial-probe.sh) no worktree
 # is a candidate: there it checks that every worktree is `unknown` for the
 # probe's reason and that dry, landed and disk-pressure runs remove none,
 # skips 1-6, 8, 9 and 14 by name, and runs 7 and 12 expecting no removal, and
-# 10.
+# 10 and 15.
 set -eu
 
 residue=$1
@@ -536,6 +539,95 @@ pass_case() {
   echo "watch-smoke: 13. a running watch recorded its passes and logged one line per changed summary"
 }
 
+# 15. A ROOT a pass skips is in its record and in `service status` (#201).
+# Watching A and B, B becomes a symbolic link, then is gone, then is a
+# folder again. The record's `skipped_roots`, last in `residue stats
+# --json` `watch_pass`, says where B leads or why it cannot be reached, and
+# `service status` has one line for B between `last pass:` and `next
+# pass:`, until B is B again. Nothing here is removed, so it runs on
+# NetBSD, OpenBSD and DragonFly too.
+skip_case() {
+  K="$S/r15"
+  mkdir -p "$K/A" "$K/B" "$K/elsewhere"
+  # The ROOTs as watch holds them: canonical, as $TMPDIR may not be.
+  KC=$(cd "$K" && pwd -P)
+  git init -q --bare -b main "$K/remote.git"
+  git clone -q "$K/remote.git" "$K/A/app" 2> /dev/null
+  git -C "$K/A/app" config user.email smoke@example.com
+  git -C "$K/A/app" config user.name smoke
+  echo hello > "$K/A/app/README.md"
+  git -C "$K/A/app" add README.md
+  git -C "$K/A/app" commit -qm init
+  git -C "$K/A/app" push -q origin main
+  git -C "$K/A/app" worktree add -q "$K/A/app/.worktrees/one" -b one
+  case $(uname) in
+    Darwin) record="$HOME/Library/Application Support/residue/watch-pass.json" ;;
+    *) record="$XDG_STATE_HOME/residue/watch-pass.json" ;;
+  esac
+  rm -rf "$record"
+  # A change under refs/remotes wakes the watch.
+  poke15() { # N
+    git -C "$K/A/app" push -q origin "main:refs/heads/poke$1"
+  }
+  # Until this watch's record holds TEXT, a fixed string.
+  wait15() { # WHAT TEXT
+    i=0
+    until grep -F -q "\"pid\":$watcher," "$record" 2> /dev/null && grep -F -q "$2" "$record"; do
+      i=$((i + 1))
+      [ "$i" -le 120 ] || fail "15: no record of $1 within 2 minutes: $(cat "$record" 2> /dev/null)"
+      sleep 1
+    done
+  }
+  # The line after `last pass:` in `service status`, and the one after it.
+  status15() {
+    "$residue" service status > "$S/status" || true
+    sed -n '/^last pass: /{n;p;n;p;}' "$S/status"
+  }
+  "$residue" watch --no-fetch --grace 1m "$KC/A" "$KC/B" 2> "$S/log" &
+  watcher=$!
+  wait15 "the first pass" '"skipped_roots":[]}'
+
+  mv "$K/B" "$K/B.real"
+  ln -s "$KC/elsewhere" "$K/B"
+  poke15 1
+  link="\"skipped_roots\":[{\"root\":\"$KC/B\",\"leads_to\":\"$KC/elsewhere\",\"error\":null}]}"
+  wait15 "B as a link" "$link"
+  "$residue" stats --json | grep -F -q "$link" \
+    || fail "15: residue stats --json watch_pass does not end with B's skipped_roots: $("$residue" stats --json)"
+  case $(uname) in
+    Darwin | Linux)
+      lines=$(status15)
+      printf '%s\n' "$lines" | sed -n 1p | grep -q "^skipped .*/r15/B: it now leads to .*/r15/elsewhere\$" \
+        || fail "15: service status has no line for B under last pass: $(cat "$S/status")"
+      printf '%s\n' "$lines" | sed -n 2p | grep -q "^next pass: " \
+        || fail "15: next pass: does not follow B's line: $(cat "$S/status")"
+      ;;
+  esac
+
+  rm "$K/B"
+  poke15 2
+  wait15 "B gone" "\"skipped_roots\":[{\"root\":\"$KC/B\",\"leads_to\":null,\"error\":\""
+  case $(uname) in
+    Darwin | Linux)
+      status15 | sed -n 1p | grep -q "^skipped .*/r15/B: it cannot be reached (.*)\$" \
+        || fail "15: service status does not say B cannot be reached: $(cat "$S/status")"
+      ;;
+  esac
+
+  mv "$K/B.real" "$K/B"
+  poke15 3
+  wait15 "B back" '"skipped_roots":[]}'
+  case $(uname) in
+    Darwin | Linux)
+      status15 > /dev/null
+      ! grep -q "^skipped " "$S/status" || fail "15: service status still names B as skipped: $(cat "$S/status")"
+      grep -q "^last pass: " "$S/status" || fail "15: service status has no last pass line: $(cat "$S/status")"
+      ;;
+  esac
+  stop_watcher
+  echo "watch-smoke: 15. the pass record and service status named B while it was a link and while it was gone"
+}
+
 # 1. fix landed; a dry run names it and removes nothing.
 git push -q origin --delete fix
 git fetch -q --prune
@@ -575,6 +667,7 @@ if [ -n "$partial_probe" ]; then
   upgrade_case
   refspec_case
   pass_case
+  skip_case
   echo "watch-smoke: ok (every worktree kept as activity unknown)"
   exit 0
 fi
@@ -1001,4 +1094,5 @@ many_case
 refspec_case
 pass_case
 link_case
+skip_case
 echo "watch-smoke: ok"

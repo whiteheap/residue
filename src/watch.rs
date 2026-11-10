@@ -673,6 +673,7 @@ fn record(opts: &Options, state: &mut State, outcome: Result<crate::pass::Seen, 
         min_free: opts.min_free,
         fetch_every: opts.fetch_every.as_ref().map(|every| every.text.clone()),
         outcome,
+        skipped_roots: state.skipped_roots.clone(),
     };
     // A failed scan logs its own line; the next summary is logged again.
     let key = pass.key();
@@ -876,8 +877,9 @@ struct State {
     /// Why the pass record could not be written, while it cannot: logged
     /// when it changes, not on every pass.
     record_failing: Option<String>,
-    /// The ROOTs a pass skips (`live_roots`), each logged once.
-    skipped_roots: HashSet<PathBuf>,
+    /// The ROOTs the last pass skipped (`live_roots`), and why: each is
+    /// logged once while it is skipped, and the pass record holds them.
+    skipped_roots: Vec<crate::pass::Skipped>,
 }
 
 /// How long the bytes a low-disk removal freed count toward later low-disk
@@ -1052,33 +1054,49 @@ enum ScanError {
 /// that still canonicalizes to itself. Once a folder on its path becomes a
 /// symbolic link, the path leads to a folder the user did not name, and a
 /// ROOT that is gone leads nowhere, so the pass skips it: logged once while
-/// it is skipped (`skipped`), and once when it leads to itself again. The
-/// roots watch started with stay as they are, so its first line and
-/// `service status` show the same ones.
-fn live_roots(roots: &[PathBuf], skipped: &mut HashSet<PathBuf>) -> Vec<PathBuf> {
+/// it is skipped, and once when it leads to itself again. `skipped` holds
+/// the last pass's skipped ROOTs, and this pass's on return, for its
+/// record (`pass::Pass::skipped_roots`). The roots watch started with stay
+/// as they are, so its first line and `service status` show the same ones.
+fn live_roots(roots: &[PathBuf], skipped: &mut Vec<crate::pass::Skipped>) -> Vec<PathBuf> {
+    use crate::pass::{Skip, Skipped};
+    let before = std::mem::take(skipped);
+    let was_skipped = |root: &PathBuf| before.iter().any(|s| s.root == *root);
     let mut live = Vec::new();
     for root in roots {
         let shown = output::home(&root.to_string_lossy());
         match std::fs::canonicalize(root) {
             Ok(now) if now == *root => {
-                if skipped.remove(root) {
+                if was_skipped(root) && !live.contains(root) {
                     log(&format!("{shown} leads to itself again; watching it"));
                 }
                 live.push(root.clone());
             }
             now => {
-                if skipped.insert(root.clone()) {
-                    let why = match now {
-                        Ok(other) => format!(
-                            "it now leads to {}: a folder on its path became a symbolic link or was renamed",
-                            output::home(&other.to_string_lossy())
-                        ),
-                        Err(e) => format!("it cannot be reached ({e})"),
+                // A ROOT given twice is skipped, logged and recorded once.
+                if skipped.iter().any(|s| s.root == *root) {
+                    continue;
+                }
+                let why = match now {
+                    Ok(other) => Skip::LeadsTo(other),
+                    Err(e) => Skip::Unreachable(e.to_string()),
+                };
+                if !was_skipped(root) {
+                    let cause = match why {
+                        Skip::LeadsTo(_) => {
+                            ": a folder on its path became a symbolic link or was renamed"
+                        }
+                        Skip::Unreachable(_) => "",
                     };
                     log(&format!(
-                        "skipping {shown}: {why}; watch skips it until it leads to itself again"
+                        "skipping {shown}: {}{cause}; watch skips it until it leads to itself again",
+                        why.text()
                     ));
                 }
+                skipped.push(Skipped {
+                    root: root.clone(),
+                    why,
+                });
             }
         }
     }
@@ -2174,6 +2192,61 @@ mod tests {
             roots: roots.iter().map(PathBuf::from).collect(),
             default_roots: false,
         }
+    }
+
+    /// A pass records each ROOT it skips, once, in the order given, with
+    /// where it leads or why it cannot be reached; a ROOT that leads to
+    /// itself again is scanned and no longer recorded (#201).
+    #[test]
+    fn live_roots_records_each_skipped_root() {
+        use crate::pass::{Skip, Skipped};
+        let dir = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "residue-live-roots-{}-{}",
+                std::process::id(),
+                output::now()
+            ));
+        let (a, b, gone, elsewhere) = (
+            dir.join("A"),
+            dir.join("B"),
+            dir.join("gone"),
+            dir.join("elsewhere"),
+        );
+        for folder in [&a, &b, &elsewhere] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        let roots = vec![a.clone(), b.clone(), gone.clone(), b.clone()];
+        std::fs::rename(&b, dir.join("B.real")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &b).unwrap();
+        let mut skipped = Vec::new();
+        assert_eq!(live_roots(&roots, &mut skipped), vec![a.clone()]);
+        assert_eq!(skipped.len(), 2, "{skipped:?}");
+        assert_eq!(
+            skipped[0],
+            Skipped {
+                root: b.clone(),
+                why: Skip::LeadsTo(elsewhere.clone()),
+            }
+        );
+        assert_eq!(skipped[1].root, gone);
+        assert!(
+            matches!(skipped[1].why, Skip::Unreachable(_)),
+            "{:?}",
+            skipped[1]
+        );
+        // The next pass records the same, and B once more is B.
+        assert_eq!(live_roots(&roots, &mut skipped), vec![a.clone()]);
+        assert_eq!(skipped.len(), 2, "{skipped:?}");
+        std::fs::remove_file(&b).unwrap();
+        std::fs::rename(dir.join("B.real"), &b).unwrap();
+        assert_eq!(
+            live_roots(&roots, &mut skipped),
+            vec![a.clone(), b.clone(), b.clone()]
+        );
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(skipped[0].root, gone);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A free-space figure prints on the same side of `--min-free` as the
