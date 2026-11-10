@@ -1416,7 +1416,8 @@ mod platform {
     }
 
     /// residue's effective group and its supplementary groups: a member of
-    /// a `/proc`'s `gid=` group sees every process whatever its `hidepid`.
+    /// a `/proc`'s `gid=` group sees every process unless its `hidepid` is
+    /// `ptraceable` ([`procview::hidepid`]).
     fn groups() -> Vec<u32> {
         // SAFETY: getegid only returns this process's effective group.
         let mut groups = vec![unsafe { libc::getegid() }];
@@ -1648,7 +1649,10 @@ mod procview {
     /// The `hidepid` of the mount at `/proc` in a `/proc/self/mountinfo`
     /// (proc(5)), when it hides processes from residue: any value but `0`
     /// or `off`, unless one of `groups` is the mount's `gid=`, whose members
-    /// see every process. Of several mounts at `/proc`, the last is on top.
+    /// see every process. Not with `ptraceable` (`4`): there the kernel
+    /// shows a process only to one who may ptrace it, and never asks about
+    /// `gid=` (`has_pid_permissions` in its fs/proc/base.c). Of several
+    /// mounts at `/proc`, the last is on top.
     pub fn hidepid(mountinfo: &str, groups: &[u32]) -> Option<String> {
         let options = mountinfo.lines().rev().find_map(|line| {
             // ID PARENT MAJ:MIN ROOT MOUNTPOINT OPTIONS [OPTIONAL...] - TYPE SOURCE SUPER
@@ -1671,7 +1675,8 @@ mod procview {
             }
         }
         let hide = hide.filter(|value| !matches!(*value, "0" | "off"))?;
-        if gid.is_some_and(|gid| groups.contains(&gid)) {
+        let ptraceable = matches!(hide, "4" | "ptraceable");
+        if !ptraceable && gid.is_some_and(|gid| groups.contains(&gid)) {
             return None;
         }
         Some(hide.to_string())
@@ -3262,6 +3267,13 @@ mod tests {
             hidepid(&info("rw,hidepid=invisible,gid=27"), &[1000]).as_deref(),
             Some("invisible")
         );
+        assert_eq!(hidepid(&info("rw,hidepid=1,gid=27"), &[27]), None);
+        // Except with ptraceable: the kernel shows a process only to one
+        // who may ptrace it, and never asks about gid=.
+        for value in ["4", "ptraceable"] {
+            let proc = format!("rw,hidepid={value},gid=27");
+            assert_eq!(hidepid(&info(&proc), &[1000, 27]).as_deref(), Some(value));
+        }
         // The mount on top of /proc is the one read: the last line.
         let over = format!(
             "{}25 23 0:24 / /proc rw,relatime - proc proc rw,hidepid=2\n",
