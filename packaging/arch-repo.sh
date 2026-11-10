@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # archlinux:base as of 2026-11-09 (built 2026-11-05), the image the 0.0.10 to
-# 0.0.12 repositories were built with. Pinned by digest, so a moved tag never
+# 0.0.13 repositories were built with. Pinned by digest, so a moved tag never
 # runs here. To update it, run `docker buildx imagetools inspect
 # archlinux:base`, put the Digest it prints here, and check a packages.yml
 # dry run, which builds the repositories with a key made for the run.
