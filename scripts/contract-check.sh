@@ -67,6 +67,13 @@ mkdir -p "$HOME"
 git config --global user.name contract-check
 git config --global user.email contract-check@example.invalid
 git config --global init.defaultBranch main
+# After each commit Git starts `git maintenance run --auto --detach` in the
+# directory the commit ran in, and that child detaches whether or not any
+# task is due (builtin/gc.c). A case that commits in a worktree and then runs
+# remove at once can find it still there, and residue rightly keeps the
+# worktree as in use by git[PID] (#180, FreeBSD 14). No case checks
+# automatic maintenance, so no fixture starts it.
+git config --global maintenance.auto false
 
 # No prompt can appear: stdin is not a terminal.
 exec </dev/null
