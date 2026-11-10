@@ -56,11 +56,15 @@
 #      refs/remotes/ that names a local branch stays, and the branch does
 #      not move: Git stores nothing through one for a refspec with a `*`,
 #      and a refspec with no `*` onto it is left out, logged once.
+#  14. Watching two ROOTs, one becomes a symbolic link to a folder with a
+#      worktree whose work landed: each pass skips that ROOT and logs it
+#      once, removes only what the other holds, and watches it again, and
+#      says so, once it is a folder again.
 # Every branch stays, and nothing goes to the trash: watch deletes.
 # On NetBSD, OpenBSD and DragonFly (scripts/partial-probe.sh) no worktree
 # is a candidate: there it checks that every worktree is `unknown` for the
 # probe's reason and that dry, landed and disk-pressure runs remove none,
-# skips 1-6, 8 and 9 by name, and runs 7 and 12 expecting no removal, and
+# skips 1-6, 8, 9 and 14 by name, and runs 7 and 12 expecting no removal, and
 # 10.
 set -eu
 
@@ -563,7 +567,8 @@ if [ -n "$partial_probe" ]; then
     "3. a running watch removes wip" "4. disk pressure removes local" \
     "5. the removal child's --only-if-upstream-gone" "6. the child's three upstream reads" \
     "8. a restored worktree is not removed again because its work landed" \
-    "9. a worktree back at its path without its marker is not removed again because its work landed"; do
+    "9. a worktree back at its path without its marker is not removed again because its work landed" \
+    "14. a ROOT that became a symbolic link is skipped"; do
     skip_partial "$case"
   done
   fetch_case
@@ -917,9 +922,83 @@ many_case() {
   echo "watch-smoke: 11. 256 open files, 302 folders to watch; removed landed after ${i}s"
 }
 
+# 14. A ROOT that a folder on its path turned into a symbolic link (#186):
+# watching A and B, B becomes a link to a folder the user never named,
+# which holds a worktree whose work landed. Each pass skips B and logs it
+# once, removes only what A holds, and watches B again, saying so, once B
+# is a folder again.
+link_case() {
+  R="$S/r13"
+  mkdir -p "$R/A" "$R/B" "$R/elsewhere"
+  for repo in A/app elsewhere/far; do
+    git init -q --bare -b main "$R/$repo.git"
+    git clone -q "$R/$repo.git" "$R/$repo" 2> /dev/null
+    git -C "$R/$repo" config user.email smoke@example.com
+    git -C "$R/$repo" config user.name smoke
+    echo hello > "$R/$repo/README.md"
+    git -C "$R/$repo" add README.md
+    git -C "$R/$repo" commit -qm init
+    git -C "$R/$repo" push -q origin main
+  done
+  for name in a1 a2 a3; do
+    git -C "$R/A/app" worktree add -q "$R/A/app/.worktrees/$name" -b "$name"
+    git -C "$R/A/app/.worktrees/$name" push -q -u origin "$name"
+  done
+  # trap landed: watch would remove it if it scanned elsewhere.
+  git -C "$R/elsewhere/far" worktree add -q "$R/elsewhere/far/.worktrees/trap" -b trap
+  git -C "$R/elsewhere/far/.worktrees/trap" push -q -u origin trap
+  git -C "$R/elsewhere/far.git" branch -q -D trap
+  git -C "$R/elsewhere/far" fetch -q --prune
+  age13() {
+    find "$R/A/app/.worktrees" "$R/A/app/.git/worktrees" "$R/elsewhere/far/.worktrees" "$R/elsewhere/far/.git/worktrees" \
+      -exec touch -t 202601010000 {} +
+  }
+  age13
+  "$residue" watch --no-fetch --grace 1m "$R/A" "$R/B" 2> "$S/log" &
+  watcher=$!
+  i=0
+  until grep -q "residue watch: watching " "$S/log"; do
+    i=$((i + 1))
+    [ "$i" -le 60 ] || fail "14: watch did not start within a minute"
+    sleep 1
+  done
+  sleep 5
+  mv "$R/B" "$R/B.real"
+  ln -s "$R/elsewhere" "$R/B"
+  land13() { # NAME
+    git -C "$R/A/app.git" branch -q -D "$1"
+    git -C "$R/A/app" fetch -q --prune
+    age13
+    i=0
+    until grep -q "removed .*worktrees/$1 " "$S/log"; do
+      i=$((i + 1))
+      [ "$i" -le 120 ] || fail "14: the running watch did not remove $1 within 2 minutes"
+      sleep 1
+    done
+  }
+  skipped13() {
+    grep -c "residue watch: skipping .*/r13/B: it now leads to .*/r13/elsewhere: a folder on its path became a symbolic link or was renamed; watch skips it until it leads to itself again" "$S/log" || true
+  }
+  land13 a1
+  [ "$(skipped13)" = 1 ] || fail "14: B, now a link, was not logged once as skipped: $(skipped13) lines"
+  land13 a2
+  [ "$(skipped13)" = 1 ] || fail "14: a second pass logged B again: $(skipped13) lines"
+  [ -d "$R/elsewhere/far/.worktrees/trap" ] || fail "14: watch removed trap, in the folder B's link leads to"
+  git -C "$R/elsewhere/far" worktree list --porcelain | grep -q "^worktree .*/\.worktrees/trap\$" || fail "14: trap is no longer registered"
+  ! grep -q "removed .*worktrees/trap" "$S/log" || fail "14: the log says trap was removed"
+  rm "$R/B"
+  mv "$R/B.real" "$R/B"
+  land13 a3
+  grep -q "residue watch: .*/r13/B leads to itself again; watching it" "$S/log" || fail "14: B, a folder again, was not logged as watched again"
+  [ "$(skipped13)" = 1 ] || fail "14: B was logged as skipped again: $(skipped13) lines"
+  stop_watcher
+  echo "watch-smoke: 14. a ROOT that became a link was skipped and logged once; trap, where it led, stayed"
+}
+
 fetch_case
 upgrade_case
 many_case
 refspec_case
 pass_case
+link_case
 echo "watch-smoke: ok"

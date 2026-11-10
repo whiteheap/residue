@@ -524,7 +524,8 @@ pub fn main(args: &[OsString]) -> u8 {
         if exit_for_upgrade(&binary) {
             return 1;
         }
-        let mut snap = match scan(&exe, &opts) {
+        let roots = live_roots(&opts.roots, &mut state.skipped_roots);
+        let mut snap = match scan(&exe, &opts, &roots) {
             Ok(snap) => snap,
             Err(e) => match failed(e, &opts, &mut state) {
                 Some(code) => return code,
@@ -535,7 +536,7 @@ pub fn main(args: &[OsString]) -> u8 {
         // those whose fetch came due while scanning: fetch, and judge with
         // the refs it brought.
         if fetcher.run(&snap) {
-            snap = match scan(&exe, &opts) {
+            snap = match scan(&exe, &opts, &roots) {
                 Ok(snap) => snap,
                 Err(e) => match failed(e, &opts, &mut state) {
                     Some(code) => return code,
@@ -875,6 +876,8 @@ struct State {
     /// Why the pass record could not be written, while it cannot: logged
     /// when it changes, not on every pass.
     record_failing: Option<String>,
+    /// The ROOTs a pass skips (`live_roots`), each logged once.
+    skipped_roots: HashSet<PathBuf>,
 }
 
 /// How long the bytes a low-disk removal freed count toward later low-disk
@@ -1045,10 +1048,55 @@ enum ScanError {
     Failed(String),
 }
 
-fn scan(exe: &Path, opts: &Options) -> Result<Snapshot, ScanError> {
+/// The ROOTs a pass scans: each of `roots`, canonical when watch started,
+/// that still canonicalizes to itself. Once a folder on its path becomes a
+/// symbolic link, the path leads to a folder the user did not name, and a
+/// ROOT that is gone leads nowhere, so the pass skips it: logged once while
+/// it is skipped (`skipped`), and once when it leads to itself again. The
+/// roots watch started with stay as they are, so its first line and
+/// `service status` show the same ones.
+fn live_roots(roots: &[PathBuf], skipped: &mut HashSet<PathBuf>) -> Vec<PathBuf> {
+    let mut live = Vec::new();
+    for root in roots {
+        let shown = output::home(&root.to_string_lossy());
+        match std::fs::canonicalize(root) {
+            Ok(now) if now == *root => {
+                if skipped.remove(root) {
+                    log(&format!("{shown} leads to itself again; watching it"));
+                }
+                live.push(root.clone());
+            }
+            now => {
+                if skipped.insert(root.clone()) {
+                    let why = match now {
+                        Ok(other) => format!(
+                            "it now leads to {}: a folder on its path became a symbolic link or was renamed",
+                            output::home(&other.to_string_lossy())
+                        ),
+                        Err(e) => format!("it cannot be reached ({e})"),
+                    };
+                    log(&format!(
+                        "skipping {shown}: {why}; watch skips it until it leads to itself again"
+                    ));
+                }
+            }
+        }
+    }
+    live
+}
+
+/// A `scan --json` of `roots`, the ROOTs this pass watches (`live_roots`).
+/// With none, nothing: a scan with no PATH would read the current folder.
+fn scan(exe: &Path, opts: &Options, roots: &[PathBuf]) -> Result<Snapshot, ScanError> {
+    if roots.is_empty() {
+        return Ok(Snapshot {
+            repos: Vec::new(),
+            worktrees: Vec::new(),
+        });
+    }
     let mut cmd = Command::new(exe);
     cmd.args(["scan", "--json", "--idle", &opts.grace.text])
-        .args(&opts.roots);
+        .args(roots);
     let out = match run::run(&mut cmd, Duration::from_secs(15 * 60), 256 << 20) {
         Ok(out) => out,
         Err(RunError::NotFound) => return Err(ScanError::Gone),

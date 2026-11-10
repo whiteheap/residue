@@ -69,7 +69,7 @@ Then turn it on:
 residue service install
 ```
 
-That starts `residue watch` now and at every login, with launchd on macOS and systemd on Linux. It watches the usual code folders in your home folder that exist, such as `~/src`, `~/code` and `~/Work`, and prints which, along with what it removes and how to preview it. If your code lives elsewhere, name its folder, which replaces the list: `residue service install ~/src`. `residue service status` shows what it runs, the folders it watches, what it freed in the last seven days, and its last pass: how many worktrees it saw, which checks keep them, and what the next pass waits for. `residue service uninstall` turns it off. `watch` runs only when you start it or install it as a service; `scan` never starts it.
+That starts `residue watch` now and at every login, with launchd on macOS and systemd on Linux. It watches the usual code folders in your home folder that exist, such as `~/src`, `~/code` and `~/Work`, and prints which, along with what it removes and how to preview it. If your code lives elsewhere, name its folder, which replaces the list: `residue service install ~/src`. A folder that becomes a symbolic link to somewhere else is skipped, and logged once, until it is the folder it was again ([Which folders](docs/automation.md#which-folders)). `residue service status` shows what it runs, the folders it watches, what it freed in the last seven days, and its last pass: how many worktrees it saw, which checks keep them, and what the next pass waits for. `residue service uninstall` turns it off. `watch` runs only when you start it or install it as a service; `scan` never starts it.
 
 A paused agent often has no process inside its worktree, because its harness returns the shell to the main checkout between commands, and an editor window may hold no file open there either. Only the time without a change keeps such a worktree: an hour once its branch is gone, two days when the disk is low. Lock one you will come back to later than that:
 
@@ -259,7 +259,7 @@ residue restore fix-login     # recreate one: its name, the worktree's name or b
 residue restore --to ~/src/app/.worktrees/fix-login-2 fix-login
 ```
 
-The list and a name look in the repositories at or under the current directory; run from your home folder, they look only in the usual code folders there. For an entry somewhere else, run `residue restore` inside its repository, or pass the record's path as the removal line prints it.
+The list and a name look in the repositories at or under the current directory; run from your home folder, they look only in the usual code folders there. For an entry somewhere else, run `residue restore` inside its repository, or pass the record's path as the removal line prints it. A program that shows the list and restores the entry you pick passes that entry's `id` as `--expect ID`, so it restores nothing, and exits 4, when the entry has been replaced since ([reference](docs/reference.md#for-coding-agents)).
 
 `residue restore` recreates the worktree with `git worktree add`, never `--force`, and never moves an existing branch:
 

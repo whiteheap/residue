@@ -1520,6 +1520,7 @@ mod tests {
             modified: Some(removed_at),
             registered: None,
             back: removed::Back::No,
+            id: String::new(),
         }
     }
 
@@ -1559,6 +1560,7 @@ mod tests {
             bare: false,
             modified: Some(50),
             extra: Some(Vec::new()),
+            id: String::new(),
         }
     }
 

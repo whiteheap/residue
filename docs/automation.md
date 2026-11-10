@@ -29,6 +29,14 @@ residue service install ~/path/to/repos
 
 A ROOT you name replaces the list. `service install` writes the folders it found into the service, so the service watches the same ones at every start, and `residue service status` shows them. A folder created later is picked up when you run `residue service install` again.
 
+Each pass watches a ROOT only while it is still the folder it was when `watch` started. When a folder on its path becomes a symbolic link, the path leads to a folder you did not name, so the pass skips that ROOT and logs it once:
+
+```text
+2026-11-10T09:12:03Z residue watch: skipping ~/Work: it now leads to /Volumes/Backup/Work: a folder on its path became a symbolic link or was renamed; watch skips it until it leads to itself again
+```
+
+A ROOT that is gone is skipped the same way. Once it leads to itself again, `watch` logs `~/Work leads to itself again; watching it` and scans it again. `residue service status` still shows the ROOTs the service was started with. To watch the folder the link leads to, name it and run `residue service install` again.
+
 ### Running install again
 
 `residue service install` replaces the service it finds, so running it twice leaves one service. Without a ROOT, it keeps the ROOTs you named for the service it replaces, and drops any that is no longer a folder, with a note; a service on the usual code folders looks for them again. To change the folders, name them. Options are not kept: each one you do not give goes back to its default, `--dry-run` included, and the command says so when the service it replaced was a dry run.
