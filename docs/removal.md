@@ -79,6 +79,12 @@ It refuses when something exists at the path; `--to PATH` restores somewhere els
 
 A restored worktree is never removed again by `watch` because its branch landed: you wanted it back after it landed. Neither is one a removal record lists as back at its path, such as after a restore that stopped before it marked the worktree, or one residue cannot tell is back. `residue remove PATH`, a sweep and `watch`'s low-disk rule still can.
 
+## The Git residue runs
+
+Every Git command residue runs has hooks and fsmonitor off, takes no optional locks, and ignores `GIT_DIR` and the other variables that point Git at another repository, and Git config set in the environment (`git -c`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG`). The programs Git starts inherit that.
+
+Clean and process filters stay on, such as Git LFS's. `git status` runs one for a tracked file it has to read again: one whose size matches the index while its time does not, or one written in the same second as the index, as in a fresh worktree. residue never rewrites the index, so such a file runs the filter on every scan. Without the filter, a Git LFS file that only had its time changed reads as modified, and residue would keep a clean worktree. `git worktree remove` checks the worktree with a `git status` of its own, which runs the same filters. The filter's command comes from your Git config; a file in the repository, `.gitattributes`, can only name it. `residue restore` checks the worktree out with `git worktree add`, which runs the smudge filters, as any checkout does.
+
 ## Stale worktrees
 
 Git still lists the worktree and the directory is gone, or Git marks it prunable. Reported, not removed. If you moved it, `git -C MAIN worktree repair NEWPATH` reconnects it; if its disk is not mounted, mounting it brings it back. residue names no command that clears Git's record of it, since that drops its HEAD and reflog. `git gc` clears it on its own, 3 months by default (`gc.worktreePruneExpire`) after its index last changed, or at the next `git gc` or `git worktree prune` when it has no index, and never while it is locked; `scan` names the `git -C MAIN reflog show worktrees/ID/HEAD` that lists the commits that may go with it.
