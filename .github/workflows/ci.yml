@@ -8,10 +8,64 @@ on:
 permissions:
   contents: read
 
+# A newer push to a pull request cancels its older run; a run on main always
+# finishes.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # What a pull request touches. No paths filter on the workflow, on purpose:
+  # the ruleset requires macos-latest, ubuntu-24.04 and ubuntu-24.04-arm, and
+  # a check that a filter skips never reports, so the pull request would wait
+  # for it forever. For a docs-only change the build jobs still start and
+  # report, with every step after the checkout skipped, and the VM jobs,
+  # which the ruleset does not require, are skipped whole. If this job fails,
+  # code stays unset and everything runs.
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.changes.outputs.code }}
+    steps:
+      # A pull request's checkout is its merge commit, whose first parent is
+      # the base branch, so two commits are enough to see what it changes.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: What the change touches
+        id: changes
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            echo "code=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --name-only HEAD^1 HEAD >"$RUNNER_TEMP/changed"
+          code=false
+          while IFS= read -r file; do
+            case $file in
+              *.sh) code=true ;;
+              # site/ has its own workflows (site.yml, install.yml); nothing
+              # in this one reads it.
+              *.md | LICENSE | docs/* | site/* | .github/ISSUE_TEMPLATE/*) ;;
+              *) code=true ;;
+            esac
+            echo "$file"
+          done <"$RUNNER_TEMP/changed"
+          echo "code=$code" | tee -a "$GITHUB_OUTPUT"
+
   build:
     name: ${{ matrix.os }}
+    needs: changes
+    # Always starts, so the names the ruleset requires always report.
+    if: ${{ !cancelled() }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      # false only when changes says the pull request is docs-only.
+      CODE: ${{ needs.changes.outputs.code != 'false' }}
     strategy:
       fail-fast: false
       matrix:
@@ -21,18 +75,24 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Toolchain
+        if: env.CODE == 'true'
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
       - name: Format
+        if: env.CODE == 'true'
         run: cargo fmt --check
       - name: Lint
+        if: env.CODE == 'true'
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: In-crate tests
+        if: env.CODE == 'true'
         run: cargo test --locked
       - name: Build
+        if: env.CODE == 'true'
         run: cargo build --locked --release
       # A real, read-only run on this checkout: one linked worktree, scanned
       # and explained. Nothing is removed.
       - name: Scan this checkout
+        if: env.CODE == 'true'
         run: |
           git worktree add --detach "$RUNNER_TEMP/ci-worktree" HEAD
           ./target/release/residue --version
@@ -40,32 +100,37 @@ jobs:
           ./target/release/residue explain "$RUNNER_TEMP/ci-worktree"
           ./target/release/residue scan . --json | jq -e '.schema == "residue.scan/v1" and .summary.linked_worktrees == 1'
       - name: Smoke test
+        if: env.CODE == 'true'
         run: sh .github/smoke.sh ./target/release/residue
       - name: Watch smoke test
+        if: env.CODE == 'true'
         run: sh .github/watch-smoke.sh ./target/release/residue
       - name: Service smoke test
-        if: ${{ !endsWith(matrix.os, '-arm') }}
+        if: ${{ env.CODE == 'true' && !endsWith(matrix.os, '-arm') }}
         run: sh .github/service-smoke.sh ./target/release/residue
       # The race check: change a worktree while the release binary waits at
       # its prompt, answer yes, and check that residue removes nothing.
       - name: Race check
+        if: env.CODE == 'true'
         run: bash scripts/race-check.sh target/release/residue
       - name: Contract check
+        if: env.CODE == 'true'
         run: bash scripts/contract-check.sh target/release/residue
       - name: Recovery check
+        if: env.CODE == 'true'
         run: bash scripts/recovery-check.sh target/release/residue
       # Its mount cases need root: a tmpfs, and a folder of the worktree's
       # own filesystem bind-mounted inside it, before the plan and after the
       # move aside (2c, 2e, 2e2). The runner's user may sudo.
       - name: Recovery check as root
-        if: runner.os == 'Linux'
+        if: ${{ env.CODE == 'true' && runner.os == 'Linux' }}
         run: sudo bash scripts/recovery-check.sh target/release/residue
       # The same with statx(2) refused for residue and what it runs
       # (.github/nostatx.c), as on Linux before 4.11 or under a seccomp
       # filter: the walk reads /proc/self/mountinfo for mount points
       # instead, and the mount cases must still keep the worktree.
       - name: Recovery check as root, without statx
-        if: matrix.os == 'ubuntu-24.04'
+        if: ${{ env.CODE == 'true' && matrix.os == 'ubuntu-24.04' }}
         run: |
           cc -O2 -Wall -Werror -o "$RUNNER_TEMP/nostatx" .github/nostatx.c
           printf '#!/bin/sh\nexec "%s" ENOSYS "%s" "$@"\n' "$RUNNER_TEMP/nostatx" "$PWD/target/release/residue" >"$RUNNER_TEMP/residue-nostatx"
@@ -75,7 +140,7 @@ jobs:
       # sleep outside in the worktree: activity unknown, never not_observed.
       # It needs root to make the namespace.
       - name: Contained check
-        if: runner.os == 'Linux'
+        if: ${{ env.CODE == 'true' && runner.os == 'Linux' }}
         run: sudo env "PATH=$PATH" bash scripts/contained-check.sh target/release/residue
 
   # FreeBSD runs in a virtual machine. residue's probe there is the base
@@ -87,7 +152,10 @@ jobs:
   # on. The log shows which filesystem the scratch folders are on.
   freebsd:
     name: freebsd-14
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
@@ -124,7 +192,10 @@ jobs:
   # NetBSD and DragonFly name every process's by default.
   netbsd:
     name: netbsd-10
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: vmactions/netbsd-vm@5957cf330aef2e6ddc63c604364c99ce2e02b91d # v1.5.3
@@ -153,7 +224,10 @@ jobs:
 
   openbsd:
     name: openbsd-7
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: vmactions/openbsd-vm@f1ca8bc8ecc5b6ef7218e5b914836e067e1546d3 # v1.4.9
@@ -179,7 +253,10 @@ jobs:
 
   dragonfly:
     name: dragonfly-6
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: vmactions/dragonflybsd-vm@4ab776fa9f914fbea72f13715b451e77e7ef5c41 # v1.3.4
@@ -218,7 +295,10 @@ jobs:
   # system has no other way to give residue a terminal.
   illumos:
     name: omnios-r151054
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: vmactions/omnios-vm@aeee92416495d9685b2997d954f6b063ae5b832d # v1.3.8
