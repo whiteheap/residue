@@ -18,6 +18,7 @@ mod inspect;
 mod json;
 mod jsonread;
 mod output;
+mod pass;
 mod policy;
 mod process;
 mod remove;

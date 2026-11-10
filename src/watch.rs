@@ -62,7 +62,7 @@ use crate::git;
 use crate::jsonread::{self, Value};
 use crate::output;
 use crate::run::{self, RunError};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
 use std::hash::BuildHasher;
@@ -419,6 +419,8 @@ impl Options {
 /// `VQ_PURGEABLE_SPACE_CHANGE` (2026-11-08). A longer interval only delays
 /// the low-disk rule, and that write took 9 s.
 const FREE_CHECK: Duration = Duration::from_secs(5 * 60);
+/// The longest a running watch waits between passes. `pass::STALE_AFTER`
+/// counts on it: change both together.
 const REDISCOVER: Duration = Duration::from_secs(6 * 60 * 60);
 const QUIET: Duration = Duration::from_secs(20);
 const SETTLE_MAX: Duration = Duration::from_secs(2 * 60);
@@ -524,7 +526,7 @@ pub fn main(args: &[OsString]) -> u8 {
         }
         let mut snap = match scan(&exe, &opts) {
             Ok(snap) => snap,
-            Err(e) => match failed(e, opts.once) {
+            Err(e) => match failed(e, &opts, &mut state) {
                 Some(code) => return code,
                 None => continue,
             },
@@ -535,7 +537,7 @@ pub fn main(args: &[OsString]) -> u8 {
         if fetcher.run(&snap) {
             snap = match scan(&exe, &opts) {
                 Ok(snap) => snap,
-                Err(e) => match failed(e, opts.once) {
+                Err(e) => match failed(e, &opts, &mut state) {
                     Some(code) => return code,
                     None => continue,
                 },
@@ -553,6 +555,12 @@ pub fn main(args: &[OsString]) -> u8 {
             }
             return 0;
         }
+        let deadline = next_deadline(&opts, &snap, output::now());
+        record(
+            &opts,
+            &mut state,
+            Ok(seen(&snap, acted, deadline, fetcher.next(&snap))),
+        );
         // Removals change free space and verdicts: look again at once, but
         // not forever.
         if acted.removed > 0 && rescans_in_a_row < 3 {
@@ -563,7 +571,6 @@ pub fn main(args: &[OsString]) -> u8 {
         if let Some(events) = events.as_mut() {
             arm(events, &snap, &mut state);
         }
-        let deadline = next_deadline(&opts, &snap, output::now());
         wait(
             events.as_mut(),
             &opts,
@@ -628,8 +635,8 @@ fn nothing_to_remove(
 }
 
 /// What to do after a failed scan: `Some(code)` to exit with, or `None` to
-/// try again after a pause.
-fn failed(error: ScanError, once: bool) -> Option<u8> {
+/// try again after a pause. A running watch records the failed pass first.
+fn failed(error: ScanError, opts: &Options, state: &mut State) -> Option<u8> {
     match error {
         ScanError::Gone => {
             log(
@@ -639,13 +646,102 @@ fn failed(error: ScanError, once: bool) -> Option<u8> {
         }
         ScanError::Failed(message) => {
             log(&format!("scan failed: {message}"));
-            if once {
+            if opts.once {
                 return Some(1);
             }
+            record(opts, state, Err(message));
             std::thread::sleep(FREE_CHECK);
             None
         }
     }
+}
+
+/// The end of a running watch's pass: write its record (`pass`), which
+/// `service status` shows, and log its summary when that differs from the
+/// last one logged, so a quiet watch is never silent for good. Neither
+/// changes what the pass did. A record that cannot be written is logged,
+/// once until the error changes, and the pass goes on. `outcome` is what
+/// the pass found and did, or why its scan failed.
+fn record(opts: &Options, state: &mut State, outcome: Result<crate::pass::Seen, String>) {
+    let pass = crate::pass::Pass {
+        at: output::now(),
+        pid: std::process::id(),
+        dry_run: opts.dry_run,
+        grace: opts.grace.text.clone(),
+        idle: opts.idle.text.clone(),
+        min_free: opts.min_free,
+        fetch_every: opts.fetch_every.as_ref().map(|every| every.text.clone()),
+        outcome,
+    };
+    // A failed scan logs its own line; the next summary is logged again.
+    let key = pass.key();
+    if key != state.logged_pass {
+        if let Some(line) = pass.log_line() {
+            log(&line);
+        }
+        state.logged_pass = key;
+    }
+    match crate::pass::write(&pass) {
+        Ok(()) => {
+            if state.record_failing.take().is_some() {
+                log("the record of each pass is written again");
+            }
+        }
+        Err(e) => {
+            if state.record_failing.as_ref() != Some(&e) {
+                log(&format!(
+                    "cannot write the record of this pass, which service status shows ({e}); passes and removals go on as before"
+                ));
+                state.record_failing = Some(e);
+            }
+        }
+    }
+}
+
+/// What a pass found and did, for its record. `next_deadline` and
+/// `next_fetch` are when the next pass can come: a waiting worktree passes
+/// `--grace` or `--idle`, and the next repository is due to fetch.
+fn seen(
+    snap: &Snapshot,
+    acted: Acted,
+    next_deadline: Option<i64>,
+    next_fetch: Option<i64>,
+) -> crate::pass::Seen {
+    let mut seen = crate::pass::Seen {
+        worktrees: snap.worktrees.len() as u64,
+        tried: acted.tried as u64,
+        removed: acted.removed as u64,
+        next_deadline,
+        // 0 is a repository never fetched: due now.
+        next_fetch: next_fetch.filter(|at| *at > 0),
+        ..Default::default()
+    };
+    let mut kept_by: BTreeMap<&str, u64> = BTreeMap::new();
+    for w in &snap.worktrees {
+        if w.verdict == "candidate" {
+            seen.candidates += 1;
+        } else if w.waits_for_idle {
+            seen.changed += 1;
+        } else {
+            seen.kept += 1;
+            for check in &w.keeping {
+                *kept_by.entry(check).or_default() += 1;
+            }
+        }
+    }
+    seen.kept_by = kept_by
+        .into_iter()
+        .map(|(check, n)| (check.to_string(), n))
+        .collect();
+    // Stable: checks that keep as many stay in id order.
+    seen.kept_by.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    let filesystems = filesystems(snap);
+    seen.filesystems = filesystems.len() as u64;
+    seen.fullest = filesystems
+        .iter()
+        .map(|(_, _, free, total)| (*free, *total))
+        .min_by(|a, b| percent(a.0, a.1).total_cmp(&percent(b.0, b.1)));
+    seen
 }
 
 /// Whether to exit so the service manager starts a new release: the
@@ -772,6 +868,13 @@ struct State {
     watch_limit_logged: bool,
     /// What low-disk removals freed that free space does not show yet.
     unseen: Unseen,
+    /// The summary of the pass last logged (`pass::Pass::key`): a pass is
+    /// logged only when its summary differs. `None` before the first and
+    /// after a failed scan.
+    logged_pass: Option<String>,
+    /// Why the pass record could not be written, while it cannot: logged
+    /// when it changes, not on every pass.
+    record_failing: Option<String>,
 }
 
 /// How long the bytes a low-disk removal freed count toward later low-disk
@@ -907,6 +1010,9 @@ struct Worktree {
     /// The only checks that fail are `idle`: it becomes a candidate once it
     /// has been unchanged long enough.
     waits_for_idle: bool,
+    /// The ids of the checks other than `idle` that did not pass: what
+    /// keeps it, for the pass record.
+    keeping: Vec<String>,
     /// `residue restore` put it back (or residue could not read whether
     /// it did), or a removal record names it as back at its path: the
     /// landed-work rule never removes it again.
@@ -1045,6 +1151,11 @@ fn scan(exe: &Path, opts: &Options) -> Result<Snapshot, ScanError> {
                     .unwrap_or(0)
                     .max(0) as u64,
                 waits_for_idle: !failing.is_empty() && failing.iter().all(|id| *id == "idle"),
+                keeping: failing
+                    .iter()
+                    .filter(|id| **id != "idle")
+                    .map(|id| id.to_string())
+                    .collect(),
                 restored: put_back(w),
                 dev: std::fs::metadata(path).ok().map(|m| m.dev()),
             });
@@ -1100,14 +1211,14 @@ fn filesystems(snap: &Snapshot) -> Vec<(u64, String, u64, u64)> {
     out
 }
 
-fn percent(free: u64, total: u64) -> f64 {
+pub(crate) fn percent(free: u64, total: u64) -> f64 {
     free as f64 * 100.0 / total as f64
 }
 
 /// `pct` as text, to one decimal unless that would print it on the other
 /// side of `min_free`: 9.96 against 10 prints `9.96`, never `10.0`, beside
 /// "below 10%".
-fn pct_text(pct: f64, min_free: f64) -> String {
+pub(crate) fn pct_text(pct: f64, min_free: f64) -> String {
     let below = pct < min_free;
     for places in 1..=6 {
         let text = format!("{pct:.places$}");
@@ -2126,6 +2237,7 @@ mod tests {
             last_change: Some(0),
             bytes: 0,
             waits_for_idle: false,
+            keeping: Vec::new(),
             restored: false,
             dev: Some(1),
         }
@@ -2340,5 +2452,51 @@ mod tests {
             kept_commits(&w),
             "; 3 commits on no remote-tracking ref stay on branch fix"
         );
+    }
+
+    /// The pass record counts each worktree once, as a candidate, changed
+    /// within --grace, or kept, and each check that keeps one, most first.
+    #[test]
+    fn seen_counts_each_worktree_once() {
+        let mut candidate = worktree("/r/a");
+        candidate.verdict = "candidate".into();
+        let mut changed = worktree("/r/b");
+        changed.waits_for_idle = true;
+        let mut ignored = worktree("/r/c");
+        ignored.keeping = vec!["ignored".into()];
+        let mut both = worktree("/r/d");
+        both.keeping = vec!["untracked".into(), "ignored".into()];
+        let mut activity = worktree("/r/e");
+        activity.keeping = vec!["activity".into()];
+        let snap = Snapshot {
+            repos: Vec::new(),
+            worktrees: vec![candidate, changed, ignored, both, activity],
+        };
+        let acted = Acted {
+            tried: 1,
+            removed: 1,
+        };
+        let seen = seen(&snap, acted, Some(5), Some(0));
+        assert_eq!(
+            (seen.worktrees, seen.candidates, seen.changed, seen.kept),
+            (5, 1, 1, 3)
+        );
+        assert_eq!(
+            seen.kept_by,
+            vec![
+                ("ignored".to_string(), 2),
+                ("activity".to_string(), 1),
+                ("untracked".to_string(), 1)
+            ]
+        );
+        assert_eq!((seen.tried, seen.removed), (1, 1));
+        assert_eq!(seen.next_deadline, Some(5));
+        assert_eq!(seen.next_fetch, None, "0 is due now, not a time");
+    }
+
+    /// A record is stale only after a running watch would have passed.
+    #[test]
+    fn a_record_is_stale_after_the_longest_wait() {
+        const { assert!(crate::pass::STALE_AFTER > REDISCOVER.as_secs() as i64) };
     }
 }

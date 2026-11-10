@@ -430,6 +430,108 @@ upgrade_case() {
   echo "watch-smoke: 10. an upgrade ended the running watch after ${i}s, exit 1"
 }
 
+# 13. A running watch records each pass for `service status` (#181). A
+# record it cannot write is logged once and changes nothing; once it can,
+# the record holds the pass's counts. The log has one line per pass only
+# when that summary changes. Runs on NetBSD, OpenBSD and DragonFly too,
+# where every worktree is kept for activity.
+pass_case() {
+  P="$S/p13"
+  mkdir -p "$P"
+  git init -q --bare -b main "$P/remote.git"
+  git clone -q "$P/remote.git" "$P/app" 2> /dev/null
+  git -C "$P/app" config user.email smoke@example.com
+  git -C "$P/app" config user.name smoke
+  echo hello > "$P/app/README.md"
+  git -C "$P/app" add README.md
+  git -C "$P/app" commit -qm init
+  git -C "$P/app" push -q origin main
+  for name in cand keep; do
+    git -C "$P/app" worktree add -q "$P/app/.worktrees/$name" -b "$name"
+  done
+  echo notes > "$P/app/.worktrees/keep/notes.md"
+  find "$P/app/.worktrees" "$P/app/.git/worktrees" -exec touch -t 202601010000 {} +
+  case $(uname) in
+    Darwin) record="$HOME/Library/Application Support/residue/watch-pass.json" ;;
+    *) record="$XDG_STATE_HOME/residue/watch-pass.json" ;;
+  esac
+  # Earlier running watches wrote one. A folder in its place: no record can
+  # be written there.
+  rm -f "$record"
+  mkdir -p "$record/blocked"
+  at() { sed -n 's/.*"at":"\([^"]*\)".*/\1/p' "$record" 2> /dev/null; }
+  passes() { grep -c "residue watch: pass: " "$S/log" || true; }
+  # A change under refs/remotes wakes the watch; it scans once that settles.
+  poke() { # N
+    git -C "$P/app" push -q origin "main:refs/heads/poke$1"
+  }
+  "$residue" watch --no-fetch --grace 1m "$P" 2> "$S/log" &
+  watcher=$!
+  i=0
+  until grep -q "residue watch: cannot write the record of this pass, which service status shows (.*); passes and removals go on as before" "$S/log"; do
+    i=$((i + 1))
+    [ "$i" -le 60 ] || fail "13: no line for the record it cannot write"
+    sleep 1
+  done
+  [ "$(passes)" = 1 ] || fail "13: the first pass was not logged once"
+  [ -d "$record/blocked" ] || fail "13: the folder at the record's path changed"
+
+  # It can write again: the next pass writes the record, and logs no new
+  # summary, since nothing changed.
+  rm -r "$record"
+  sleep 1
+  poke 1
+  i=0
+  until [ -f "$record" ]; do
+    i=$((i + 1))
+    [ "$i" -le 120 ] || fail "13: no record within 2 minutes of the next pass"
+    sleep 1
+  done
+  grep -q "residue watch: the record of each pass is written again" "$S/log" || fail "13: the log does not say the record is written again"
+  [ "$(grep -c "cannot write the record" "$S/log")" = 1 ] || fail "13: the failed write was logged more than once"
+  [ "$(passes)" = 1 ] || fail "13: a pass with the same summary was logged again"
+  grep -q '"v":1,"at":"[0-9TZ:-]*","pid":[0-9]*,"dry_run":false,"grace":"1m","idle":"2d","min_free_percent":10,"fetch_every":null,"scan_error":null,"worktrees":2,' "$record" \
+    || fail "13: the record does not hold the pass: $(cat "$record")"
+  if [ -n "$partial_probe" ]; then
+    grep -q '"candidates":0,"changed_within_grace":0,"kept":2,"kept_by":\[{"check":"activity","worktrees":2},{"check":"untracked","worktrees":1}\]' "$record" \
+      || fail "13: the record does not count both kept for activity: $(cat "$record")"
+  else
+    grep -q '"candidates":1,"changed_within_grace":0,"kept":1,"kept_by":\[{"check":"untracked","worktrees":1}\],"tried":0,"removed":0,' "$record" \
+      || fail "13: the record does not count cand as a candidate and keep as kept by untracked: $(cat "$record")"
+  fi
+  "$residue" stats --json | grep -q '"watch_pass":{"path":".*watch-pass.json","stale":false,"error":null,"v":1,' \
+    || fail "13: residue stats --json has no watch_pass"
+  # It reads only. With HOME a scratch one, no systemd unit is found; on
+  # macOS launchd answers for this user whatever HOME is.
+  case $(uname) in
+    Darwin | Linux)
+      "$residue" service status > "$S/status" || true
+      grep -q "^last pass: .* (just now), 2 worktrees: .*; .*free, removes below 10%$" "$S/status" \
+        || fail "13: service status has no last pass line: $(cat "$S/status")"
+      grep -q "^next pass: when a branch lands (after your own git fetch --prune; --no-fetch), or the disk drops below 10%" "$S/status" \
+        || fail "13: service status does not say what the next pass waits for: $(cat "$S/status")"
+      ;;
+  esac
+
+  # A change to the summary is logged: cand gets an untracked file.
+  before=$(at)
+  sleep 1
+  echo notes > "$P/app/.worktrees/cand/notes.md"
+  poke 2
+  i=0
+  until [ "$(at)" != "$before" ]; do
+    i=$((i + 1))
+    [ "$i" -le 120 ] || fail "13: no new record within 2 minutes of a change"
+    sleep 1
+  done
+  [ "$(passes)" = 2 ] || fail "13: a changed summary was not logged once: $(passes) pass lines"
+  grep "residue watch: pass: " "$S/log" | tail -n 1 | grep -q "2 worktrees: 2 kept (.*untracked 2.*); .*; logged again when this changes" \
+    || fail "13: the new pass line does not count cand as kept"
+  stop_watcher
+  [ -d "$P/app/.worktrees/cand" ] && [ -d "$P/app/.worktrees/keep" ] || fail "13: a worktree is gone"
+  echo "watch-smoke: 13. a running watch recorded its passes and logged one line per changed summary"
+}
+
 # 1. fix landed; a dry run names it and removes nothing.
 git push -q origin --delete fix
 git fetch -q --prune
@@ -467,6 +569,7 @@ if [ -n "$partial_probe" ]; then
   fetch_case
   upgrade_case
   refspec_case
+  pass_case
   echo "watch-smoke: ok (every worktree kept as activity unknown)"
   exit 0
 fi
@@ -818,4 +921,5 @@ fetch_case
 upgrade_case
 many_case
 refspec_case
+pass_case
 echo "watch-smoke: ok"

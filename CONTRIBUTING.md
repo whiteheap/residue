@@ -146,7 +146,7 @@ residue stores no state field. Its store is Git and the filesystem, and each lif
 | The restored marker | `removed::marked` | `removed::mark` |
 | A hold on a trash entry or a removal record (flock(2) on its `info`): free, held by a run, held by the `git worktree remove` it started, which keeps it after residue is killed; none where the filesystem has no flock(2) | `hold::take` (`Busy`; `Unsupported` with no flock(2), where no run removes or restores), `hold::held`, `removed::Item::activity` (`Idle`, `Held`, `Unheld` for a record without the `hold` line whose worktree something may still be deleting, `removed::unheld`) | `hold::take`, `hold::write_new`, `hold::pass_to`; the kernel frees it when the last process with the file exits |
 
-The stats ledger only appends one line per event, so it has no moves. `watch` keeps its timers in memory.
+The stats ledger only appends one line per event, so it has no moves. `watch` keeps its timers in memory. Its pass record (`pass::write`) has no moves either: each pass replaces it whole (staged, synced, renamed), and nothing decides from it, `watch` included, which never reads it back.
 
 A change that adds a state or a move:
 

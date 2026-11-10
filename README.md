@@ -69,7 +69,7 @@ Then turn it on:
 residue service install
 ```
 
-That starts `residue watch` now and at every login, with launchd on macOS and systemd on Linux. It watches the usual code folders in your home folder that exist, such as `~/src`, `~/code` and `~/Work`, and prints which, along with what it removes and how to preview it. If your code lives elsewhere, name its folder, which replaces the list: `residue service install ~/src`. `residue service status` shows what it runs, the folders it watches and what it freed in the last seven days, and `residue service uninstall` turns it off. `watch` runs only when you start it or install it as a service; `scan` never starts it.
+That starts `residue watch` now and at every login, with launchd on macOS and systemd on Linux. It watches the usual code folders in your home folder that exist, such as `~/src`, `~/code` and `~/Work`, and prints which, along with what it removes and how to preview it. If your code lives elsewhere, name its folder, which replaces the list: `residue service install ~/src`. `residue service status` shows what it runs, the folders it watches, what it freed in the last seven days, and its last pass: how many worktrees it saw, which checks keep them, and what the next pass waits for. `residue service uninstall` turns it off. `watch` runs only when you start it or install it as a service; `scan` never starts it.
 
 A paused agent often has no process inside its worktree, because its harness returns the shell to the main checkout between commands, and an editor window may hold no file open there either. Only the time without a change keeps such a worktree: an hour once its branch is gone, two days when the disk is low. Lock one you will come back to later than that:
 
@@ -87,6 +87,8 @@ A branch gone from the remote counts as landed, so squash and rebase merges coun
 Each removal's log line ends with the command that brings the worktree back, `restore: residue restore RECORD`. A worktree you restore is never removed again because its work landed; disk pressure still removes it. Each run also purges that repository's trash entries older than seven days. The removal records last 30 days; `residue service install --keep-removed 12w` keeps them twelve weeks ([Removal records](docs/automation.md#removal-records)).
 
 To see a branch deleted on the remote, `watch` runs `git fetch --prune --no-tags` about every 30 minutes for each remote a worktree's branch tracks. The fetch never prompts: one that needs a password or a passphrase fails, is logged, and changes nothing. It changes only remote-tracking refs, and it is never a reason to remove. `--no-fetch` turns it off. To try the service itself first, `residue service install --dry-run` installs one that only logs what it would remove.
+
+A `watch` that removes nothing is usually waiting: for a branch to land, or for the disk to run low. `residue service status` says which, from the record of its last pass, and says when no pass has finished for over seven hours ([Is it working?](docs/automation.md#is-it-working)).
 
 Logs, when `watch` wakes, the six-hour rescan and running `service install` again are in [Automate residue](docs/automation.md#reclaim-storage-automatically).
 
