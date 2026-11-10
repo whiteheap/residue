@@ -589,6 +589,56 @@ mod unlisted {
         ))
     }
 
+    /// A process lsof listed but could not read every file of: its first
+    /// name in place of a file (`platform::unread`), such as `FD info error:
+    /// Operation not permitted`, which a sandbox around residue that denies
+    /// `process-info-pidfdinfo` leaves.
+    pub struct Gap {
+        pub pid: u32,
+        pub command: String,
+        pub name: Vec<u8>,
+    }
+
+    /// The gaps that may hide a use of yours: in a process of yours, or one
+    /// whose user residue cannot read (`owner`), once each; residue's own
+    /// and those of processes gone or another user's do not count.
+    pub fn partly(
+        gaps: &[Gap],
+        me: u32,
+        euid: u32,
+        owner: impl Fn(u32) -> Owner,
+    ) -> Vec<(String, String)> {
+        let mut seen: Vec<u32> = Vec::new();
+        let mut partly = Vec::new();
+        for gap in gaps {
+            if gap.pid == me || seen.contains(&gap.pid) {
+                continue;
+            }
+            seen.push(gap.pid);
+            let who = match owner(gap.pid) {
+                Owner::Gone => continue,
+                Owner::Runs(uid, _) if uid != euid => continue,
+                Owner::Runs(..) => format!("{}[{}], which runs as your user", gap.command, gap.pid),
+                Owner::Unread => format!("process {}, whose user residue cannot read", gap.pid),
+            };
+            partly.push((who, String::from_utf8_lossy(&gap.name).into_owned()));
+        }
+        partly
+    }
+
+    /// Why lsof's answer cannot show that no process of yours is using a
+    /// worktree, from what `partly` found, or `None` when it can.
+    pub fn describe_gaps(partly: &[(String, String)]) -> Option<String> {
+        let (who, name) = partly.first()?;
+        let which = match partly.len() {
+            1 => who.clone(),
+            n => format!("{n} running processes, such as {who}"),
+        };
+        Some(format!(
+            "lsof could not read every file of {which} ({name}): a sandbox around residue may hide them"
+        ))
+    }
+
     /// The length of `struct kinfo_proc` (`<sys/sysctl.h>`), which
     /// `kern.proc.pid.PID` returns, and where its fields sit, the same on
     /// arm64 and x86_64 (`offsetof` against the macOS 26 SDK): `kp_proc`'s
@@ -685,14 +735,16 @@ mod platform {
         // SAFETY: geteuid only returns this process's effective user.
         let euid = unsafe { libc::geteuid() };
         let (mut yours, mut unread) = unlisted::unseen(&listed, &read.printed, me, euid, owner);
-        if !yours.is_empty() || !unread.is_empty() {
+        let mut partly = unlisted::partly(&read.gaps, me, euid, owner);
+        if !yours.is_empty() || !unread.is_empty() || !partly.is_empty() {
             // One that lsof read while it was starting, as one launchd
-            // spawns can be, is listed now: lsof is asked again for those
-            // alone. A sandbox hides them from this run too.
+            // spawns can be, is listed, and read, now: lsof is asked again
+            // for those alone. A sandbox hides them from this run too.
             let pids: Vec<String> = yours
                 .iter()
                 .map(|(pid, _)| *pid)
                 .chain(unread.iter().copied())
+                .chain(read.gaps.iter().map(|gap| gap.pid).filter(|pid| *pid != me))
                 .map(|pid| pid.to_string())
                 .collect();
             // lsof exits 1 when a process it was asked for is gone.
@@ -703,14 +755,26 @@ mod platform {
                     _ => Err(()),
                 })
             {
-                if let Err(detail) = parse(&out.stdout, &mut read) {
+                let mut again = Read::default();
+                if let Err(detail) = parse(&out.stdout, &mut again) {
                     return unavailable(BACKEND, "parse_error", detail.into());
                 }
+                // The second answer stands for each process it lists.
+                read.gaps.retain(|gap| !again.printed.contains(&gap.pid));
+                read.gaps.append(&mut again.gaps);
+                read.uses.append(&mut again.uses);
+                read.printed.append(&mut again.printed);
+                read.inspected += again.inspected;
                 read.printed.sort_unstable();
+                read.printed.dedup();
                 (yours, unread) = unlisted::unseen(&listed, &read.printed, me, euid, owner);
+                partly = unlisted::partly(&read.gaps, me, euid, owner);
             }
         }
         if let Some(detail) = unlisted::describe(&yours, &unread) {
+            return unavailable(BACKEND, "probe_failed", detail);
+        }
+        if let Some(detail) = unlisted::describe_gaps(&partly) {
             return unavailable(BACKEND, "probe_failed", detail);
         }
         Snapshot {
@@ -735,6 +799,8 @@ mod platform {
         printed: Vec<u32>,
         /// Those whose working directory and files lsof read whole.
         inspected: usize,
+        /// Those it listed but could not read every file of.
+        gaps: Vec<unlisted::Gap>,
     }
 
     /// One run of lsof, with `more` arguments, or the reason and detail to
@@ -801,7 +867,18 @@ mod platform {
                         path: value.to_vec(),
                     });
                 }
-                b'n' if unread(value) => whole = false,
+                b'n' if unread(value) => {
+                    whole = false;
+                    if let Some(p) = pid {
+                        if read.gaps.last().is_none_or(|gap| gap.pid != p) {
+                            read.gaps.push(unlisted::Gap {
+                                pid: p,
+                                command: command.clone(),
+                                name: value.to_vec(),
+                            });
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -950,6 +1027,16 @@ mod platform {
             assert!(parse(b"p11\ncnode\nfcwd\nn/w/b\np12\nccat\nfcwd\nncwd info error: Operation not permitted\n", &mut read).is_ok());
             assert_eq!(read.printed, [10, 11, 12]);
             assert_eq!(read.inspected, 2);
+            // The process whose working directory lsof could not read.
+            let gaps: Vec<(u32, &[u8])> = read
+                .gaps
+                .iter()
+                .map(|g| (g.pid, g.name.as_slice()))
+                .collect();
+            assert_eq!(
+                gaps,
+                [(12, &b"cwd info error: Operation not permitted"[..])]
+            );
             let uses: Vec<(u32, &[u8])> = read
                 .uses
                 .iter()
@@ -1049,7 +1136,7 @@ mod platform {
     use super::{Hidden, Seen, Snapshot, Use, maps, procview, unavailable};
     use std::fs;
     use std::io::ErrorKind;
-    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
@@ -1066,11 +1153,11 @@ mod platform {
                 );
             }
         };
-        let hidden = match hidden(&status) {
+        let me = procview::Creds::read(&status);
+        let hidden = match hidden(&status, &me) {
             Ok(hidden) => hidden,
             Err(detail) => return unavailable(BACKEND, "probe_failed", detail),
         };
-        let me = procview::Creds::read(&status);
         // SAFETY: geteuid only returns this process's effective user.
         let euid = unsafe { libc::geteuid() };
         let listing = match fs::read_dir("/proc") {
@@ -1100,81 +1187,57 @@ mod platform {
                 .map(|c| c.trim_end().to_string())
                 .unwrap_or_default();
             paths.clear();
-            // A kernel thread has no executable, and a process that exits
-            // mid-scan loses its working directory: neither link is required.
-            for link in ["cwd", "exe"] {
-                if let Ok(target) = fs::read_link(base.join(link)) {
-                    paths.push(target.into_os_string().into_vec());
+            let mut files = match read_files(&base, pid, &mut paths) {
+                Ok(files) => files,
+                Err(detail) => return unavailable(BACKEND, "probe_failed", detail),
+            };
+            // A process of yours that the kernel refuses to show: residue
+            // cannot see whether it is using a worktree. Where residue
+            // already counts every process as maybe hidden (`hidden`),
+            // there is nothing more to learn from it.
+            if hidden.is_none() && files.refused.is_some() && yours(&base, euid) {
+                // One that changes its user while residue reads it, as one
+                // cron, sshd, su or `docker exec -u` starts does, can be
+                // refused once: it is read again, and fails the probe only
+                // when it is still refused and its credentials held.
+                let before = creds(&base);
+                paths.clear();
+                files = match read_files(&base, pid, &mut paths) {
+                    Ok(files) => files,
+                    Err(detail) => return unavailable(BACKEND, "probe_failed", detail),
+                };
+                if let Some(error) = &files.refused {
+                    let why = match (before, creds(&base)) {
+                        (Ok(Some(before)), Ok(Some(after)))
+                            if before == after && yours(&base, euid) =>
+                        {
+                            procview::refusal(&after, &me)
+                        }
+                        (Err(()), _) | (_, Err(())) => Some(procview::UNSURE),
+                        // Gone, or its credentials changed.
+                        _ => None,
+                    };
+                    if let Some(why) = why {
+                        return unavailable(
+                            BACKEND,
+                            "probe_failed",
+                            format!(
+                                "the kernel would not show the files of {command}[{pid}], which runs as your user ({error}): {why}"
+                            ),
+                        );
+                    }
                 }
             }
-            // Why the kernel refused to show this process's files, if it did.
-            let mut refused: Option<std::io::Error> = None;
-            let fds_read = match fs::read_dir(base.join("fd")) {
-                Ok(fds) => {
-                    for fd in fds.flatten() {
-                        // An fd closed between listing and readlink is gone; skip it.
-                        if let Ok(target) = fs::read_link(fd.path()) {
-                            paths.push(target.into_os_string().into_vec());
-                        }
-                    }
-                    true
-                }
-                Err(e) => {
-                    if e.kind() == ErrorKind::PermissionDenied {
-                        refused = Some(e);
-                    }
-                    false
-                }
-            };
-            // Mapped files: a shared library or native module loaded from a
-            // worktree, or a file a process maps and then closes (Git's
-            // index), holds no descriptor and no working directory there.
-            let maps_read = match maps::read(&base.join("maps"), &mut paths) {
-                Ok(()) => true,
-                Err(maps::Error::Unreadable(e)) => {
-                    if e.kind() == ErrorKind::PermissionDenied {
-                        refused = refused.or(Some(e));
-                    }
-                    false
-                }
-                Err(maps::Error::TooLarge) => {
-                    return unavailable(
-                        BACKEND,
-                        "probe_failed",
-                        format!(
-                            "/proc/{pid}/maps is larger than {} MiB, so residue cannot read every file process {pid} maps",
-                            maps::CAP >> 20
-                        ),
-                    );
-                }
-            };
-            paths.retain(|p| p.first() == Some(&b'/'));
-            paths.sort_unstable();
-            paths.dedup();
             uses.extend(paths.drain(..).map(|path| Use {
                 pid,
                 command: command.clone(),
                 path,
             }));
-            // A process of yours that the kernel refuses to show: residue
-            // cannot see whether it is using a worktree.
-            let refused_for = refused
-                .filter(|_| yours(&base, euid))
-                .and_then(|error| Some((error, refusal(&base, &me)?)));
-            if let Some((error, why)) = refused_for {
-                return unavailable(
-                    BACKEND,
-                    "probe_failed",
-                    format!(
-                        "the kernel would not show the files of {command}[{pid}], which runs as your user ({error}): {why}"
-                    ),
-                );
-            }
             // Inspected means residue read the process's open files and its
             // mapped files. One it cannot read (another user's, one of yours
             // that is not dumpable, or one that exited) is not counted; what
             // was read of it still counts as use.
-            if fds_read && maps_read {
+            if files.fds_read && files.maps_read {
                 inspected += 1;
             }
         }
@@ -1192,6 +1255,72 @@ mod platform {
         }
     }
 
+    /// What residue read of one process's files.
+    struct Files {
+        fds_read: bool,
+        maps_read: bool,
+        /// Why the kernel refused to show its open or mapped files, if it
+        /// did (Permission denied).
+        refused: Option<std::io::Error>,
+    }
+
+    /// Adds the paths of the working directory, executable, open files and
+    /// mapped files of the process at `base` to `paths`, or says why the
+    /// probe cannot go on.
+    fn read_files(base: &Path, pid: u32, paths: &mut Vec<Vec<u8>>) -> Result<Files, String> {
+        // A kernel thread has no executable, and a process that exits
+        // mid-scan loses its working directory: neither link is required.
+        for link in ["cwd", "exe"] {
+            if let Ok(target) = fs::read_link(base.join(link)) {
+                paths.push(target.into_os_string().into_vec());
+            }
+        }
+        let mut refused: Option<std::io::Error> = None;
+        let fds_read = match fs::read_dir(base.join("fd")) {
+            Ok(fds) => {
+                for fd in fds.flatten() {
+                    // An fd closed between listing and readlink is gone; skip it.
+                    if let Ok(target) = fs::read_link(fd.path()) {
+                        paths.push(target.into_os_string().into_vec());
+                    }
+                }
+                true
+            }
+            Err(e) => {
+                if e.kind() == ErrorKind::PermissionDenied {
+                    refused = Some(e);
+                }
+                false
+            }
+        };
+        // Mapped files: a shared library or native module loaded from a
+        // worktree, or a file a process maps and then closes (Git's
+        // index), holds no descriptor and no working directory there.
+        let maps_read = match maps::read(&base.join("maps"), paths) {
+            Ok(()) => true,
+            Err(maps::Error::Unreadable(e)) => {
+                if e.kind() == ErrorKind::PermissionDenied {
+                    refused = refused.or(Some(e));
+                }
+                false
+            }
+            Err(maps::Error::TooLarge) => {
+                return Err(format!(
+                    "/proc/{pid}/maps is larger than {} MiB, so residue cannot read every file process {pid} maps",
+                    maps::CAP >> 20
+                ));
+            }
+        };
+        paths.retain(|p| p.first() == Some(&b'/'));
+        paths.sort_unstable();
+        paths.dedup();
+        Ok(Files {
+            fds_read,
+            maps_read,
+            refused,
+        })
+    }
+
     /// Whether the process at `base` runs as `euid` and is dumpable. The
     /// kernel gives `/proc/PID/status` the process's effective user as its
     /// owner, or root when the process is not dumpable (`task_dump_owner` in
@@ -1203,31 +1332,46 @@ mod platform {
         fs::metadata(base.join("status")).is_ok_and(|meta| meta.uid() == euid)
     }
 
-    /// Why the kernel refused residue a dumpable process of yours at `base`
-    /// (`procview::refusal`, from its `status`), or `None` when it holds
-    /// capabilities residue lacks, or exited.
-    fn refusal(base: &Path, me: &procview::Creds) -> Option<&'static str> {
+    /// The credentials in the `status` of the process at `base`: `None`
+    /// when it is gone (`procview::gone`), `Err` when residue could not
+    /// read them.
+    fn creds(base: &Path) -> Result<Option<procview::Creds>, ()> {
         match fs::read_to_string(base.join("status")) {
-            Ok(status) => procview::refusal(&procview::Creds::read(&status), me),
-            Err(e) if e.kind() == ErrorKind::NotFound => None,
-            Err(_) => Some(procview::UNSURE),
+            Ok(status) => Ok(Some(procview::Creds::read(&status))),
+            Err(e) if procview::gone(&e) => Ok(None),
+            Err(_) => Err(()),
         }
     }
 
     /// Where residue runs, when the `/proc` it reads can hide processes of
     /// yours (`procview`), or why residue cannot tell. `status` is residue's
-    /// own `/proc/self/status`.
-    fn hidden(status: &str) -> Result<Option<Hidden>, String> {
-        let ns = fs::metadata("/proc/self/ns/pid").map(|meta| meta.ino());
-        let own = procview::own_namespace(&ns, procview::nspid(status));
-        if procview::contained(own, || procview::wsl(&wsl()))? {
+    /// own `/proc/self/status`, and `me` the credentials in it.
+    fn hidden(status: &str, me: &procview::Creds) -> Result<Option<Hidden>, String> {
+        let pid_ns = fs::metadata("/proc/self/ns/pid").map(|meta| meta.ino());
+        let user_ns = fs::metadata("/proc/self/ns/user").map(|meta| meta.ino());
+        let own_user = procview::own_user_namespace(&user_ns);
+        let init_user = matches!(own_user, Ok(false));
+        // WSL is read at most once, and only for a namespace of its own.
+        let mut wsl: Option<bool> = None;
+        let mut in_wsl = || *wsl.get_or_insert_with(|| procview::wsl(&read_wsl()));
+        let own_pid = procview::own_namespace(&pid_ns, procview::nspid(status));
+        if procview::contained(own_pid, &mut in_wsl)? {
             return Ok(Some(Hidden::inside(
                 "inside a container",
                 "inside a container (a PID namespace of its own)",
             )));
         }
+        if procview::contained(own_user, &mut in_wsl)? {
+            return Ok(Some(Hidden::inside(
+                "in a user namespace of its own",
+                "in a user namespace of its own",
+            )));
+        }
         let mountinfo = fs::read_to_string("/proc/self/mountinfo")
             .map_err(|e| format!("residue could not read /proc/self/mountinfo ({e})"))?;
+        if procview::sees_all(me, init_user) {
+            return Ok(None);
+        }
         Ok(procview::hidepid(&mountinfo, &groups()).map(|value| Hidden {
             short: format!("/proc hidepid={value}"),
             detail: format!(
@@ -1236,16 +1380,39 @@ mod platform {
         }))
     }
 
-    /// What tells a WSL distribution from a container (`procview::wsl`).
-    fn wsl() -> procview::Wsl {
-        let set = |name: &str| std::env::var_os(name).is_some();
+    /// What proves that this `/proc` is a WSL distribution's own
+    /// (`procview::wsl`). The `/init` processes are looked for only on
+    /// Microsoft's kernel and with no container's marker.
+    fn read_wsl() -> procview::Wsl {
+        let kernel = fs::read_to_string("/proc/sys/kernel/osrelease")
+            .is_ok_and(|release| procview::wsl_kernel(&release));
+        let container = procview::CONTAINER_MARKERS
+            .iter()
+            .any(|marker| Path::new(marker).exists());
+        let init = kernel && !container && wsl_init();
         procview::Wsl {
-            kernel: fs::read_to_string("/proc/sys/kernel/osrelease")
-                .is_ok_and(|release| procview::wsl_kernel(&release)),
-            session: set("WSL_DISTRO_NAME") || set("WSL_INTEROP") || Path::new("/run/WSL").is_dir(),
-            container: Path::new("/.dockerenv").exists()
-                || Path::new("/run/.containerenv").exists(),
+            kernel,
+            init,
+            container,
         }
+    }
+
+    /// Whether WSL's `/init` runs in this `/proc`: PID 1, or, where systemd
+    /// is PID 1, any other process.
+    fn wsl_init() -> bool {
+        let init = |pid: &std::ffi::OsStr| {
+            fs::read(Path::new("/proc").join(pid).join("cmdline"))
+                .is_ok_and(|cmdline| procview::is_init(&cmdline))
+        };
+        if init(std::ffi::OsStr::new("1")) {
+            return true;
+        }
+        fs::read_dir("/proc").is_ok_and(|listing| {
+            listing.flatten().any(|entry| {
+                let name = entry.file_name();
+                name.as_bytes().iter().all(u8::is_ascii_digit) && init(&name)
+            })
+        })
     }
 
     /// residue's effective group and its supplementary groups: a member of
@@ -1363,21 +1530,41 @@ mod procview {
             .map(|pids| pids.split_whitespace().count())
     }
 
-    /// What residue reads to tell a WSL distribution from a container.
-    /// Under WSL 2 each distribution runs in a PID namespace of its own in
-    /// one virtual machine, and that namespace is the user's whole Linux
+    /// `PROC_USER_INIT_INO` (`include/linux/proc_ns.h`): the initial user
+    /// namespace's `/proc/self/ns/user` is `user:[4026531837]`.
+    pub const USER_INIT_INO: u64 = 0xEFFF_FFFD;
+
+    /// `CAP_SYS_PTRACE`, whose bit in `CapEff` lets residue read every
+    /// process whatever `hidepid` says.
+    const CAP_SYS_PTRACE: u64 = 1 << 19;
+
+    /// The files a container leaves for what runs in it: Docker's,
+    /// Podman's, systemd-nspawn's, and the one toolbx, distrobox and
+    /// Flatpak's host bridge use.
+    pub const CONTAINER_MARKERS: [&str; 4] = [
+        "/.dockerenv",
+        "/run/.containerenv",
+        "/run/systemd/container",
+        "/run/host/container-manager",
+    ];
+
+    /// What proves that the `/proc` residue reads is a WSL distribution's
+    /// own. Under WSL 2 each distribution runs in a PID namespace of its own
+    /// in one virtual machine, and that namespace is the user's whole Linux
     /// session: what is outside is other distributions and Windows
     /// programs, which no setup lets residue see. A container on the same
-    /// kernel, as Docker Desktop runs one, reports the same kernel, so the
-    /// kernel alone is not enough.
+    /// kernel, as Docker Desktop runs one, reports the same kernel; a
+    /// sandbox started in a distribution (bwrap, firejail, `unshare`)
+    /// keeps WSL's variables and can see `/run/WSL` through `/`. Neither
+    /// shows WSL's `/init` in its `/proc`.
     #[derive(Debug, Default)]
     pub struct Wsl {
         /// `/proc/sys/kernel/osrelease` names Microsoft's kernel (WSL 1 and 2).
         pub kernel: bool,
-        /// WSL set `WSL_DISTRO_NAME` or `WSL_INTEROP`, or made `/run/WSL`, as
-        /// it does for a distribution.
-        pub session: bool,
-        /// Docker's `/.dockerenv` or Podman's `/run/.containerenv` is there.
+        /// WSL's `/init` is a process in this `/proc`: PID 1, or, with
+        /// systemd as PID 1, another (`is_init`).
+        pub init: bool,
+        /// One of `CONTAINER_MARKERS` is there.
         pub container: bool,
     }
 
@@ -1388,23 +1575,27 @@ mod procview {
         osrelease.to_ascii_lowercase().contains("microsoft")
     }
 
-    /// Whether residue runs in a WSL distribution, which is not counted as a
-    /// container.
-    pub fn wsl(wsl: &Wsl) -> bool {
-        wsl.kernel && wsl.session && !wsl.container
+    /// Whether a `/proc/PID/cmdline` is WSL's `/init`: its first argument.
+    pub fn is_init(cmdline: &[u8]) -> bool {
+        cmdline.split(|b| *b == 0).next() == Some(b"/init")
     }
 
-    /// Whether residue counts as in a container: in a PID namespace other
-    /// than the initial one, or one it cannot read (`own_namespace`), unless
-    /// it runs in a WSL distribution. `wsl` is asked only when the
-    /// namespace would count, so outside a namespace nothing more is read.
+    /// Whether residue runs in a WSL distribution, reading its own `/proc`.
+    pub fn wsl(wsl: &Wsl) -> bool {
+        wsl.kernel && wsl.init && !wsl.container
+    }
+
+    /// Whether a namespace residue runs in counts: `own` says whether it is
+    /// one of its own (`own_namespace`, `own_user_namespace`), and one in
+    /// a WSL distribution does not count. `wsl` is asked only for one of
+    /// its own, so outside one nothing more is read; and when residue
+    /// cannot tell (`Err`), WSL changes nothing.
     pub fn contained(
-        own_namespace: Result<bool, String>,
+        own: Result<bool, String>,
         wsl: impl FnOnce() -> bool,
     ) -> Result<bool, String> {
-        match own_namespace {
-            Ok(false) => Ok(false),
-            _ if wsl() => Ok(false),
+        match own {
+            Ok(true) if wsl() => Ok(false),
             other => other,
         }
     }
@@ -1421,6 +1612,37 @@ mod procview {
                 "residue cannot read which PID namespace it runs in (/proc/self/ns/pid: {e}), so it cannot tell whether it sees every process"
             )),
         }
+    }
+
+    /// Whether residue runs in a user namespace other than the initial one,
+    /// from the inode of `/proc/self/ns/user`, or why residue cannot tell.
+    /// There, as in toolbx or distrobox, the processes outside it are
+    /// listed but shown only to one with `CAP_SYS_PTRACE` over them. A
+    /// kernel without user namespaces has no such file.
+    pub fn own_user_namespace(ns: &std::io::Result<u64>) -> Result<bool, String> {
+        match ns {
+            Ok(inode) => Ok(*inode != USER_INIT_INO),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!(
+                "residue cannot read which user namespace it runs in (/proc/self/ns/user: {e}), so it cannot tell whether it sees every process"
+            )),
+        }
+    }
+
+    /// Whether residue may read every process whatever a `/proc`'s
+    /// `hidepid` says: it holds `CAP_SYS_PTRACE` in effect, in the initial
+    /// user namespace (`init_user`), as root does.
+    pub fn sees_all(me: &Creds, init_user: bool) -> bool {
+        init_user
+            && me
+                .cap_effective
+                .is_some_and(|caps| caps & CAP_SYS_PTRACE != 0)
+    }
+
+    /// Whether reading a process's `/proc` file failed because the process
+    /// is gone: ENOENT, or ESRCH from one in the middle of exiting.
+    pub fn gone(error: &std::io::Error) -> bool {
+        error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
     }
 
     /// The `hidepid` of the mount at `/proc` in a `/proc/self/mountinfo`
@@ -1636,9 +1858,22 @@ mod platform {
     const MOST: usize = 64 << 20;
 
     pub fn take() -> Snapshot {
-        let hidden = match super::jailed(jailed()) {
-            Ok(false) => None,
+        // SAFETY: geteuid only returns this process's effective user.
+        let root = unsafe { libc::geteuid() } == 0;
+        let hidden = match super::jailed(sysctl_int(c"security.jail.jailed")) {
             Ok(true) => Some(Hidden::inside("inside a jail", "inside a jail")),
+            Ok(false) => match super::jails_hidden(
+                sysctl_int(c"security.bsd.see_jail_proc"),
+                root,
+                jail_exists,
+            ) {
+                Ok(false) => None,
+                Ok(true) => Some(Hidden {
+                    short: "jails hidden".into(),
+                    detail: "security.bsd.see_jail_proc is 0, so residue cannot see the processes in this machine's jails, yours among them".into(),
+                }),
+                Err(detail) => return unavailable(BACKEND, "probe_failed", detail),
+            },
             Err(detail) => return unavailable(BACKEND, "probe_failed", detail),
         };
         let mut cmd = Command::new("/bin/ps");
@@ -1854,17 +2089,17 @@ mod platform {
         }
     }
 
-    /// `security.jail.jailed`: 1 inside a jail (jail(8)).
-    fn jailed() -> std::io::Result<libc::c_int> {
-        let mut jailed: libc::c_int = 0;
+    /// An integer sysctl, such as `security.jail.jailed` (1 inside a jail,
+    /// jail(8)) or `security.bsd.see_jail_proc`.
+    fn sysctl_int(name: &std::ffi::CStr) -> std::io::Result<libc::c_int> {
+        let mut value: libc::c_int = 0;
         let mut len: libc::size_t = size_of::<libc::c_int>();
-        // SAFETY: the name is NUL-terminated; `jailed` is writable for
-        // `len` bytes and the kernel writes at most `len`; no new value is
-        // set.
+        // SAFETY: the name is NUL-terminated; `value` is writable for `len`
+        // bytes and the kernel writes at most `len`; no new value is set.
         let rc = unsafe {
             libc::sysctlbyname(
-                c"security.jail.jailed".as_ptr(),
-                (&raw mut jailed).cast(),
+                name.as_ptr(),
+                (&raw mut value).cast(),
                 &mut len,
                 std::ptr::null(),
                 0,
@@ -1873,7 +2108,29 @@ mod platform {
         if rc != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(jailed)
+        Ok(value)
+    }
+
+    /// Whether a jail exists below this one: jail_get(2) with `lastjid` 0
+    /// gives the first, or fails with ENOENT when there is none. Any other
+    /// failure counts as one, since residue cannot tell.
+    fn jail_exists() -> bool {
+        let name = c"lastjid";
+        let mut lastjid: libc::c_int = 0;
+        let mut iov = [
+            libc::iovec {
+                iov_base: name.as_ptr().cast_mut().cast(),
+                iov_len: name.to_bytes_with_nul().len(),
+            },
+            libc::iovec {
+                iov_base: (&raw mut lastjid).cast(),
+                iov_len: size_of::<libc::c_int>(),
+            },
+        ];
+        // SAFETY: `iov` holds one name and value pair as jail_get(2) reads
+        // them: the NUL-terminated name, and an int it only reads.
+        let jid = unsafe { libc::jail_get(iov.as_mut_ptr(), 2, 0) };
+        jid >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT)
     }
 
     enum Read {
@@ -1954,6 +2211,33 @@ fn jailed(answer: std::io::Result<i32>) -> Result<bool, String> {
         Ok(jailed) => Ok(jailed != 0),
         Err(e) => Err(format!(
             "residue cannot read security.jail.jailed ({e}), so it cannot tell whether it runs in a jail, which would hide the processes outside it"
+        )),
+    }
+}
+
+/// Whether the processes in this machine's jails are hidden from residue:
+/// with `security.bsd.see_jail_proc` at 0, a process that is not root sees
+/// another only in its own prison (`cr_canseejailproc` in
+/// `sys/kern/kern_prot.c`), which every `cr_cansee`, and so `ps` and the
+/// `kern.proc` sysctls, goes through. That hides a process of yours in a
+/// jail, which can share the host's files (a jail's root is a folder of the
+/// host's, and nullfs mounts more), so it counts when a jail exists. A
+/// FreeBSD without the sysctl has no such policy.
+#[cfg(any(target_os = "freebsd", test))]
+fn jails_hidden(
+    see_jail_proc: std::io::Result<i32>,
+    root: bool,
+    jail_exists: impl FnOnce() -> bool,
+) -> Result<bool, String> {
+    if root {
+        return Ok(false);
+    }
+    match see_jail_proc {
+        Ok(0) => Ok(jail_exists()),
+        Ok(_) => Ok(false),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(false),
+        Err(e) => Err(format!(
+            "residue cannot read security.bsd.see_jail_proc ({e}), so it cannot tell whether it sees the processes in this machine's jails"
         )),
     }
 }
@@ -2868,8 +3152,17 @@ mod tests {
     }
 
     #[test]
-    fn a_wsl_distribution_is_not_a_container_and_a_container_on_its_kernel_is() {
-        use super::procview::{Wsl, contained, wsl, wsl_kernel};
+    fn a_wsl_distribution_is_not_a_container_and_a_sandbox_in_one_is() {
+        use super::procview::{CONTAINER_MARKERS, Wsl, contained, is_init, wsl, wsl_kernel};
+        assert_eq!(
+            CONTAINER_MARKERS,
+            [
+                "/.dockerenv",
+                "/run/.containerenv",
+                "/run/systemd/container",
+                "/run/host/container-manager"
+            ]
+        );
         // WSL 1, WSL 2, and kernels that are not WSL's: Ubuntu's, and
         // Docker Desktop's on a Mac.
         assert!(wsl_kernel("4.4.0-19041-Microsoft\n"));
@@ -2877,31 +3170,70 @@ mod tests {
         assert!(wsl_kernel("6.6.87.2-microsoft-standard-WSL2"));
         assert!(!wsl_kernel("6.8.0-48-generic\n"));
         assert!(!wsl_kernel("7.0.14-linuxkit\n"));
-        let of = |kernel, session, container| {
+        // WSL's /init, and what is not it: systemd as PID 1, a shell, a
+        // kernel thread's empty command line.
+        assert!(is_init(b"/init\0"));
+        assert!(is_init(b"/init\0SessionLeader\0"));
+        assert!(!is_init(b"/sbin/init\0"));
+        assert!(!is_init(b"/bin/bash\0/init\0"));
+        assert!(!is_init(b""));
+        let of = |kernel, init, container| {
             wsl(&Wsl {
                 kernel,
-                session,
+                init,
                 container,
             })
         };
+        // A distribution: Microsoft's kernel, WSL's /init in this /proc.
         assert!(of(true, true, false));
-        // Docker Desktop's containers run on the WSL 2 kernel.
+        // A sandbox started in a distribution with a /proc of its own
+        // (bwrap, firejail, nsjail, `unshare --pid --mount-proc`), which
+        // keeps WSL_DISTRO_NAME, WSL_INTEROP and /run/WSL: no /init in it.
         assert!(!of(true, false, false));
+        // A container on WSL's kernel whose own PID 1 is called /init (an
+        // s6-overlay image), with its marker.
         assert!(!of(true, true, true));
-        // WSL's variables in a shell elsewhere.
+        // /init elsewhere than on WSL's kernel.
         assert!(!of(false, true, false));
-        // A PID namespace of its own counts, unless it is a WSL
-        // distribution; so does one residue cannot read.
+        // A namespace of its own counts unless it is a WSL distribution's;
+        // one residue cannot read counts whatever WSL says.
         let unread = || Err("residue cannot read which PID namespace it runs in".to_string());
         assert_eq!(contained(Ok(true), || false), Ok(true));
         assert_eq!(contained(Ok(true), || true), Ok(false));
         assert!(contained(unread(), || false).is_err());
-        assert_eq!(contained(unread(), || true), Ok(false));
+        assert!(contained(unread(), || true).is_err());
         // The initial namespace reads nothing about WSL.
         assert_eq!(
             contained(Ok(false), || panic!("WSL read outside a namespace")),
             Ok(false)
         );
+    }
+
+    #[test]
+    fn a_user_namespace_of_its_own_hides_processes_and_root_sees_past_hidepid() {
+        use super::procview::{USER_INIT_INO, gone, own_user_namespace, sees_all};
+        use std::io::{Error, ErrorKind};
+        assert_eq!(USER_INIT_INO, 4_026_531_837);
+        assert_eq!(own_user_namespace(&Ok(USER_INIT_INO)), Ok(false));
+        // toolbx, distrobox, `unshare --user`.
+        assert_eq!(own_user_namespace(&Ok(4_026_532_745)), Ok(true));
+        // A kernel without user namespaces.
+        assert_eq!(
+            own_user_namespace(&Err(Error::from(ErrorKind::NotFound))),
+            Ok(false)
+        );
+        assert!(own_user_namespace(&Err(Error::from(ErrorKind::PermissionDenied))).is_err());
+        // root, with CAP_SYS_PTRACE (bit 19) in effect, in the initial user
+        // namespace; not root, or root in a namespace of its own.
+        let root = creds([0; 4], [0; 4], 0x1ff_ffff_ffff, 0x1ff_ffff_ffff);
+        let user = creds([1000; 4], [1000; 4], 0, 0);
+        assert!(sees_all(&root, true));
+        assert!(!sees_all(&root, false));
+        assert!(!sees_all(&user, true));
+        // A process gone: ENOENT, or ESRCH while it exits.
+        assert!(gone(&Error::from(ErrorKind::NotFound)));
+        assert!(gone(&Error::from_raw_os_error(libc::ESRCH)));
+        assert!(!gone(&Error::from(ErrorKind::PermissionDenied)));
     }
 
     #[test]
@@ -2961,6 +3293,37 @@ mod tests {
         );
         assert!(!super::in_zone(0));
         assert!(super::in_zone(3));
+        // security.bsd.see_jail_proc at 0 hides jailed processes from all
+        // but root, and only matters when a jail exists.
+        use super::jails_hidden;
+        let no_jail = || false;
+        let a_jail = || true;
+        assert_eq!(jails_hidden(Ok(0), false, a_jail), Ok(true));
+        assert_eq!(jails_hidden(Ok(0), false, no_jail), Ok(false));
+        assert_eq!(
+            jails_hidden(Ok(1), false, || panic!("asked for jails")),
+            Ok(false)
+        );
+        assert_eq!(
+            jails_hidden(Ok(0), true, || panic!("asked for jails")),
+            Ok(false)
+        );
+        assert_eq!(
+            jails_hidden(
+                Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
+                false,
+                a_jail
+            ),
+            Ok(false)
+        );
+        assert!(
+            jails_hidden(
+                Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+                false,
+                a_jail
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3013,6 +3376,52 @@ mod tests {
             hidden(&[3, 5, 8]).as_deref(),
             Some(
                 "lsof did not list 2 running processes whose user residue cannot read, such as process 6: a sandbox around residue may hide them"
+            )
+        );
+    }
+
+    #[test]
+    fn a_process_of_yours_lsof_could_not_read_whole_fails_the_probe() {
+        use super::unlisted::{Gap, Owner, describe_gaps, partly};
+        let gap = |pid: u32, command: &str| Gap {
+            pid,
+            command: command.into(),
+            name: b"FD info error: Operation not permitted".to_vec(),
+        };
+        let owner = |pid: u32| match pid {
+            3 => Owner::Runs(501, "sleep".into()),
+            4 => Owner::Runs(0, "launchd".into()),
+            5 => Owner::Gone,
+            6 => Owner::Unread,
+            _ => panic!("process {pid} must not be looked up"),
+        };
+        // residue itself (2), another user's (4), one gone (5): no gap.
+        let none = partly(
+            &[gap(2, "residue"), gap(4, "launchd"), gap(5, "cat")],
+            2,
+            501,
+            owner,
+        );
+        assert!(none.is_empty());
+        assert_eq!(describe_gaps(&none), None);
+        // Each process once, however many names it could not read.
+        let some = partly(
+            &[gap(3, "sleep"), gap(3, "sleep"), gap(6, "?")],
+            2,
+            501,
+            owner,
+        );
+        assert_eq!(some.len(), 2);
+        assert_eq!(
+            describe_gaps(&some[..1]).as_deref(),
+            Some(
+                "lsof could not read every file of sleep[3], which runs as your user (FD info error: Operation not permitted): a sandbox around residue may hide them"
+            )
+        );
+        assert_eq!(
+            describe_gaps(&some).as_deref(),
+            Some(
+                "lsof could not read every file of 2 running processes, such as sleep[3], which runs as your user (FD info error: Operation not permitted): a sandbox around residue may hide them"
             )
         );
     }

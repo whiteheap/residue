@@ -2486,7 +2486,7 @@ elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), 
 elif [ "$(jq -r --arg plan "$plan" '.plan == $plan and .expected_plan == $plan' "$out")" != true ]; then fail "plan $(jq -r .plan "$out"), want $plan"
 elif untouched "$before"; then ok; fi
 
-# 19. macOS: residue in a sandbox that lets it list every process but
+# 20. macOS: residue in a sandbox that lets it list every process but
 # inspect only its own (Seatbelt, `sandbox-exec`), the shape a coding
 # agent's command sandbox can have. lsof there lists only the sandbox's
 # processes and still exits 0. A sleep outside the sandbox works in w:
@@ -2549,7 +2549,66 @@ else
     echo "skip activity-sandboxed: it runs on macOS, with sandbox-exec"
 fi
 
-# 20. Linux: a process of yours running with another of your groups, as
+# 20b. macOS: residue in a sandbox that lets it list and inspect every
+# process but read the files only of its own (it denies
+# `process-info-pidfdinfo` outside the sandbox). lsof lists a process
+# outside and prints `FD info error` in place of its files. A sleep outside
+# with a file open in w and its working directory elsewhere: outside, w is
+# in_use by it; inside, its activity must be unknown (probe_failed), and
+# `remove --yes` must keep w.
+sandboxed_files_case() {
+    name=activity-sandboxed-files
+    make_repo
+    local before holder i explain_status outside busy real=$bin
+    local profile=$work/$name.sb
+    printf '%s\n' '(version 1)' '(allow default)' '(deny process-info-pidfdinfo)' \
+        '(allow process-info-pidfdinfo (target same-sandbox))' >"$profile"
+    if ! sandbox-exec -f "$profile" /usr/bin/true 2>/dev/null; then
+        echo "skip $name: sandbox-exec cannot apply a profile here (already in a sandbox?)"
+        return
+    fi
+    before=$(sums "$wt")
+    (cd "$work" && exec sleep 300 3<"$wt/sub/file.txt") >/dev/null 2>&1 &
+    holder=$!
+    holders="$holders $holder"
+    for ((i = 0; i < 100; i++)); do
+        case $(ps -o comm= -p "$holder" 2>/dev/null) in *sleep) break ;; esac
+        sleep 0.1
+    done
+    run explain --json "$wt"
+    outside=$work/$name.outside
+    mv "$out" "$outside" || exit 2
+    bin=/usr/bin/sandbox-exec
+    run -f "$profile" "$real" explain --json "$wt"
+    explain_status=$status
+    busy=$work/$name.busy
+    mv "$out" "$busy" || exit 2
+    run -f "$profile" "$real" remove --yes --json --no-trash "$wt"
+    bin=$real
+    kill "$holder" 2>/dev/null
+    wait "$holder" 2>/dev/null
+    local gap='.state == "unknown" and .reason == "probe_failed" and (.detail | startswith("lsof could not read every file of"))'
+    if ! jq -e --argjson pid "$holder" '.worktree.activity.state == "in_use" and any(.worktree.activity.processes[]; .pid == $pid)' "$outside" >/dev/null; then
+        fail "outside the sandbox, with sleep[$holder] holding a file in w, explain says $(jq -c '.worktree.activity' "$outside")"
+    elif [ "$explain_status" != 0 ]; then fail "in the sandbox, explain exit $explain_status, want 0"
+    elif ! jq -e ".worktree.verdict == \"unknown\" and (.worktree.activity | $gap)" "$busy" >/dev/null; then
+        fail "in the sandbox, with sleep[$holder] holding a file in w, explain says $(jq -c '[.worktree.verdict, .worktree.activity]' "$busy")"
+    elif [ "$status" != 3 ]; then fail "in the sandbox, remove --yes exit $status, want 3"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), want refused"
+    elif [ "$(failing_checks 0)" != activity ]; then fail "failing checks: $(failing_checks 0), want activity"
+    elif untouched "$before"; then
+        ok
+        echo "     $(jq -r '.worktree.activity.detail' "$busy" | cut -c1-200)"
+    fi
+}
+if [ "$(uname -s)" = Darwin ] && [ -x /usr/bin/sandbox-exec ]; then
+    sandboxed_files_case
+else
+    echo "skip activity-sandboxed-files: it runs on macOS, with sandbox-exec"
+fi
+
+# 21. Linux: a process of yours running with another of your groups, as
 # `sg` or `newgrp` leave a shell, is listed, but the kernel shows its files
 # only to a process with the same group, or to root. A sleep started that
 # way works in w: explain must say unknown (probe_failed), naming a process
