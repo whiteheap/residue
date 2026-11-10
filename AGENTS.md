@@ -58,6 +58,7 @@ These are the reasons people trust the tool. Do not weaken them without an expli
 | `src/policy.rs` | Regenerable rules (names and paths) for ignored entries |
 | `src/discover.rs` | Finding repositories under a root |
 | `src/output.rs`, `src/json.rs` | Terminal text and JSON documents |
+| `src/pass.rs` | The record of a running `watch`'s last pass (`watch-pass.json` beside the ledger: written whole, read by `service status` and `stats --json`), its log line, and the lines `service status` shows |
 | `src/run.rs` | Child processes with a deadline and an output cap, and `run::spawn`, the one place a child starts, under a lock that keeps a child from inheriting another's pipes on macOS. `clippy.toml` refuses `Command::spawn`, `output` and `status` anywhere else (#114) |
 | `src/watch.rs` | `residue watch`: when to remove (branch landed, disk low), by running `scan --json` and `remove --yes --idle --no-trash`; when to fetch (`Fetcher`); the default roots |
 | `src/events.rs` | Waiting for file changes: inotify on Linux, kqueue on macOS and the BSDs. kqueue holds an open file per watched path, so `Events::room` raises the soft open-file limit and keeps 128 of it free for the children a pass starts |

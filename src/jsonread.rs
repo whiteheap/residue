@@ -43,6 +43,14 @@ impl Value {
         }
     }
 
+    /// A number, with any fraction; `None` for anything that is not one.
+    pub fn f64(&self) -> Option<f64> {
+        match self {
+            Value::Number(n) => Some(*n),
+            _ => None,
+        }
+    }
+
     /// The items of an array, or none for anything else.
     pub fn items(&self) -> &[Value] {
         match self {

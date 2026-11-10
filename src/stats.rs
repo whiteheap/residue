@@ -263,11 +263,20 @@ impl Ledger {
 
 /// Where the ledger is.
 pub fn path() -> Result<PathBuf, String> {
+    // `dir` fails only without HOME.
+    dir()
+        .map(|d| d.join(FILE))
+        .map_err(|_| "HOME is not set, so residue has no stats ledger".to_string())
+}
+
+/// residue's state folder, which holds the ledger and `watch`'s record of
+/// its last pass (`pass::FILE`).
+pub fn dir() -> Result<PathBuf, String> {
     let home = || {
         std::env::var_os("HOME")
             .filter(|h| !h.is_empty())
             .map(PathBuf::from)
-            .ok_or_else(|| "HOME is not set, so residue has no stats ledger".to_string())
+            .ok_or_else(|| "HOME is not set, so residue has no state folder".to_string())
     };
     #[cfg(target_os = "macos")]
     let dir = home()?.join("Library/Application Support/residue");
@@ -281,7 +290,7 @@ pub fn path() -> Result<PathBuf, String> {
         Some(d) => d.join("residue"),
         None => home()?.join(".local/state/residue"),
     };
-    Ok(dir.join(FILE))
+    Ok(dir)
 }
 
 /// The ledger; an empty one when there is no file yet.
@@ -306,8 +315,8 @@ fn read_at(path: PathBuf) -> Result<Ledger, String> {
 /// read wait for a writer forever, after `remove`'s confirmation too, and
 /// a device such as `/dev/zero` would never end; the caller reports it as
 /// any ledger it cannot use, a warning. `O_NONBLOCK` changes nothing for a
-/// regular file.
-fn open(path: &Path, options: &mut OpenOptions) -> io::Result<fs::File> {
+/// regular file. `pass::read` opens `watch`'s pass record the same way.
+pub(crate) fn open(path: &Path, options: &mut OpenOptions) -> io::Result<fs::File> {
     let file = options.custom_flags(libc::O_NONBLOCK).open(path)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::other(
@@ -1063,6 +1072,9 @@ fn json(ledger: &Ledger, stats: &Stats, trash: &TrashNow, errors: &[String], sta
             "errors",
             Json::Arr(errors.iter().map(|e| Json::str(e.clone())).collect()),
         ),
+        // `watch`'s last pass. It is not the ledger: a record that cannot
+        // be read is its own `error`, never in `errors` or the exit status.
+        ("watch_pass", crate::pass::json(started)),
     ])
 }
 

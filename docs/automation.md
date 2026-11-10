@@ -86,11 +86,32 @@ No run forgets a record before the `--keep-removed` it was written with. A run f
 ```sh
 residue watch --once --dry-run             # what it would remove right now
 residue service install --dry-run          # a service that only logs what it would remove
-residue service status                     # is it running, what it watches, how long it keeps removal records, what it freed, the last lines of its log
+residue service status                     # is it running, what it watches, how long it keeps removal records, what it freed, its last pass, the last lines of its log
 residue service uninstall
 ```
 
 When a `--once` pass removes, or would remove, nothing, it logs one line saying why: no linked worktrees, no branch landed or a check keeps those that did, and each disk's free space against `--min-free`. A dry run still fetches; add `--no-fetch` to leave the refs alone too. The log is `~/Library/Logs/residue/watch.log` on macOS and `journalctl --user -u residue-watch` on Linux. After each removal it logs what the removal freed and the total for this machine, with the UTC date, like the log's own times. `residue service status` has a `freed:` line: what automatic cleanup freed in the last seven days and when it last removed a worktree, such as `freed: about 2.1 GB from 4 worktrees in the last 7 days; last removal 2026-11-07 04:12 +02:00 (5 hours ago)`. `residue stats` has the rest; [Stats](reference.md#stats) says how it is counted. A Linux user service stops when you log out unless you run `loginctl enable-linger "$USER"` once. On other systems, `residue service install` prints the `residue watch` command to run from your system's service manager. [Why `--idle` matters](#why---idle-matters) explains what counts as a change, and why a paused agent session needs a wait. If you would rather sweep at a fixed time, see [Run it on a schedule](#run-it-on-a-schedule).
+
+### Is it working?
+
+A `watch` that removes nothing is usually right to: no branch has landed, and the disk has room. `residue service status` shows what its last pass found and what the next one waits for:
+
+```text
+last pass: 2026-11-10 21:08 +02:00 (3 minutes ago), 23 worktrees: 1 candidate, 22 kept (ignored 13, activity 7, untracked 2); the disk is 39.2% free, removes below 10%
+next pass: when a branch lands (next fetch 2026-11-10 21:38 +02:00), or the disk drops below 10%
+```
+
+A candidate passes every check. A worktree changed within `--grace` is counted on its own (`2 changed within 1h`), and becomes a candidate once it has not changed for that long. Each kept worktree is counted under each check that keeps it, by the check's id, so the counts in brackets can add up to more than the kept ones; `residue explain PATH` gives one worktree's reasons. Many kept by `ignored` often means build output that no rule covers yet: `residue explain` names it, and `git config --add residue.regenerable PATH` tells residue it is safe to delete. The second line names what would start a removal: a branch that lands, with when `watch` fetches next; the disk dropping below `--min-free`; and the time a worktree that waits passes `--grace` or `--idle`. A dry run adds `would remove N`; a pass that removed something adds `removed N`. When the scan failed, the line says why.
+
+The lines read a record `watch` replaces at the end of each pass: `watch-pass.json`, beside the [stats ledger](reference.md#the-ledger), on macOS in `~/Library/Application Support/residue/`. `residue stats --json` has the same as `watch_pass`. `watch --once` writes none, so a preview never stands in for the service's pass. A running `watch` passes at least every six hours, so a record older than seven hours is marked `stale`: no `watch` has finished a pass since. The first line of `service status` shows whether it runs, and the log why it stopped. With no record yet, `service status` says `last pass: none recorded yet`. A `watch` that residue 0.0.13 or earlier started writes none; an upgrade restarts it on the new release ([After an upgrade](#after-an-upgrade)).
+
+The log has one line per pass only when its summary changes, so a quiet day stays short but is never silent for good:
+
+```text
+2026-11-10T19:08:12Z residue watch: pass: 23 worktrees: 1 candidate, 22 kept (ignored 13, activity 7, untracked 2); the disk is 39.2% free, removes below 10%; logged again when this changes
+```
+
+Free space changing within the same side of `--min-free` does not count as a change. The record decides nothing: `watch` never reads it back. One it cannot write is logged once, `cannot write the record of this pass, which service status shows (...); passes and removals go on as before`, and when it can again, `the record of each pass is written again`. One `service status` cannot read is a line that says so, and changes neither its other lines nor its exit status.
 
 ### After an upgrade
 

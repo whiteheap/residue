@@ -7,6 +7,9 @@ pub enum Json {
     Bool(bool),
     Int(i64),
     UInt(u64),
+    /// A number that may have a fraction, such as a percentage. One that
+    /// is not finite, which JSON cannot hold, is written as null.
+    Num(f64),
     Str(String),
     Arr(Vec<Json>),
     Obj(Vec<(&'static str, Json)>),
@@ -38,6 +41,10 @@ impl Json {
             Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
             Json::Int(n) => out.push_str(&n.to_string()),
             Json::UInt(n) => out.push_str(&n.to_string()),
+            // Rust prints a finite f64 as plain digits, never with an
+            // exponent: `10`, `39.25`, `0.0001`.
+            Json::Num(n) if n.is_finite() => out.push_str(&n.to_string()),
+            Json::Num(_) => out.push_str("null"),
             Json::Str(s) => escape(s, out),
             Json::Arr(items) => {
                 out.push('[');

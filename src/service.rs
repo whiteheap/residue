@@ -11,7 +11,7 @@ residue service: run `residue watch` in the background, from login.
 
 Usage:
   residue service install [OPTIONS] [ROOT...]  Install or replace it; start it
-  residue service status                       Show what it runs, and its log
+  residue service status                       Show it, its last pass and log
   residue service uninstall                    Stop it and remove it
 
 Examples:
@@ -1013,6 +1013,7 @@ mod platform {
                 }
                 super::print_fingerprint(&seen);
                 super::freed(true);
+                super::last_pass(true);
                 if let Some(log) = log_file() {
                     println!("log: {}", log.display());
                     super::tail(&log);
@@ -1024,6 +1025,7 @@ mod platform {
                 super::homebrew_note();
                 super::print_fingerprint(&seen);
                 super::freed(false);
+                super::last_pass(false);
                 3
             }
         }
@@ -1239,6 +1241,7 @@ mod platform {
             super::homebrew_note();
             super::print_fingerprint(&seen);
             super::freed(false);
+            super::last_pass(false);
             return 3;
         }
         let state = match run(SYSTEMCTL, &["--user", "is-active", UNIT]) {
@@ -1251,6 +1254,7 @@ mod platform {
         }
         super::print_fingerprint(&seen);
         super::freed(true);
+        super::last_pass(true);
         if let Ok(log) = run(
             "journalctl",
             &["--user", "-u", UNIT, "-n", "5", "--no-pager", "-o", "cat"],
@@ -1320,6 +1324,18 @@ fn homebrew_note() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn freed(installed: bool) {
     if let Some(line) = crate::stats::service_line(installed) {
+        println!("{}", output::clean(&line));
+    }
+}
+
+/// On `service status`: `watch`'s last pass and what the next one waits
+/// for (`pass::status_lines`), after the first line and before `log:`,
+/// which the Mac app reads by their prefixes. Without residue's own
+/// service, only when some `watch` wrote a record. A record that cannot be
+/// read is one line saying so; it never changes the exit status.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn last_pass(installed: bool) {
+    for line in crate::pass::status_lines(installed, output::now()) {
         println!("{}", output::clean(&line));
     }
 }

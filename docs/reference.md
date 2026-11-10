@@ -150,7 +150,7 @@ Every size is an estimate: the `reclaimable` size residue measured before the re
 
 ### The ledger
 
-On macOS, `~/Library/Application Support/residue/ledger.jsonl`, whatever `XDG_STATE_HOME` says, so a terminal, the launchd agent and an app find the same file. Elsewhere, `$XDG_STATE_HOME/residue/ledger.jsonl` when `XDG_STATE_HOME` is an absolute path, and `~/.local/state/residue/ledger.jsonl` otherwise. residue creates the folder with mode 0700 and the file with mode 0600. There is one per user, and nothing in it leaves the machine.
+On macOS, `~/Library/Application Support/residue/ledger.jsonl`, whatever `XDG_STATE_HOME` says, so a terminal, the launchd agent and an app find the same file. Elsewhere, `$XDG_STATE_HOME/residue/ledger.jsonl` when `XDG_STATE_HOME` is an absolute path, and `~/.local/state/residue/ledger.jsonl` otherwise. residue creates the folder with mode 0700 and the file with mode 0600. There is one per user, and nothing in it leaves the machine. The same folder holds `watch-pass.json`, a running `watch`'s record of its last pass ([Is it working?](automation.md#is-it-working)).
 
 Each line is one JSON object, one event:
 
@@ -209,3 +209,4 @@ A preview has `stats` with zeros and nulls. The `watch` log names what each remo
 - `last_freed_at`: `{"all", "remove", "sweep", "watch", "other"}`, each a time or null.
 - `skipped_lines`: lines it could not read.
 - `errors`: trash folders it could not list.
+- `watch_pass`: the record of a running `watch`'s last pass ([Is it working?](automation.md#is-it-working)), or null when no `watch` has written one. `path` is the record's file, `watch-pass.json` beside the ledger; `stale` is true once its pass is over seven hours old; `error` says why it could not be read, and is null when it could, and then the record's fields follow: `v` (`1`), `at`, `pid`, `dry_run`, `grace`, `idle`, `min_free_percent` and `fetch_every` (null with `--no-fetch`) as that `watch` ran; `scan_error`, why the pass's scan failed, or null; `worktrees`, `candidates`, `changed_within_grace` and `kept`, which add up to `worktrees`; `kept_by`, `[{"check", "worktrees"}]`, each check id that keeps a kept worktree with how many it keeps, most first, a worktree two checks keep counted under both; `tried`, the worktrees the pass handed to a removal (in a dry run, those it would remove), and `removed`; `filesystems`, and `free_bytes`, `total_bytes` and `free_percent` of the one with the least free space; `next_deadline_at`, when a waiting worktree passes `--grace` or `--idle`, and `next_fetch_at`. Counts and free space are null when the scan failed, and a time is null when there is none. A record that cannot be read never changes `errors` or the exit status.
