@@ -611,7 +611,7 @@ pub fn remove(options: &Options) -> u8 {
     let mut reports = inspect::all(&jobs, &snapshot, &policy).into_iter();
     for item in &mut items {
         if item.target.is_some() {
-            let Some(report) = reports.next() else {
+            let Some(mut report) = reports.next() else {
                 item.outcome = Some(Outcome::Failed("internal: no report".into()));
                 continue;
             };
@@ -624,6 +624,11 @@ pub fn remove(options: &Options) -> u8 {
                         unmet.text()
                     )));
                 }
+            }
+            // Only for a worktree the plan lists: the walk of the build
+            // folder its removal leaves behind costs as much as a worktree's.
+            if item.outcome.is_none() {
+                report.measure_target_dir(&snapshot);
             }
             item.report = Some(report);
         }
@@ -2405,6 +2410,9 @@ fn plan_text(
                     clean(&deleted.join(", "))
                 ));
             }
+            if let Some(line) = target_dir_line(r, places) {
+                out.push_str(&format!("    leaves behind: {line}\n"));
+            }
             if let (Ok(Some(n)), Some(b)) = (&r.local_commits, r.entry.short_branch()) {
                 if *n > 0 {
                     out.push_str(&format!(
@@ -2559,6 +2567,25 @@ fn purge_summary(p: &Purge, now: i64, places: &Places, style: &Style) -> String 
     )
 }
 
+/// The Cargo build folder the worktree's config names outside it, which
+/// residue does not remove (#190): `~/build/wt, 1.0 MB (Cargo build folder,
+/// not removed)`. `None` when there is none or nothing is there.
+fn target_dir_line(r: &Report, places: &Places) -> Option<String> {
+    let t = r.target_dir.as_ref()?;
+    let dir = r.canonical.as_deref()?;
+    let config = output::target_dir_config(t, dir);
+    match (&t.path, output::target_dir_phrase(t, places)) {
+        (Err(why), _) => Some(format!(
+            "any Cargo build folder {config} names: residue could not read it ({})",
+            clean(why)
+        )),
+        (Ok(_), None) => None,
+        (Ok(_), Some(phrase)) => Some(format!(
+            "{phrase} (Cargo build folder from {config}, not removed)"
+        )),
+    }
+}
+
 /// `; restore: residue restore PATH` for a deletion residue recorded.
 fn restore_hint(record: &Option<PathBuf>) -> String {
     record
@@ -2587,9 +2614,14 @@ fn outcome_line(item: &Item, outcome: &Outcome, places: &Places) -> String {
     };
     match outcome {
         Outcome::Removed(record) => format!(
-            "removed {shown}{branch}{}{}",
+            "removed {shown}{branch}{}{}{}",
             reclaimable("reclaimable"),
-            restore_hint(record)
+            restore_hint(record),
+            item.report
+                .as_ref()
+                .and_then(|r| target_dir_line(r, places))
+                .map(|line| format!("\n  left behind: {line}"))
+                .unwrap_or_default()
         ),
         Outcome::Trashed(entry) => format!(
             "moved {shown} to the trash{branch}; restore: residue restore {}",

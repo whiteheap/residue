@@ -3226,5 +3226,122 @@ else
     done
 fi
 
+# 24. The Cargo build folder a worktree's own config names outside it
+# (#190): explain and remove name it, measure it only when it holds the
+# CACHEDIR.TAG Cargo writes, and the removal leaves it as it was. A folder
+# inside the worktree is not named, and a config residue cannot parse is
+# "not read". No check and no verdict changes.
+cargo_tag='Signature: 8a477f597d28d172789f06886806bc55
+# This file is a cache directory tag created by cargo.
+# For information about cache directory tags see https://bford.info/cachedir/'
+# w's verdict whatever its config says: candidate, or unknown on a partial probe.
+plain_verdict=candidate
+[ -z "$partial_probe" ] || plain_verdict=unknown
+target_fixture() { # CONFIG-TEXT TAG(cargo|other|none)
+    make_repo
+    mkdir -p "$wt/.cargo"
+    printf '%s\n' "$1" >"$wt/.cargo/config.toml"
+    setup git -C "$wt" add .cargo/config.toml
+    setup git -C "$wt" commit -qm cargo
+    w_sha=$(git -C "$repo" rev-parse w) || exit 2
+    build=$work/$name-build
+    mkdir -p "$build"
+    head -c 100000 /dev/zero >"$build/blob"
+    case $2 in
+    cargo) printf '%s\n' "$cargo_tag" >"$build/CACHEDIR.TAG" ;;
+    other) printf 'Signature: 8a477f597d28d172789f06886806bc55\n# another tool\n' >"$build/CACHEDIR.TAG" ;;
+    esac
+    build=$(cd "$build" && pwd -P) || exit 2
+    build_sum=$(sums "$build") || exit 2
+}
+# The folder is where it was, with the same files.
+build_kept() {
+    [ "$(sums "$build")" = "$build_sum" ] || { fail "the build folder $build changed"; return 1; }
+}
+target_explain() { # JQ-FILTER over .worktree.cargo_target_dir, as $t
+    run explain --json "$wt"
+    if [ "$status" != 0 ]; then fail "explain exit $status, want 0"
+    elif ! jq -e --arg verdict "$plain_verdict" '.worktree.verdict == $verdict' "$out" >/dev/null; then
+        fail "verdict $(jq -r .worktree.verdict "$out"), want $plain_verdict"
+    elif ! jq -e --arg build "$build" ".worktree.cargo_target_dir as \$t | $1" "$out" >/dev/null; then
+        fail "cargo_target_dir is $(jq -c .worktree.cargo_target_dir "$out")"
+    elif build_kept && common_ok; then ok; fi
+}
+
+name=target-dir-explain
+target_fixture "[build]
+target-dir = \"../../../target-dir-explain-build\"" cargo
+target_explain '$t.path == $build and $t.state == "measured" and $t.reason == null
+    and $t.size.apparent_bytes >= 100000 and ($t.activity.state | type) == "string"
+    and ($t.config | endswith("/.worktrees/w/.cargo/config.toml")) and $t.config_error == null'
+
+if [ -z "$partial_probe" ]; then
+    name=target-dir-remove-json
+    target_fixture 'build.target-dir = "../../../target-dir-remove-json-build"' cargo
+    run remove --yes --json "$wt"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(result 0 result)" != removed ]; then fail "result $(result 0 result), want removed"
+    elif ! jq -e --arg build "$build" '.results[0].worktree.cargo_target_dir
+            | .path == $build and .state == "measured" and .size.apparent_bytes >= 100000' "$out" >/dev/null; then
+        fail "cargo_target_dir is $(jq -c '.results[0].worktree.cargo_target_dir' "$out")"
+    elif [ -e "$wt" ]; then fail "the worktree is still on disk"
+    elif build_kept && common_ok; then ok; fi
+
+    name=target-dir-remove-text
+    target_fixture 'build = { target-dir = "../../../target-dir-remove-text-build" }' cargo
+    run remove --yes "$wt"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif ! grep -qF "    leaves behind: $build, " "$out"; then fail "the plan has no 'leaves behind: $build' line"
+    elif ! grep -q "^  left behind: .*target-dir-remove-text-build, [0-9.]* [KM]B (Cargo build folder from .cargo/config.toml, not removed)$" "$out"; then
+        fail "no 'left behind: PATH, SIZE (Cargo build folder from .cargo/config.toml, not removed)' line"
+    elif [ -e "$wt" ]; then fail "the worktree is still on disk"
+    elif build_kept && common_ok; then ok; fi
+else
+    skip_partial target-dir-remove-json
+    skip_partial target-dir-remove-text
+fi
+
+# Named, never measured: no tag, another tool's tag, and `/`, which holds
+# the worktree.
+name=target-dir-untagged
+target_fixture '[build]
+target-dir = "../../../target-dir-untagged-build"' none
+target_explain '$t.path == $build and $t.state == "not_measured" and $t.reason == "no_cargo_tag" and $t.size == null'
+
+name=target-dir-other-tag
+target_fixture '[build]
+target-dir = "../../../target-dir-other-tag-build"' other
+target_explain '$t.path == $build and $t.state == "not_measured" and $t.reason == "no_cargo_tag" and $t.size == null'
+
+name=target-dir-root
+target_fixture '[build]
+target-dir = "/"' none
+target_explain '$t.path == "/" and $t.state == "not_measured" and $t.reason == "holds_worktree" and $t.size == null'
+
+# Inside the checkout: the walk counts it, so it is not named.
+name=target-dir-inside
+target_fixture '[build]
+target-dir = "node_modules"' none
+printf '%s\n' "$cargo_tag" >"$wt/node_modules/CACHEDIR.TAG"
+target_explain '$t == null'
+
+# A config residue cannot parse, and one whose `include` may set it: not
+# read, never taken as no folder.
+name=target-dir-malformed
+target_fixture '[build
+target-dir = "../../../target-dir-malformed-build"' cargo
+target_explain '$t.state == "not_read" and $t.path == null and ($t.config_error | type) == "string" and $t.size == null'
+
+# Arrays nested 100,000 deep: not read, where a reader that recurses
+# without a limit runs the stack out and stops every scan of the repository.
+name=target-dir-nested
+target_fixture "a = $(head -c 100000 /dev/zero | tr '\0' '[')" cargo
+target_explain '$t.state == "not_read" and ($t.config_error | test("deep"))'
+
+name=target-dir-include
+target_fixture 'include = ["more.toml"]' cargo
+target_explain '$t.state == "not_read" and ($t.config_error | test("include"))'
+
 echo "contract-check: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]

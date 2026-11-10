@@ -14,6 +14,7 @@ use crate::fsinfo::{Space, Usage};
 use crate::inspect::{LastChange, Report, Status, Verdict};
 use crate::json::Json;
 use crate::policy::{Policy, RuleSource};
+use crate::target_dir::{Size, TargetDir};
 
 pub const SCHEMA_SCAN: &str = "residue.scan/v1";
 pub const SCHEMA_EXPLAIN: &str = "residue.explain/v1";
@@ -769,6 +770,84 @@ fn usage_json(u: &Usage) -> Json {
     ])
 }
 
+/// `cargo_target_dir`: the Cargo build folder the worktree's own config
+/// names outside it, which a removal leaves behind (#190).
+fn target_dir_json(t: &TargetDir) -> Json {
+    let (path, error) = match &t.path {
+        Ok(path) => (Json::path(path), Json::Null),
+        Err(why) => (Json::Null, Json::str(why.clone())),
+    };
+    let (state, reason, detail) = match &t.path {
+        Ok(_) => (
+            t.size.state(),
+            Json::opt(t.size.reason(), Json::str),
+            Json::opt(t.size.detail(), Json::Str),
+        ),
+        Err(_) => ("not_read", Json::Null, Json::Null),
+    };
+    let (size, activity) = match &t.size {
+        Size::Measured { usage, activity } if t.path.is_ok() => {
+            (usage_json(usage), evidence_json(activity))
+        }
+        _ => (Json::Null, Json::Null),
+    };
+    Json::Obj(vec![
+        ("config", Json::path(&t.config)),
+        ("path", path),
+        ("state", Json::str(state)),
+        ("reason", reason),
+        ("detail", detail),
+        ("config_error", error),
+        ("size", size),
+        ("activity", activity),
+    ])
+}
+
+/// The build folder in words, for `explain`, the plan and the line after a
+/// removal: `~/build/wt, 1.0 MB`, with what keeps it from a size and, when
+/// the run's activity snapshot shows one, the process using it. `None` when
+/// nothing is there.
+pub fn target_dir_phrase(t: &TargetDir, places: &Places) -> Option<String> {
+    let path = match &t.path {
+        Ok(path) => places.show(path),
+        Err(_) => return None,
+    };
+    Some(match &t.size {
+        Size::Missing => return None,
+        Size::Measured { usage, activity } => {
+            let mut text = format!("{path}, {}", bytes(usage.allocated));
+            if usage.unreadable > 0 {
+                text.push_str(&format!(
+                    " ({} entr{} not read)",
+                    usage.unreadable,
+                    if usage.unreadable == 1 { "y" } else { "ies" }
+                ));
+            }
+            if let Evidence::InUse(procs) = activity {
+                let who: Vec<String> = procs
+                    .iter()
+                    .map(|(pid, cmd)| format!("{}[{pid}]", clean(cmd)))
+                    .collect();
+                text.push_str(&format!(", in use by {}", who.join(", ")));
+            }
+            text
+        }
+        Size::NotRequested => format!("{path}, not measured"),
+        Size::NotMeasured { detail, .. } => format!("{path}, not measured: {}", clean(detail)),
+    })
+}
+
+/// The config that named the folder, relative to the worktree:
+/// `.cargo/config.toml`.
+pub fn target_dir_config(t: &TargetDir, worktree: &Path) -> String {
+    clean(
+        &t.config
+            .strip_prefix(worktree)
+            .unwrap_or(&t.config)
+            .to_string_lossy(),
+    )
+}
+
 pub fn space_json(s: &Space) -> Json {
     Json::Obj(vec![
         // A decimal string, not a number: dev_t can exceed 2^53, which a
@@ -867,6 +946,11 @@ pub fn report_json(r: &Report) -> Json {
         ),
         ("restored", restored),
         ("restored_error", restored_error),
+        // Added after the others, so every field before it keeps its place.
+        (
+            "cargo_target_dir",
+            Json::opt(r.target_dir.as_ref(), target_dir_json),
+        ),
     ])
 }
 
