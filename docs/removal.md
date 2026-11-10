@@ -12,7 +12,7 @@ skipped .worktrees/big: node_modules/ changed since you confirmed (1,204 -> 1,38
 
 residue deletes what you saw, or nothing. With `--yes` there is no prompt, so the reason says `changed since the plan`.
 
-A program that shows the plan in one run and removes in a second once you confirm passes the first run's `plan` to the second as `--expect`. Before the second run moves anything, it makes its own plan and compares. When a worktree at a PATH moved to another branch or HEAD, another worktree took its path, or it would purge or forget a trash entry or removal record the plan did not show, it removes nothing and exits 4, and the program shows the new plan ([reference](reference.md#for-coding-agents)). Without `--expect`, the second run acts on what it finds at each PATH, when every check passes.
+A program that shows the plan in one run and removes in a second once you confirm passes the first run's `plan` to the second as `--expect`. Before the second run moves anything, it makes its own plan and compares. When a worktree at a PATH moved to another branch or HEAD, another worktree took its path, or it would purge or forget a trash entry or removal record the plan did not show, it removes nothing and exits 4, and the program shows the new plan ([reference](reference.md#for-coding-agents)). Without `--expect`, the second run acts on what it finds at each PATH, when every check passes. `residue restore --expect ID ENTRY` does the same for a restore: ID is the `id` of the entry `restore --json` listed, and when ENTRY now names another entry, such as the record of a later removal of the same worktree, it restores nothing and exits 4.
 
 ## The move aside, and the window that remains
 

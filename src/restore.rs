@@ -16,11 +16,12 @@ use std::path::{Component, Path, PathBuf};
 use crate::cli::Options;
 use crate::commands::{VERSION, fail, header};
 use crate::discover;
+use crate::fingerprint;
 use crate::git;
 use crate::hold::Hold;
 use crate::json::Json;
 use crate::output::{self, Places, Style, clean};
-use crate::removed::{self, How};
+use crate::removed::{self, How, NotRestored};
 use crate::stats;
 use crate::trash;
 
@@ -62,77 +63,34 @@ pub fn command(options: &Options) -> u8 {
             );
         }
         if options.json {
-            println!("{}", list_json(&found, started, None).render());
+            println!("{}", list_json(&found, started, Shown::List, None).render());
         } else {
             print!("{}", list_text(&found, started, &places));
         }
         return if found.errors.is_empty() { 0 } else { 1 };
     };
-    // A path names its repository directly, from any directory, even once
-    // the worktree it names is gone; a name is looked up in the
-    // repositories at or under this one.
-    let mut chosen = None;
-    let mut unsearched = None;
-    let mut missed = None;
-    match repository_of(wanted) {
-        Ok(Some(root)) => {
-            let found = gather(std::slice::from_ref(&root));
-            match choose(&found, wanted) {
-                Ok(pick) => chosen = Some((found, pick)),
-                // More than one entry where the path points is the answer:
-                // the message names them.
-                Err(Miss::Many(e)) => return fail(&e),
-                Err(Miss::Nothing) => missed = Some(root),
-            }
-        }
-        Ok(None) => {}
-        Err(e) => unsearched = Some(e),
-    }
-    let (found, pick) = match chosen {
-        Some(c) => c,
-        None => {
-            // A path ENTRY that is not where it points, or a name, leaves
-            // the current directory to search, but never the home folder or
-            // a folder above it, for the reason `repository_of` gives: from
-            // there a name is looked up in the usual code folders (`Search`).
-            if at_or_above_home(Path::new(".")) {
-                if let Some(e) = unsearched {
-                    return fail(&e);
-                }
-                if let Some(root) = missed {
-                    return fail(&format!(
-                        "nothing named {} under {}; run residue restore inside its repository, or pass the entry's path",
-                        wanted.display(),
-                        root.display()
-                    ));
-                }
-            }
-            let search = match Search::here() {
-                Ok(s) => s,
-                Err(e) => return fail(&e),
-            };
-            let found = gather(&search.roots);
-            match choose(&found, wanted) {
-                Ok(pick) => (found, pick),
-                Err(miss) => {
-                    return fail(
-                        &unsearched.unwrap_or_else(|| miss.text(wanted, &search, &places)),
-                    );
-                }
-            }
-        }
+    let (found, pick) = match look_up(wanted, &places) {
+        Ok(chosen) => chosen,
+        Err(e) => return fail(&e),
     };
     let to = match options.to.as_deref().map(destination) {
         None => None,
         Some(Ok(to)) => Some(to),
         Some(Err(e)) => return fail(&e),
     };
+    // Under `--expect ID`, the entry ENTRY names must be the one a listing
+    // showed: as this run listed it, and again once the restore holds it,
+    // before anything changes.
+    let expect = options.expect.as_deref();
+    if expect.is_some_and(|want| want != id_of(&found, pick)) {
+        return other(options, &found, pick, started);
+    }
     // Before the restore takes a removal record back, the stats ledger
     // takes in what it lacks, so the removal it undoes still counts.
     let seeded = seed(&found);
     let result = match pick {
-        Pick::Trash(i) => restore_trash(&found, i, to.as_deref()),
-        Pick::Removed(i) => restore_removed(&found, i, to.as_deref()),
+        Pick::Trash(i) => restore_trash(&found, i, to.as_deref(), expect),
+        Pick::Removed(i) => restore_removed(&found, i, to.as_deref(), expect),
     };
     match result {
         Ok(mut done) => {
@@ -150,14 +108,133 @@ pub fn command(options: &Options) -> u8 {
             if options.json {
                 println!(
                     "{}",
-                    list_json(&found, started, Some((pick, &done))).render()
+                    list_json(&found, started, Shown::Restored(pick, &done), expect).render()
                 );
             } else {
                 print!("{}", done_text(&found, pick, &done, &places));
             }
             0
         }
-        Err(e) => fail(&format!("cannot restore {}: {e}", name_of(&found, pick))),
+        Err(NotRestored::Refused(e)) => {
+            fail(&format!("cannot restore {}: {e}", name_of(&found, pick)))
+        }
+        // The entry changed between this run's listing and its hold. What
+        // the listing read is no longer that entry, so it is listed again:
+        // the document shows the entry ENTRY names now, as it is, and the
+        // `id` of what it shows.
+        Err(NotRestored::Other) => match look_up(wanted, &places) {
+            Ok((again, pick)) => other(options, &again, pick, started),
+            Err(e) => fail(&format!(
+                "restored nothing: {} is no longer the entry --expect names, and listing it again failed: {e}",
+                clean(&wanted.to_string_lossy())
+            )),
+        },
+    }
+}
+
+/// The entries ENTRY (`wanted`) can name, and the one it names. A path
+/// names its repository directly, from any directory, even once the
+/// worktree it names is gone; a name is looked up in the repositories at
+/// or under this one.
+fn look_up(wanted: &Path, places: &Places) -> Result<(Found, Pick), String> {
+    let mut chosen = None;
+    let mut unsearched = None;
+    let mut missed = None;
+    match repository_of(wanted) {
+        Ok(Some(root)) => {
+            let found = gather(std::slice::from_ref(&root));
+            match choose(&found, wanted) {
+                Ok(pick) => chosen = Some((found, pick)),
+                // More than one entry where the path points is the answer:
+                // the message names them.
+                Err(Miss::Many(e)) => return Err(e),
+                Err(Miss::Nothing) => missed = Some(root),
+            }
+        }
+        Ok(None) => {}
+        Err(e) => unsearched = Some(e),
+    }
+    Ok(match chosen {
+        Some(c) => c,
+        None => {
+            // A path ENTRY that is not where it points, or a name, leaves
+            // the current directory to search, but never the home folder or
+            // a folder above it, for the reason `repository_of` gives: from
+            // there a name is looked up in the usual code folders (`Search`).
+            if at_or_above_home(Path::new(".")) {
+                if let Some(e) = unsearched {
+                    return Err(e);
+                }
+                if let Some(root) = missed {
+                    return Err(format!(
+                        "nothing named {} under {}; run residue restore inside its repository, or pass the entry's path",
+                        wanted.display(),
+                        root.display()
+                    ));
+                }
+            }
+            let search = Search::here()?;
+            let found = gather(&search.roots);
+            match choose(&found, wanted) {
+                Ok(pick) => (found, pick),
+                Err(miss) => {
+                    return Err(unsearched.unwrap_or_else(|| miss.text(wanted, &search, places)));
+                }
+            }
+        }
+    })
+}
+
+/// The id of the entry `pick` names, as this run listed it.
+fn id_of(found: &Found, pick: Pick) -> &str {
+    match pick {
+        Pick::Trash(i) => &found.trash[i].id,
+        Pick::Removed(i) => &found.removed[i].id,
+    }
+}
+
+/// `restore --expect ID` found that ENTRY names another entry than ID,
+/// `pick` in `found`: it restored nothing, and shows that entry with its
+/// id. Exit 4, as `remove --expect` does.
+fn other(options: &Options, found: &Found, pick: Pick, started: i64) -> u8 {
+    if options.json {
+        println!(
+            "{}",
+            list_json(
+                found,
+                started,
+                Shown::Other(pick),
+                options.expect.as_deref()
+            )
+            .render()
+        );
+    } else {
+        let wanted = options
+            .paths
+            .first()
+            .map(|p| p.as_os_str())
+            .unwrap_or_default();
+        println!(
+            "nothing restored: {} now names {}, not the entry --expect names",
+            clean(&wanted.to_string_lossy()),
+            what_of(found, pick)
+        );
+        println!(
+            "next: if that is the one to restore, run again with --expect {}",
+            id_of(found, pick)
+        );
+    }
+    fingerprint::CHANGED
+}
+
+/// The entry `pick` names, for a sentence.
+fn what_of(found: &Found, pick: Pick) -> String {
+    match pick {
+        Pick::Trash(_) => format!("the trash entry {}", name_of(found, pick)),
+        Pick::Removed(i) if found.removed[i].interrupted() => {
+            format!("the interrupted removal {}", name_of(found, pick))
+        }
+        Pick::Removed(_) => format!("the removal record {}", name_of(found, pick)),
     }
 }
 
@@ -492,26 +569,34 @@ struct Done {
 /// only a lock its plan saw, and Git's remove refuses a locked worktree.
 /// Once the worktree is moved, the records are read again, and a purge
 /// record that came meanwhile stays and is named in the notes. What the
-/// removal model leaves out here is its `Late`.
-fn restore_trash(found: &Found, i: usize, to: Option<&Path>) -> Result<Done, String> {
+/// removal model leaves out here is its `Late`. Under `--expect ID`
+/// (`expect`), it reads the entry again once it holds it, and refuses,
+/// having changed nothing, when it is not ID.
+fn restore_trash(
+    found: &Found,
+    i: usize,
+    to: Option<&Path>,
+    expect: Option<&str>,
+) -> Result<Done, NotRestored> {
     let item = &found.trash[i];
     let from = item.worktree.clone().unwrap_or_default();
     // A damaged entry: nothing to move back by.
     item.record.as_ref().map_err(|e| e.clone())?;
     let held = trash::take(item)?;
+    NotRestored::check(expect, "trash", &item.dir, &trash::info(&item.dir))?;
     let _using = keep_open(item)?;
     let main = &item.command_dir;
     let listed = git::worktrees(main)?;
     let unlocked = in_trash(&listed, &from).is_some_and(|e| e.locked.is_none());
     if !unlocked {
-        return settle_trash(found, i, to, &from, &held, &listed, false);
+        return Ok(settle_trash(found, i, to, &from, &held, &listed, false)?);
     }
     git::lock_worktree(main, &from, trash::LOCK).map_err(|e| {
         format!("residue could not lock it in the trash before it reads what else acts on it ({e}), so it changed nothing")
     })?;
-    git::worktrees(main)
+    Ok(git::worktrees(main)
         .and_then(|listed| settle_trash(found, i, to, &from, &held, &listed, true))
-        .map_err(|e| lift(main, &from, e))
+        .map_err(|e| lift(main, &from, e))?)
 }
 
 /// The trash worktree's `.git`, open for reading, which the activity probe
@@ -805,9 +890,14 @@ fn settle_trash(
     })
 }
 
-fn restore_removed(found: &Found, i: usize, to: Option<&Path>) -> Result<Done, String> {
+fn restore_removed(
+    found: &Found,
+    i: usize,
+    to: Option<&Path>,
+    expect: Option<&str>,
+) -> Result<Done, NotRestored> {
     let item = &found.removed[i];
-    let restored = removed::restore(item, to)?;
+    let restored = removed::restore(item, to, expect)?;
     let record = item.record.as_ref().ok();
     let gone = record.map_or_else(Vec::new, |r| r.gone.clone());
     let not_kept = match restored.how {
@@ -879,13 +969,7 @@ fn how_text(done: &Done) -> String {
 }
 
 fn done_text(found: &Found, pick: Pick, done: &Done, places: &Places) -> String {
-    let from = match pick {
-        Pick::Trash(_) => format!("the trash entry {}", name_of(found, pick)),
-        Pick::Removed(i) if found.removed[i].interrupted() => {
-            format!("the interrupted removal {}", name_of(found, pick))
-        }
-        Pick::Removed(_) => format!("the removal record {}", name_of(found, pick)),
-    };
+    let from = what_of(found, pick);
     let mut out = format!(
         "restored {} from {from}\n  {}\n",
         places.show(&done.path),
@@ -1085,17 +1169,42 @@ fn removed_row(item: &removed::Item, now: i64, places: &Places, style: &Style) -
     out
 }
 
+/// What a `residue.restore/v1` document shows.
+#[derive(Clone, Copy)]
+enum Shown<'a> {
+    /// Every entry of both kinds.
+    List,
+    /// The entry it restored, as it was before, and how it came back.
+    Restored(Pick, &'a Done),
+    /// Under `--expect`, the entry ENTRY names, which is not the one
+    /// expected.
+    Other(Pick),
+}
+
+/// The JSON of the entry `pick` names.
+fn entry_json(found: &Found, pick: Pick) -> (Vec<Json>, Vec<Json>) {
+    match pick {
+        Pick::Trash(i) => (vec![trash::item_json(&found.trash[i])], Vec::new()),
+        Pick::Removed(i) => (Vec::new(), vec![removed::item_json(&found.removed[i])]),
+    }
+}
+
 /// `residue.restore/v1`. A listing has every entry of both kinds; after a
 /// restore, `trash` or `removed` holds only the entry it restored, as it
-/// was before, and `restore` says how it came back.
-fn list_json(found: &Found, started: i64, done: Option<(Pick, &Done)>) -> Json {
-    let (trash, removed): (Vec<Json>, Vec<Json>) = match done {
-        None => (
+/// was before, and `restore` says how it came back. Under `--expect` they
+/// hold only the entry ENTRY names, when it is not the one expected.
+/// `expect` is the `--expect` ID.
+fn list_json(found: &Found, started: i64, shown: Shown, expect: Option<&str>) -> Json {
+    let (trash, removed): (Vec<Json>, Vec<Json>) = match shown {
+        Shown::List => (
             found.trash.iter().map(trash::item_json).collect(),
             found.removed.iter().map(removed::item_json).collect(),
         ),
-        Some((Pick::Trash(i), _)) => (vec![trash::item_json(&found.trash[i])], Vec::new()),
-        Some((Pick::Removed(i), _)) => (Vec::new(), vec![removed::item_json(&found.removed[i])]),
+        Shown::Restored(pick, _) | Shown::Other(pick) => entry_json(found, pick),
+    };
+    let done = match shown {
+        Shown::Restored(pick, d) => Some((pick, d)),
+        Shown::List | Shown::Other(..) => None,
     };
     let restore = done.map(|(pick, d)| {
         Json::Obj(vec![
@@ -1158,6 +1267,11 @@ fn list_json(found: &Found, started: i64, done: Option<(Pick, &Done)>) -> Json {
         (
             "errors",
             Json::Arr(found.errors.iter().map(|e| Json::str(e.clone())).collect()),
+        ),
+        // Added last, so every field before it keeps its place.
+        (
+            "expected_id",
+            Json::opt(expect.map(str::to_string), Json::Str),
         ),
     ])
 }

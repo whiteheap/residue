@@ -64,6 +64,8 @@ residue treats every lock as final. Unlock it when you resume.
 
 To keep every file, ignored ones included, add `--trash` to the remove. `residue restore PATH` then puts the worktree back whole for 7 days by default, and it frees no disk until a later run purges it.
 
+To restore the one the user picks from a list, read `residue restore --json`, show the user the entries, and run `residue restore --json --expect ID ENTRY` with the `id` of the entry they picked. `4` means ENTRY now names another entry and nothing was restored: show the user the entry this run printed, and on a yes run it again with its `id`.
+
 ## Other worktrees
 
 When the user asks you to clean up worktrees:

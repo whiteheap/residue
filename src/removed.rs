@@ -72,6 +72,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::activity::{Evidence, Snapshot};
+use crate::fingerprint;
 use crate::git::{self, Checkout, Entry, RefChange};
 use crate::hold::{self, Hold, Taken};
 use crate::json::Json;
@@ -1114,6 +1115,9 @@ pub struct Item {
     /// Whether Git lists this record's worktree at its original path
     /// again (`is_back`).
     pub back: Back,
+    /// Its fingerprint (`fingerprint::entry`), from the `info` read here:
+    /// `id` in its JSON, which `restore --expect` compares.
+    pub id: String,
 }
 
 /// Whether Git lists a record's worktree at its original path again.
@@ -1487,7 +1491,9 @@ fn list(
         if !meta.is_dir() || name.starts_with('.') {
             continue;
         }
-        let (record, incomplete) = match fs::read(dir.join(INFO)) {
+        let info = fs::read(dir.join(INFO));
+        let id = fingerprint::entry("removed", &dir, info.as_deref().ok());
+        let (record, incomplete) = match info {
             Ok(bytes) => (
                 Record::parse(&bytes).map_err(|e| format!("{}: {e}", dir.join(INFO).display())),
                 false,
@@ -1526,6 +1532,7 @@ fn list(
             registered,
             back,
             dir,
+            id,
         });
     }
     items.sort_by_key(|i| {
@@ -2115,6 +2122,37 @@ pub struct Restored {
     pub notes: Vec<String>,
 }
 
+/// Why a restore, of a removal record or a trash entry, brought nothing
+/// back.
+pub enum NotRestored {
+    /// It refused, or a step failed: why, and what it changed.
+    Refused(String),
+    /// Under `restore --expect ID`, the entry it holds is not ID. It
+    /// changed nothing.
+    Other,
+}
+
+impl From<String> for NotRestored {
+    fn from(why: String) -> NotRestored {
+        NotRestored::Refused(why)
+    }
+}
+
+impl NotRestored {
+    /// Under `--expect ID`, the entry at `dir`, whose `info` is at `info`,
+    /// read now that the restore holds it: refused when it is not ID.
+    pub fn check(expect: Option<&str>, kind: &str, dir: &Path, info: &Path) -> Result<(), Self> {
+        let Some(want) = expect else {
+            return Ok(());
+        };
+        if fingerprint::entry_now(kind, dir, info)? == want {
+            Ok(())
+        } else {
+            Err(NotRestored::Other)
+        }
+    }
+}
+
 /// Where a worktree Git lists is, for a message: in the trash, left by an
 /// interrupted removal, the main checkout, or a path.
 fn whereabouts(entry: &Entry, main: &Entry, trash_root: &Path) -> String {
@@ -2268,10 +2306,16 @@ pub fn info_of(dir: &Path) -> PathBuf {
 /// lack: the restored mark, its config.worktree, the recorded HEAD reflog
 /// in front of its own. Each leaves alone what is already there, and the
 /// record goes only once the worktree holds what it keeps, as for any
-/// restore.
-pub fn restore(item: &Item, to: Option<&Path>) -> Result<Restored, String> {
+/// restore. Under `--expect ID` (`expect`), it reads the record again once
+/// it holds it, and refuses, having changed nothing, when it is not ID.
+pub fn restore(
+    item: &Item,
+    to: Option<&Path>,
+    expect: Option<&str>,
+) -> Result<Restored, NotRestored> {
     let record = item.record.as_ref().map_err(|e| e.clone())?;
     let hold = take(item)?;
+    NotRestored::check(expect, "removed", &item.dir, &item.dir.join(INFO))?;
     let listed = git::worktrees(&item.command_dir)?;
     let registered = listed
         .iter()
@@ -2294,7 +2338,7 @@ pub fn restore(item: &Item, to: Option<&Path>) -> Result<Restored, String> {
     if let (None, Back::Unknown(e)) = (to, &standing) {
         return Err(format!(
             "{e}, so it cannot tell whether that worktree holds what this record keeps; move that worktree away, or restore somewhere else with --to PATH"
-        ));
+        ).into());
     }
     let dest = to.unwrap_or(&record.original);
     match fs::symlink_metadata(dest) {
@@ -2304,9 +2348,10 @@ pub fn restore(item: &Item, to: Option<&Path>) -> Result<Restored, String> {
             return Err(format!(
                 "{} exists; move it away first, or restore somewhere else with --to PATH",
                 dest.display()
-            ));
+            )
+            .into());
         }
-        Err(e) => return Err(format!("cannot check {}: {e}", dest.display())),
+        Err(e) => return Err(format!("cannot check {}: {e}", dest.display()).into()),
     }
     // Read before anything changes: another run may forget this record
     // meanwhile, and nothing else holds the copies.
@@ -3178,6 +3223,8 @@ pub fn item_json(item: &Item) -> Json {
                 Ok(_) => Json::Null,
             },
         ),
+        // Added last, so every field before it keeps its place.
+        ("id", Json::str(item.id.clone())),
     ])
 }
 
@@ -3257,6 +3304,7 @@ mod tests {
             modified: None,
             registered: None,
             back: Back::No,
+            id: String::new(),
         };
         let day = 86_400;
         let removed = sample().removed;

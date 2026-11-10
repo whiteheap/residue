@@ -446,6 +446,10 @@ usage usage-expect-twice remove --yes --expect "$some_plan" --expect "$some_plan
 usage usage-expect-uppercase remove --yes --expect 0123456789ABCDEF0123456789ABCDEF "$work/x"
 usage usage-expect-short remove --yes --expect 0123456789abcdef "$work/x"
 usage usage-expect-no-value remove --yes "$work/x" --expect
+usage usage-restore-expect-without-entry restore --json --expect "$some_plan"
+usage usage-restore-expect-twice restore --expect "$some_plan" --expect "$some_plan" "$work/x"
+usage usage-restore-expect-short restore --expect 0123456789abcdef "$work/x"
+usage usage-restore-expect-no-value restore "$work/x" --expect
 
 # 8. Removal records: every removal writes one before it deletes, and
 # `residue restore` recreates the worktree from it. A record that cannot be
@@ -2492,6 +2496,142 @@ elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 resu
 elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), want refused"
 elif [ "$(jq -r --arg plan "$plan" '.plan == $plan and .expected_plan == $plan' "$out")" != true ]; then fail "plan $(jq -r .plan "$out"), want $plan"
 elif untouched "$before"; then ok; fi
+
+# `restore --expect ID ENTRY`: the entry ENTRY names must be the one with
+# ID in a `restore --json` list. When another entry took its place at the
+# same path (another kind, or the same worktree removed again), it exits 4,
+# says the id ENTRY's entry has now, and restores nothing; that id, given
+# in turn, restores it. Every case needs a removal, so a partial probe
+# skips them all.
+
+# The id of the one entry `restore --json` lists in $repo.
+listed_id() {
+    (cd "$repo" && "$bin" restore --json) >"$work/$name.list" 2>"$err" || { echo "contract-check: setup failed in $name: restore --json (the list)" >&2; exit 2; }
+    jq -er '[.trash[], .removed[]] | if length == 1 then .[0].id else error("not one entry") end' "$work/$name.list" || exit 2
+}
+
+# The trash entry w went to, from a `remove --trash` of w; stops the run
+# when it did not go.
+trash_w() {
+    run remove --yes --json --trash "$wt"
+    entry=$(result 0 trash_entry)
+    [ "$status" = 0 ] && [ -d "$entry" ] || { echo "contract-check: setup failed in $name: remove --trash w exit $status" >&2; exit 2; }
+}
+
+# Restore w with no --expect; stops the run when it does not come back.
+restore_w() {
+    run restore --json "$wt"
+    if [ "$status" != 0 ] || ! registered "$wt"; then
+        echo "contract-check: setup failed in $name: restore w exit $status" >&2
+        exit 2
+    fi
+}
+
+# The run refused with exit 4: one restore document that restored nothing,
+# lists only the entry of KIND that ENTRY names now, with an id other than
+# $id, and expects $id. Sets $now to that id.
+expect_other() { # KIND
+    now=
+    if [ "$status" != 4 ]; then fail "exit $status, want 4"; return 1; fi
+    if ! jq -e -s --arg kind "$1" --arg id "$id" '
+        length == 1 and (.[0] |
+            .schema == "residue.restore/v1" and .restored == null and .restore == null
+            and .expected_id == $id and .errors == []
+            and ([.trash[], .removed[]] | length) == 1
+            and ([.trash[], .removed[]][0] | .kind == $kind and (.id | test("^[0-9a-f]{32}$")) and .id != $id))
+    ' "$out" >/dev/null; then fail "stdout is not one restore document of the other $1 entry: $(head -c 2000 "$out")"; return 1; fi
+    now=$(jq -r '[.trash[], .removed[]][0].id' "$out")
+}
+
+if [ -z "$partial_probe" ]; then
+    # The record the list showed, by its original path: restored, and the
+    # document says which id it expected.
+    name=restore-expect-matches
+    make_repo
+    remove_w
+    id=$(listed_id)
+    run restore --json --expect "$id" "$wt"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif ! restore_ok removed checked_out_branch; then fail "stdout is not one restore document with checkout checked_out_branch"
+    elif [ "$(jq -r --arg id "$id" '.expected_id == $id and .removed[0].id == $id' "$out")" != true ]; then fail "ids: $(jq -c '{expected_id, id: .removed[0].id}' "$out")"
+    elif ! registered "$wt"; then fail "Git does not list the restored worktree"
+    elif [ "$(records)" != "0 records, 0 refs" ]; then fail "$(records) after the restore, want 0 records, 0 refs"
+    elif common_ok; then ok; fi
+
+    # The trash entry the list showed, by its name, in text.
+    name=restore-expect-matches-trash
+    make_repo
+    trash_w
+    id=$(listed_id)
+    in_dir "$repo" run restore --expect "$id" "$(basename "$entry")"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif ! grep -q "^restored .*\.worktrees/w from the trash entry $(basename "$entry")" "$out"; then fail "no 'restored ... from the trash entry' line"
+    elif ! registered "$wt"; then fail "Git does not list the restored worktree"
+    elif [ -e "$entry" ]; then fail "the trash entry is still on disk"
+    elif common_ok; then ok; fi
+
+    # The list showed a trash entry; it was restored, and w removed again
+    # into a removal record: exit 4, the record stays as it is. The id it
+    # reported, given in turn, restores the record.
+    name=restore-expect-other-record
+    make_repo
+    trash_w
+    id=$(listed_id)
+    restore_w
+    remove_w
+    run restore --json --expect "$id" "$wt"
+    if ! expect_other removed; then :
+    elif [ -e "$wt" ] || registered "$wt"; then fail "w is back"
+    elif [ "$(records)" != "1 records, 1 refs" ]; then fail "$(records), want 1 records, 1 refs"
+    else
+        run restore --json --expect "$now" "$wt"
+        if [ "$status" != 0 ]; then fail "the id it reported, given: exit $status, want 0"
+        elif ! restore_ok removed checked_out_branch; then fail "the id it reported, given: stdout is not one restore document"
+        elif ! registered "$wt"; then fail "the id it reported, given: Git does not list w"
+        elif common_ok; then ok; fi
+    fi
+
+    # The list showed a removal record; it was restored, and w went to the
+    # trash: exit 4 in text, and the trash entry stays as it is.
+    name=restore-expect-other-trash
+    make_repo
+    remove_w
+    id=$(listed_id)
+    restore_w
+    trash_w
+    run restore --expect "$id" "$wt"
+    if [ "$status" != 4 ]; then fail "exit $status, want 4"
+    elif ! grep -q "^nothing restored: .*\.worktrees/w now names the trash entry $(basename "$entry"), not the entry --expect names$" "$out"; then fail "no 'nothing restored: ... now names the trash entry' line"
+    elif ! grep -q "^next: if that is the one to restore, run again with --expect [0-9a-f]\{32\}$" "$out"; then fail "no 'next: ... --expect ID' line"
+    elif grep -q -- "--expect $id\$" "$out"; then fail "it names the id it was given as the one to give"
+    elif [ -e "$wt" ]; then fail "w is back"
+    elif ! registered "$entry/w"; then fail "the trash entry's worktree is gone"
+    elif [ "$(records)" != "0 records, 0 refs" ]; then fail "$(records), want 0 records, 0 refs"
+    else ok; fi
+
+    # The list showed a removal record; it was restored, and w removed
+    # again into another record of the same kind: exit 4, and the new
+    # record stays as it is.
+    name=restore-expect-recreated
+    make_repo
+    remove_w
+    id=$(listed_id)
+    restore_w
+    remove_w
+    rec=$(find "$repo/.git/residue-removed" -mindepth 1 -maxdepth 1 -type d)
+    info=$(cksum <"$rec/info")
+    run restore --json --expect "$id" "$wt"
+    if ! expect_other removed; then :
+    elif [ -e "$wt" ] || registered "$wt"; then fail "w is back"
+    elif [ "$(records)" != "1 records, 1 refs" ] || [ "$(cksum <"$rec/info")" != "$info" ]; then fail "the new record changed: $(records)"
+    elif common_ok; then ok; fi
+else
+    skip_partial restore-expect-matches
+    skip_partial restore-expect-matches-trash
+    skip_partial restore-expect-other-record
+    skip_partial restore-expect-other-trash
+    skip_partial restore-expect-recreated
+fi
 
 # 20. macOS: residue in a sandbox that lets it list every process but
 # inspect only its own (Seatbelt, `sandbox-exec`), the shape a coding

@@ -1,13 +1,14 @@
 //! The fingerprints a program reads from one run and passes back to the
 //! next with `--expect`: a remove plan's (`plan` in `residue.remove/v1`)
-//! and the service's (`service status`). Each is 32 lowercase hex digits.
+//! and the service's (`service status`), and a restore entry's (`id` in
+//! `residue.restore/v1`). Each is 32 lowercase hex digits.
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 /// The exit status of a run whose `--expect` names what is no longer
-/// there: `remove` removed, trashed, purged and forgot nothing, and
-/// `service install` wrote nothing.
+/// there: `remove` removed, trashed, purged and forgot nothing, `restore`
+/// restored nothing, and `service install` wrote nothing.
 pub const CHANGED: u8 = 4;
 
 /// FNV-1a, 128 bits, over parts, each with its length first, so a byte
@@ -257,6 +258,35 @@ pub fn plan(steps: &[Step], keep_trash: i64, keep_removed: i64) -> String {
         hash.part(step);
     }
     hash.hex()
+}
+
+/// A restore ENTRY's fingerprint, `id` in `residue.restore/v1`, which
+/// `restore --expect ID` compares: the entry's kind (`trash` or
+/// `removed`), its directory, and the bytes of its `info`, which residue
+/// writes once (`info.new`, synced, renamed) and never changes. So it stays
+/// the same while the entry does, and another entry at that directory, or
+/// another removal or trash of the same worktree, has another: its `info`
+/// names another time, process or path. `info` is `None` for an entry with
+/// none, or one residue cannot read, which no restore takes.
+pub fn entry(kind: &str, dir: &Path, info: Option<&[u8]>) -> String {
+    let mut hash = Hasher::start(b"residue restore entry 1");
+    hash.part(kind.as_bytes());
+    hash.part(dir.as_os_str().as_bytes());
+    match info {
+        Some(bytes) => {
+            hash.part(b"info");
+            hash.part(bytes);
+        }
+        None => hash.part(b"no info"),
+    }
+    hash.hex()
+}
+
+/// [`entry`] for the entry at `dir` as it is now, from its `info` at
+/// `info`: a restore reads it under its hold, before it changes anything.
+pub fn entry_now(kind: &str, dir: &Path, info: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(info).map_err(|e| format!("cannot read {}: {e}", info.display()))?;
+    Ok(entry(kind, dir, Some(&bytes)))
 }
 
 #[cfg(test)]
@@ -562,5 +592,40 @@ mod tests {
             of(&[acted(at(Some("refs/heads/u"), HEAD))]),
             of(&[acted(at(Some("refs/heads/u"), OTHER))])
         );
+    }
+
+    /// A restore entry's id is the same for the same entry, and another for
+    /// another kind, another directory, or another `info` at that
+    /// directory, one byte apart included.
+    #[test]
+    fn each_other_entry_gives_another_id() {
+        let dir = Path::new("/r/.git/residue-removed/w-20260101T000000Z");
+        let info: &[u8] = b"path /r/.worktrees/w\nhead 1111\nremoved 1767225600 x\n";
+        let id = entry("removed", dir, Some(info));
+        assert!(is_fingerprint(&id));
+        assert_eq!(entry("removed", dir, Some(info)), id);
+        let mut later = info.to_vec();
+        let at = later.len() - 4;
+        later[at] = b'y';
+        let all = [
+            ("same", id),
+            ("trash", entry("trash", dir, Some(info))),
+            (
+                "another directory",
+                entry(
+                    "removed",
+                    Path::new("/r/.git/residue-removed/w-20260101T000000Z-2"),
+                    Some(info),
+                ),
+            ),
+            ("another info", entry("removed", dir, Some(&later))),
+            ("an empty info", entry("removed", dir, Some(b""))),
+            ("no info", entry("removed", dir, None)),
+        ];
+        for (i, (what, a)) in all.iter().enumerate() {
+            for (other, b) in &all[i + 1..] {
+                assert_ne!(a, b, "{what} and {other}");
+            }
+        }
     }
 }

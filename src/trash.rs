@@ -26,6 +26,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use crate::fingerprint;
 use crate::git::{self, Entry};
 use crate::hold::{self, Hold, Taken};
 use crate::json::Json;
@@ -176,6 +177,9 @@ pub struct Item {
     /// anything else there and never deletes it. Empty, and not read, for
     /// an entry that holds its worktree: nothing decided there needs it.
     pub extra: Option<Vec<String>>,
+    /// Its fingerprint (`fingerprint::entry`), from the `info` read here:
+    /// `id` in its JSON, which `restore --expect` compares.
+    pub id: String,
 }
 
 impl Item {
@@ -289,7 +293,9 @@ pub fn list(
         // `missing_or_damaged`: an `info` residue can tell it did not finish
         // (none, or one that does not parse), as opposed to one it could
         // not read at all.
-        let (record, incomplete, missing_or_damaged) = match fs::read(dir.join(INFO)) {
+        let info = fs::read(dir.join(INFO));
+        let id = fingerprint::entry("trash", &dir, info.as_deref().ok());
+        let (record, incomplete, missing_or_damaged) = match info {
             Ok(bytes) => {
                 let record =
                     Record::parse(&bytes).map_err(|e| format!("{}: {e}", dir.join(INFO).display()));
@@ -349,6 +355,7 @@ pub fn list(
             bare,
             modified,
             extra,
+            id,
         });
     }
     items.sort_by_key(|i| {
@@ -832,6 +839,8 @@ pub fn item_json(item: &Item) -> Json {
             "keep_seconds",
             Json::opt(own_keep(record), |k| Json::Int(k.seconds)),
         ),
+        // Added last, so every field before it keeps its place.
+        ("id", Json::str(item.id.clone())),
     ])
 }
 
@@ -870,6 +879,7 @@ mod tests {
             bare: false,
             modified: Some(1_000),
             extra: Some(Vec::new()),
+            id: String::new(),
         }
     }
 
