@@ -734,11 +734,15 @@ pub fn explain_text(r: &Report, repo: &Repo, places: &Places, style: &Style) -> 
     }
     if let Some(u) = &r.usage {
         fact(&mut out, "size", output::usage_phrase(u));
-        fact(
-            &mut out,
-            "",
-            style.dim("reclaimable leaves out hard links from outside; clones are not detected"),
-        );
+        // On macOS the walk asks APFS what each file shares with a clone
+        // (`fsinfo::Stat::unshared`); elsewhere it cannot (#193).
+        let caveat = if cfg!(target_os = "macos") {
+            "reclaimable leaves out hard links and APFS clones from outside, \
+             so blocks shared with another worktree count for neither"
+        } else {
+            "reclaimable leaves out hard links from outside; clones are not detected"
+        };
+        fact(&mut out, "", style.dim(caveat));
     }
     if !r.ignored.is_empty() {
         const SHOWN: usize = 8;
