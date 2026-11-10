@@ -31,6 +31,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check the site
         run: sh site/check.sh
+      # The deploy's Wrangler, from site/package-lock.json, builds the upload
+      # from public/ and stops there. No token.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Wrangler, as the deploy runs it
+        working-directory: site
+        env:
+          WRANGLER_SEND_METRICS: "false"
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          node_modules/.bin/wrangler deploy --dry-run --outdir "$RUNNER_TEMP/wrangler-dry-run"
 
   deploy:
     needs: check
@@ -46,7 +58,6 @@ jobs:
       group: site-deploy
       cancel-in-progress: false
     env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: 5946f06692c48cd0bea2d074e02f2f38
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -55,13 +66,23 @@ jobs:
         with:
           node-version: 22
       - name: Token
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
             echo '::error::The site environment has no CLOUDFLARE_API_TOKEN secret. site/README.md, "Deploy", says how to create it.'
             exit 1
           fi
+      # Wrangler and every package it loads, at the version and hash
+      # site/package-lock.json pins, with no install scripts. The token is
+      # only in the Token and Deploy steps.
+      - name: Wrangler
+        working-directory: site
+        run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Deploy
         working-directory: site
-        run: npx --yes wrangler@4.158.0 deploy --message "site at ${GITHUB_SHA::7}"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: node_modules/.bin/wrangler deploy --message "site at ${GITHUB_SHA::7}"
       - name: Smoke
         run: sh site/smoke.sh

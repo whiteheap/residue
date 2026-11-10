@@ -58,8 +58,8 @@ curl -fsSL https://residue.whiteheap.com/install.sh | sh -s -- --no-service
 What it checks:
 
 - Every download is HTTPS only, TLS 1.2 or later, including redirects.
-- The release archive must match its line in the release's `SHA256SUMS`, or nothing is installed. When `gh` is installed and logged in, the archive's [build-provenance attestation](#release-archives-and-packages) must verify against `whiteheap/residue-cli` too, or `whiteheap/residue` for 0.0.10 and earlier; otherwise the summary says it was skipped and why.
-- The signing key it adds for apt, dnf or pacman must match the SHA-256 pinned in the script, the key `1AEA B314 3511 8A1F E575  D36E E155 3632 FC32 554A`. Each package manager trusts only that key for residue's repository: apt through `signed-by`, pacman through `--lsign-key`, and dnf through the repository file the script writes, whose `gpgkey` names the checked key as the local file `/etc/pki/rpm-gpg/RPM-GPG-KEY-residue`, so dnf never imports a key from a URL.
+- The release archive must match its line in the release's `SHA256SUMS`, or nothing is installed. When `gh` is installed and logged in, the archive's [build-provenance attestation](#release-archives-and-packages) must also show that the workflow that builds it built it, on a GitHub-hosted runner: `release.yml` at the release's tag for macOS and Linux, `packages.yml` on `main` for FreeBSD, in `whiteheap/residue-cli`, or `whiteheap/residue` for 0.0.10 and earlier. The summary names the workflow and ref it checked. A `gh` older than 2.49 cannot check this, so the script stops and asks you to update it. Without `gh`, or logged out, the summary says the check was skipped and why.
+- The signing key it adds for apt, dnf or pacman must match the SHA-256 pinned in the script, the key `1AEA B314 3511 8A1F E575  D36E E155 3632 FC32 554A`. apt trusts it for residue's repository alone, through `signed-by`. dnf does too, through the repository file the script writes, whose `gpgkey` names the checked key as the local file `/etc/pki/rpm-gpg/RPM-GPG-KEY-residue`, so dnf never imports a key from a URL. pacman has no key per repository: `--lsign-key` trusts the key for every repository, and the `[residue]` section accepts what any key pacman trusts signed. The section the script writes, or adds that line to, requires a signature on the database as well as on each package (`SigLevel = Required DatabaseRequired`), which pacman's default does not.
 - Every command that changes the machine is printed (`+ ...`) before it runs.
 - The whole script is functions called on its last line, so a download cut short runs nothing.
 
@@ -104,9 +104,11 @@ sudo dnf install residue
 ```sh
 curl -fsSL https://whiteheap.github.io/residue/residue-signing-key.asc | sudo pacman-key --add -
 sudo pacman-key --lsign-key 1AEAB31435118A1FE575D36EE1553632FC32554A
-printf '\n[residue]\nServer = https://whiteheap.github.io/residue/arch/$arch\n' | sudo tee -a /etc/pacman.conf
+printf '\n[residue]\nSigLevel = Required DatabaseRequired\nServer = https://whiteheap.github.io/residue/arch/$arch\n' | sudo tee -a /etc/pacman.conf
 sudo pacman -Syu residue
 ```
+
+`SigLevel = Required DatabaseRequired` makes pacman refuse residue's database unless it is signed; under pacman's default it would take an unsigned one. To a `[residue]` section with no `SigLevel`, from an older install script or these steps, the install script adds that line under the header, and `--dry-run` shows the change. It first checks with `pacman-conf` that pacman would then require residue's database signature and read every other `SigLevel` as before. Whether it adds the line or, on a fresh install, the whole section, it writes the new file beside `/etc/pacman.conf` with its mode and owner and renames it into place, so a full disk leaves the file as it was. It keeps the file as it was in `/etc/pacman.conf.residue-bak`, or `.residue-bak.1` and so on when an older one is there. When `/etc/pacman.conf` is a link, a fresh section goes into the file it points at and the link stays. It leaves the file as it is, with a note, when the section has a `SigLevel` of its own (in an `Include` too), when there are two `[residue]` sections, when `[residue]` is in an included file, and when the section to edit is in a linked `/etc/pacman.conf`. pacman takes `#` as a comment only at the start of a line, so it does not read `[residue] # note` as a section; the script stops on such a line before it changes anything, as it does when it cannot read `/etc/pacman.conf`.
 
 All three are signed with the key `1AEA B314 3511 8A1F E575  D36E E155 3632 FC32 554A`. Each package installs `/usr/bin/residue` and pulls in Git if it is missing. To install one release without adding a repository, every release also carries `residue_amd64.deb`, `residue.x86_64.rpm` and `residue-x86_64.pkg.tar.zst`, and for arm64 `residue_arm64.deb`, `residue.aarch64.rpm` and `residue-aarch64.pkg.tar.zst`, on the [releases page](https://github.com/whiteheap/residue-cli/releases/latest).
 
@@ -115,10 +117,13 @@ All three are signed with the key `1AEA B314 3511 8A1F E575  D36E E155 3632 FC32
 Prebuilt binaries for macOS (Apple silicon and Intel), static Linux (x86_64 and arm64) and FreeBSD (x86_64 and aarch64) are on the releases page too. Releases 0.0.8 to 0.0.10 also carry the Mac app, `residue-macos.dmg`, which now releases from [residue-ui](https://github.com/whiteheap/residue-ui) (README, [Mac app](../README.md#mac-app)). Each archive and package has a SHA-256 checksum in `SHA256SUMS` and a GitHub build-provenance attestation:
 
 ```sh
-gh attestation verify residue_amd64.deb --repo whiteheap/residue-cli
+gh attestation verify residue-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz --repo whiteheap/residue-cli \
+  --cert-identity https://github.com/whiteheap/residue-cli/.github/workflows/release.yml@refs/tags/vX.Y.Z
+gh attestation verify residue_amd64.deb --repo whiteheap/residue-cli \
+  --cert-identity https://github.com/whiteheap/residue-cli/.github/workflows/packages.yml@refs/heads/main
 ```
 
-For 0.0.10 and earlier, built before the rename, use `--repo whiteheap/residue`. The FreeBSD archives and the packages are attested by the packages workflow on `main`, at the release's commit, so check them with `--repo`, not with `--source-ref` set to the tag.
+`--cert-identity` names the workflow and the ref that must have built the file; `--repo` alone would accept any workflow in the repository, at any ref. The macOS and static Linux archives come from `release.yml` at the release's tag, as in the first command. The packages and the FreeBSD archives come from `packages.yml` on `main`, as in the second: it builds the packages from the Linux archives `release.yml` attested and the FreeBSD archives from the tag's source. For 0.0.10 and earlier, built before the rename, put `whiteheap/residue` in place of `whiteheap/residue-cli` in both places.
 
 The macOS binaries need macOS 11 or later on Apple silicon and 10.12 or later on Intel, and the FreeBSD ones FreeBSD 14. The Linux binaries are static (musl) and need no libc. On a Mac, a binary from an archive your browser downloaded is blocked the first time it runs, because it is not notarized: run `xattr -d com.apple.quarantine residue` on it, or download the archive with `curl`, which does not mark it.
 

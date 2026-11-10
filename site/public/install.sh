@@ -7,12 +7,13 @@
 # It installs or upgrades residue through the best channel here: Homebrew on
 # macOS; the signed apt, dnf or pacman repository on Linux when it can act as
 # root; otherwise the release archive, checked against SHA256SUMS and, when gh
-# is logged in, its build-provenance attestation. When the latest release has
-# no archive for this machine yet (FreeBSD's arrive minutes after a release),
-# it takes the newest release that has one and says so. Then it runs `residue
-# service install`, and prints what it did and how to undo it. Each command
-# that changes the machine is printed (+ ...) before it runs. Everything is in
-# functions called on the last line, so a download cut short runs nothing.
+# is logged in, its build-provenance attestation from the workflow that builds
+# it. When the latest release has no archive for this machine yet (FreeBSD's
+# arrive minutes after a release), it takes the newest release that has one
+# and says so. Then it runs `residue service install`, and prints what it did
+# and how to undo it. Each command that changes the machine is printed (+ ...)
+# before it runs. Everything is in functions called on the last line, so a
+# download cut short runs nothing.
 # Source: https://github.com/whiteheap/residue-cli/blob/main/site/public/install.sh
 set -eu
 
@@ -31,6 +32,13 @@ KEY_ASC_SHA256=f63c31e514d7f8b87a2a61e7fe4833d6708c734fe3093286a505055482471554
 KEY_GPG_SHA256=1347e2c9b519414386f5997651a6bae055d0df86eb002b6e2b95ea946172e2cc
 # Where dnf finds that key: the repository file names this local file, not a URL.
 RPM_KEY=/etc/pki/rpm-gpg/RPM-GPG-KEY-residue
+# residue's pacman section requires the database's signature too, which
+# pacman's default, DatabaseOptional, does not.
+SIGLEVEL='SigLevel = Required DatabaseRequired'
+# /etc/pacman.conf as it was before install.sh added SIGLEVEL to an older
+# [residue] section. Not .pacnew, .pacsave or .pacorig: pacdiff takes those
+# for pacman's own and offers to merge them.
+PACMAN_BAK=/etc/pacman.conf.residue-bak
 # The first release whose `residue service install` needs no folder (#28).
 SERVICE_NO_ROOT_SINCE=0.0.7
 # residue needs Git 2.36 or later: src/git.rs MIN_VERSION, and the packages'
@@ -211,14 +219,12 @@ install_dnf() {
 }
 
 install_pacman() {
+  # Read only: what to do about [residue], decided before anything changes.
+  pacman_plan
   [ "$dry_run" = 1 ] || fetch_key "$PAGES/residue-signing-key.asc" "$tmp/residue.asc" "$KEY_ASC_SHA256"
   as_root pacman-key --add "$tmp/residue.asc"
   as_root pacman-key --lsign-key "$KEY_FPR"
-  if ! grep -q '^\[residue\]' /etc/pacman.conf; then
-    printf '\n[residue]\nServer = %s/arch/%sarch\n' "$PAGES" '$' >"$tmp/pacman.conf"
-    # shellcheck disable=SC2016 # $1 belongs to the inner sh.
-    as_root sh -c 'cat "$1" >>/etc/pacman.conf' sh "$tmp/pacman.conf"
-  fi
+  case $plan in append | edit) write_pacman_conf ;; esac
   # Arch supports only full upgrades, so this is `pacman -Syu`, as in the
   # docs. With a terminal, pacman shows the transaction and asks first.
   if [ "$dry_run" = 0 ] && has_tty; then
@@ -228,7 +234,112 @@ install_pacman() {
   fi
   bin=/usr/bin/residue
   updates="pacman -Syu"
-  undo="${sudo:+sudo }pacman -R residue, and remove the [residue] section from /etc/pacman.conf"
+  undo="${sudo:+sudo }pacman -R residue, and remove the [residue] section from /etc/pacman.conf${edited:+ ($edited is that file as it was before install.sh changed it)}"
+}
+
+# What to do about the [residue] section of /etc/pacman.conf. Sets $plan:
+# append (there is none), edit (residue's own, with no SigLevel: add
+# SIGLEVEL), or keep, with a $note when what is kept does not require
+# residue's database signature. pacman reads the file as pacman-conf prints
+# it: it trims each line, skips a blank one or one that starts with #, and
+# takes # nowhere else as a comment. Each change is checked with pacman-conf
+# on a copy first, and anything that stops the script stops here, before
+# anything changes.
+pacman_plan() {
+  plan=keep edited=
+  [ -r /etc/pacman.conf ] || die "/etc/pacman.conf is not readable by $(id -un), so install.sh cannot check it. Nothing was changed."
+  stray=$(awk '{ s = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", s) }
+    s ~ /^\[residue\]/ && s != "[residue]" { print s; exit }' /etc/pacman.conf)
+  [ -z "$stray" ] || die "pacman does not read \"$stray\" in /etc/pacman.conf as a section: # starts a comment only at the start of a line. Make that line [residue], then run this again. Nothing was changed."
+  headers=$(awk '{ s = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", s) } s == "[residue]" { n++ } END { print n + 0 }' /etc/pacman.conf)
+  printf '\n[residue]\n%s\nServer = %s/arch/%sarch\n' "$SIGLEVEL" "$PAGES" '$' >"$tmp/residue.section"
+  if ! has pacman-conf; then
+    if [ "$headers" = 0 ]; then plan=append; cat /etc/pacman.conf "$tmp/residue.section" >"$tmp/pacman.conf"
+    else note="this pacman has no pacman-conf to check /etc/pacman.conf with, so [residue] was left as it is. For pacman to require residue's database signature, add this line under [residue]: $SIGLEVEL"
+    fi
+    return 0
+  fi
+  pacman-conf --config /etc/pacman.conf --repo-list >"$tmp/repos" 2>"$tmp/pacman-conf.err" ||
+    die "pacman cannot read /etc/pacman.conf: $(head -n 1 "$tmp/pacman-conf.err"). Fix it, then run this again. Nothing was changed."
+  sections=$(grep -cx residue "$tmp/repos") || true
+  if [ "$sections" -gt 1 ] || [ "$headers" -gt 1 ]; then
+    note="/etc/pacman.conf has more than one [residue] section, left as they are. For pacman to require residue's database signature, keep one, with this line under it: $SIGLEVEL"
+  elif [ "$sections" = 0 ]; then
+    [ "$headers" = 0 ] || die "pacman does not read [residue] in /etc/pacman.conf as a repository. Fix it, then run this again. Nothing was changed."
+    cat /etc/pacman.conf "$tmp/residue.section" >"$tmp/pacman.conf"
+    reads_as_intended /etc/pacman.conf "$tmp/pacman.conf" ||
+      die "pacman would not read residue's section as intended at the end of /etc/pacman.conf, so nothing was changed."
+    plan=append
+  elif [ "$headers" = 0 ]; then
+    note="[residue] is in a file /etc/pacman.conf includes, left as it is. For pacman to require residue's database signature, add this line under [residue] there: $SIGLEVEL"
+  elif sig=$(pacman-conf --config /etc/pacman.conf --repo residue SigLevel 2>/dev/null) && [ -n "$sig" ]; then
+    # A SigLevel of the user's own, in the section or a file it includes.
+    printf '%s\n' "$sig" | grep -qx DatabaseRequired ||
+      note="[residue] in /etc/pacman.conf has a SigLevel of its own, left as it is, and it does not require residue's database signature. This line under [residue] would: $SIGLEVEL"
+  elif [ -L /etc/pacman.conf ]; then
+    note="/etc/pacman.conf is a link to $(readlink /etc/pacman.conf), and install.sh does not edit through a link, so [residue] was left as it is. For pacman to require residue's database signature, add this line under [residue] there: $SIGLEVEL"
+  else
+    # residue's own section, from an older install.sh or the docs, with no
+    # SigLevel: SIGLEVEL goes right under its header, and nothing else
+    # changes. A second run finds it and changes nothing.
+    awk -v line="$SIGLEVEL" '{ print; s = $0; cr = (s ~ /\r$/) ? "\r" : ""; gsub(/^[[:space:]]+|[[:space:]]+$/, "", s) }
+      s == "[residue]" { print line cr }' /etc/pacman.conf >"$tmp/pacman.conf"
+    reads_as_intended /etc/pacman.conf "$tmp/pacman.conf" ||
+      die "with \"$SIGLEVEL\" under [residue], pacman would not read /etc/pacman.conf as intended, so nothing was changed. Add the line there by hand."
+    plan=edit
+  fi
+}
+
+# Does pacman read the pacman.conf $2 as $1, but with residue's database
+# signature required? The global SigLevel, and each other repository and
+# its SigLevel, must be the same in both, and residue's must name
+# DatabaseRequired.
+reads_as_intended() {
+  pacman-conf --config "$2" --repo residue SigLevel 2>/dev/null | grep -qx DatabaseRequired || return 1
+  before=$(pacman_sigs "$1") && after=$(pacman_sigs "$2") && [ "$before" = "$after" ]
+}
+
+# pacman's reading of the pacman.conf $1, residue aside: the global SigLevel,
+# then each other repository's, one line each.
+pacman_sigs() {
+  repos=$(pacman-conf --config "$1" --repo-list 2>/dev/null) || return 1
+  printf 'global: %s\n' "$(pacman-conf --config "$1" SigLevel 2>/dev/null | tr '\n' ' ')"
+  for repo in $repos; do
+    [ "$repo" = residue ] || printf '%s: %s\n' "$repo" "$(pacman-conf --config "$1" --repo "$repo" SigLevel 2>/dev/null | tr '\n' ' ')"
+  done
+}
+
+# Put $tmp/pacman.conf, the file pacman_plan checked with pacman-conf, in
+# place of /etc/pacman.conf, keeping the file as it was as PACMAN_BAK, or
+# PACMAN_BAK.1 and so on, never over an older one. The new file is written
+# beside it with its mode and owner, then renamed over it: pacman never reads
+# a half-written file, and a write that fails, as on a full disk, removes
+# what it wrote and leaves /etc/pacman.conf as it was. A link stays a link:
+# the file it points at is replaced, by a rename in that file's directory.
+write_pacman_conf() {
+  conf=/etc/pacman.conf real=/etc/pacman.conf bak=$PACMAN_BAK n=0
+  if [ -L "$conf" ]; then
+    real=$(readlink -f "$conf") || die "cannot tell what the link $conf points at. Nothing was changed."
+  fi
+  while [ -e "$bak" ] || [ -L "$bak" ]; do n=$((n + 1)); bak=$PACMAN_BAK.$n; done
+  cp "$conf" "$tmp/pacman.conf.before"
+  case $plan in
+    append) say "+ add residue's section at the end of $conf; the file as it is now is kept as $bak" ;;
+    edit) say "+ add \"$SIGLEVEL\" under [residue] in $conf; the file as it is now is kept as $bak" ;;
+  esac
+  [ "$real" = "$conf" ] || say "  ($conf is a link to $real, which is replaced; the link stays)"
+  # shellcheck disable=SC2016 # $1 to $4 belong to the inner sh.
+  as_root sh -c 'cp -p "$1" "$2" && cp -p "$1" "$3" && cat "$4" >"$3" && mv -f "$3" "$1" || { rm -f "$2" "$3"; exit 1; }' \
+    sh "$real" "$bak" "$real.residue-new" "$tmp/pacman.conf" ||
+    die "could not write $conf, as the error above says, so it is unchanged."
+  edited=$bak
+  # A pacman before 5.1 has no pacman-conf to check with.
+  { [ "$dry_run" = 0 ] && has pacman-conf; } || return 0
+  reads_as_intended "$tmp/pacman.conf.before" "$conf" && return 0
+  # shellcheck disable=SC2016 # $1 to $3 belong to the inner sh.
+  as_root sh -c 'cp -p "$1" "$2" && mv -f "$2" "$3" || { rm -f "$2"; exit 1; }' sh "$bak" "$real.residue-new" "$real" ||
+    die "pacman does not read the new $conf as intended, and putting it back failed. Put it back with: ${sudo:+sudo }cp -p $bak $real"
+  die "pacman does not read the new $conf as intended, so it was put back from $bak. Add residue's section by hand, as docs/installation.md shows."
 }
 
 target() {
@@ -318,6 +429,12 @@ install_archive() {
     listed || die "SHA256SUMS of $tag lists no $name.tar.gz"
     say "residue $latest has no archive for $triple yet.$late Using $tag, the newest release that has one. To update to $latest, run this script again later."
   fi
+  # Who attests the archive: release.yml at the tag for the macOS and Linux
+  # ones, packages.yml on main for FreeBSD's (docs/installation.md).
+  case $triple in
+    *-freebsd) workflow=packages.yml ref=refs/heads/main ;;
+    *) workflow=release.yml ref=refs/tags/$tag ;;
+  esac
   bin=$prefix/residue
   updates="run this script again"
   undo="rm $bin"
@@ -326,7 +443,7 @@ install_archive() {
     return 0
   fi
   if [ "$dry_run" = 1 ]; then
-    say "+ download $base/$name.tar.gz; check it against SHA256SUMS and its attestation"
+    say "+ download $base/$name.tar.gz; check it against SHA256SUMS and its attestation from $workflow at $ref"
   else
     say "Downloading $name.tar.gz"
     code=$(fetch_status "$base/$name.tar.gz" "$tmp/$name.tar.gz")
@@ -341,16 +458,18 @@ install_archive() {
     # Up to OLD_REPO_UNTIL the old name first, then REPO, for an archive
     # attested again after the rename (a packages.yml re-run). Each verify
     # takes seconds, so a later release tries only REPO. gh's reasons are kept
-    # for the error.
+    # for the error. A gh without `gh attestation` (before 2.49) stops with
+    # a plain message, where it stopped with gh's own error before.
     if ! has gh; then
       attestation="skipped (gh is not installed)"
     elif ! gh auth status >/dev/null 2>&1; then
       attestation="skipped (gh is not logged in)"
-    elif at_least "$OLD_REPO_UNTIL" "${tag#v}" &&
-      gh attestation verify "$tmp/$name.tar.gz" --repo "$OLD_REPO" >/dev/null 2>>"$tmp/attestation.err"; then
-      attestation="verified, built by $OLD_REPO's release workflow ($REPO's name up to $OLD_REPO_UNTIL)"
-    elif gh attestation verify "$tmp/$name.tar.gz" --repo "$REPO" >/dev/null 2>>"$tmp/attestation.err"; then
-      attestation="verified, built by $REPO's release workflow"
+    elif ! gh attestation verify --help 2>/dev/null | grep -q -- --cert-identity; then
+      die "this gh cannot check which workflow built $name.tar.gz; gh 2.49 or later can. Update gh, then run this again. Nothing was installed."
+    elif at_least "$OLD_REPO_UNTIL" "${tag#v}" && attested_by "$OLD_REPO"; then
+      attestation="verified, built by $OLD_REPO's $workflow at $ref ($REPO's name up to $OLD_REPO_UNTIL)"
+    elif attested_by "$REPO"; then
+      attestation="verified, built by $REPO's $workflow at $ref"
     else
       cat "$tmp/attestation.err" >&2
       die "the build-provenance attestation of $name.tar.gz did not verify; nothing was installed"
@@ -364,6 +483,13 @@ install_archive() {
   run cp "$tmp/$name/residue" "$prefix/.residue.new"
   run chmod 0755 "$prefix/.residue.new"
   run mv -f "$prefix/.residue.new" "$bin"
+}
+
+# Did $1's $workflow at $ref attest the archive, on a GitHub-hosted runner?
+# --repo alone would accept any workflow in that repository, at any ref.
+attested_by() {
+  gh attestation verify "$tmp/$name.tar.gz" --repo "$1" --deny-self-hosted-runners \
+    --cert-identity "https://github.com/$1/.github/workflows/$workflow@$ref" >/dev/null 2>>"$tmp/attestation.err"
 }
 
 # A dotted version is at least another: is $1 >= $2?
@@ -464,7 +590,7 @@ main() {
   tmp=$(mktemp -d 2>/dev/null || mktemp -d -t residue)
   trap 'rm -rf "$tmp"' EXIT
   trap 'exit 130' INT TERM
-  failed=0 turned_on=0
+  failed=0 turned_on=0 note=
   choose_channel
   say "Installing residue through: $channel"
   case $channel in
@@ -476,6 +602,7 @@ main() {
   esac
   start_service
   summary
+  if [ -n "$note" ]; then say ""; say "Note: $note"; fi
   exit "$failed"
 }
 

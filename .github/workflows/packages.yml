@@ -14,7 +14,8 @@ name: packages
 # To publish the repositories again from the packages already in the latest
 # release, building and uploading nothing:
 # gh workflow run packages.yml -f tag=vX.Y.Z -f republish=true
-# To check a change to this workflow without uploading or deploying anything:
+# To check a change to this workflow without uploading or deploying anything,
+# which also builds the repositories with a key made for the run:
 # gh workflow run packages.yml --ref BRANCH -f tag=vX.Y.Z -f dry_run=true
 
 on:
@@ -62,7 +63,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.tag }}
+          # The tag's source, never a branch with the tag's name.
+          ref: refs/tags/${{ inputs.tag }}
       - name: Does this release have the FreeBSD probe
         id: probe
         run: |
@@ -95,11 +97,22 @@ jobs:
             cp "$bin" README.md LICENSE CHANGELOG.md "dist/$name/"
             tar -C dist -czf "dist/$name.tar.gz" "$name"
             rm -rf "dist/$name"
+      # The VM hands back the whole workspace. Only this leg's archive leaves
+      # the job, and anything else in dist fails it.
+      - name: Only this leg's archive
+        if: steps.probe.outputs.build == 'true'
+        run: |
+          name="residue-$TAG-$ARCH-unknown-freebsd.tar.gz"
+          ls -lA dist
+          if [ "$(ls -A dist)" != "$name" ] || [ -L "dist/$name" ] || [ ! -f "dist/$name" ]; then
+            echo "::error::dist must hold $name and nothing else"
+            exit 1
+          fi
       - if: steps.probe.outputs.build == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: freebsd-${{ matrix.arch }}
-          path: dist/*.tar.gz
+          path: dist/residue-${{ inputs.tag }}-${{ matrix.arch }}-unknown-freebsd.tar.gz
           if-no-files-found: error
 
   # Runs even when a FreeBSD build failed, so the Linux packages and the
@@ -117,6 +130,14 @@ jobs:
       TAG: ${{ inputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      # install.sh and the repositories job accept only this workflow's
+      # attestations on main, and a run from a branch never replaces a
+      # release's files: it attests and uploads nothing.
+      - name: Only main uploads
+        if: ${{ !inputs.dry_run && github.ref != 'refs/heads/main' }}
+        run: |
+          echo "::error::Only a run on main attests and uploads. From a branch, add -f dry_run=true."
+          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: nfpm
         run: |
@@ -128,6 +149,18 @@ jobs:
         run: |
           gh release download "$TAG" --dir dist --pattern '*-unknown-linux-musl.tar.gz' --pattern SHA256SUMS
           cd dist && grep -E 'unknown-linux-musl\.tar\.gz$' SHA256SUMS | sha256sum -c
+      # The packages are built only from the archives release.yml built and
+      # attested at the tag, never from one replaced on the release since.
+      # Releases up to 0.0.10 were built before the rename, so their
+      # attestations name the old repository (#127).
+      - name: Check that release.yml built them, at the tag
+        run: |
+          repo=$GITHUB_REPOSITORY
+          if [ "$(printf '%s\n' "${TAG#v}" 0.0.10 | sort -V | head -n 1)" = "${TAG#v}" ]; then repo=whiteheap/residue; fi
+          for archive in dist/residue-"$TAG"-{x86_64,aarch64}-unknown-linux-musl.tar.gz; do
+            gh attestation verify "$archive" --repo "$repo" --deny-self-hosted-runners \
+              --cert-identity "https://github.com/$repo/.github/workflows/release.yml@refs/tags/$TAG"
+          done
       - name: Build packages
         run: packaging/linux-packages.sh "$TAG" dist pkgs
       - name: The FreeBSD binaries that were built
@@ -136,7 +169,27 @@ jobs:
         with:
           pattern: freebsd-*
           merge-multiple: true
-          path: pkgs
+          path: freebsd
+      # Only the names this workflow builds reach the release: the six
+      # packages packaging/linux-packages.sh names, and the FreeBSD archive of
+      # each leg that succeeded. A file named like one of release.yml's
+      # archives, or anything else, fails the run.
+      - name: Only the files this workflow builds
+        run: |
+          printf '%s\n' residue_amd64.deb residue_arm64.deb residue.x86_64.rpm residue.aarch64.rpm \
+            residue-x86_64.pkg.tar.zst residue-aarch64.pkg.tar.zst | LC_ALL=C sort > "$RUNNER_TEMP/packages"
+          (cd pkgs && LC_ALL=C ls -A) | diff "$RUNNER_TEMP/packages" - ||
+            { echo "::error::pkgs must hold the six packages (<) and nothing else (>)"; exit 1; }
+          shopt -s dotglob nullglob
+          for path in freebsd/*; do
+            case ${path#freebsd/} in
+              "residue-$TAG-x86_64-unknown-freebsd.tar.gz" | "residue-$TAG-aarch64-unknown-freebsd.tar.gz") ;;
+              *) echo "::error::$path is not a FreeBSD archive of $TAG"; exit 1 ;;
+            esac
+            if [ -L "$path" ] || [ ! -f "$path" ]; then echo "::error::$path is not a file"; exit 1; fi
+            mv "$path" pkgs/
+          done
+          ls -l pkgs
       - if: ${{ !inputs.dry_run }}
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -156,6 +209,23 @@ jobs:
             (cd pkgs && sha256sum -- *)
           } > SHA256SUMS
           cat SHA256SUMS
+          # release.yml's four lines stay as release.yml wrote them.
+          release='-(apple-darwin|unknown-linux-musl)\.tar\.gz$'
+          grep -E -- "$release" SHA256SUMS | cmp - <(grep -E -- "$release" dist/SHA256SUMS) ||
+            { echo "::error::SHA256SUMS must keep release.yml's lines unchanged"; exit 1; }
+      # A dry run also builds and checks the apt, dnf and pacman repositories
+      # from these packages, as the repositories job does, with a key made
+      # for the run. It publishes nothing.
+      - name: The repositories, with a key made for this run
+        if: ${{ inputs.dry_run }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq apt-utils createrepo-c libarchive-tools rpm
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -m 700 "$GNUPGHOME"
+          gpg --batch --pinentry-mode loopback --passphrase '' --quick-gen-key 'residue dry run <dry-run@example.invalid>' ed25519 sign never
+          gpg --armor --export > "$RUNNER_TEMP/dry-run-key.asc"
+          packaging/repositories.sh pkgs "$RUNNER_TEMP/repositories" "$RUNNER_TEMP/dry-run-key.asc"
+          (cd "$RUNNER_TEMP/repositories" && find . -type f | LC_ALL=C sort)
       - name: Upload
         if: ${{ !inputs.dry_run }}
         run: gh release upload "$TAG" pkgs/* SHA256SUMS --clobber
@@ -195,14 +265,18 @@ jobs:
   # not change with this repository's name. Both secrets, the signing key and
   # the deploy key that can push there, belong to the github-pages
   # environment, which only main and v* tags can use, so only this job can
-  # read them. One run publishes at a time; the push's lease and the second
-  # latest-release check keep a late run from replacing a newer release.
+  # read them. It signs only packages this workflow attested on main. One
+  # run publishes at a time; the push's lease and the second latest-release
+  # check keep a late run from replacing a newer release.
   repositories:
     needs: [latest, linux]
     if: >-
       ${{ !cancelled() && !inputs.dry_run && needs.latest.outputs.latest == 'true' &&
       (needs.linux.result == 'success' || (inputs.republish && needs.linux.result == 'skipped')) }}
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      attestations: read
     concurrency:
       group: package-repositories
       cancel-in-progress: false
@@ -216,7 +290,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Tools
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq apt-utils createrepo-c rpm
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq apt-utils createrepo-c libarchive-tools rpm
       - name: Download the packages
         run: |
           gh release download "$TAG" --dir pkgs --pattern '*.deb' --pattern '*.rpm' --pattern '*.pkg.tar.zst' --pattern SHA256SUMS
@@ -227,34 +301,24 @@ jobs:
           diff "$RUNNER_TEMP/listed" "$RUNNER_TEMP/downloaded" ||
             { echo "::error::The packages downloaded (>) and those SHA256SUMS lists (<) differ"; exit 1; }
           grep -E '\.(deb|rpm|pkg\.tar\.zst)$' SHA256SUMS | sha256sum -c
+          # Only a package this workflow attested on main is signed: the linux
+          # job builds them from the archives release.yml attested at the tag,
+          # so one replaced on the release since never gets the key.
+          while read -r package; do
+            gh attestation verify "$package" --repo "$GITHUB_REPOSITORY" --deny-self-hosted-runners \
+              --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/packages.yml@refs/heads/main"
+          done < "$RUNNER_TEMP/downloaded"
+      # The key is in this step alone, and never enters a container:
+      # arch-repo.sh runs only repo-add there, with no key and no network.
       - name: Build and sign the apt, dnf and pacman repositories
         env:
           PACKAGE_SIGNING_KEY: ${{ secrets.PACKAGE_SIGNING_KEY }}
         run: |
-          fpr=$(gpg --show-keys --with-colons "$KEYRING" | awk -F: '/^fpr/ { print $10; exit }')
           export GNUPGHOME="$RUNNER_TEMP/gnupg"
           mkdir -m 700 "$GNUPGHOME"
           printf '%s\n' "$PACKAGE_SIGNING_KEY" | gpg --batch --import
-          packaging/apt-repo.sh pkgs repositories/apt "$fpr"
-          packaging/rpm-repo.sh pkgs repositories/rpm "$fpr"
-          # repo-add only exists on Arch.
-          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e PACKAGE_SIGNING_KEY \
-            -v "$PWD:/w" -w /w archlinux:base bash -c '
-              export GNUPGHOME=$(mktemp -d)
-              printf "%s\n" "$PACKAGE_SIGNING_KEY" | gpg --batch --quiet --import
-              packaging/arch-repo.sh pkgs repositories/arch "$0"' "$fpr"
+          packaging/repositories.sh pkgs repositories "$KEYRING"
           rm -rf "$GNUPGHOME"
-          cp "$KEYRING" repositories/residue-signing-key.asc
-          gpg --dearmor < "$KEYRING" > repositories/apt/residue-archive-keyring.gpg
-          cp packaging/rpm/residue.repo repositories/rpm/residue.repo
-      - name: Check every signature against the committed public key
-        run: |
-          keyring=repositories/apt/residue-archive-keyring.gpg
-          gpgv --keyring "$keyring" repositories/apt/dists/stable/InRelease
-          gpgv --keyring "$keyring" repositories/apt/dists/stable/Release.gpg repositories/apt/dists/stable/Release
-          for sig in repositories/arch/*/*.sig repositories/rpm/*/repodata/repomd.xml.asc; do
-            gpgv --keyring "$keyring" "$sig" "${sig%.*}"
-          done
       # The deploy key is a write key for whiteheap/whiteheap.github.io only.
       # packaging/github-known-hosts pins GitHub's host keys.
       - name: Push to whiteheap/whiteheap.github.io
