@@ -53,6 +53,11 @@ pub struct Record {
     pub trashed: i64,
     pub allocated: Option<u64>,
     pub reclaimable: Option<u64>,
+    /// The `--keep-trash` of the run that trashed it, so no later run
+    /// purges it sooner; `None` in an entry an earlier release made, and
+    /// the line as written when this release cannot read it (damaged, or
+    /// a later release's), which no run purges.
+    pub keep: Option<Result<removed::Keep, String>>,
 }
 
 impl Record {
@@ -79,6 +84,11 @@ impl Record {
             )
             .as_bytes(),
         );
+        // A release before this one ignores the line, and purges the entry
+        // after its own --keep-trash.
+        if let Some(Ok(k)) = &self.keep {
+            out.extend_from_slice(format!("keep {} {}\n", k.seconds, k.text).as_bytes());
+        }
         if let Some(n) = self.allocated {
             out.extend_from_slice(format!("allocated {n}\n").as_bytes());
         }
@@ -97,6 +107,7 @@ impl Record {
             trashed: 0,
             allocated: None,
             reclaimable: None,
+            keep: None,
         };
         let mut trashed = None;
         for line in bytes.split(|b| *b == b'\n') {
@@ -120,6 +131,9 @@ impl Record {
                 b"branch" => record.branch = Some(text()),
                 b"head" => record.head = Some(text()),
                 b"trashed" => trashed = Some(number("trashed")?),
+                // One this release cannot read keeps the entry readable,
+                // so it can be restored, and never expiring.
+                b"keep" => record.keep = Some(removed::Keep::parse(&text()).ok_or_else(text)),
                 b"allocated" => record.allocated = number("allocated")?.try_into().ok(),
                 b"reclaimable" => record.reclaimable = number("reclaimable")?.try_into().ok(),
                 // Keys a later version adds carry nothing this one needs.
@@ -156,6 +170,12 @@ pub struct Item {
     pub bare: bool,
     /// The entry directory's modification time, in Unix seconds.
     pub modified: Option<i64>,
+    /// What an entry that does not hold its worktree, or whose `info` is
+    /// missing or damaged, holds besides `info` and `info.new`, by name,
+    /// sorted; `None` when residue could not list it. residue never puts
+    /// anything else there and never deletes it. Empty, and not read, for
+    /// an entry that holds its worktree: nothing decided there needs it.
+    pub extra: Option<Vec<String>>,
 }
 
 impl Item {
@@ -173,10 +193,12 @@ impl Item {
         self.record.is_ok() && !self.holds_worktree() && self.registered.is_none()
     }
 
-    /// An entry that holds only its record files: an empty record, or a
-    /// bare entry whose `info` is missing or damaged.
+    /// An entry that holds only its record files: an empty record with
+    /// nothing else beside it, or a bare entry whose `info` is missing or
+    /// damaged.
     pub fn holds_only_record(&self) -> bool {
-        self.is_empty_record() || (self.record.is_err() && self.bare)
+        (self.is_empty_record() && self.extra.as_ref().is_some_and(Vec::is_empty))
+            || (self.record.is_err() && self.bare)
     }
 
     /// An entry that holds only its record files and is old enough that no
@@ -188,13 +210,51 @@ impl Item {
     pub fn clearable(&self, now: i64) -> bool {
         let settled = |since: i64| now - since >= removed::INCOMPLETE_AFTER;
         match &self.record {
-            Ok(r) => self.is_empty_record() && settled(r.trashed),
+            Ok(r) => self.holds_only_record() && settled(r.trashed),
             Err(_) => self.bare && self.modified.is_some_and(settled),
         }
     }
 
-    pub fn age(&self, now: i64) -> Option<i64> {
-        self.record.as_ref().ok().map(|r| now - r.trashed)
+    /// An entry no purge can clear, which every run keeps: why, naming what
+    /// it holds. An empty record as old as a clearable one that also holds
+    /// something else, or that residue could not list; or an entry with no
+    /// `info` that holds anything but `info.new`, which no run of this
+    /// release leaves (`discard` keeps `info` beside anything else) and
+    /// none is making (a run writes `info` before it moves a worktree in).
+    pub fn stranded(&self, now: i64) -> Option<String> {
+        match &self.record {
+            Ok(r) if self.is_empty_record() && now - r.trashed >= removed::INCOMPLETE_AFTER => {
+                match &self.extra {
+                    Some(names) if names.is_empty() => None,
+                    Some(names) => Some(beside(names)),
+                    None => Some(
+                        "its worktree is gone, but residue could not list what else the entry holds, so the entry stays".into(),
+                    ),
+                }
+            }
+            Ok(_) => None,
+            Err(_) if self.incomplete && !self.bare => Some(match &self.extra {
+                Some(names) => format!(
+                    "it has no info, so residue cannot tell what it holds ({}) and leaves it; once that is moved or deleted, a later remove run clears the entry",
+                    crate::inspect::examples(names, 5)
+                ),
+                None => "it has no info, and residue could not list what it holds, so the entry stays".into(),
+            }),
+            Err(_) => None,
+        }
+    }
+
+    /// At least `keep` old, and at least as old as the `--keep-trash` of
+    /// the run that trashed it, the longer of the two, as a removal
+    /// record's `--keep-removed` (`removed::Item::expired`). An entry
+    /// without one, from 0.0.13 or earlier, has only `keep`; one whose
+    /// `keep` this release cannot read never expires.
+    pub fn expired(&self, now: i64, keep: i64) -> bool {
+        self.record.as_ref().is_ok_and(|r| match &r.keep {
+            Some(Err(_)) => false,
+            Some(Ok(own)) => now - r.trashed >= keep.max(own.seconds),
+            None => now - r.trashed >= keep,
+        })
     }
 }
 
@@ -250,12 +310,25 @@ pub fn list(
                 false,
             ),
         };
-        let bare = missing_or_damaged && holds_only_info(&dir);
-        let worktree = record
+        let name_in = record.as_ref().ok().and_then(|r| r.original.file_name());
+        let worktree = name_in.map(|n| dir.join(n));
+        let holds_worktree = worktree
             .as_ref()
-            .ok()
-            .and_then(|r| r.original.file_name())
-            .map(|n| dir.join(n));
+            .is_some_and(|w| fs::symlink_metadata(w).is_ok());
+        // Listed only where a decision reads it, so `scan` reads no more
+        // of an entry that holds its worktree.
+        let extra = if missing_or_damaged || (record.is_ok() && !holds_worktree) {
+            besides_record(&dir).ok().map(|names| {
+                names
+                    .into_iter()
+                    .filter(|n| Some(n.as_os_str()) != name_in)
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            })
+        } else {
+            Some(Vec::new())
+        };
+        let bare = missing_or_damaged && extra.as_ref().is_some_and(Vec::is_empty);
         let registered = worktree.as_ref().and_then(|w| {
             registered
                 .iter()
@@ -275,6 +348,7 @@ pub fn list(
             incomplete,
             bare,
             modified,
+            extra,
         });
     }
     items.sort_by_key(|i| {
@@ -352,39 +426,102 @@ pub fn create(common_dir: &Path, record: &Record) -> Result<(PathBuf, Hold), Str
     ))
 }
 
+/// Why an entry whose worktree is gone stays: it also holds `names`.
+pub fn beside(names: &[String]) -> String {
+    format!(
+        "its worktree is gone, but the entry also holds {}, which residue never deletes, so the entry stays; once that is moved or deleted, a later remove run clears it",
+        crate::inspect::examples(names, 5)
+    )
+}
+
+/// Why [`discard`] left an entry where it is.
+pub enum Stays {
+    /// The entry holds these besides its record, which residue never
+    /// deletes, so it removed nothing: the record stays with them.
+    Holds(PathBuf, Vec<String>),
+    /// Listing or removing it failed.
+    Failed(String),
+}
+
+impl std::fmt::Display for Stays {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Stays::Holds(entry, names) => write!(
+                f,
+                "the trash entry {} stays, with its record: it also holds {}, which residue never deletes",
+                entry.display(),
+                crate::inspect::examples(names, 5)
+            ),
+            Stays::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+impl Stays {
+    /// What a run whose worktree left the entry says of the entry: the
+    /// worktree is gone or back, so what is left is not it.
+    pub fn note(&self) -> String {
+        match self {
+            Stays::Holds(..) => {
+                format!("{self}; once that is moved or deleted, a later remove run clears it")
+            }
+            Stays::Failed(e) => format!("residue could not clear its trash entry ({e})"),
+        }
+    }
+}
+
 /// Remove an entry's record and its now empty directory, and the trash
-/// directory once it is empty. Never recursive: if anything else is left
-/// in the entry, it stays and the error says so.
-pub fn discard(entry: &Path) -> Result<(), String> {
+/// directory once it is empty. Never recursive, and the entry is listed
+/// first: when it holds anything but `info` and `info.new`, a worktree
+/// Git left there included, nothing is removed, so the record stays with
+/// what it is about and `residue restore` still finds them. Something
+/// that arrives between the listing and the rmdir(2) stays too, and the
+/// error says so.
+pub fn discard(entry: &Path) -> Result<(), Stays> {
+    let names = besides_record(entry)
+        .map_err(|e| Stays::Failed(format!("cannot list {}: {e}", entry.display())))?;
+    if !names.is_empty() {
+        return Err(Stays::Holds(
+            entry.to_path_buf(),
+            names
+                .iter()
+                .map(|n| n.to_string_lossy().into_owned())
+                .collect(),
+        ));
+    }
     for file in [INFO, INFO_NEW] {
         match fs::remove_file(entry.join(file)) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("cannot remove {}: {e}", entry.join(file).display())),
+            Err(e) => {
+                return Err(Stays::Failed(format!(
+                    "cannot remove {}: {e}",
+                    entry.join(file).display()
+                )));
+            }
         }
     }
-    fs::remove_dir(entry).map_err(|e| format!("cannot remove {}: {e}", entry.display()))?;
+    fs::remove_dir(entry)
+        .map_err(|e| Stays::Failed(format!("cannot remove {}: {e}", entry.display())))?;
     if let Some(root) = entry.parent() {
         // Other entries may still be in the trash.
-        remove_dir_if_empty(root).map_err(|e| format!("cannot remove {}: {e}", root.display()))?;
+        remove_dir_if_empty(root)
+            .map_err(|e| Stays::Failed(format!("cannot remove {}: {e}", root.display())))?;
     }
     Ok(())
 }
 
-/// The entry directory holds nothing but `info` and `info.new`. One that
-/// cannot be read counts as holding more.
-fn holds_only_info(entry: &Path) -> bool {
-    let Ok(listing) = fs::read_dir(entry) else {
-        return false;
-    };
-    let mut only = true;
-    for child in listing {
-        match child {
-            Ok(c) if c.file_name() == INFO || c.file_name() == INFO_NEW => {}
-            _ => only = false,
+/// The names in an entry directory besides `info` and `info.new`, sorted.
+fn besides_record(entry: &Path) -> io::Result<Vec<OsString>> {
+    let mut names = Vec::new();
+    for child in fs::read_dir(entry)? {
+        let name = child?.file_name();
+        if name != INFO && name != INFO_NEW {
+            names.push(name);
         }
     }
-    only
+    names.sort();
+    Ok(names)
 }
 
 /// Remove a directory if it is empty; one that still has entries stays and
@@ -484,8 +621,8 @@ impl From<String> for NotBack {
 /// by `git worktree move`, and drop the entry. The caller holds the entry
 /// (`take`) and passes every worktree Git lists for the repository, read
 /// since then (`listed`), so the lock it lifts is the one there now.
-/// Returns the restored path, and a note when the record stays behind (the
-/// next purge clears it).
+/// Returns the restored path, and a note when the entry stays behind,
+/// naming what it still holds ([`Stays::note`]).
 pub fn restore(
     item: &Item,
     to: Option<&Path>,
@@ -525,9 +662,7 @@ pub fn restore(
             moved,
         })));
     }
-    let note = discard(&item.dir)
-        .err()
-        .map(|e| format!("could not remove the trash record ({e}); the next remove run clears it"));
+    let note = discard(&item.dir).err().map(|stays| stays.note());
     Ok((dest.to_path_buf(), note))
 }
 
@@ -615,8 +750,9 @@ pub fn nearest_existing(parent: &Path) -> (&Path, Option<&Path>) {
 /// since: `registered` is Git's entry for it from that check, so the lock
 /// lifted is the one there now. Git inherits `holds`, the entry's and its
 /// removal record's. If Git refuses, the worktree is locked again and
-/// stays in the trash.
-pub fn purge(item: &Item, registered: &Entry, holds: &[&Hold]) -> Result<(), String> {
+/// stays in the trash. Once Git deleted it, an entry [`discard`] leaves
+/// is the `Ok` value: the worktree is gone either way.
+pub fn purge(item: &Item, registered: &Entry, holds: &[&Hold]) -> Result<Option<Stays>, String> {
     let worktree = item
         .worktree
         .as_ref()
@@ -633,7 +769,14 @@ pub fn purge(item: &Item, registered: &Entry, holds: &[&Hold]) -> Result<(), Str
         }
         return Err(e);
     }
-    discard(&item.dir)
+    Ok(discard(&item.dir).err())
+}
+
+/// The `--keep-trash` a record keeps, when this release can read it.
+fn own_keep(record: Option<&Record>) -> Option<&removed::Keep> {
+    record
+        .and_then(|r| r.keep.as_ref())
+        .and_then(|k| k.as_ref().ok())
 }
 
 pub fn item_json(item: &Item) -> Json {
@@ -678,5 +821,169 @@ pub fn item_json(item: &Item) -> Json {
                 Ok(_) => Json::Null,
             },
         ),
+        // The `--keep-trash` it was trashed with, as a removal record's
+        // `keep`; null for an entry an earlier release made, or one whose
+        // keep line this release cannot read.
+        (
+            "keep",
+            Json::opt(own_keep(record), |k| Json::str(k.text.clone())),
+        ),
+        (
+            "keep_seconds",
+            Json::opt(own_keep(record), |k| Json::Int(k.seconds)),
+        ),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(keep: Option<(i64, &str)>) -> Record {
+        Record {
+            original: PathBuf::from("/src/app/.worktrees/w"),
+            branch: Some("refs/heads/w".into()),
+            head: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            trashed: 1_000,
+            allocated: Some(10),
+            reclaimable: Some(8),
+            keep: keep.map(|(seconds, text)| {
+                Ok(removed::Keep {
+                    seconds,
+                    text: text.into(),
+                })
+            }),
+        }
+    }
+
+    /// An entry of `record`, holding its worktree, as `list` makes it.
+    fn item(record: Record) -> Item {
+        Item {
+            name: "w-19700101T001640Z".into(),
+            dir: PathBuf::from("/src/app/.git/residue-trash/w-19700101T001640Z"),
+            common_dir: PathBuf::from("/src/app/.git"),
+            command_dir: PathBuf::from("/src/app"),
+            record: Ok(record),
+            worktree: None,
+            registered: None,
+            incomplete: false,
+            bare: false,
+            modified: Some(1_000),
+            extra: Some(Vec::new()),
+        }
+    }
+
+    /// An empty folder of the test's own.
+    fn scratch(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "residue-trash-{test}-{}-{}",
+            std::process::id(),
+            output::now()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn info_keeps_the_keep_trash_it_was_written_with() {
+        let entry = Path::new("/src/app/.git/residue-trash/w-19700101T001640Z");
+        let bytes = record(Some((2_592_000, "30d"))).render(entry);
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(text.contains("\nkeep 2592000 30d\n"), "{text}");
+        let back = Record::parse(&bytes).unwrap();
+        let keep = back.keep.unwrap().unwrap();
+        assert_eq!((keep.seconds, keep.text.as_str()), (2_592_000, "30d"));
+        // An entry an earlier release made has none, and reads as before.
+        let old = Record::parse(&record(None).render(entry)).unwrap();
+        assert!(old.keep.is_none());
+        assert!(
+            !String::from_utf8(record(None).render(entry))
+                .unwrap()
+                .contains("keep")
+        );
+        // One this release cannot read leaves the record readable, so it
+        // can be restored, and it never expires.
+        let damaged = text.replace("keep 2592000 30d", "keep soon");
+        let read = Record::parse(damaged.as_bytes()).unwrap();
+        assert!(matches!(&read.keep, Some(Err(line)) if line == "soon"));
+        assert!(!item(read).expired(1_000 + 520 * 7 * 86_400, 86_400));
+    }
+
+    #[test]
+    fn an_entry_expires_at_the_longer_of_the_run_s_keep_and_its_own() {
+        let day = 86_400;
+        let own = item(record(Some((30 * day, "30d"))));
+        let trashed = 1_000;
+        // A run with 7d keeps it until its own 30d have passed.
+        assert!(!own.expired(trashed + 10 * day, 7 * day));
+        assert!(!own.expired(trashed + 10 * day, day));
+        assert!(own.expired(trashed + 30 * day, 7 * day));
+        // A run with a longer keep keeps it longer.
+        assert!(!own.expired(trashed + 31 * day, 60 * day));
+        // One without its own keep has only the run's.
+        let old = item(record(None));
+        assert!(old.expired(trashed + 7 * day, 7 * day));
+        assert!(!old.expired(trashed + 7 * day - 1, 7 * day));
+    }
+
+    #[test]
+    fn discard_removes_nothing_from_an_entry_that_holds_more_than_its_record() {
+        let dir = scratch("discard");
+        let entry = dir.join("w-19700101T001640Z");
+        fs::create_dir(&entry).unwrap();
+        fs::write(
+            entry.join(INFO),
+            b"path /src/app/.worktrees/w\ntrashed 1000 x\n",
+        )
+        .unwrap();
+        fs::write(entry.join("stray.txt"), b"stray").unwrap();
+        match discard(&entry) {
+            Err(Stays::Holds(at, names)) => {
+                assert_eq!(at, entry);
+                assert_eq!(names, vec!["stray.txt".to_string()]);
+            }
+            Err(Stays::Failed(e)) => panic!("failed: {e}"),
+            Ok(()) => panic!("discarded an entry that holds stray.txt"),
+        }
+        // The record stays with what is left, and the entry is whole.
+        assert!(entry.join(INFO).is_file());
+        assert!(entry.join("stray.txt").is_file());
+        // Once only the record is left, it goes, and so does the trash.
+        fs::remove_file(entry.join("stray.txt")).unwrap();
+        discard(&entry).map_err(|e| e.to_string()).unwrap();
+        assert!(!entry.exists());
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn an_entry_no_purge_can_clear_says_what_it_holds() {
+        let hour = removed::INCOMPLETE_AFTER;
+        // An empty record that also holds a file: kept, naming it, once it
+        // is as old as a clearable one.
+        let mut beside = item(record(None));
+        beside.extra = Some(vec!["stray.txt".into()]);
+        assert!(beside.is_empty_record() && !beside.holds_only_record());
+        assert!(!beside.clearable(1_000 + hour));
+        assert!(beside.stranded(1_000 + hour - 1).is_none());
+        assert!(beside.stranded(1_000 + hour).unwrap().contains("stray.txt"));
+        // With only its record, it is cleared instead.
+        let only = item(record(None));
+        assert!(only.stranded(1_000 + hour).is_none());
+        assert!(only.clearable(1_000 + hour));
+        // No info, and more than info.new: kept at any age.
+        let mut lost = item(record(None));
+        lost.record = Err("it has no info".into());
+        lost.incomplete = true;
+        lost.extra = Some(vec!["w".into()]);
+        assert!(lost.stranded(0).unwrap().contains("it has no info"));
+        // No info and nothing else: bare, which a purge clears an hour on.
+        lost.extra = Some(Vec::new());
+        lost.bare = true;
+        assert!(lost.stranded(0).is_none());
+        // A damaged info beside other files stays an error, as before.
+        let mut damaged = item(record(None));
+        damaged.record = Err("it has no path line".into());
+        damaged.extra = Some(vec!["w".into()]);
+        assert!(damaged.stranded(0).is_none());
+    }
 }

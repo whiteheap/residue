@@ -27,7 +27,8 @@ Options:
   --yes                    remove: skip the prompt; only once the task is done
   --trash                  remove: into the trash; frees nothing until purged
   --no-trash               remove: delete, even with --idle
-  --keep-trash DURATION    remove: purge trash entries older than this (7d)
+  --keep-trash DURATION    remove: purge trash entries older than this (7d);
+                           new entries keep it, and it cannot shorten their own
   --keep-removed DURATION  remove: keep removal records at least this long (30d)
   --as-of TIME             remove: judge ages at TIME, a plan's generated_at
   --removal-reason REASON  remove: watch-landed or watch-low-disk (set by watch)
@@ -53,7 +54,8 @@ Kept:          branches, commits and the stash
 Restore:       each deletion writes a removal record first; `residue restore`
                brings the worktree back for 30d, without its ignored files
 Rules:         ~/.config/residue/regenerable, one RULE per line
-Exit status:   0 ok, 1 error, 2 usage, 3 remove refused or skipped a path
+Exit status:   0 ok, 1 error, 2 usage, 3 remove refused or skipped a path,
+               or could not purge an expired trash entry
 Details:       https://github.com/whiteheap/residue-cli#readme
 ";
 

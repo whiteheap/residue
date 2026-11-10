@@ -1053,8 +1053,9 @@ fi
 # cleared: an empty record by its trashed time, one with no info or a
 # damaged one by its directory's time. A younger one may be another run's,
 # about to move a worktree in, so it stays, and one with no info yet is
-# no error. An hour-old entry with no info that holds anything else stays,
-# and is an error, exit 3: residue cannot tell what it holds.
+# no error. An entry with no info that holds anything else, which an older
+# release could leave, stays: residue cannot tell what it holds, so it is
+# kept, with a warning naming what it holds, and no run fails for it.
 name=trash-record-only
 make_repo
 tr=$repo/.git/residue-trash
@@ -1080,11 +1081,171 @@ else
     echo keep >"$tr/held-20260101T000000Z/w/file.txt" || exit 2
     touch -t 202601010000 "$tr/held-20260101T000000Z" || exit 2
     run remove --all --yes --json --idle 30d "$repo"
-    if [ "$status" != 3 ]; then fail "with an entry holding more than its record: exit $status, want 3"
-    elif ! jq -e '.errors | length == 1 and (.[0] | contains("held-20260101T000000Z") and contains("it has no info"))' "$out" >/dev/null; then fail "errors: $(jq -c .errors "$out")"
-    elif [ "$(jq -c .purged "$out")" != "[]" ]; then fail "purged: $(jq -c '[.purged[] | {result, entry: .entry.entry}]' "$out")"
+    if [ "$status" != 0 ]; then fail "with an entry holding more than its record: exit $status, want 0"
+    elif [ "$(jq -c .errors "$out")" != "[]" ]; then fail "errors: $(jq -c .errors "$out"), want []"
+    elif [ "$(jq -r '[.purged[] | .result + " " + .entry.entry] | join(",")' "$out")" != "kept held-20260101T000000Z" ]; then fail "purged: $(jq -c '[.purged[] | {result, reason, entry: .entry.entry}]' "$out")"
+    elif ! jq -e '.purged[0].reason | contains("it has no info") and contains("w")' "$out" >/dev/null; then fail "reason: $(jq -c '.purged[0].reason' "$out")"
+    elif ! jq -e '.warnings | length == 1 and (.[0] | contains("held-20260101T000000Z") and contains("it has no info"))' "$out" >/dev/null; then fail "warnings: $(jq -c .warnings "$out")"
+    elif ! grep -q 'residue: warning: kept the trash entry .*held-20260101T000000Z' "$err"; then fail "no warning on stderr"
     elif [ "$(cat "$tr/held-20260101T000000Z/w/file.txt" 2>/dev/null)" != keep ]; then fail "the entry holding more than its record changed"
     else ok; fi
+fi
+
+# 8c. A trash entry that holds a file residue did not put there, beside
+# the worktree and its record. The purge deletes the worktree and keeps
+# the entry's record with that file, with a warning. Later runs keep the
+# entry, with a warning, and fail for it no more than a run that removes
+# another worktree does, until the entry holds only its record again,
+# which the next run clears.
+if [ -z "$partial_probe" ]; then
+    name=trash-stray-beside-record
+    make_repo
+    run remove --yes --json --trash "$wt"
+    entry=$(result 0 trash_entry)
+    [ "$status" = 0 ] && [ -d "$entry" ] || { echo "contract-check: setup failed in $name: remove --trash exit $status" >&2; exit 2; }
+    sed 's/^trashed [0-9]* .*/trashed 1767225600 2026-01-01T00:00:00Z/' "$entry/info" >"$work/$name.info" && cat "$work/$name.info" >"$entry/info" || exit 2
+    echo stray >"$entry/stray.txt" || exit 2
+    setup git -C "$repo" worktree add -q "$repo/.worktrees/x" -b x
+    setup git -C "$repo" worktree add -q "$repo/.worktrees/y" -b y
+    run remove --yes --json --no-trash "$repo/.worktrees/x"
+    left=$(ls -A "$entry" 2>/dev/null | LC_ALL=C sort | paste -s -d , -)
+    if [ "$status" != 0 ]; then fail "the purge: exit $status, want 0"
+    elif [ "$(result 0 result)" != removed ]; then fail "x: $(result 0 result), want removed"
+    elif [ "$(jq -r '[.purged[] | .result] | join(",")' "$out")" != purged ]; then fail "purged: $(jq -c '[.purged[] | {result, reason}]' "$out")"
+    elif [ "$(jq -r '.purged[0].removal_record | type' "$out")" != string ]; then fail "the purge wrote no removal record"
+    elif [ -e "$entry/w" ]; then fail "the purged worktree is still in the entry"
+    elif [ "$left" != "info,stray.txt" ]; then fail "left in the entry: $left, want info,stray.txt"
+    elif ! grep -qxF "path $(cd "$repo" && pwd -P)/.worktrees/w" "$entry/info"; then fail "its info changed: $(cat "$entry/info")"
+    elif ! jq -e '.warnings | length == 1 and (.[0] | contains("stray.txt"))' "$out" >/dev/null; then fail "warnings: $(jq -c .warnings "$out")"
+    else
+        run remove --yes --json --no-trash "$repo/.worktrees/y"
+        if [ "$status" != 0 ]; then fail "the next run: exit $status, want 0"
+        elif [ "$(result 0 result)" != removed ]; then fail "y: $(result 0 result), want removed"
+        elif [ "$(jq -c .errors "$out")" != "[]" ]; then fail "the next run's errors: $(jq -c .errors "$out")"
+        elif [ "$(jq -r '[.purged[] | .result] | join(",")' "$out")" != kept ]; then fail "the next run purged: $(jq -c '[.purged[] | {result, reason}]' "$out")"
+        elif ! jq -e '.purged[0].reason | contains("stray.txt")' "$out" >/dev/null; then fail "the next run's reason: $(jq -c '.purged[0].reason' "$out")"
+        elif ! jq -e '.warnings | length == 1 and (.[0] | contains("stray.txt"))' "$out" >/dev/null; then fail "the next run's warnings: $(jq -c .warnings "$out")"
+        elif [ "$(cat "$entry/stray.txt" 2>/dev/null)" != stray ]; then fail "stray.txt changed"
+        else
+            rm -f "$entry/stray.txt"
+            run remove --all --yes --json --idle 30d "$repo"
+            if [ "$status" != 0 ]; then fail "once only the record is left: exit $status, want 0"
+            elif [ "$(jq -r '[.purged[] | .result] | join(",")' "$out")" != purged ]; then fail "once only the record is left, purged: $(jq -c '[.purged[] | {result, reason}]' "$out")"
+            elif [ -e "$entry" ]; then fail "the entry is still there: $(ls -A "$entry")"
+            elif common_ok; then ok; fi
+        fi
+    fi
+else
+    skip_partial trash-stray-beside-record
+fi
+
+# 8d. A trash entry keeps the --keep-trash it was trashed with, as a
+# removal record keeps its --keep-removed: no run purges it sooner, and
+# restore --json shows it. Trashed with 30d and set ten days back, it
+# outlives a sweep with the default 7d and one with --keep-trash 1d; set
+# 31 days back, the default sweep purges it.
+if [ -z "$partial_probe" ]; then
+    name=trash-own-keep
+    make_repo
+    run remove --yes --json --trash --keep-trash 30d "$wt"
+    entry=$(result 0 trash_entry)
+    [ "$status" = 0 ] && [ -d "$entry" ] || { echo "contract-check: setup failed in $name: remove --trash exit $status" >&2; exit 2; }
+    trashed_ago() { # SECONDS
+        sed "s/^trashed [0-9]* .*/trashed $(($(date +%s) - $1)) earlier/" "$entry/info" >"$work/$name.info" && cat "$work/$name.info" >"$entry/info" || exit 2
+    }
+    trashed_ago 864000
+    if ! grep -qx 'keep 2592000 30d' "$entry/info"; then fail "its info has no keep line: $(cat "$entry/info")"
+    elif ! (cd "$repo" && "$bin" restore --json) >"$work/$name.list" 2>"$err"; then fail "restore --json (the list) failed"
+    elif ! jq -e '[.trash[] | {keep, keep_seconds}] == [{"keep": "30d", "keep_seconds": 2592000}]' "$work/$name.list" >/dev/null; then fail "restore --json keep: $(jq -c '[.trash[] | {entry, keep, keep_seconds}]' "$work/$name.list")"
+    else
+        run remove --all --yes --json --idle 30d "$repo"
+        if [ "$status" != 0 ]; then fail "the 7d sweep: exit $status, want 0"
+        elif [ "$(jq -c .purged "$out")" != "[]" ]; then fail "the 7d sweep purged: $(jq -c '[.purged[] | {result, reason}]' "$out")"
+        else
+            run remove --all --yes --json --idle 30d --keep-trash 1d "$repo"
+            if [ "$status" != 0 ]; then fail "the 1d sweep: exit $status, want 0"
+            elif [ "$(jq -c .purged "$out")" != "[]" ]; then fail "the 1d sweep purged: $(jq -c '[.purged[] | {result, reason}]' "$out")"
+            elif [ ! -d "$entry/w" ]; then fail "the worktree is gone from the trash"
+            else
+                trashed_ago 2678400
+                run remove --all --yes --json --idle 30d "$repo"
+                if [ "$status" != 0 ]; then fail "at 31 days: exit $status, want 0"
+                elif [ "$(jq -r '[.purged[] | .result] | join(",")' "$out")" != purged ]; then fail "at 31 days, purged: $(jq -c '[.purged[] | {result, reason}]' "$out")"
+                elif common_ok; then ok; fi
+            fi
+        fi
+    fi
+else
+    skip_partial trash-own-keep
+fi
+
+# 8e. Two expired entries no purge can act on: one that holds its worktree
+# while Git lists that worktree at its old path (a move into the trash that
+# stopped after its rename, or a repository moved since), and one whose
+# keep line this release cannot read. Both stay, with a warning each, and
+# the sweep exits 0. The second is still restorable.
+if [ -z "$partial_probe" ]; then
+    name=trash-kept-unpurgeable
+    make_repo
+    setup git -C "$repo" worktree add -q "$repo/.worktrees/v" -b v
+    run remove --yes --json --trash "$wt" "$repo/.worktrees/v"
+    lost=$(result 0 trash_entry) odd=$(result 1 trash_entry)
+    [ "$status" = 0 ] && [ -d "$lost" ] && [ -d "$odd" ] || { echo "contract-check: setup failed in $name: remove --trash exit $status" >&2; exit 2; }
+    for e in "$lost" "$odd"; do
+        sed 's/^trashed [0-9]* .*/trashed 1767225600 2026-01-01T00:00:00Z/' "$e/info" >"$work/$name.info" && cat "$work/$name.info" >"$e/info" || exit 2
+    done
+    sed 's/^keep .*/keep later/' "$odd/info" >"$work/$name.info" && cat "$work/$name.info" >"$odd/info" || exit 2
+    # Git's record of w points at its old path again; its folder stays in the entry.
+    printf '%s\n' "$wt/.git" >"$repo/.git/worktrees/w/gitdir" || exit 2
+    before=$(sums "$lost/w")
+    want=$(printf 'kept %s\nkept %s\n' "$(basename "$lost")" "$(basename "$odd")" | LC_ALL=C sort | paste -s -d , -)
+    run remove --all --yes --json --idle 30d "$repo"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif [ "$(jq -c .errors "$out")" != "[]" ]; then fail "errors: $(jq -c .errors "$out")"
+    elif [ "$(jq -r '[.purged[] | .result + " " + .entry.entry] | sort | join(",")' "$out")" != "$want" ]; then fail "purged: $(jq -c '[.purged[] | {result, reason, entry: .entry.entry}]' "$out")"
+    elif ! jq -e --arg e "$(basename "$lost")" '[.purged[] | select(.entry.entry == $e) | .reason][0] | contains("Git does not list its worktree here") and contains("worktree repair")' "$out" >/dev/null; then fail "the reason for the entry Git lists elsewhere: $(jq -c '.purged' "$out")"
+    elif ! jq -e --arg e "$(basename "$odd")" '[.purged[] | select(.entry.entry == $e)][0] | (.reason | contains("keep line (later)")) and .entry.error == null and .entry.keep == null' "$out" >/dev/null; then fail "the entry with the odd keep line: $(jq -c '.purged' "$out")"
+    elif [ "$(jq '.warnings | length' "$out")" != 2 ]; then fail "warnings: $(jq -c .warnings "$out"), want 2"
+    elif [ "$(sums "$lost/w")" != "$before" ] || [ ! -d "$odd/v" ]; then fail "an entry changed"
+    else
+        in_dir "$repo" run restore --json "$odd"
+        if [ "$status" != 0 ]; then fail "restore of the entry with the odd keep line: exit $status: $(cat "$err")"
+        elif ! registered "$repo/.worktrees/v"; then fail "v is not back"
+        else ok; fi
+    fi
+else
+    skip_partial trash-kept-unpurgeable
+fi
+
+# 8f. An expired entry beside a damaged removal record named for its
+# worktree, which may be an earlier purge's: residue cannot tell, so the
+# purge keeps the entry, with a warning naming the record, and never
+# forgets that record. Two sweeps, each exit 0.
+if [ -z "$partial_probe" ]; then
+    name=trash-damaged-purge-record
+    make_repo
+    run remove --yes --json --trash "$wt"
+    entry=$(result 0 trash_entry)
+    [ "$status" = 0 ] && [ -d "$entry" ] || { echo "contract-check: setup failed in $name: remove --trash exit $status" >&2; exit 2; }
+    sed 's/^trashed [0-9]* .*/trashed 1767225600 2026-01-01T00:00:00Z/' "$entry/info" >"$work/$name.info" && cat "$work/$name.info" >"$entry/info" || exit 2
+    damaged=$repo/.git/residue-removed/w-20260601T000000Z
+    mkdir -p "$damaged" && printf 'not a record\n' >"$damaged/info" || exit 2
+    wrong=
+    for round in 1 2; do
+        run remove --all --yes --json --idle 30d "$repo"
+        if [ "$status" != 0 ]; then wrong+=" sweep $round: exit $status, want 0;"
+        elif [ "$(jq -r '[.purged[] | .result] | join(",")' "$out")" != kept ]; then wrong+=" sweep $round purged: $(jq -c '[.purged[] | {result, reason}]' "$out");"
+        elif ! jq -e '.purged[0].reason | contains("w-20260601T000000Z") and contains("cannot read")' "$out" >/dev/null; then wrong+=" sweep $round reason: $(jq -c '.purged[0].reason' "$out");"
+        elif ! jq -e '[.warnings[] | select(contains("kept the trash entry") and contains("w-20260601T000000Z"))] | length == 1' "$out" >/dev/null; then wrong+=" sweep $round warnings: $(jq -c .warnings "$out");"
+        elif [ "$(jq -c .errors "$out")" != "[]" ]; then wrong+=" sweep $round errors: $(jq -c .errors "$out");"
+        fi
+    done
+    if [ -n "$wrong" ]; then fail "$wrong"
+    elif [ "$(cat "$damaged/info" 2>/dev/null)" != "not a record" ]; then fail "the damaged record changed"
+    elif ! registered "$entry/w"; then fail "the trashed worktree is gone"
+    else ok; fi
+else
+    skip_partial trash-damaged-purge-record
 fi
 
 # 9. Stats: each removal, move into the trash, purge and restore adds a
@@ -1646,12 +1807,13 @@ layout_limited limited-past-cap 2 0 '*.log\n' \
 # --keep-trash 1m and --keep-removed 1m, and long expired now. Each case
 # needs a move into the trash and a removal, so a partial probe skips them.
 
-# Trash t and remove r (with --keep-removed 1m) in $repo, and say both
-# happened at AT, Unix seconds and RFC 3339.
+# Trash t (with --keep-trash 1m) and remove r (with --keep-removed 1m) in
+# $repo, each keeping 1m of its own, and say both happened at AT, Unix
+# seconds and RFC 3339.
 as_of_fixture() { # AT AT-RFC3339
     setup git -C "$repo" worktree add -q "$repo/.worktrees/t" -b t
     setup git -C "$repo" worktree add -q "$repo/.worktrees/r" -b r
-    run remove --yes --json --trash "$repo/.worktrees/t"
+    run remove --yes --json --trash --keep-trash 1m "$repo/.worktrees/t"
     entry=$(result 0 trash_entry)
     [ "$status" = 0 ] && [ -d "$entry" ] || { echo "contract-check: setup failed in $name: remove --trash t exit $status" >&2; exit 2; }
     run remove --yes --json --keep-removed 1m "$repo/.worktrees/r"
@@ -1769,6 +1931,43 @@ else
         elif [ -z "$partial_probe" ] && [ -e "$base/feat" ]; then fail "feat is still on disk"
         else ok; fi
     fi
+fi
+
+# 15b. A trash entry on the branch a bare repository's HEAD names is kept
+# like that branch's worktree: the purge's plan judges it as its re-check
+# does, so the entry stays, kept by `head`, and the run does not fail.
+# Once HEAD names another branch, the next sweep purges it.
+if [ -z "$partial_probe" ]; then
+    name=bare-head-trash
+    base=$work/$name
+    setup git init -q "$base/src"
+    echo hello >"$base/src/README.md"
+    setup git -C "$base/src" add .
+    setup git -C "$base/src" commit -qm init
+    setup git clone -q --bare "$base/src" "$base/repo.git"
+    setup git -C "$base/repo.git" worktree add -q "$base/main" main
+    setup git -C "$base/repo.git" worktree add -q "$base/feat" -b feat
+    run remove --yes --json --trash "$base/feat"
+    entry=$(result 0 trash_entry)
+    [ "$status" = 0 ] && [ -d "$entry" ] || { echo "contract-check: setup failed in $name: remove --trash exit $status" >&2; exit 2; }
+    sed 's/^trashed [0-9]* .*/trashed 1767225600 2026-01-01T00:00:00Z/' "$entry/info" >"$work/$name.info" && cat "$work/$name.info" >"$entry/info" || exit 2
+    setup git -C "$base/repo.git" symbolic-ref HEAD refs/heads/feat
+    run remove --all --yes --json --idle 30d "$base/repo.git"
+    if [ "$status" != 0 ]; then fail "exit $status, want 0"
+    elif [ "$(jq -r '[.purged[] | .result] | join(",")' "$out")" != kept ]; then fail "purged: $(jq -c '[.purged[] | {result, reason}]' "$out")"
+    elif [ "$(jq -r '[.purged[0].worktree.checks[] | select(.status != "pass") | .id] | join(",")' "$out")" != head ]; then fail "the entry's failing checks: $(jq -c '[.purged[0].worktree.checks[] | select(.status != "pass") | {id, detail}]' "$out")"
+    elif [ ! -f "$entry/feat/README.md" ]; then fail "the trashed worktree's files are gone"
+    else
+        setup git -C "$base/repo.git" symbolic-ref HEAD refs/heads/main
+        run remove --all --yes --json --idle 30d "$base/repo.git"
+        if [ "$status" != 0 ]; then fail "with HEAD on main again: exit $status, want 0"
+        elif [ "$(jq -r '[.purged[] | .result] | join(",")' "$out")" != purged ]; then fail "with HEAD on main again, purged: $(jq -c '[.purged[] | {result, reason}]' "$out")"
+        elif [ -e "$entry" ]; then fail "the entry is still there"
+        elif [ ! -f "$base/main/README.md" ]; then fail "main's files are gone"
+        else ok; fi
+    fi
+else
+    skip_partial bare-head-trash
 fi
 
 # 16. A process inside a worktree keeps it in use whatever bytes its path

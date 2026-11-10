@@ -126,7 +126,7 @@ residue remove --all --yes --idle 2d --keep-trash 7d ~/src
 
 `--all` treats each PATH as a scan root, the way `scan` does, and takes every candidate it finds. `--idle 2d` keeps every worktree that changed in the last two days. `remove --all --yes` refuses to run without `--idle`.
 
-`--idle` also turns on `--trash`: the sweep moves each candidate to [the trash](../README.md#the-trash) instead of deleting it, so a worktree it took by mistake comes back with `residue restore`. The same run purges the entries older than `--keep-trash`, seven days here, which is also the default. The purge is what frees the disk. A sweep that trashes frees nothing until its entries expire, so with a daily sweep a worktree leaves the disk between nine and eleven days after its last change. For the space sooner, lower `--keep-trash`, or pass `--no-trash` to delete at once.
+`--idle` also turns on `--trash`: the sweep moves each candidate to [the trash](../README.md#the-trash) instead of deleting it, so a worktree it took by mistake comes back with `residue restore`. The same run purges the entries older than `--keep-trash`, seven days here, which is also the default, and than the `--keep-trash` each was trashed with. The purge is what frees the disk. A sweep that trashes frees nothing until its entries expire, so with a daily sweep a worktree leaves the disk between nine and eleven days after its last change. For the space sooner, lower `--keep-trash`, or pass `--no-trash` to delete at once.
 
 ### Why `--idle` matters
 
@@ -250,4 +250,4 @@ journalctl --user -u residue.service       # the log
 
 ### Exit status of a sweep
 
-`remove --all` exits 0 when it moved every candidate to the trash (or removed it, with `--no-trash`), and purged every expired trash entry, including when there was none. A worktree it keeps does not make it fail, and neither does an expired entry it keeps because a check failed. It exits 3 when a candidate or an expired entry was skipped or failed, or when it could not read part of a PATH or a trash record. A removal record it could not read or forget never makes it fail: it prints a warning on stderr and lists it in JSON `warnings`, never in `errors`. The log names each one.
+`remove --all` exits 0 when it moved every candidate to the trash (or removed it, with `--no-trash`), and purged every expired trash entry, including when there was none. A worktree it keeps does not make it fail, and neither does an expired entry it keeps because a check failed. It exits 3 when a candidate or an expired entry was skipped or failed, or when it could not read part of a PATH or a trash record. A removal record it could not read or forget never makes it fail, nor does a trash entry it keeps because no purge can act on it: it prints a warning on stderr and lists it in JSON `warnings`, never in `errors`. The log names each one.

@@ -73,6 +73,13 @@
 #                  of the entry's worktree: after it read the removal
 #                  records, right before it moves the worktree back (4m,
 #                  4q)
+#   plant-at-record, reset-at-record, hold-at-record
+#                  at a purge's `update-ref` that writes its removal
+#                  record's refs, once the record's info is in place: add a
+#                  file to the trashed worktree's ignored node_modules/
+#                  (4t), move its HEAD back one commit (4u), or run it and
+#                  then stop, so the test can kill the purge before its
+#                  re-check (4v)
 #   hold-purge     stop a purge at `worktree remove` of its trash entry,
 #                  after it wrote its removal record (4d, 4l)
 #   stop-purge     at the same point, delete an ignored file and the
@@ -439,7 +446,28 @@ case " \$* " in
     case \$mode in *hold-add*) [ -e "\$work/at-add" ] || hold add ;; esac
     ;;
 *" update-ref "*)
-    case \$mode in *hold-update-ref*) [ -e "\$work/at-update-ref" ] || hold update-ref ;; esac
+    case \$mode in
+    *hold-update-ref*) [ -e "\$work/at-update-ref" ] || hold update-ref ;;
+    *-at-record*)
+        # A purge writing its removal record's refs: its info is in place
+        # in the records folder named in plant-records. In the worktree
+        # named in plant-in, add a file to its ignored node_modules/, or
+        # move its HEAD back one commit; or let the refs be written, then
+        # hold, so the test can stop the purge before its re-check.
+        if [ ! -e "\$work/touched" ] && ls "\$(cat "\$work/plant-records")"/*/info >/dev/null 2>&1; then
+            : >"\$work/touched"
+            case \$mode in
+            *plant-at-record*) echo new >"\$(cat "\$work/plant-in")/node_modules/b.js" || exit 1 ;;
+            *reset-at-record*) "\$real" -C "\$(cat "\$work/plant-in")" reset -q --hard HEAD~1 || exit 1 ;;
+            *hold-at-record*)
+                "\$real" "\$@" || exit
+                hold record
+                exit 0
+                ;;
+            esac
+        fi
+        ;;
+    esac
     ;;
 *" worktree list "*)
     case \$mode in
@@ -671,7 +699,8 @@ if [ -n "$partial_probe" ]; then
         opened-before-move restore-to-other-fs stale-no-index leftover-dotgit-kept restore-forget-race forget-restore-race \
         forget-before-restore-reads restore-forget-race-reftable stale-names-repair gone-aside-no-record \
         stale-keeps-reflog stale-keeps-reflog-reftable stale-keeps-same-name stale-locked-no-remove move-back-guard \
-        restore-raced-git-dir restore-move-stops-after-rename noflock-recreate noflock-kept; do
+        restore-raced-git-dir restore-move-stops-after-rename purge-change-at-record purge-reset-at-record \
+        purge-stopped-before-recheck noflock-recreate noflock-kept; do
         skip_partial "$scenario"
     done
     echo "recovery-check: $passes passed, $failures failed"
@@ -2285,6 +2314,136 @@ elif ! grep -qF "Git moved its files to " "$err" || ! grep -qF " worktree repair
 elif [ -z "$followed" ] || [ -n "$follow_failed" ]; then fail "the lines it names failed: ${follow_failed:-none named}"
 elif [ "$(record "$dest")" != registered ] || [ "$(sums "$dest")" != "$w_sum" ]; then fail "w is not back whole at the new path: $(record "$dest")"
 elif common_ok; then ok "the restore says Git moved the files and names the repair, which brings w back"; fi
+
+# --- 4t. A change while a purge writes its removal record -----------------
+# The purge writes its record before its re-check, as a removal writes its
+# record before its last check, so writing and syncing it is not part of
+# the time between that check and Git's delete. A file added to the
+# trashed w's ignored node_modules/ while the record is written is seen by
+# the re-check: the purge is skipped, naming node_modules/, its record is
+# undone, and w stays in the trash, whole and locked, with that file.
+name=purge-change-at-record
+make_repo
+: >"$work/mode"
+setup "$bin" remove --yes --json --trash "$wt"
+entry=$(find "$repo/.git/residue-trash" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+tinfo=$entry/info
+sed 's/^trashed [0-9]* .*/trashed 1767225600 2026-01-01T00:00:00Z/' "$tinfo" >"$work/$name.info" && cat "$work/$name.info" >"$tinfo" || exit 2
+echo "$entry/w" >"$work/plant-in"
+echo "$repo/.git/residue-removed" >"$work/plant-records"
+echo plant-at-record >"$work/mode"
+start "" remove --all --yes --json --idle 30d "$repo"
+finish "$pid"
+: >"$work/mode"
+out=$work/$name.out
+if [ ! -e "$work/touched" ]; then fail "the purge never wrote its record's refs (exit $status)"
+elif [ "$status" != 3 ]; then fail "exit $status, want 3"
+elif [ "$(jq -r '.purged[0].result' "$out")" != skipped ]; then fail "the purge's result is $(jq -r '.purged[0].result' "$out"), want skipped: $(jq -r '.purged[0].reason' "$out")"
+elif ! jq -r '.purged[0].reason' "$out" | grep -qF 'node_modules/'; then fail "the reason does not name node_modules/: $(jq -r '.purged[0].reason' "$out")"
+elif [ "$(cat "$entry/w/node_modules/b.js" 2>/dev/null)" != new ]; then fail "the file added while the record was written is gone"
+elif [ "$(record "$entry/w")" != "registered, locked residue: in trash" ]; then fail "w in the trash: $(record "$entry/w")"
+elif [ "$(records)" != "0 records, 0 refs" ]; then fail "removal records: $(records), want 0 records, 0 refs"
+elif common_ok; then ok "a file added while the purge wrote its record keeps w in the trash, and the record is undone"; fi
+
+# Trash w, set its record back to 2026-01-01, and name it for the
+# -at-record modes. Sets $entry.
+trash_w_expired() {
+    : >"$work/mode"
+    setup "$bin" remove --yes --json --trash "$wt"
+    entry=$(find "$repo/.git/residue-trash" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+    sed 's/^trashed [0-9]* .*/trashed 1767225600 2026-01-01T00:00:00Z/' "$entry/info" >"$work/$name.info" && cat "$work/$name.info" >"$entry/info" || exit 2
+    echo "$entry/w" >"$work/plant-in"
+    echo "$repo/.git/residue-removed" >"$work/plant-records"
+}
+
+# How many records `residue restore --json` lists, and what `residue
+# stats --json` counts as freed: "N records, M freed".
+listed_freed() {
+    local n m
+    n=$( (cd "$repo" && "$bin" restore --json 2>/dev/null) | jq '.removed | length')
+    m=$("$bin" stats --json 2>/dev/null | jq '.freed.all_time.worktrees')
+    echo "$n records, $m freed"
+}
+
+# --- 4u. HEAD moved back while a purge writes its removal record ----------
+# The re-check finds HEAD changed, and the record stays, since w no longer
+# holds the commit it keeps; the purge names it. The next purge finds that
+# record, which w still does not hold, and keeps the entry, naming that
+# record in removal_record, until it is restored, instead of writing a
+# second record for the same worktree: one record, nothing counted as
+# freed, w still in the trash.
+name=purge-reset-at-record
+make_repo
+rm -f "$XDG_STATE_HOME/residue/ledger.jsonl" "$HOME/Library/Application Support/residue/ledger.jsonl"
+trash_w_expired
+echo reset-at-record >"$work/mode"
+start "" remove --all --yes --json --idle 30d "$repo"
+finish "$pid"
+first=$status
+: >"$work/mode"
+out=$work/$name.out
+kept_at=$(jq -r '.purged[0].removal_record // empty' "$out")
+start ".again" remove --all --yes --json --idle 30d "$repo"
+finish "$pid"
+again=$status
+out2=$work/$name.out.again
+if [ ! -e "$work/touched" ]; then fail "the purge never wrote its record's refs (exit $first)"
+elif [ "$first" != 3 ] || [ "$(jq -r '.purged[0].result' "$out")" != skipped ]; then fail "the first purge: exit $first, $(jq -r '.purged[0].result' "$out"), want 3, skipped: $(jq -r '.purged[0].reason' "$out")"
+elif ! jq -r '.purged[0].reason' "$out" | grep -qF 'HEAD changed'; then fail "the first purge's reason: $(jq -r '.purged[0].reason' "$out")"
+elif [ -z "$kept_at" ] || [ ! -f "$kept_at/info" ]; then fail "the first purge does not name the record that stays: removal_record ${kept_at:-null}"
+elif [ "$again" != 0 ] || [ "$(jq -r '.purged[0].result' "$out2")" != kept ]; then fail "the next purge: exit $again, $(jq -r '.purged[0].result' "$out2"), want 0, kept: $(jq -r '.purged[0].reason' "$out2")"
+elif ! jq -r '.purged[0].reason' "$out2" | grep -qF "$(basename "$kept_at")" || ! jq -r '.purged[0].reason' "$out2" | grep -qF 'until you restore it'; then fail "the next purge does not name the earlier record, or say it stays until restored: $(jq -r '.purged[0].reason' "$out2")"
+elif [ "$(jq -r '.purged[0].removal_record // empty' "$out2")" != "$kept_at" ]; then fail "the next purge's removal_record is $(jq -r '.purged[0].removal_record' "$out2"), want $kept_at"
+elif [ "$(records)" != "1 records, 1 refs" ]; then fail "removal records: $(records), want 1 records, 1 refs"
+elif [ "$(listed_freed)" != "1 records, 0 freed" ]; then fail "restore and stats: $(listed_freed), want 1 records, 0 freed"
+elif [ "$(record "$entry/w")" != "registered, locked residue: in trash" ]; then fail "w in the trash: $(record "$entry/w")"
+elif [ "$(git -C "$repo" rev-parse -q --verify "refs/residue/removed/$(basename "$kept_at")")" != "$w_sha" ]; then fail "the record's ref does not keep w's commit"
+else ok "the record that stays is named, and the next purge keeps the entry: one record, nothing freed"; fi
+
+# --- 4v. A purge stopped after its record, before its re-check ------------
+# The record stays with w whole in the trash. The next purge forgets it,
+# since w holds all it keeps, then purges w with a record of its own: one
+# record for one worktree, counted once. A record is named for the second
+# it was written in, and a name a trash entry or record has is skipped, so
+# when both runs fall in one second the new record takes the name the
+# forgotten one had: each is told by its writer's PID, its `pid` line.
+name=purge-stopped-before-recheck
+make_repo
+rm -f "$XDG_STATE_HOME/residue/ledger.jsonl" "$HOME/Library/Application Support/residue/ledger.jsonl"
+trash_w_expired
+echo hold-at-record >"$work/mode"
+start "" remove --all --yes --json --idle 30d "$repo"
+if ! await "$work/at-record"; then
+    finish "$pid"
+    fail "the purge never wrote its record's refs (exit $status)"
+else
+    stopped_at=$(find "$repo/.git/residue-removed" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+    stopped_pid=$(sed -n 's/^pid //p' "$stopped_at/info" 2>/dev/null)
+    kill -TERM "$pid"
+    finish "$pid"
+    end_held record
+    ended=$?
+    : >"$work/mode"
+    between=$(records)
+    whole=$(sums "$entry/w")
+    start ".again" remove --all --yes --json --idle 30d "$repo"
+    finish "$pid"
+    again=$status
+    out2=$work/$name.out.again
+    new_at=$(jq -r '.purged[0].removal_record // empty' "$out2")
+    # Each record left, as NAME (pid PID).
+    left=$(for d in "$repo"/.git/residue-removed/*/; do [ -d "$d" ] && printf '%s (pid %s) ' "$(basename "$d")" "$(sed -n 's/^pid //p' "$d/info" 2>/dev/null)"; done)
+    if [ "$ended" != 0 ]; then fail "the held update-ref did not exit"
+    elif [ -z "$stopped_pid" ]; then fail "the stopped purge's record $(basename "$stopped_at") names no pid"
+    elif [ "$between" != "1 records, 1 refs" ] || [ "$whole" != "$w_sum" ]; then fail "after the stop: $between, w whole: $([ "$whole" = "$w_sum" ] && echo yes || echo no)"
+    elif [ "$again" != 0 ] || [ "$(jq -r '.purged[0].result' "$out2")" != purged ]; then fail "the next purge: exit $again, $(jq -r '.purged[0].result' "$out2"): $(jq -r '.purged[0].reason' "$out2")"
+    elif grep -qx "pid $stopped_pid" "$repo"/.git/residue-removed/*/info 2>/dev/null; then fail "the stopped purge's record (pid $stopped_pid) is still there; left: $left"
+    elif [ -z "$new_at" ] || [ ! -f "$new_at/info" ]; then fail "the next purge names no record of its own: ${new_at:-null}; left: $left"
+    elif [ "$(records)" != "1 records, 1 refs" ]; then fail "removal records: $(records), want 1 records, 1 refs; left: $left"
+    elif [ "$(listed_freed)" != "1 records, 1 freed" ]; then fail "restore and stats: $(listed_freed), want 1 records, 1 freed"
+    elif [ -n "$(ls -A "$repo/.git/residue-trash" 2>/dev/null)" ]; then fail "the trash entry is left: $(ls -A "$repo/.git/residue-trash")"
+    elif common_ok; then ok "the next purge forgets the stopped purge's record $(basename "$stopped_at") (pid $stopped_pid) and leaves one of its own, counted once: $left"; fi
+fi
 
 # --- 5. git worktree remove fails part way ----------------------------------
 # Git deletes the checkout, then its own directory for the worktree, each

@@ -8,8 +8,8 @@
 # the races between them left out; and a removal or a purge by a release
 # that takes no hold, stopped with its Git or killed alone while its Git
 # goes on), then runs each mutant in
-# model/mutants, a model with one guard of the code removed, which must
-# fail its rule. The result must match model/expected: every rule holds
+# model/mutants, a model with one guard of the code removed (or two,
+# named A+B), which must fail its rule. The result must match model/expected: every rule holds
 # except the known breaks listed there, each with its shortest path.
 #
 # Exit status: 0 the result matches model/expected, 1 it does not, 2 the
@@ -214,7 +214,26 @@ while read -r mutant start faults off rule old late; do
     failed=1
     continue
   fi
-  result=$(tlc "$start" "$faults" "$off" "{}" "$old" "$late" "{\"$mutant\"}" "$rule" 2>"$work/last")
+  # A+B removes both guards: for two that each keep the rule alone. Each
+  # alone must leave it holding, or the pair shows nothing new.
+  case $mutant in
+    *+*)
+      alone=ok
+      for part in ${mutant//+/ }; do
+        single=$(tlc "$start" "$faults" "$off" "{}" "$old" "$late" "{\"$part\"}" "$rule" 2>"$work/last")
+        case $single in
+          holds*) ;;
+          "breaks $rule"*)
+            echo "mutant $mutant: $part alone already breaks $rule ($single), so the pair shows nothing"
+            failed=1 alone=no ;;
+          *) echo "mutant $mutant, $part alone: $single (output: $(cat "$work/last"))" >&2; exit 2 ;;
+        esac
+      done
+      [ "$alone" = ok ] || continue
+      echo "mutant $mutant: each alone leaves $rule holding"
+      ;;
+  esac
+  result=$(tlc "$start" "$faults" "$off" "{}" "$old" "$late" "{\"${mutant//+/\",\"}\"}" "$rule" 2>"$work/last")
   case $result in
     "breaks $rule"*) echo "mutant $mutant: caught by $rule" ;;
     holds*) echo "mutant $mutant: NOT caught, $rule still holds"; failed=1 ;;

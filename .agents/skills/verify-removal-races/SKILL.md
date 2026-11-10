@@ -68,11 +68,11 @@ The faults: a kill of residue with its Git child (Ctrl-C), the 30-minute Git tim
 | Remove orphan | rm, rr, user | orphaning kill | 3,722 |
 | Remove unraced | rm, user | kill, orphaning kill | 743 |
 | Remove after | rm, then rr, user | kill, timeout | 3,479 |
-| Trash no-faults | pg, tr, rr, user | none | 48,509 |
-| Trash faults | pg, tr, rr, user | kill, timeout | 241,272 |
-| Trash orphan | pg, tr, rr, user | orphaning kill | 83,465 |
-| Trash unraced | pg, rr, user | kill, orphaning kill | 10,848 |
-| Trash after | pg, then tr and rr, user | kill, timeout | 52,660 |
+| Trash no-faults | pg, tr, rr, user | none | 52,993 |
+| Trash faults | pg, tr, rr, user | kill, timeout | 260,428 |
+| Trash orphan | pg, tr, rr, user | orphaning kill | 89,567 |
+| Trash unraced | pg, rr, user | kill, orphaning kill | 11,112 |
+| Trash after | pg, then tr and rr, user | kill, timeout | 54,202 |
 | Remove old | rm of a release that takes no hold, rr, user | kill, timeout | 10,591 |
 | Trash old | pg of a release that takes no hold, tr, rr, user | kill, timeout | 496,086 |
 | Remove old-orphan | rm of a release that takes no hold, rr, user | orphaning kill | 5,312 |
@@ -100,14 +100,14 @@ Run the check for a change to any function in this table, or for one that adds a
 | `RVerify` | `remove.rs` `verify_moved` |
 | `PBCheck`, `PBUnlock`, `PBMove`, `PBStuck` | `remove.rs` `Moved::put_back`, `Moved::stuck` |
 | `RSettle`, `PSettle` | `remove.rs` `settle`, `standing`, `Files` |
-| `PHold`, `PRecheck`, `PRecord`, `PAfter`, `PRelock` | `remove.rs` `purge`: `hold::take(trash::info)`, `recheck(path, ours = trash::LOCK)`, `removed::create` |
+| `PHold`, `PRecord`, `PRecheck`, `PUndo`, `PAfter`, `PRelock` | `remove.rs` `purge`: `hold::take(trash::info)`, `removed::create`, `recheck(path, ours = trash::LOCK)`, and `settle` with `standing` and no `Files` when the re-check fails; after `git::remove_worktree`, `trash::discard`, whose result does not change the outcome once Git deleted the worktree. A purge in Old re-checks before it writes its record, as 0.0.10 did (`PFirst`). Its step between the hold and the record, `removed::settle_before_purge` over `stopped_purges` (said through `Unsettled::purge_text`), acts only on a record an earlier purge left, which no setup has |
 | `PUnlock` | `trash.rs` `purge(item, registered, holds)` |
 | `StartGit` | `git.rs` `remove_worktree(main, path, holds)`, `hold.rs` `pass_to` |
 | `GFind`, `GExists`, `GStatus`, `GTree`, `GGitdir` | Git's `remove_worktree`, run by `git.rs` `remove_worktree` |
 | `GitTimeout` | `git.rs` `REMOVE_TIMEOUT` and `run.rs` `stop` |
 | `Kill`, `Orphan` | No code: residue stopped with its Git child, or alone (`run.rs` `stop` on watch's 30-minute deadline for its `residue remove` kills that PID alone); the kernel frees a hold once every process that has it has exited |
 | `TList`, `SList` | `restore.rs` `gather`, `choose` |
-| `THold`, `TOpen`, `TLock`, `TRead`, `TLift` | `trash.rs` `take`; `restore.rs` `restore_trash`: `keep_open`, `git::worktrees`, `git::lock_worktree(trash::LOCK)` when Git lists it unlocked, `lift`, `removed::stopped_purges` and its `refuse_unheld`: `unheld`, `process::removing`, `process::started` |
+| `THold`, `TOpen`, `TLock`, `TRead`, `TLift` | `trash.rs` `take`; `restore.rs` `restore_trash`: `keep_open`, `git::worktrees`, `git::lock_worktree(trash::LOCK)` when Git lists it unlocked, `lift`, `removed::stopped_purges` and its `unheld_refusal`: `unheld`, `process::removing`, `process::started`, said through `Unsettled::restore_text` |
 | `TCheck`, `TUnlock`, `TMove`, `TRelock` | `restore.rs` `restore_trash`'s refusal when a stopped purge left no files or files Git cannot use (`holds_worktree`, `remove::unusable`); `trash.rs` `restore(item, to, listed, held)`: `holds_worktree`, `was_locked` |
 | `TDiscard` | `trash.rs` `discard` |
 | `TForget` | `removed.rs` `after_trash_restore`, `finish`; `restore.rs` `settle_trash`: `removed::raced_purges` after the move |
@@ -132,7 +132,7 @@ In check.sh's output:
 - `mutant NAME: NOT caught` means the model no longer depends on that guard of the code.
 - `no control` means the mutant's rule already breaks in its setup without the mutant, so the line shows nothing.
 
-Each mutant in `model/mutants` removes one guard the code has, to show that a rule depends on it:
+Each mutant in `model/mutants` removes one guard the code has, to show that a rule depends on it. `A+B` removes two, for a guard a rule needs only once another is gone:
 
 | Mutant | The guard it removes | Rule that breaks |
 | --- | --- | --- |
@@ -144,8 +144,8 @@ Each mutant in `model/mutants` removes one guard the code has, to show that a ru
 | `StandingIgnoresFiles` | `standing`'s comparison of the files with the plan's once Git ran (`Files`) | `RecordDroppedOnlyWhenWhole` |
 | `MoveBackNoNote` | `move_back`'s "part of it is gone" note | `RestoreTellsTheTruth` |
 | `PutBackAlwaysUnlocks` | `Moved::put_back(locked)`: unlock only a lock residue set | `OnlyOwnLocksLifted` |
-| `PurgeNoHold` | the purge's `hold::take` on the entry | `NotDeletedOnceBack` |
-| `TrashRestoreNoHold` | `trash::take` in `restore_trash` | `NotDeletedOnceBack` |
+| `PurgeNoHold+TrashRestoreNoUse` | the purge's `hold::take` on the entry, and the trash restore's open `.git` | `NotDeletedOnceBack` |
+| `TrashRestoreNoHold+TrashRestoreNoUse` | `trash::take` in `restore_trash`, and its open `.git` | `NotDeletedOnceBack` |
 | `RestoreNoHold` | `removed.rs` `take` in `restore` | `NotDeletedOnceBack` |
 | `GitNoHold` | `hold::pass_to` in `git::remove_worktree`: Git inherits the holds | `NotDeletedOnceBack` |
 | `TrashRestoreStale` | `trash::restore` reading the lock from Git's list under the hold, not the listing's | `OnlyOwnLocksLifted` |
@@ -229,11 +229,14 @@ Its second review added the old-orphan setups. For a record without a `hold` lin
 
 Its third review added the trash restore's open `.git`, its lock of a worktree Git lists unlocked, its second read of the records once the worktree has moved, and the note of a record restore whose purge's worktree is already back, each with a mutant. In the old setups the trash restore now races the purge throughout, outside the window `LatePurge` names. Every rule holds in all fourteen setups.
 
+A purge writes its removal record before its re-check, as a removal writes its record before its last check, so writing and syncing the record does not lengthen the time between that check and Git's delete. The model has no clock, so no rule shows that time; what it shows is that the new order breaks no rule, that a re-check that fails after the record settles the record as a removal does (`PUndo`), and that the entry's holds are no longer the only guard against a trash restore: a restore that a missing hold lets in either finds the purge's record held and refuses, or opened the worktree's `.git` before that record, which the re-check then sees as a use. So `PurgeNoHold` and `TrashRestoreNoHold` are each checked with `TrashRestoreNoUse` too, and both holds stay in the code. A purge by a release that takes no hold keeps its old order in the model (`PFirst`).
+
 ## Not covered
 
 - `remove --trash` moving a worktree into the trash, and clearing empty records or forgetting them after `--keep-removed`.
 - `residue watch`'s decisions, the service, and how the restored mark changes later runs.
-- Two remove runs at once, and `restore --to`.
+- Two remove runs at once, and `restore --to`: so also two purges of one entry at once, and a purge after an earlier one of the same entry stopped, which settles that purge's record first (`removed::settle_before_purge`; `scripts/recovery-check.sh` `purge-reset-at-record` and `purge-stopped-before-recheck` check it on the real code).
+- A trash restore that a purge's activity probe cannot see, such as one another user runs, which a probe that is not root does not list. The re-check then misses the restore's open `.git` (`TrUses`), and only the holds keep the two apart; the `PurgeNoHold+TrashRestoreNoUse` and `TrashRestoreNoHold+TrashRestoreNoUse` mutants are that case.
 - Symbolic links, path canonicalization, and moves across filesystems.
 - The stats ledger and the Mac app.
 - Reftable repositories, and branches others move during a run.

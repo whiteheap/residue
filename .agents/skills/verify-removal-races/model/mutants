@@ -1,4 +1,6 @@
-# One mutant per line: the guard it removes (Mut("NAME") in Removal.tla),
+# One mutant per line: the guard it removes (Mut("NAME") in Removal.tla;
+# A+B removes two that each keep the rule alone, and check.sh checks that
+# each alone leaves it holding),
 # the setup (Start, the Faults set, the actors that do not run; After is
 # always {}), the rule that must break, and, when the setup has them, the
 # actors of a release that takes no hold (Old) and the trash restores
@@ -18,8 +20,12 @@ StandingIgnoresFiles       orig   {"timeout"}  {}      RecordDroppedOnlyWhenWhol
 StandingIgnoresFiles       trash  {"timeout"}  {}      RecordDroppedOnlyWhenWhole
 MoveBackNoNote             orig   {"kill"}     {}      RestoreTellsTheTruth
 PutBackAlwaysUnlocks       orig   {}           {"rr"}  OnlyOwnLocksLifted
-PurgeNoHold                trash  {}           {}      NotDeletedOnceBack
-TrashRestoreNoHold         trash  {}           {}      NotDeletedOnceBack
+# Since the purge writes its record before its re-check, a trash restore
+# that a missing entry hold lets in either finds that record held and
+# refuses, or opened the worktree's .git first, which the re-check sees as
+# a use. So each hold is checked with that open .git gone too.
+PurgeNoHold+TrashRestoreNoUse        trash  {}  {}  NotDeletedOnceBack
+TrashRestoreNoHold+TrashRestoreNoUse trash  {}  {}  NotDeletedOnceBack
 RestoreNoHold              orig   {"orphan"}   {}      NotDeletedOnceBack
 GitNoHold                  orig   {"orphan"}   {}      NotDeletedOnceBack
 GitNoHold                  trash  {"orphan"}   {}      NotDeletedOnceBack

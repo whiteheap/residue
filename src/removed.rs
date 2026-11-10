@@ -191,6 +191,20 @@ pub struct Keep {
     pub text: String,
 }
 
+impl Keep {
+    /// The value of a `keep` line, `SECONDS TEXT` with SECONDS above zero;
+    /// `None` for anything else. A trash entry's `info` keeps it the same
+    /// way.
+    pub fn parse(value: &str) -> Option<Keep> {
+        let (seconds, shown) = value.split_once(' ').filter(|(_, s)| !s.is_empty())?;
+        let seconds = seconds.parse::<i64>().ok().filter(|s| *s > 0)?;
+        Some(Keep {
+            seconds,
+            text: shown.to_string(),
+        })
+    }
+}
+
 /// An ignored entry the deletion took, as the plan measured it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Gone {
@@ -404,18 +418,7 @@ impl Record {
                 b"by" => record.by = Some(text()),
                 b"removed" => removed = Some(number("removed")?),
                 b"keep" => {
-                    let t = text();
-                    let keep = t
-                        .split_once(' ')
-                        .filter(|(_, shown)| !shown.is_empty())
-                        .and_then(|(seconds, shown)| {
-                            let seconds = seconds.parse::<i64>().ok().filter(|s| *s > 0)?;
-                            Some(Keep {
-                                seconds,
-                                text: shown.to_string(),
-                            })
-                        });
-                    record.keep = Some(keep.ok_or("keep is not SECONDS DURATION")?);
+                    record.keep = Some(Keep::parse(&text()).ok_or("keep is not SECONDS DURATION")?);
                 }
                 b"allocated" => record.allocated = number("allocated")?.try_into().ok(),
                 b"reclaimable" => record.reclaimable = number("reclaimable")?.try_into().ok(),
@@ -707,36 +710,193 @@ fn refuse_unheld(
     registered: &Entry,
     what: &str,
 ) -> Result<(), String> {
-    let found = unheld(item, record, registered, None);
-    let release = record
-        .version
-        .as_deref()
-        .map_or("an older residue".to_string(), |v| {
-            format!("residue {}", output::clean(v))
-        });
-    Err(match found {
-        Ok(None) => return Ok(()),
-        // A PID may be reused: when it alone keeps the worktree, the move
-        // back by hand is named for when it is not residue.
-        Ok(Some(Unheld::Writer(pid, true))) => format!(
-            "{release} wrote {what}, takes no hold, and its process {pid} still runs, so it may still be deleting the worktree; run this restore again once it ends; if `ps -p {pid}` shows it is not residue, this moves it back: {}",
-            move_back_line(&item.command_dir, registered, &record.original)
-        ),
-        Ok(Some(Unheld::Writer(pid, false))) => format!(
-            "{release} wrote {what}, takes no hold, and its process {pid} still runs, so it may still be deleting the worktree; run this restore again once it ends; `ps -p {pid}` shows what it is"
-        ),
-        Ok(Some(Unheld::Git(pid))) => format!(
-            "{release} wrote {what} and takes no hold, and process {pid}, a `git worktree remove` of the worktree, still runs, so it may still be deleting it; run this restore again once it ends; `ps -p {pid}` shows what it is"
-        ),
-        Ok(Some(Unheld::Using(pid, command))) => format!(
-            "{release} wrote {what} and takes no hold, and process {pid} ({}) is using the worktree or its Git directory, so it may still be deleting it; run this restore again once it ends",
-            output::clean(&command)
-        ),
-        Err(e) => format!(
-            "{release} wrote {what} and takes no hold, and residue cannot tell whether anything still deletes the worktree ({e}), so it changed nothing; once nothing can, such as after a restart, this moves it back: {}",
-            move_back_line(&item.command_dir, registered, &record.original)
-        ),
+    match unheld_refusal(item, record, registered, what) {
+        None => Ok(()),
+        Some(unsettled) => Err(unsettled.restore_text()),
+    }
+}
+
+/// What keeps a restore or a purge off the worktree of `record`, which a
+/// release that takes no hold wrote, while something may still delete it
+/// (`unheld`); `None` when nothing can. Each caller words it.
+fn unheld_refusal(
+    item: &Item,
+    record: &Record,
+    registered: &Entry,
+    what: &str,
+) -> Option<Unsettled> {
+    let found = match unheld(item, record, registered, None) {
+        Ok(None) => return None,
+        Ok(Some(found)) => Ok(found),
+        Err(e) => Err(e),
+    };
+    Some(Unsettled::Unheld {
+        what: what.to_string(),
+        release: record
+            .version
+            .as_deref()
+            .map_or("an older residue".to_string(), |v| {
+                format!("residue {}", output::clean(v))
+            }),
+        found,
+        move_back: move_back_line(&item.command_dir, registered, &record.original),
     })
+}
+
+/// Why `stopped_purges` found that a purge of the entry may not have
+/// stopped, or could not tell, before anything changed. A restore says it
+/// one way (`restore_text`), a purge another (`purge_text`).
+pub enum Unsettled {
+    /// A process holds `what`, a purge's record, at `info`; `pid` is the
+    /// one the record names.
+    Held {
+        what: String,
+        info: PathBuf,
+        pid: Option<u32>,
+    },
+    /// `what` comes from `release`, which takes no hold, and something may
+    /// still delete the worktree (`found`), or residue cannot tell; the
+    /// move back by hand is `move_back`.
+    Unheld {
+        what: String,
+        release: String,
+        found: Result<Unheld, String>,
+        move_back: String,
+    },
+    /// The record `name` may be one of this entry's purges, and cannot be
+    /// read (`error`); `why` residue cannot set it by.
+    Unreadable {
+        name: String,
+        error: String,
+        why: Unread,
+    },
+    /// What residue could not read or take, in words for any caller.
+    Error(String),
+}
+
+/// Why an unreadable record that may be a purge's of the entry stops it.
+pub enum Unread {
+    /// A process holds it, at this `info`.
+    Held(PathBuf),
+    /// Something may still delete the worktree: this.
+    Deleting(String),
+    /// No record that can be read names the worktree, so this one may be
+    /// its purge's; the line that sets it aside, keeping its files and refs.
+    NotNamed(String),
+}
+
+impl Unsettled {
+    /// Whether it ends without a person: a process that holds a record, or
+    /// may still delete the worktree, ends. An unreadable record that no
+    /// readable one explains stays until someone reads or sets it aside.
+    pub fn passes(&self) -> bool {
+        !matches!(
+            self,
+            Unsettled::Unreadable {
+                why: Unread::NotNamed(_),
+                ..
+            }
+        )
+    }
+
+    fn cannot(name: &str, error: &str) -> String {
+        format!(
+            "residue cannot read the removal record {name} ({error}), so it cannot tell whether a purge of this entry stopped partway, or still runs"
+        )
+    }
+
+    /// What a restore says, having changed nothing.
+    pub fn restore_text(&self) -> String {
+        match self {
+            Unsettled::Held { what, info, pid } => busy_note_of(*pid, info, what),
+            Unsettled::Unheld {
+                what,
+                release,
+                found,
+                move_back,
+            } => match found {
+                // A PID may be reused: when it alone keeps the worktree, the
+                // move back by hand is named for when it is not residue.
+                Ok(Unheld::Writer(pid, true)) => format!(
+                    "{release} wrote {what}, takes no hold, and its process {pid} still runs, so it may still be deleting the worktree; run this restore again once it ends; if `ps -p {pid}` shows it is not residue, this moves it back: {move_back}"
+                ),
+                Ok(Unheld::Writer(pid, false)) => format!(
+                    "{release} wrote {what}, takes no hold, and its process {pid} still runs, so it may still be deleting the worktree; run this restore again once it ends; `ps -p {pid}` shows what it is"
+                ),
+                Ok(Unheld::Git(pid)) => format!(
+                    "{release} wrote {what} and takes no hold, and process {pid}, a `git worktree remove` of the worktree, still runs, so it may still be deleting it; run this restore again once it ends; `ps -p {pid}` shows what it is"
+                ),
+                Ok(Unheld::Using(pid, command)) => format!(
+                    "{release} wrote {what} and takes no hold, and process {pid} ({}) is using the worktree or its Git directory, so it may still be deleting it; run this restore again once it ends",
+                    output::clean(command)
+                ),
+                Err(e) => format!(
+                    "{release} wrote {what} and takes no hold, and residue cannot tell whether anything still deletes the worktree ({e}), so it changed nothing; once nothing can, such as after a restart, this moves it back: {move_back}"
+                ),
+            },
+            Unsettled::Unreadable { name, error, why } => {
+                let cannot = Self::cannot(name, error);
+                match why {
+                    Unread::Held(info) => format!(
+                        "{cannot}, and a process holds that record (`lsof {}` names it); residue changed nothing; run this restore again once that process ends",
+                        output::shell(info)
+                    ),
+                    Unread::Deleting(why) => {
+                        format!("{cannot}, and {why}; residue changed nothing")
+                    }
+                    Unread::NotNamed(line) => format!(
+                        "{cannot}; residue changed nothing; if that record is not about this entry, `{line}` sets it aside, keeping its files and refs"
+                    ),
+                }
+            }
+            Unsettled::Error(e) => e.clone(),
+        }
+    }
+
+    /// What a purge says as it leaves the entry in the trash.
+    pub fn purge_text(&self) -> String {
+        let again = "a later remove run tries the purge again";
+        match self {
+            Unsettled::Held { what, info, .. } => format!(
+                "a residue run, or the `git worktree remove` it started, still holds {what} (`lsof {}` names it): it may still be deleting the worktree, or restoring or forgetting the record; {again} once that ends",
+                output::shell(info)
+            ),
+            Unsettled::Unheld {
+                what,
+                release,
+                found,
+                ..
+            } => match found {
+                Ok(Unheld::Writer(pid, _)) => format!(
+                    "{release} wrote {what}, takes no hold, and its process {pid} still runs, so it may still be deleting the worktree; {again} once it ends; `ps -p {pid}` shows what it is"
+                ),
+                Ok(Unheld::Git(pid)) => format!(
+                    "{release} wrote {what} and takes no hold, and process {pid}, a `git worktree remove` of the worktree, still runs, so it may still be deleting it; {again} once it ends"
+                ),
+                Ok(Unheld::Using(pid, command)) => format!(
+                    "{release} wrote {what} and takes no hold, and process {pid} ({}) is using the worktree or its Git directory, so it may still be deleting it; {again} once it ends",
+                    output::clean(command)
+                ),
+                Err(e) => format!(
+                    "{release} wrote {what} and takes no hold, and residue cannot tell whether anything still deletes the worktree ({e}); {again}"
+                ),
+            },
+            Unsettled::Unreadable { name, error, why } => {
+                let cannot = Self::cannot(name, error);
+                match why {
+                    Unread::Held(info) => format!(
+                        "{cannot}, and a process holds that record (`lsof {}` names it); {again} once that process ends",
+                        output::shell(info)
+                    ),
+                    Unread::Deleting(why) => format!("{cannot}, and {why}; {again} once that ends"),
+                    Unread::NotNamed(line) => format!(
+                        "{cannot}, so the entry stays until that record can be read; if it is not about this entry, `{line}` sets it aside, keeping its files and refs"
+                    ),
+                }
+            }
+            Unsettled::Error(e) => e.clone(),
+        }
+    }
 }
 
 /// The commands that move the worktree Git lists at `registered` back to
@@ -866,8 +1026,13 @@ fn choose(item: &Item, record: &Record, listed: &[Entry]) -> Result<Choice, Stri
 /// program that Git started, or another run that restores or forgets the
 /// record, and `lsof` names it.
 fn busy_note(record: Option<&Record>, info: &Path, what: &str) -> String {
+    busy_note_of(record.and_then(|r| r.pid), info, what)
+}
+
+/// [`busy_note`] for the record that names `pid`.
+fn busy_note_of(pid: Option<u32>, info: &Path, what: &str) -> String {
     let lsof = format!("`lsof {}` names it", output::shell(info));
-    match record.and_then(|r| r.pid) {
+    match pid {
         Some(pid) if !crate::remove::running(pid) => format!(
             "the residue run that wrote {what} (process {pid}) has exited, but another process still holds it ({lsof}): the `git worktree remove` it started, or a program that Git started, may still be deleting the worktree, or another residue run is restoring or forgetting the record; run this restore again once that process ends"
         ),
@@ -1104,10 +1269,10 @@ pub fn stopped_purges(
     original: &Path,
     trashed: i64,
     listed: &[Entry],
-) -> Result<Vec<(Item, Hold)>, String> {
+) -> Result<Vec<(Item, Hold)>, Unsettled> {
     let listed: Vec<&Entry> = listed.iter().collect();
     let aside_now = git::canonical(aside).ok();
-    let items = list(common_dir, command_dir, &listed, &[])?;
+    let items = list(common_dir, command_dir, &listed, &[]).map_err(Unsettled::Error)?;
     let ours = |item: &Item| {
         item.interrupted()
             && item
@@ -1126,23 +1291,20 @@ pub fn stopped_purges(
         if !item.may_be_unreadable_for(original) || before {
             continue;
         }
-        let e = item.record.as_ref().err().map_or("", String::as_str);
-        let cannot = format!(
-            "residue cannot read the removal record {} ({e}), so it cannot tell whether a purge of this entry stopped partway, or still runs",
-            item.name
-        );
+        let unreadable = |why: Unread| Unsettled::Unreadable {
+            name: item.name.clone(),
+            error: item.record.as_ref().err().cloned().unwrap_or_default(),
+            why,
+        };
         let info = item.dir.join(INFO);
-        match hold::take(&info)? {
-            Taken::Busy => {
-                return Err(format!(
-                    "{cannot}, and a process holds that record (`lsof {}` names it); residue changed nothing; run this restore again once that process ends",
-                    output::shell(&info)
-                ));
-            }
+        match hold::take(&info).map_err(Unsettled::Error)? {
+            Taken::Busy => return Err(unreadable(Unread::Held(info))),
             Taken::Held(_) => {}
             // Forgotten since the listing.
             Taken::Gone => continue,
-            Taken::Unsupported(why) => return Err(unsupported_note(&why, None)),
+            Taken::Unsupported(why) => {
+                return Err(Unsettled::Error(unsupported_note(&why, None)));
+            }
         }
         // Its release, and so whether a free hold shows its run, is
         // unknown: a `git worktree remove` of the worktree refuses too, and
@@ -1158,13 +1320,10 @@ pub fn stopped_purges(
             Err(e) => Some(e),
         };
         if let Some(why) = deleting.or_else(|| foreign(&info).err()) {
-            return Err(format!("{cannot}, and {why}; residue changed nothing"));
+            return Err(unreadable(Unread::Deleting(why)));
         }
         if !named {
-            return Err(format!(
-                "{cannot}; residue changed nothing; if that record is not about this entry, `{}` sets it aside, keeping its files and refs",
-                item.set_aside_line()
-            ));
+            return Err(unreadable(Unread::NotNamed(item.set_aside_line())));
         }
     }
     for item in items {
@@ -1173,20 +1332,110 @@ pub fn stopped_purges(
         }
         let info = item.dir.join(INFO);
         let what = format!("{}, the removal record of a purge of this entry", item.name);
-        match hold::take(&info)? {
+        match hold::take(&info).map_err(Unsettled::Error)? {
             Taken::Held(hold) => {
                 if let (Ok(record), Some(registered)) = (&item.record, &item.registered) {
-                    refuse_unheld(&item, record, registered, &what)?;
+                    if let Some(unsettled) = unheld_refusal(&item, record, registered, &what) {
+                        return Err(unsettled);
+                    }
                 }
                 stopped.push((item, hold));
             }
-            Taken::Busy => return Err(busy_note(item.record.as_ref().ok(), &info, &what)),
+            Taken::Busy => {
+                return Err(Unsettled::Held {
+                    pid: item.record.as_ref().ok().and_then(|r| r.pid),
+                    what,
+                    info,
+                });
+            }
             // Forgotten since the listing: nothing of it is left to settle.
             Taken::Gone => {}
-            Taken::Unsupported(why) => return Err(unsupported_note(&why, None)),
+            Taken::Unsupported(why) => {
+                return Err(Unsettled::Error(unsupported_note(&why, None)));
+            }
         }
     }
     Ok(stopped)
+}
+
+/// Before a purge of the trash worktree at `path` writes its own record:
+/// the records of earlier purges of the same entry that Git still lists
+/// there (`stopped_purges`, each held), which a purge stopped before or
+/// while its Git ran leaves, or one whose re-check failed after something
+/// changed what the record keeps. A record whose worktree still holds all
+/// it keeps (`still_holds`) is forgotten: the purge's own record keeps the
+/// same, so one worktree has one record. Any other stays, and so does the
+/// entry, at `entry`, until it is restored: the error says why, and names
+/// that record.
+pub fn settle_before_purge(
+    stopped: Vec<(Item, Hold)>,
+    path: &Path,
+    entry: &Path,
+) -> Result<(), (String, PathBuf)> {
+    let restore = output::shell(entry);
+    for (item, _held) in stopped {
+        let lacks = item
+            .record
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|record| still_holds(&item, record, path));
+        if let Some(why) = lacks.unwrap_or_else(Some) {
+            return Err((
+                format!(
+                    "the removal record {} of an earlier purge of this entry stays, since {why}, so the entry stays until you restore it: residue restore {restore}",
+                    item.name
+                ),
+                item.dir,
+            ));
+        }
+        if let Err(e) = forget(&item) {
+            return Err((
+                format!(
+                    "could not forget {}, the removal record of an earlier purge of this entry ({e}), so the entry stays until a later remove run forgets it, or you restore it: residue restore {restore}",
+                    item.name
+                ),
+                item.dir,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// What the worktree at `path`, still where the record's purge started,
+/// lacks of what the record keeps, or `None`: its HEAD contains the
+/// recorded HEAD, its HEAD reflog names every commit the record's refs
+/// keep, as Git reads it (`unnamed_kept`), and its config.worktree is the
+/// record's copy, when the record has one.
+fn still_holds(item: &Item, record: &Record, path: &Path) -> Result<Option<String>, String> {
+    let short = |c: &str| c[..c.len().min(12)].to_string();
+    let now = git::commit_of(path, "HEAD")?.ok_or("it has no HEAD commit")?;
+    if !git::is_ancestor(path, &record.head, &now)? {
+        return Ok(Some(format!(
+            "the worktree's HEAD {} does not contain the recorded HEAD {}",
+            short(&now),
+            short(&record.head)
+        )));
+    }
+    let missing = unnamed_kept(record, path, &item.command_dir)?.len();
+    if missing > 0 {
+        return Ok(Some(format!(
+            "the worktree's HEAD reflog does not name {missing} of the commits the record keeps"
+        )));
+    }
+    let (config, _) = read_copies(item)?;
+    if let Some(copy) = config.map_err(|e| format!("its copy of config.worktree: {e}"))? {
+        let at = git::identity(path)?.git_dir.join(CONFIG);
+        match fs::read(&at) {
+            Ok(now) if now == copy => {}
+            Ok(_) => {
+                return Ok(Some(
+                    "the worktree's config.worktree differs from the record's copy".into(),
+                ));
+            }
+            Err(e) => return Ok(Some(format!("cannot read {}: {e}", at.display()))),
+        }
+    }
+    Ok(None)
 }
 
 /// The names of the records of purges of the trash worktree at any of
@@ -2169,9 +2418,7 @@ fn clear_purged(
     if entry_hold.is_none() {
         return Ok(None);
     }
-    Ok(crate::trash::discard(entry)
-        .err()
-        .map(|e| format!("its trash entry stays ({e}); the next remove run clears it")))
+    Ok(crate::trash::discard(entry).err().map(|stays| stays.note()))
 }
 
 /// After `residue restore ENTRY` moved a trash entry's worktree to `path`:
