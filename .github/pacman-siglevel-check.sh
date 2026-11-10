@@ -6,13 +6,21 @@
 #   sh pacman-siglevel-check.sh check INSTALL_SH   # after its dry run and first run
 #
 # seed adds a [residue] section as an older install.sh and the docs wrote it,
-# with no SigLevel. check then shows that the dry run named the change and
-# made none; that the run put SigLevel = Required DatabaseRequired under that
-# header, once, changed nothing else and kept the file as it was; that a
-# second run changes nothing; that a SigLevel of the user's own is left alone,
-# with a note; that pacman takes an unsigned residue.db under the old section
-# and refuses it under the new one; and that a fresh install writes the
-# section with the line. The dry run's output is in /tmp/dry.log.
+# with no SigLevel. check then shows, as pacman-conf reads each file:
+# - the dry run named the change and made none; the run put SIGLEVEL under
+#   that header, once, changed nothing else, and kept the file as it was;
+# - a second run changes nothing;
+# - an older backup is kept, and the next one gets a free name;
+# - a SigLevel of the user's own, two [residue] sections, an Include that
+#   sets a SigLevel, and a pacman.conf that is a link are left alone, each
+#   with a note;
+# - on the stock Arch layout, where [extra] is the last section, a header
+#   followed by "# comment" stops the script with nothing changed, and an
+#   old section gets SIGLEVEL with every other repository's SigLevel the same;
+# - pacman takes an unsigned residue.db under the old section and refuses it
+#   under the new one;
+# - a fresh install writes the section with SIGLEVEL.
+# The dry run's output is in /tmp/dry.log.
 set -eu
 
 conf=/etc/pacman.conf
@@ -20,8 +28,26 @@ bak=/etc/pacman.conf.residue-bak
 siglevel='SigLevel = Required DatabaseRequired'
 fail() { echo "pacman-siglevel-check: $*" >&2; exit 1; }
 sum() { cksum < "$1"; }
-run() { # LOG: install.sh, quietly, showing its output only when it fails
-  sh "$install" --no-service > "$1" 2>&1 || { cat "$1"; fail "install.sh failed"; }
+run() { # LOG [OPTION]: install.sh, showing its output only when it fails
+  log=$1; shift
+  sh "$install" --no-service "$@" > "$log" 2>&1 || { cat "$log"; fail "install.sh failed"; }
+}
+# pacman's reading of a pacman.conf, residue aside: every SigLevel but residue's.
+sigs() {
+  printf 'global: %s\n' "$(pacman-conf --config "$1" SigLevel | tr '\n' ' ')"
+  for repo in $(pacman-conf --config "$1" --repo-list); do
+    [ "$repo" = residue ] || printf '%s: %s\n' "$repo" "$(pacman-conf --config "$1" --repo "$repo" SigLevel | tr '\n' ' ')"
+  done
+}
+required() { pacman-conf --config "$conf" --repo residue SigLevel | grep -qx DatabaseRequired; }
+# A dry run must leave $conf alone and print NOTE's first words, with no edit.
+kept() { # LABEL NOTE
+  before=$(sum "$conf")
+  run /tmp/kept.log --dry-run
+  [ "$(sum "$conf")" = "$before" ] || fail "$1: the dry run changed $conf"
+  if grep -q '^+ add ' /tmp/kept.log; then cat /tmp/kept.log; fail "$1: install.sh would edit $conf"; fi
+  grep -qF "Note: $2" /tmp/kept.log || { cat /tmp/kept.log; fail "$1: no note"; }
+  echo "ok: $1 is left alone, with a note"
 }
 
 case ${1:-} in
@@ -35,11 +61,18 @@ case ${1:-} in
   *) fail "usage: $0 seed | check INSTALL_SH" ;;
 esac
 
+# shellcheck disable=SC2016 # $arch is pacman's.
+server='Server = https://whiteheap.github.io/residue/arch/$arch'
+# The stock Arch file ends with [extra]; the image adds an [options] after it.
+awk '/^\[options\]$/ { n++ } n < 2' /tmp/pacman.conf.stock > /tmp/pacman.conf.arch
+
 grep -qF "+ add \"$siglevel\" under [residue] in $conf" /tmp/dry.log || fail "the dry run did not show the change"
 [ "$(sum "$bak")" = "$(sum /tmp/pacman.conf.old)" ] || fail "$bak is not the file as it was before the run"
 grep -A1 '^\[residue\]$' "$conf" | grep -qxF "$siglevel" || fail "no $siglevel under [residue]"
 [ "$(grep -cxF "$siglevel" "$conf")" = 1 ] || fail "$siglevel is in $conf more than once"
 [ "$(grep -vxF "$siglevel" "$conf" | cksum)" = "$(sum /tmp/pacman.conf.old)" ] || fail "something else in $conf changed"
+required || fail "pacman-conf does not read residue's SigLevel as DatabaseRequired"
+[ "$(sigs "$conf")" = "$(sigs /tmp/pacman.conf.old)" ] || fail "another SigLevel changed"
 echo "ok: the dry run named the change; the run added it under [residue], once, and $bak keeps the file as it was"
 
 before=$(sum "$conf") kept=$(sum "$bak")
@@ -48,23 +81,58 @@ run /tmp/second.log
 if grep -q '^Note:' /tmp/second.log; then cat /tmp/second.log; fail "a second run printed a note"; fi
 echo "ok: a second run changes nothing"
 
+cp /tmp/pacman.conf.old "$conf"
+run /tmp/third.log
+[ "$(sum "$bak")" = "$kept" ] || fail "the older backup was overwritten"
+[ "$(sum "$bak.1")" = "$(sum /tmp/pacman.conf.old)" ] || fail "the next backup is not $bak.1"
+grep -qF "kept as $bak.1" /tmp/third.log || fail "install.sh did not say where the backup is"
+echo "ok: an older backup is kept, and the next one is $bak.1"
+
 sed -i "s/^$siglevel\$/SigLevel = Optional TrustAll/" "$conf"
+kept "a SigLevel of the user's own" "[residue] in /etc/pacman.conf has a SigLevel of its own"
 mine=$(sum "$conf")
 run /tmp/mine.log
 [ "$(sum "$conf")" = "$mine" ] || fail "install.sh changed a SigLevel of the user's own"
-grep -q '^Note: \[residue\] in /etc/pacman.conf has a SigLevel of your own' /tmp/mine.log || fail "no note for a SigLevel of the user's own"
 sed -i "s/^SigLevel = Optional TrustAll\$/$siglevel/" "$conf"
-echo "ok: a SigLevel of the user's own is left alone, with a note"
+
+cp /tmp/pacman.conf.old "$conf"
+printf '\n[residue]\n%s\n' "$server" >> "$conf"
+kept "two [residue] sections" "/etc/pacman.conf has more than one [residue] section"
+
+printf 'SigLevel = Never\n%s\n' "$server" > /tmp/residue-include.conf
+{ cat /tmp/pacman.conf.stock; printf '\n[residue]\nInclude = /tmp/residue-include.conf\n'; } > "$conf"
+kept "an Include that sets a SigLevel" "[residue] in /etc/pacman.conf has a SigLevel of its own"
+
+cp /tmp/pacman.conf.old /etc/pacman.conf.real
+ln -sf pacman.conf.real "$conf"
+kept "a pacman.conf that is a link" "/etc/pacman.conf is a link to pacman.conf.real"
+[ -L "$conf" ] || fail "the link was replaced"
+rm "$conf" /etc/pacman.conf.real
+
+{ cat /tmp/pacman.conf.arch; printf '\n[residue] # whiteheap\n%s\n' "$server"; } > "$conf"
+before=$(sum "$conf")
+if sh "$install" --no-service > /tmp/comment.log 2>&1; then cat /tmp/comment.log; fail "a header followed by a comment did not stop the script"; fi
+grep -q 'does not read "\[residue\] # whiteheap" .* as a section' /tmp/comment.log || { cat /tmp/comment.log; fail "it stopped for another reason"; }
+[ "$(sum "$conf")" = "$before" ] || fail "a header followed by a comment changed $conf"
+echo "ok: on the stock Arch layout, \"[residue] # whiteheap\" stops the script with nothing changed"
+
+{ cat /tmp/pacman.conf.arch; printf '\n[residue]\n%s\n' "$server"; } > "$conf"
+cp "$conf" /tmp/pacman.conf.arch-old
+run /tmp/arch.log
+required || fail "on the stock Arch layout, residue's SigLevel is not DatabaseRequired"
+[ "$(sigs "$conf")" = "$(sigs /tmp/pacman.conf.arch-old)" ] || fail "on the stock Arch layout, another SigLevel changed"
+pacman -Sy > /tmp/arch-sync.log 2>&1 || { cat /tmp/arch-sync.log; fail "pacman -Sy failed on the stock Arch layout"; }
+echo "ok: on the stock Arch layout, the old section gets $siglevel, the other SigLevels stay, and pacman -Sy works"
 
 # residue.db with no residue.db.sig beside it, served from a file, under the
-# section as it was ($bak) and as it is now.
+# section as it was and as it is now.
 arch=$(uname -m)
 mkdir -p "/tmp/unsigned/$arch"
 curl -fsSLo "/tmp/unsigned/$arch/residue.db" "https://whiteheap.github.io/residue/arch/$arch/residue.db"
 # shellcheck disable=SC2016 # $arch is pacman's.
 unsigned='Server = file:///tmp/unsigned/$arch'
 for c in old new; do
-  if [ "$c" = old ]; then from=$bak; else from=$conf; fi
+  if [ "$c" = old ]; then from=/tmp/pacman.conf.old; else from=$conf; fi
   sed "s|^Server = https://whiteheap.github.io/residue/arch/.*|$unsigned|" "$from" > "/tmp/$c-unsigned.conf"
   grep -qxF "$unsigned" "/tmp/$c-unsigned.conf" || fail "could not point $from at the unsigned copy"
 done

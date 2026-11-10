@@ -219,18 +219,15 @@ install_dnf() {
 }
 
 install_pacman() {
+  # Read only: what to do about [residue], decided before anything changes.
+  pacman_plan
   [ "$dry_run" = 1 ] || fetch_key "$PAGES/residue-signing-key.asc" "$tmp/residue.asc" "$KEY_ASC_SHA256"
   as_root pacman-key --add "$tmp/residue.asc"
   as_root pacman-key --lsign-key "$KEY_FPR"
-  edited=
-  case $(residue_section /etc/pacman.conf) in
-    absent)
-      printf '\n[residue]\n%s\nServer = %s/arch/%sarch\n' "$SIGLEVEL" "$PAGES" '$' >"$tmp/pacman.conf"
-      # shellcheck disable=SC2016 # $1 belongs to the inner sh.
-      as_root sh -c 'cat "$1" >>/etc/pacman.conf' sh "$tmp/pacman.conf" ;;
-    none) add_siglevel ;;
-    required) ;;
-    *) note="[residue] in /etc/pacman.conf has a SigLevel of your own, left as it is. It does not itself require residue's database signature; this line would: $SIGLEVEL" ;;
+  # shellcheck disable=SC2016 # $1 belongs to the inner sh.
+  case $plan in
+    append) as_root sh -c 'cat "$1" >>/etc/pacman.conf' sh "$tmp/residue.section" ;;
+    edit) add_siglevel ;;
   esac
   # Arch supports only full upgrades, so this is `pacman -Syu`, as in the
   # docs. With a terminal, pacman shows the transaction and asks first.
@@ -241,41 +238,101 @@ install_pacman() {
   fi
   bin=/usr/bin/residue
   updates="pacman -Syu"
-  undo="${sudo:+sudo }pacman -R residue, and remove the [residue] section from /etc/pacman.conf${edited:+ ($PACMAN_BAK is that file before residue added its SigLevel)}"
+  undo="${sudo:+sudo }pacman -R residue, and remove the [residue] section from /etc/pacman.conf${edited:+ ($edited is that file as it was before residue added its SigLevel)}"
 }
 
-# What the [residue] section of the pacman.conf $1 asks of residue's
-# database: absent (no such section), none (no SigLevel), required, or other
-# (a SigLevel that does not itself require its signature). As pacman reads
-# it: a comment runs from # to the end of the line, and a later word wins.
-residue_section() {
-  awk '{ sub(/#.*/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, "") }
-    /^\[.*\]$/ { on = ($0 == "[residue]"); if (on) found = 1; next }
-    on && /^SigLevel[[:space:]]*=/ {
-      set = 1
-      sub(/^SigLevel[[:space:]]*=/, "")
-      for (i = 1; i <= NF; i++)
-        if ($i == "Required" || $i == "DatabaseRequired") db = 1
-        else if ($i ~ /^(Database)?(Optional|Never)$/) db = 0
-    }
-    END { if (!found) print "absent"; else if (!set) print "none"; else if (db) print "required"; else print "other" }' "$1"
-}
-
-# An older install.sh, and the docs before it, wrote [residue] with no
-# SigLevel. Add SIGLEVEL under that section's header and change nothing else;
-# the file as it was stays as PACMAN_BAK. Only a section with no SigLevel
-# gets here, so a second run changes nothing.
-add_siglevel() {
-  awk -v line="$SIGLEVEL" '{ print; s = $0; sub(/#.*/, "", s); gsub(/^[[:space:]]+|[[:space:]]+$/, "", s) }
-    s == "[residue]" { print line }' /etc/pacman.conf >"$tmp/pacman.conf"
-  if [ "$(residue_section "$tmp/pacman.conf")" != required ]; then
-    note="install.sh could not add \"$SIGLEVEL\" under [residue] in /etc/pacman.conf, so pacman does not require residue's database signature. Add the line there by hand."
+# What to do about the [residue] section of /etc/pacman.conf. Sets $plan:
+# append (there is none), edit (residue's own, with no SigLevel: add
+# SIGLEVEL), or keep, with a $note when what is kept does not require
+# residue's database signature. pacman reads the file as pacman-conf prints
+# it: it trims each line, skips a blank one or one that starts with #, and
+# takes # nowhere else as a comment. Each change is checked with pacman-conf
+# on a copy first, and anything that stops the script stops here, before
+# anything changes.
+pacman_plan() {
+  plan=keep edited=
+  stray=$(awk '{ s = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", s) }
+    s ~ /^\[residue\]/ && s != "[residue]" { print s; exit }' /etc/pacman.conf)
+  [ -z "$stray" ] || die "pacman does not read \"$stray\" in /etc/pacman.conf as a section: # starts a comment only at the start of a line. Make that line [residue], then run this again. Nothing was changed."
+  headers=$(awk '{ s = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", s) } s == "[residue]" { n++ } END { print n + 0 }' /etc/pacman.conf)
+  printf '\n[residue]\n%s\nServer = %s/arch/%sarch\n' "$SIGLEVEL" "$PAGES" '$' >"$tmp/residue.section"
+  if ! has pacman-conf; then
+    if [ "$headers" = 0 ]; then plan=append
+    else note="this pacman has no pacman-conf to check /etc/pacman.conf with, so [residue] was left as it is. For pacman to require residue's database signature, add this line under [residue]: $SIGLEVEL"
+    fi
     return 0
   fi
-  say "+ add \"$SIGLEVEL\" under [residue] in /etc/pacman.conf; the file as it was stays as $PACMAN_BAK"
+  pacman-conf --config /etc/pacman.conf --repo-list >"$tmp/repos" 2>"$tmp/pacman-conf.err" ||
+    die "pacman cannot read /etc/pacman.conf: $(head -n 1 "$tmp/pacman-conf.err"). Fix it, then run this again. Nothing was changed."
+  sections=$(grep -cx residue "$tmp/repos") || true
+  if [ "$sections" -gt 1 ] || [ "$headers" -gt 1 ]; then
+    note="/etc/pacman.conf has more than one [residue] section, left as they are. For pacman to require residue's database signature, keep one, with this line under it: $SIGLEVEL"
+  elif [ "$sections" = 0 ]; then
+    [ "$headers" = 0 ] || die "pacman does not read [residue] in /etc/pacman.conf as a repository. Fix it, then run this again. Nothing was changed."
+    cat /etc/pacman.conf "$tmp/residue.section" >"$tmp/pacman.conf"
+    reads_as_intended /etc/pacman.conf "$tmp/pacman.conf" ||
+      die "pacman would not read residue's section as intended at the end of /etc/pacman.conf, so nothing was changed."
+    plan=append
+  elif [ "$headers" = 0 ]; then
+    note="[residue] is in a file /etc/pacman.conf includes, left as it is. For pacman to require residue's database signature, add this line under [residue] there: $SIGLEVEL"
+  elif sig=$(pacman-conf --config /etc/pacman.conf --repo residue SigLevel 2>/dev/null) && [ -n "$sig" ]; then
+    # A SigLevel of the user's own, in the section or a file it includes.
+    printf '%s\n' "$sig" | grep -qx DatabaseRequired ||
+      note="[residue] in /etc/pacman.conf has a SigLevel of its own, left as it is, and it does not require residue's database signature. This line under [residue] would: $SIGLEVEL"
+  elif [ -L /etc/pacman.conf ]; then
+    note="/etc/pacman.conf is a link to $(readlink /etc/pacman.conf), and install.sh does not edit through a link, so [residue] was left as it is. For pacman to require residue's database signature, add this line under [residue] there: $SIGLEVEL"
+  else
+    # residue's own section, from an older install.sh or the docs, with no
+    # SigLevel: SIGLEVEL goes right under its header, and nothing else
+    # changes. A second run finds it and changes nothing.
+    awk -v line="$SIGLEVEL" '{ print; s = $0; cr = (s ~ /\r$/) ? "\r" : ""; gsub(/^[[:space:]]+|[[:space:]]+$/, "", s) }
+      s == "[residue]" { print line cr }' /etc/pacman.conf >"$tmp/pacman.conf"
+    reads_as_intended /etc/pacman.conf "$tmp/pacman.conf" ||
+      die "with \"$SIGLEVEL\" under [residue], pacman would not read /etc/pacman.conf as intended, so nothing was changed. Add the line there by hand."
+    plan=edit
+  fi
+}
+
+# Does pacman read the pacman.conf $2 as $1, but with residue's database
+# signature required? The global SigLevel, and each other repository and
+# its SigLevel, must be the same in both, and residue's must name
+# DatabaseRequired.
+reads_as_intended() {
+  pacman-conf --config "$2" --repo residue SigLevel 2>/dev/null | grep -qx DatabaseRequired || return 1
+  before=$(pacman_sigs "$1") && after=$(pacman_sigs "$2") && [ "$before" = "$after" ]
+}
+
+# pacman's reading of the pacman.conf $1, residue aside: the global SigLevel,
+# then each other repository's, one line each.
+pacman_sigs() {
+  repos=$(pacman-conf --config "$1" --repo-list 2>/dev/null) || return 1
+  printf 'global: %s\n' "$(pacman-conf --config "$1" SigLevel 2>/dev/null | tr '\n' ' ')"
+  for repo in $repos; do
+    [ "$repo" = residue ] || printf '%s: %s\n' "$repo" "$(pacman-conf --config "$1" --repo "$repo" SigLevel 2>/dev/null | tr '\n' ' ')"
+  done
+}
+
+# Put $tmp/pacman.conf, which pacman_plan checked, in place of
+# /etc/pacman.conf: a copy beside it renamed over it, so pacman never reads a
+# half-written file, with the mode and owner the file had. The file as it was
+# stays as PACMAN_BAK, or PACMAN_BAK.1 and so on, never over an older one.
+add_siglevel() {
+  conf=/etc/pacman.conf bak=$PACMAN_BAK n=0
+  while [ -e "$bak" ] || [ -L "$bak" ]; do n=$((n + 1)); bak=$PACMAN_BAK.$n; done
+  restore="${sudo:+sudo }cp -p $bak $conf"
+  cp "$conf" "$tmp/pacman.conf.before"
+  say "+ add \"$SIGLEVEL\" under [residue] in $conf; the file as it is now is kept as $bak"
+  # shellcheck disable=SC2016 # $1 to $4 belong to the inner sh.
+  as_root sh -c 'cp -p "$1" "$2" && cp -p "$1" "$3" && cat "$4" >"$3" && mv -f "$3" "$1" || { rm -f "$3"; exit 1; }' \
+    sh "$conf" "$bak" "$conf.residue-new" "$tmp/pacman.conf" ||
+    die "could not write $conf. If it changed, put it back with: $restore"
+  edited=$bak
+  [ "$dry_run" = 0 ] || return 0
+  reads_as_intended "$tmp/pacman.conf.before" "$conf" && return 0
   # shellcheck disable=SC2016 # $1 to $3 belong to the inner sh.
-  as_root sh -c 'cp -p "$1" "$2" && cat "$3" >"$1"' sh /etc/pacman.conf "$PACMAN_BAK" "$tmp/pacman.conf"
-  edited=1
+  as_root sh -c 'cp -p "$1" "$2" && mv -f "$2" "$3"' sh "$bak" "$conf.residue-new" "$conf" ||
+    die "pacman does not read the new $conf as intended, and putting it back failed. Put it back with: $restore"
+  die "pacman does not read the new $conf as intended, so it was put back from $bak. Add \"$SIGLEVEL\" under [residue] by hand."
 }
 
 target() {
