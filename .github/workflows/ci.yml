@@ -54,6 +54,23 @@ jobs:
         run: bash scripts/contract-check.sh target/release/residue
       - name: Recovery check
         run: bash scripts/recovery-check.sh target/release/residue
+      # Its mount cases need root: a tmpfs, and a folder of the worktree's
+      # own filesystem bind-mounted inside it, before the plan and after the
+      # move aside (2c, 2e, 2e2). The runner's user may sudo.
+      - name: Recovery check as root
+        if: runner.os == 'Linux'
+        run: sudo bash scripts/recovery-check.sh target/release/residue
+      # The same with statx(2) refused for residue and what it runs
+      # (.github/nostatx.c), as on Linux before 4.11 or under a seccomp
+      # filter: the walk reads /proc/self/mountinfo for mount points
+      # instead, and the mount cases must still keep the worktree.
+      - name: Recovery check as root, without statx
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          cc -O2 -Wall -Werror -o "$RUNNER_TEMP/nostatx" .github/nostatx.c
+          printf '#!/bin/sh\nexec "%s" ENOSYS "%s" "$@"\n' "$RUNNER_TEMP/nostatx" "$PWD/target/release/residue" >"$RUNNER_TEMP/residue-nostatx"
+          chmod +x "$RUNNER_TEMP/residue-nostatx"
+          sudo bash scripts/recovery-check.sh "$RUNNER_TEMP/residue-nostatx"
 
   # FreeBSD runs in a virtual machine. residue's probe there is the base
   # system's ps and two kernel sysctls, so nothing beyond Rust and Git is
