@@ -12,7 +12,7 @@
 //! bucket), and judges the contents of a collapsed ignored directory that
 //! a path rule reaches into, so the worktree is read once.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr};
 use std::fs;
 use std::io;
@@ -82,8 +82,14 @@ pub struct Usage {
     /// Blocks allocated, each hard-linked inode counted once.
     pub allocated: u64,
     /// Blocks that removal frees: excludes inodes that also have links
-    /// outside the worktree (a pnpm store, for example). Copy-on-write
-    /// clones and snapshots are not detected, so even this can overstate.
+    /// outside the worktree (a pnpm store, for example) and, on APFS, the
+    /// data blocks a file shares with a clone outside it (`Stat::unshared`,
+    /// `Clones`). It can still overstate: snapshots, and clones on other
+    /// systems (Btrfs and XFS reflinks, ZFS block cloning), are not
+    /// detected. And it can understate: a block two files share counts for
+    /// neither, unless they are a set of full clones the worktree holds
+    /// whole, though removing both frees it, as when they are in two
+    /// worktrees removed together.
     pub reclaimable: u64,
     pub entries: u64,
     pub newest_mtime: Option<i64>,
@@ -187,10 +193,79 @@ pub enum Expansion {
     Unreadable(String),
 }
 
+/// A hard-linked inode the walk found: how many of its links, and what
+/// deleting it frees once every link is gone.
 struct Shared {
     seen: u64,
     links: u64,
-    blocks: u64,
+    frees: u64,
+    /// The set of full clones it is one of, if any.
+    set: Option<Member>,
+}
+
+/// A file that is one of a set of APFS full clones ([`Clones`]), by its
+/// device and the set's clone ID.
+#[derive(Clone, Copy)]
+struct Member {
+    key: (u64, u64),
+    clones: Clones,
+}
+
+/// The sets of full clones the walk found files of, each file found whole:
+/// with every hard link of it inside the worktree.
+#[derive(Default)]
+struct Sets {
+    /// Sets the walk found one file of, by key alone: most, as pnpm and Bun
+    /// clone each file of a node_modules from a store outside it. A set
+    /// has two files or more, so none of these is whole inside.
+    one: HashSet<(u64, u64)>,
+    /// Sets it found more than one file of.
+    more: HashMap<(u64, u64), Set>,
+}
+
+/// A set of full clones the walk found more than one file of.
+struct Set {
+    /// Its files the walk found whole.
+    inside: u64,
+    /// How many files the set has.
+    count: u64,
+    /// The data bytes they share.
+    shared: u64,
+}
+
+impl Sets {
+    /// The blocks that sets whose every file is inside share: removing the
+    /// worktree frees them once, as it frees a hard-linked inode once.
+    fn whole(&self) -> u64 {
+        self.more
+            .values()
+            .filter(|set| set.inside >= set.count)
+            .map(|set| set.shared)
+            .sum()
+    }
+}
+
+impl Member {
+    /// Counts the file, found whole, toward its set. Files of one set agree
+    /// on its count and size, and a set's are those of its files after the
+    /// first; where two do not, as when one changed during the walk, the
+    /// larger count and the smaller size count nothing twice.
+    fn join(self, sets: &mut Sets) {
+        if let Some(set) = sets.more.get_mut(&self.key) {
+            set.inside += 1;
+            set.count = set.count.max(self.clones.count);
+            set.shared = set.shared.min(self.clones.shared);
+        } else if !sets.one.insert(self.key) {
+            sets.more.insert(
+                self.key,
+                Set {
+                    inside: 2,
+                    count: self.clones.count,
+                    shared: self.clones.shared,
+                },
+            );
+        }
+    }
 }
 
 /// Where a walked entry sits relative to the buckets.
@@ -354,7 +429,8 @@ fn measure_with(
         .collect();
     let mut walked = vec![0u64; buckets.len()];
     let mut shared: HashMap<(u64, u64), Shared> = HashMap::new();
-    account(&mut usage, &mut shared, &top, root);
+    let mut sets = Sets::default();
+    account(&mut usage, &mut shared, &mut sets, &top, root);
     let top_fd = match opened {
         Ok(fd) => Rc::new(fd),
         Err(e) => {
@@ -377,7 +453,7 @@ fn measure_with(
     });
     let mut stack: Vec<Pending> = Vec::new();
     let mut kept = Reopened::default();
-    let mut buf = Vec::new();
+    let mut lister = Lister::default();
     loop {
         let folder = match next.take() {
             Some(folder) => folder,
@@ -402,7 +478,7 @@ fn measure_with(
             place,
             below,
         } = folder;
-        let listing = list(fd.as_fd(), &dir, &mut buf);
+        let listing = list(fd.as_fd(), &dir, &mut lister);
         let before = stack.len();
         let listing = match listing {
             Ok(listing) => listing,
@@ -489,7 +565,7 @@ fn measure_with(
                 usage.mount_points.push(path);
                 continue;
             }
-            let first = account(&mut usage, &mut shared, &meta, &path);
+            let first = account(&mut usage, &mut shared, &mut sets, &meta, &path);
             if let Some(i) = here.bucket {
                 let stamp = (meta.mtime(), meta.mtime_nsec());
                 let newest = &mut usage.buckets[i].newest;
@@ -553,9 +629,13 @@ fn measure_with(
     }
     for inode in shared.values() {
         if inode.seen >= inode.links {
-            usage.reclaimable += inode.blocks;
+            usage.reclaimable += inode.frees;
+            if let Some(member) = inode.set {
+                member.join(&mut sets);
+            }
         }
     }
+    usage.reclaimable += sets.whole();
     // A mount the table lists inside the worktree counts even where the
     // walk did not list it by that path.
     #[cfg(any(
@@ -1101,6 +1181,7 @@ fn display(path: &Path, root: &Path) -> String {
 fn account(
     usage: &mut Usage,
     shared: &mut HashMap<(u64, u64), Shared>,
+    sets: &mut Sets,
     meta: &Stat,
     path: &Path,
 ) -> bool {
@@ -1111,11 +1192,20 @@ fn account(
         usage.newest_path = Some(path.to_path_buf());
     }
     let blocks = meta.blocks().saturating_mul(512);
+    // What deleting it frees: its blocks, less those it shares with a
+    // clone, where the system says so. Every link of an inode reports the
+    // same, so a hard-linked one is counted once, as its blocks are.
+    let frees = meta.unshared.map_or(blocks, |b| b.min(blocks));
+    let set = meta.clones.map(|clones| Member {
+        key: (meta.dev(), clones.id),
+        clones,
+    });
     if !meta.is_dir() && meta.nlink() > 1 {
         let inode = shared.entry((meta.dev(), meta.ino())).or_insert(Shared {
             seen: 0,
             links: meta.nlink(),
-            blocks,
+            frees,
+            set,
         });
         inode.seen += 1;
         if inode.seen == 1 {
@@ -1127,7 +1217,10 @@ fn account(
     }
     usage.apparent += meta.len();
     usage.allocated += blocks;
-    usage.reclaimable += blocks;
+    usage.reclaimable += frees;
+    if let Some(member) = set {
+        member.join(sets);
+    }
     true
 }
 
@@ -1166,6 +1259,31 @@ struct Stat {
     len: u64,
     mtime: i64,
     mtime_nsec: i64,
+    /// The bytes of its allocation that no other file shares, which
+    /// deleting it frees: on APFS, for a file that may share blocks with a
+    /// clone (macOS's listing, `bulk`). `None` where the system does not
+    /// say, and then deleting it frees all of `blocks`.
+    unshared: Option<u64>,
+    /// The set of full clones it is one of, when it has others: on APFS.
+    clones: Option<Clones>,
+}
+
+/// A set of files, on APFS, that are full clones of each other: each
+/// shares every data block with the rest. Deleting all of them frees those
+/// blocks once, as deleting every link of an inode frees its blocks once.
+/// APFS gives each set an ID and counts its files (`ATTR_CMNEXT_CLONEID`
+/// and `ATTR_CMNEXT_CLONE_REFCNT`, getattrlist(2)): cargo's copy of a
+/// built binary into `target/debug/` is one, beside the file in `deps/`.
+#[derive(Clone, Copy)]
+// Only macOS's listing (`bulk`) makes one.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct Clones {
+    /// The set's clone ID, the same for each file in it.
+    id: u64,
+    /// How many files (inodes) the set has, this one among them.
+    count: u64,
+    /// The data bytes each file shares with the rest.
+    shared: u64,
 }
 
 impl Stat {
@@ -1221,6 +1339,8 @@ impl From<&sys::stat> for Stat {
             len: st.st_size as u64,
             mtime: st.st_mtime as i64,
             mtime_nsec: mtime_nsec as i64,
+            unshared: None,
+            clones: None,
         }
     }
 }
@@ -1408,6 +1528,8 @@ mod statx {
             len: stx.stx_size,
             mtime: stx.stx_mtime.tv_sec,
             mtime_nsec: i64::from(stx.stx_mtime.tv_nsec),
+            unshared: None,
+            clones: None,
         }
     }
 }
@@ -1739,34 +1861,48 @@ fn clear_errno() {
 )))]
 compile_error!("residue's walk needs this system's errno: add it to fsinfo::clear_errno");
 
+/// What the listings of one walk share: nothing, but on macOS.
 #[cfg(not(target_os = "macos"))]
-fn list(fd: BorrowedFd, dir: &Path, _buf: &mut Vec<u8>) -> io::Result<Listing> {
+#[derive(Default)]
+struct Lister {}
+
+#[cfg(not(target_os = "macos"))]
+fn list(fd: BorrowedFd, dir: &Path, _: &mut Lister) -> io::Result<Listing> {
     list_readdir(fd, dir)
 }
+
+#[cfg(target_os = "macos")]
+use bulk::Lister;
 
 /// On macOS, one `getattrlistbulk` call returns a batch of entries with
 /// their attributes, where `readdir` plus `fstatat` costs one system call
 /// per entry: `du` lists this way through fts. A regular file's fields come
-/// from the batch. Any other entry, or one the call reports an error for,
+/// from the batch, with what APFS says deleting it frees (`Stat::unshared`,
+/// `Stat::clones`). Any other entry, or one the call reports an error for,
 /// is read with `fstatat`, exactly as the standard library reads it. A
 /// directory the call refuses gets the readdir listing.
 #[cfg(target_os = "macos")]
-fn list(fd: BorrowedFd, dir: &Path, buf: &mut Vec<u8>) -> io::Result<Listing> {
-    bulk::list(fd, dir, buf)
+fn list(fd: BorrowedFd, dir: &Path, lister: &mut Lister) -> io::Result<Listing> {
+    bulk::list(fd, dir, lister)
 }
 
 #[cfg(target_os = "macos")]
 mod bulk {
-    use super::{Listed, Listing, Stat, list_readdir, lstat_at};
+    use super::{Clones, Listed, Listing, Stat, list_readdir, lstat_at};
     use std::ffi::{CStr, OsStr};
     use std::io;
     use std::os::fd::{AsRawFd, BorrowedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
+    use std::sync::OnceLock;
 
-    // <sys/attr.h> and <sys/vnode.h>; the libc crate does not have these.
+    // The libc crate does not have these. <sys/attr.h>:
     const ATTR_CMN_ERROR: libc::attrgroup_t = 0x2000_0000;
+    const ATTR_CMNEXT_CLONE_REFCNT: libc::attrgroup_t = 0x0000_1000;
+    // <sys/vnode.h>:
     const VREG: u32 = 1;
+    // <sys/stat.h>, "file may share blocks with another file":
+    const EF_MAY_SHARE_BLOCKS: u64 = 0x0000_0001;
     /// Bytes per call: room for several hundred entries.
     const BUF_LEN: usize = 128 * 1024;
 
@@ -1776,11 +1912,96 @@ mod bulk {
         | libc::ATTR_CMN_DEVID
         | libc::ATTR_CMN_OBJTYPE
         | libc::ATTR_CMN_MODTIME
+        | libc::ATTR_CMN_FLAGS
         | libc::ATTR_CMN_FILEID;
-    const FILE: libc::attrgroup_t =
-        libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_ALLOCSIZE | libc::ATTR_FILE_DATALENGTH;
+    const FILE: libc::attrgroup_t = libc::ATTR_FILE_LINKCOUNT
+        | libc::ATTR_FILE_ALLOCSIZE
+        | libc::ATTR_FILE_DATALENGTH
+        | libc::ATTR_FILE_DATAALLOCSIZE;
+    /// The common extended attributes residue asks for, in `forkattr` with
+    /// `FSOPT_ATTR_CMN_EXTENDED` (getattrlist(2)): whether a file may share
+    /// blocks (`flags`), and for one that may, what deleting it frees and
+    /// the full clones it is one of (`private`). A file system without them
+    /// returns none, and each file counts all its blocks, as before.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct Extended {
+        pub flags: libc::attrgroup_t,
+        pub private: libc::attrgroup_t,
+    }
 
-    pub fn list(fd: BorrowedFd, dir: &Path, buf: &mut Vec<u8>) -> io::Result<Listing> {
+    impl Extended {
+        /// Those this kernel knows: getattrlist(2) refuses a bit it does
+        /// not know with EINVAL, and xnu's `ATTR_CMNEXT_VALIDMASK` gains
+        /// `ATTR_CMNEXT_CLONEID` and `ATTR_CMNEXT_EXT_FLAGS` in xnu-7195
+        /// (Darwin 20, macOS 11) and `ATTR_CMNEXT_CLONE_REFCNT` in
+        /// xnu-10002 (Darwin 23, macOS 14). Before Darwin 20, and where the
+        /// release cannot be read, residue asks for none, as before.
+        pub(super) fn known() -> Extended {
+            static KNOWN: OnceLock<Extended> = OnceLock::new();
+            *KNOWN.get_or_init(|| Extended::of(darwin()))
+        }
+
+        /// Whether the kernel counts a file's full clones, which residue
+        /// needs to count a set of them inside the worktree once.
+        #[cfg(test)]
+        pub(super) fn sets(self) -> bool {
+            self.private & ATTR_CMNEXT_CLONE_REFCNT != 0
+        }
+
+        pub(super) fn of(darwin: Option<u32>) -> Extended {
+            match darwin {
+                Some(major) if major >= 20 => Extended {
+                    flags: libc::ATTR_CMNEXT_EXT_FLAGS,
+                    private: libc::ATTR_CMNEXT_PRIVATESIZE
+                        | libc::ATTR_CMNEXT_CLONEID
+                        | if major >= 23 {
+                            ATTR_CMNEXT_CLONE_REFCNT
+                        } else {
+                            0
+                        },
+                },
+                _ => Extended {
+                    flags: 0,
+                    private: 0,
+                },
+            }
+        }
+    }
+
+    /// The Darwin release's major number, from uname(3): 25 on macOS 26.
+    fn darwin() -> Option<u32> {
+        // SAFETY: utsname is plain bytes, for which all zeros is valid.
+        let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+        // SAFETY: uname writes only into `name`, which is ours.
+        if unsafe { libc::uname(&mut name) } != 0 {
+            return None;
+        }
+        let release: Vec<u8> = name.release.iter().map(|&c| c as u8).collect();
+        let release = CStr::from_bytes_until_nul(&release).ok()?;
+        release.to_str().ok()?.split('.').next()?.parse().ok()
+    }
+
+    /// What the listings of one walk share: the batch buffer, and whether
+    /// the folder listed last held a file that may share blocks.
+    ///
+    /// Asking for the private size made the listings of a worktree of
+    /// 27,000 files that share no blocks take 2.2 times the system time,
+    /// measured on macOS 26.3.1 (#193), where `ATTR_CMNEXT_EXT_FLAGS`,
+    /// `ATTR_CMN_FLAGS` and `ATTR_FILE_DATAALLOCSIZE` together cost 0 to 15
+    /// percent, as much as two runs differ. So a folder's listing asks for
+    /// it only after a folder that held such a file, as the folders of a
+    /// node_modules that pnpm or Bun cloned do. Any other listing asks each
+    /// such file on its own.
+    #[derive(Default)]
+    pub struct Lister {
+        buf: Vec<u8>,
+        clones: bool,
+    }
+
+    pub fn list(fd: BorrowedFd, dir: &Path, lister: &mut Lister) -> io::Result<Listing> {
+        let known = Extended::known();
+        let batched = std::mem::take(&mut lister.clones);
+        let forkattr = known.flags | if batched { known.private } else { 0 };
         let mut attrs = libc::attrlist {
             bitmapcount: libc::ATTR_BIT_MAP_COUNT,
             reserved: 0,
@@ -1788,21 +2009,28 @@ mod bulk {
             volattr: 0,
             dirattr: 0,
             fileattr: FILE,
-            forkattr: 0,
+            forkattr,
         };
+        let options = if forkattr == 0 {
+            0
+        } else {
+            u64::from(libc::FSOPT_ATTR_CMN_EXTENDED)
+        };
+        let buf = &mut lister.buf;
         buf.resize(BUF_LEN, 0);
         let mut out = Vec::new();
         let mut first = true;
         loop {
             // SAFETY: the call reads `attrs` and writes at most `buf.len()`
-            // bytes into `buf`; both are ours and outlive it.
+            // bytes into `buf`; both are ours and outlive it. It reads the
+            // folder through the descriptor the walk holds, as before.
             let count = unsafe {
                 libc::getattrlistbulk(
                     fd.as_raw_fd(),
                     (&raw mut attrs).cast(),
                     buf.as_mut_ptr().cast(),
                     buf.len(),
-                    0,
+                    options,
                 )
             };
             if count < 0 {
@@ -1827,7 +2055,7 @@ mod bulk {
             first = false;
             let mut at = 0;
             for _ in 0..count {
-                let Some((entry, len)) = buf.get(at..).and_then(parse) else {
+                let Some((mut entry, len)) = buf.get(at..).and_then(parse) else {
                     out.push(Err(io::Error::other(
                         "getattrlistbulk returned an entry residue cannot read",
                     )));
@@ -1838,6 +2066,12 @@ mod bulk {
                 // readdir skips these two, and the walk must never descend them.
                 if name == b"." || name == b".." {
                     continue;
+                }
+                if entry.may_share() {
+                    lister.clones = true;
+                    if !batched {
+                        entry.ask_private(fd);
+                    }
                 }
                 let path = dir.join(OsStr::from_bytes(name));
                 let stat = match entry.stat() {
@@ -1855,16 +2089,27 @@ mod bulk {
     }
 
     /// One entry of a batch: the attributes it returned.
+    #[derive(Default)]
     struct Entry<'a> {
         name: &'a CStr,
         error: u32,
         objtype: Option<u32>,
         dev: Option<i32>,
         mtime: Option<(i64, i64)>,
+        /// `st_flags`.
+        flags: Option<u32>,
         ino: Option<u64>,
         nlink: Option<u32>,
         alloc: Option<i64>,
         len: Option<i64>,
+        /// The data fork's allocation.
+        data_alloc: Option<i64>,
+        /// The data bytes "not trapped inside a clone or snapshot, and which
+        /// would be freed immediately if the file were deleted".
+        private: Option<i64>,
+        clone_id: Option<u64>,
+        ext_flags: Option<u64>,
+        clone_count: Option<u32>,
     }
 
     impl Entry<'_> {
@@ -1875,6 +2120,7 @@ mod bulk {
                 return None;
             }
             let (mtime, mtime_nsec) = self.mtime?;
+            let alloc = u64::try_from(self.alloc?).ok()?;
             Some(Stat {
                 dir: false,
                 file: true,
@@ -1887,12 +2133,141 @@ mod bulk {
                 nlink: u64::from(self.nlink?),
                 // Allocation is in whole file system blocks, so this is
                 // exact; st_blocks counts the same allocation.
-                blocks: u64::try_from(self.alloc?).ok()?.div_ceil(512),
+                blocks: alloc.div_ceil(512),
                 len: u64::try_from(self.len?).ok()?,
                 mtime,
                 mtime_nsec,
+                unshared: self.shared().map(|shared| alloc.saturating_sub(shared)),
+                clones: self.clones(),
             })
         }
+
+        /// A regular file that may share blocks with another
+        /// (`EF_MAY_SHARE_BLOCKS`, which a clone and its source carry) and
+        /// is not compressed (`UF_COMPRESSED`): the only files whose
+        /// private size residue reads ([`Entry::shared`]).
+        fn may_share(&self) -> bool {
+            self.error == 0
+                && self.objtype == Some(VREG)
+                && self.ext_flags.is_some_and(|f| f & EF_MAY_SHARE_BLOCKS != 0)
+                && self.flags.is_some_and(|f| f & libc::UF_COMPRESSED == 0)
+        }
+
+        /// The data bytes the file shares with a clone, where APFS says:
+        /// its data fork's allocation less its private size. Measured on
+        /// macOS 26.3.1 (#193), the private size counts the data fork alone
+        /// (a resource fork is left out), is 0 for a compressed file, which
+        /// keeps its data elsewhere, and is the same for every hard link of
+        /// an inode. getattrlist(2) says it also leaves out blocks a
+        /// snapshot holds, which deleting the file frees once the snapshot
+        /// goes. So it is read only for a file that may share blocks
+        /// ([`Entry::may_share`]); any other file, or one an attribute is
+        /// missing for, frees all of its blocks.
+        fn shared(&self) -> Option<u64> {
+            if !self.may_share() {
+                return None;
+            }
+            let data = u64::try_from(self.data_alloc?).ok()?;
+            let private = u64::try_from(self.private?).ok()?;
+            Some(data.saturating_sub(private))
+        }
+
+        /// Asks for the file's private size and clone set on its own,
+        /// through the folder's descriptor the walk holds and without
+        /// following a link, and keeps them only when the name still names
+        /// the inode the batch listed. When the call fails, as when the
+        /// file was deleted meanwhile, the attributes stay missing and the
+        /// file counts all its blocks: the estimate as before, never a
+        /// guess.
+        fn ask_private(&mut self, fd: BorrowedFd) {
+            let mut attrs = libc::attrlist {
+                bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+                reserved: 0,
+                commonattr: libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_FILEID,
+                volattr: 0,
+                dirattr: 0,
+                fileattr: 0,
+                forkattr: Extended::known().private,
+            };
+            // The length, the returned set, FILEID and the three: 52 bytes.
+            let mut buf = [0u8; 64];
+            // SAFETY: the call reads `attrs` and the NUL-terminated name, a
+            // single component the batch returned, and writes at most
+            // `buf.len()` bytes into `buf`; all are ours and outlive it.
+            let failed = unsafe {
+                libc::getattrlistat(
+                    fd.as_raw_fd(),
+                    self.name.as_ptr(),
+                    (&raw mut attrs).cast(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    libc::c_ulong::from(libc::FSOPT_NOFOLLOW | libc::FSOPT_ATTR_CMN_EXTENDED),
+                )
+            } != 0;
+            if failed {
+                return;
+            }
+            if let Some(private) = parse_private(&buf).filter(|p| Some(p.ino) == self.ino) {
+                self.private = private.size;
+                self.clone_id = private.clone_id;
+                self.clone_count = private.clone_count;
+            }
+        }
+
+        /// The set of full clones the file is one of, when it has others.
+        fn clones(&self) -> Option<Clones> {
+            let count = u64::from(self.clone_count?);
+            if count < 2 {
+                return None;
+            }
+            Some(Clones {
+                id: self.clone_id?,
+                count,
+                shared: self.shared()?,
+            })
+        }
+    }
+
+    /// What one file's own call returned ([`Entry::ask_private`]).
+    struct Private {
+        ino: u64,
+        size: Option<i64>,
+        clone_id: Option<u64>,
+        clone_count: Option<u32>,
+    }
+
+    /// Reads [`Entry::ask_private`]'s reply: the length, the returned
+    /// attribute set, FILEID, then the returned ones of
+    /// `Extended::private` in bit order, as getattrlist(2) lays them out.
+    fn parse_private(buf: &[u8]) -> Option<Private> {
+        let len = u32::from_ne_bytes(buf.get(..4)?.try_into().ok()?) as usize;
+        let rec = buf.get(..len)?;
+        let mut at = 4;
+        let common = u32::from_ne_bytes(take(rec, &mut at)?);
+        let _vol = take::<4>(rec, &mut at)?;
+        let _dir = take::<4>(rec, &mut at)?;
+        let _file = take::<4>(rec, &mut at)?;
+        let extended = u32::from_ne_bytes(take(rec, &mut at)?);
+        if common & libc::ATTR_CMN_FILEID == 0 {
+            return None;
+        }
+        let ino = u64::from_ne_bytes(take(rec, &mut at)?);
+        let mut private = Private {
+            ino,
+            size: None,
+            clone_id: None,
+            clone_count: None,
+        };
+        if extended & libc::ATTR_CMNEXT_PRIVATESIZE != 0 {
+            private.size = Some(i64::from_ne_bytes(take(rec, &mut at)?));
+        }
+        if extended & libc::ATTR_CMNEXT_CLONEID != 0 {
+            private.clone_id = Some(u64::from_ne_bytes(take(rec, &mut at)?));
+        }
+        if extended & ATTR_CMNEXT_CLONE_REFCNT != 0 {
+            private.clone_count = Some(u32::from_ne_bytes(take(rec, &mut at)?));
+        }
+        Some(private)
     }
 
     fn take<const N: usize>(rec: &[u8], at: &mut usize) -> Option<[u8; N]> {
@@ -1904,7 +2279,8 @@ mod bulk {
     /// Reads the entry at the start of `buf`, and returns it with its
     /// length. The layout is getattrlist(2)'s: the length, the returned
     /// attribute set, the error code, then each returned attribute in bit
-    /// order, every one a multiple of 4 bytes and 4-byte aligned.
+    /// order, common, directory, file, then the common extended ones in
+    /// the fork set, every one a multiple of 4 bytes and 4-byte aligned.
     fn parse(buf: &[u8]) -> Option<(Entry<'_>, usize)> {
         let len = u32::from_ne_bytes(buf.get(..4)?.try_into().ok()?) as usize;
         let rec = buf.get(..len)?;
@@ -1913,18 +2289,8 @@ mod bulk {
         let _vol = take::<4>(rec, &mut at)?;
         let _dir = take::<4>(rec, &mut at)?;
         let file = u32::from_ne_bytes(take(rec, &mut at)?);
-        let _fork = take::<4>(rec, &mut at)?;
-        let mut entry = Entry {
-            name: c"",
-            error: 0,
-            objtype: None,
-            dev: None,
-            mtime: None,
-            ino: None,
-            nlink: None,
-            alloc: None,
-            len: None,
-        };
+        let extended = u32::from_ne_bytes(take(rec, &mut at)?);
+        let mut entry = Entry::default();
         if common & ATTR_CMN_ERROR != 0 {
             entry.error = u32::from_ne_bytes(take(rec, &mut at)?);
         }
@@ -1953,6 +2319,9 @@ mod bulk {
             let nsec = i64::from_ne_bytes(take(rec, &mut at)?);
             entry.mtime = Some((sec, nsec));
         }
+        if common & libc::ATTR_CMN_FLAGS != 0 {
+            entry.flags = Some(u32::from_ne_bytes(take(rec, &mut at)?));
+        }
         if common & libc::ATTR_CMN_FILEID != 0 {
             entry.ino = Some(u64::from_ne_bytes(take(rec, &mut at)?));
         }
@@ -1964,6 +2333,21 @@ mod bulk {
         }
         if file & libc::ATTR_FILE_DATALENGTH != 0 {
             entry.len = Some(i64::from_ne_bytes(take(rec, &mut at)?));
+        }
+        if file & libc::ATTR_FILE_DATAALLOCSIZE != 0 {
+            entry.data_alloc = Some(i64::from_ne_bytes(take(rec, &mut at)?));
+        }
+        if extended & libc::ATTR_CMNEXT_PRIVATESIZE != 0 {
+            entry.private = Some(i64::from_ne_bytes(take(rec, &mut at)?));
+        }
+        if extended & libc::ATTR_CMNEXT_CLONEID != 0 {
+            entry.clone_id = Some(u64::from_ne_bytes(take(rec, &mut at)?));
+        }
+        if extended & libc::ATTR_CMNEXT_EXT_FLAGS != 0 {
+            entry.ext_flags = Some(u64::from_ne_bytes(take(rec, &mut at)?));
+        }
+        if extended & ATTR_CMNEXT_CLONE_REFCNT != 0 {
+            entry.clone_count = Some(u32::from_ne_bytes(take(rec, &mut at)?));
         }
         Some((entry, len))
     }
@@ -2021,6 +2405,8 @@ mod tests {
     //! entry. And Git's spelling of a path, name by name, with the walk
     //! finding an ignored entry by it.
 
+    #[cfg(target_os = "macos")]
+    use super::bulk::Extended;
     #[cfg(target_os = "macos")]
     use super::git_spelling;
     use super::{
@@ -2492,6 +2878,189 @@ mod tests {
             );
         }
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    const MIB: usize = 1024 * 1024;
+
+    /// A file of `len` bytes of its own, written to disk, so its blocks are
+    /// allocated when the walk reads it.
+    fn write_synced(path: &Path, len: usize, seed: u8) {
+        use std::io::Write;
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8 ^ seed).collect();
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(&data).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    /// Allocated bytes, and the bytes of them that removal does not free.
+    fn kept(w: &Path) -> (u64, u64) {
+        let usage = measure(w, &[], &|_| false, &|_| false, &[]).unwrap();
+        (usage.allocated, usage.allocated - usage.reclaimable)
+    }
+
+    /// A hard-linked file counts once, and frees nothing while a link of it
+    /// is outside the worktree.
+    #[test]
+    fn a_hard_link_outside_keeps_the_file_and_one_inside_counts_once() {
+        let root = scratch("links");
+        let (w, outside) = (root.join("w"), root.join("outside"));
+        fs::create_dir_all(&w).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        write_synced(&w.join("pair"), MIB, 1);
+        fs::hard_link(w.join("pair"), w.join("pair2")).unwrap();
+        write_synced(&w.join("kept"), MIB, 2);
+        fs::hard_link(w.join("kept"), outside.join("kept")).unwrap();
+        let blocks = |name: &str| {
+            use std::os::unix::fs::MetadataExt;
+            fs::symlink_metadata(w.join(name)).unwrap().blocks() * 512
+        };
+        assert_eq!(
+            kept(&w),
+            (blocks("pair") + blocks("kept") + blocks(""), blocks("kept"))
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// An APFS clone of `from` at `to`, as `cp -c` makes one, or false where
+    /// the file system makes none.
+    #[cfg(target_os = "macos")]
+    fn clone_file(from: &Path, to: &Path) -> bool {
+        let from = CString::new(from.as_os_str().as_bytes()).unwrap();
+        let to = CString::new(to.as_os_str().as_bytes()).unwrap();
+        // SAFETY: both are NUL-terminated paths that outlive the call,
+        // which only reads them.
+        if unsafe { libc::clonefile(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+            return true;
+        }
+        let error = std::io::Error::last_os_error();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ENOTSUP),
+            "clonefile: {error}"
+        );
+        false
+    }
+
+    /// On APFS, the blocks a file shares with a clone outside the worktree
+    /// are not freed by removing it, and a file and its full clone, both
+    /// inside, free their blocks once. Allocated size counts every file's
+    /// blocks, as before (#193). Each case runs twice: in the worktree's
+    /// top folder, which the walk lists first, so each file is asked on its
+    /// own, and in a folder listed after one that held a clone, so its
+    /// listing call asks for every file's private size.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn blocks_shared_with_a_clone_count_only_where_removal_frees_them() {
+        let root = scratch("clones");
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        for (seed, name) in [(2, "primer"), (3, "a"), (4, "b"), (5, "c")] {
+            write_synced(&outside.join(name), MIB, seed);
+        }
+        if !clone_file(&outside.join("a"), &root.join("probe")) {
+            eprintln!("skip: {} makes no clones", root.display());
+            fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+        let mib = MIB as u64;
+        for batched in [false, true] {
+            // The worktree, and the folder the case goes in. Batched, the
+            // walk lists `w/primer/` alone after `w/`, and it holds a clone
+            // of a file kept elsewhere, so the case's folder, the only one
+            // in it, is listed next with every private size. The primer is
+            // 1 MiB allocated that removal does not free.
+            let worktree = |name: &str| {
+                let w = root.join(format!("{name}-{batched}"));
+                if !batched {
+                    fs::create_dir_all(&w).unwrap();
+                    return (w.clone(), w);
+                }
+                let case = w.join("primer").join("case");
+                fs::create_dir_all(&case).unwrap();
+                let primer = w.join("primer").join("primer");
+                assert!(clone_file(&outside.join("primer"), &primer));
+                (w, case)
+            };
+            let primed = if batched { mib } else { 0 };
+            let at = |what: &str| format!("{what}, batched: {batched}");
+
+            // A clone of a file kept elsewhere frees nothing; a file of its
+            // own frees its blocks.
+            let (w, case) = worktree("full");
+            assert!(clone_file(&outside.join("a"), &case.join("a")));
+            write_synced(&case.join("own"), MIB, 6);
+            let want = (2 * mib + primed, mib + primed);
+            assert_eq!(kept(&w), want, "{}", at("a clone of a file kept"));
+
+            // With its first quarter rewritten, it frees that quarter.
+            let (w, case) = worktree("partial");
+            assert!(clone_file(&outside.join("b"), &case.join("b")));
+            {
+                use std::io::Write;
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .open(case.join("b"))
+                    .unwrap();
+                file.write_all(&vec![0xa5; MIB / 4]).unwrap();
+                file.sync_all().unwrap();
+            }
+            let want = (mib + primed, 3 * mib / 4 + primed);
+            assert_eq!(kept(&w), want, "{}", at("a partial clone"));
+
+            // Two links of one clone of a file kept elsewhere: the inode
+            // once, and it frees nothing.
+            let (w, case) = worktree("linked");
+            assert!(clone_file(&outside.join("c"), &case.join("c")));
+            fs::hard_link(case.join("c"), case.join("c2")).unwrap();
+            let want = (mib + primed, mib + primed);
+            assert_eq!(kept(&w), want, "{}", at("a hard-linked clone"));
+
+            // A file and its clone, both inside, the clone with a second
+            // link: removing them frees the blocks they share, once. Before
+            // macOS 14 the kernel does not count a file's clones, so they
+            // count for neither.
+            let (w, case) = worktree("pair");
+            write_synced(&case.join("src"), MIB, 7);
+            assert!(clone_file(&case.join("src"), &case.join("dst")));
+            fs::hard_link(case.join("dst"), case.join("dst2")).unwrap();
+            let once = if Extended::known().sets() {
+                mib
+            } else {
+                2 * mib
+            };
+            let want = (2 * mib + primed, once + primed);
+            assert_eq!(kept(&w), want, "{}", at("a file and its clone"));
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The listing asks only for the extended attributes the kernel knows,
+    /// by xnu's `ATTR_CMNEXT_VALIDMASK` in each release, and none where it
+    /// cannot read the release.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_listing_asks_only_for_attributes_the_kernel_knows() {
+        let none = Extended::of(None);
+        assert_eq!((none.flags, none.private), (0, 0));
+        assert_eq!(Extended::of(Some(19)), none, "macOS 10.15");
+        let eleven = Extended::of(Some(20));
+        assert_eq!(eleven.flags, libc::ATTR_CMNEXT_EXT_FLAGS);
+        assert_eq!(
+            eleven.private,
+            libc::ATTR_CMNEXT_PRIVATESIZE | libc::ATTR_CMNEXT_CLONEID
+        );
+        assert!(!eleven.sets());
+        assert_eq!(Extended::of(Some(22)), eleven, "macOS 13");
+        let fourteen = Extended::of(Some(23));
+        assert_eq!(fourteen.private, eleven.private | 0x0000_1000);
+        assert!(fourteen.sets());
+        assert_eq!(Extended::of(Some(25)), fourteen, "macOS 26");
+        let mut uname = std::process::Command::new("/usr/bin/uname");
+        uname.arg("-r");
+        let release = crate::run::run(&mut uname, std::time::Duration::from_secs(30), 4096);
+        let major = String::from_utf8(release.unwrap().stdout).unwrap();
+        let major = major.split('.').next().unwrap().parse().unwrap();
+        assert_eq!(Extended::known(), Extended::of(Some(major)), "uname -r");
     }
 
     #[test]
