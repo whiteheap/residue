@@ -1219,7 +1219,8 @@ mod platform {
     /// own `/proc/self/status`.
     fn hidden(status: &str) -> Result<Option<Hidden>, String> {
         let ns = fs::metadata("/proc/self/ns/pid").map(|meta| meta.ino());
-        if procview::own_namespace(&ns, procview::nspid(status))? {
+        let own = procview::own_namespace(&ns, procview::nspid(status));
+        if procview::contained(own, || procview::wsl(&wsl()))? {
             return Ok(Some(Hidden::inside(
                 "inside a container",
                 "inside a container (a PID namespace of its own)",
@@ -1233,6 +1234,18 @@ mod platform {
                 "/proc is mounted with hidepid={value}, which hides the processes residue may not inspect, some of yours among them, so it cannot see every process of yours"
             ),
         }))
+    }
+
+    /// What tells a WSL distribution from a container (`procview::wsl`).
+    fn wsl() -> procview::Wsl {
+        let set = |name: &str| std::env::var_os(name).is_some();
+        procview::Wsl {
+            kernel: fs::read_to_string("/proc/sys/kernel/osrelease")
+                .is_ok_and(|release| procview::wsl_kernel(&release)),
+            session: set("WSL_DISTRO_NAME") || set("WSL_INTEROP") || Path::new("/run/WSL").is_dir(),
+            container: Path::new("/.dockerenv").exists()
+                || Path::new("/run/.containerenv").exists(),
+        }
     }
 
     /// residue's effective group and its supplementary groups: a member of
@@ -1348,6 +1361,52 @@ mod procview {
             .lines()
             .find_map(|line| line.strip_prefix("NSpid:"))
             .map(|pids| pids.split_whitespace().count())
+    }
+
+    /// What residue reads to tell a WSL distribution from a container.
+    /// Under WSL 2 each distribution runs in a PID namespace of its own in
+    /// one virtual machine, and that namespace is the user's whole Linux
+    /// session: what is outside is other distributions and Windows
+    /// programs, which no setup lets residue see. A container on the same
+    /// kernel, as Docker Desktop runs one, reports the same kernel, so the
+    /// kernel alone is not enough.
+    #[derive(Debug, Default)]
+    pub struct Wsl {
+        /// `/proc/sys/kernel/osrelease` names Microsoft's kernel (WSL 1 and 2).
+        pub kernel: bool,
+        /// WSL set `WSL_DISTRO_NAME` or `WSL_INTEROP`, or made `/run/WSL`, as
+        /// it does for a distribution.
+        pub session: bool,
+        /// Docker's `/.dockerenv` or Podman's `/run/.containerenv` is there.
+        pub container: bool,
+    }
+
+    /// Whether `/proc/sys/kernel/osrelease` names Microsoft's kernel, as it
+    /// does under WSL 1 (`4.4.0-19041-Microsoft`) and WSL 2
+    /// (`6.6.87.2-microsoft-standard-WSL2`).
+    pub fn wsl_kernel(osrelease: &str) -> bool {
+        osrelease.to_ascii_lowercase().contains("microsoft")
+    }
+
+    /// Whether residue runs in a WSL distribution, which is not counted as a
+    /// container.
+    pub fn wsl(wsl: &Wsl) -> bool {
+        wsl.kernel && wsl.session && !wsl.container
+    }
+
+    /// Whether residue counts as in a container: in a PID namespace other
+    /// than the initial one, or one it cannot read (`own_namespace`), unless
+    /// it runs in a WSL distribution. `wsl` is asked only when the
+    /// namespace would count, so outside a namespace nothing more is read.
+    pub fn contained(
+        own_namespace: Result<bool, String>,
+        wsl: impl FnOnce() -> bool,
+    ) -> Result<bool, String> {
+        match own_namespace {
+            Ok(false) => Ok(false),
+            _ if wsl() => Ok(false),
+            other => other,
+        }
     }
 
     /// Whether residue runs in a PID namespace other than the initial one,
@@ -2806,6 +2865,43 @@ mod tests {
             Some("a sandbox or security module around residue refuses it")
         );
         assert_eq!(refusal(&Creds::read("Name:\tsleep\n"), &me), Some(UNSURE));
+    }
+
+    #[test]
+    fn a_wsl_distribution_is_not_a_container_and_a_container_on_its_kernel_is() {
+        use super::procview::{Wsl, contained, wsl, wsl_kernel};
+        // WSL 1, WSL 2, and kernels that are not WSL's: Ubuntu's, and
+        // Docker Desktop's on a Mac.
+        assert!(wsl_kernel("4.4.0-19041-Microsoft\n"));
+        assert!(wsl_kernel("5.15.167.4-microsoft-standard-WSL2\n"));
+        assert!(wsl_kernel("6.6.87.2-microsoft-standard-WSL2"));
+        assert!(!wsl_kernel("6.8.0-48-generic\n"));
+        assert!(!wsl_kernel("7.0.14-linuxkit\n"));
+        let of = |kernel, session, container| {
+            wsl(&Wsl {
+                kernel,
+                session,
+                container,
+            })
+        };
+        assert!(of(true, true, false));
+        // Docker Desktop's containers run on the WSL 2 kernel.
+        assert!(!of(true, false, false));
+        assert!(!of(true, true, true));
+        // WSL's variables in a shell elsewhere.
+        assert!(!of(false, true, false));
+        // A PID namespace of its own counts, unless it is a WSL
+        // distribution; so does one residue cannot read.
+        let unread = || Err("residue cannot read which PID namespace it runs in".to_string());
+        assert_eq!(contained(Ok(true), || false), Ok(true));
+        assert_eq!(contained(Ok(true), || true), Ok(false));
+        assert!(contained(unread(), || false).is_err());
+        assert_eq!(contained(unread(), || true), Ok(false));
+        // The initial namespace reads nothing about WSL.
+        assert_eq!(
+            contained(Ok(false), || panic!("WSL read outside a namespace")),
+            Ok(false)
+        );
     }
 
     #[test]
