@@ -1296,6 +1296,10 @@ pub struct Fetched {
     /// remote's remote-tracking refs, each with that remote:
     /// `(refspec, OTHER)`.
     pub reaching: Vec<(String, String)>,
+    /// The remote's refspecs with no `*` left out because the destination
+    /// is a symbolic ref: Git would store through it, into the ref it
+    /// names, such as a local branch ([`symbolic_destinations`]).
+    pub symbolic: Vec<String>,
 }
 
 /// Why [`fetch`] did not run Git for a remote.
@@ -1306,6 +1310,52 @@ pub enum Skip {
     /// Each of its refspecs into `refs/remotes/` also stores into another
     /// remote's refs (`Fetched::reaching`).
     OtherRemotesRefs,
+    /// Each of its refspecs into `refs/remotes/` is left out, at least one
+    /// because its destination is a symbolic ref (`Fetched::symbolic`), the
+    /// others because they store into another remote's refs.
+    LeftOut,
+}
+
+/// The kept refspecs with no `*` whose destination is a symbolic ref now,
+/// taken out of `selection.kept`. Git ignores a symbolic ref at the
+/// destination only for a refspec with a `*` (`ignore_symref_update` in its
+/// remote.c); for an exact one, `+refs/heads/topic:refs/remotes/origin/topic`,
+/// it updates the ref the symbolic ref names, so a symbolic ref that names
+/// a local branch would move that branch. An error reading one is an error
+/// of the fetch, which then does not run.
+fn symbolic_destinations<'a>(
+    dir: &Path,
+    selection: &mut Selection<'a>,
+) -> Result<Vec<&'a [u8]>, String> {
+    let mut symbolic = Vec::new();
+    let mut kept = Vec::with_capacity(selection.kept.len());
+    for spec in std::mem::take(&mut selection.kept) {
+        let exact = destination(spec).filter(|dst| !dst.contains(&b'*'));
+        let Some(dst) = exact else {
+            kept.push(spec);
+            continue;
+        };
+        let args = [
+            OsStr::new("symbolic-ref"),
+            OsStr::new("-q"),
+            OsStr::from_bytes(dst),
+        ];
+        let exit = exec(dir, &args, QUERY_TIMEOUT)?;
+        match exit.code {
+            Some(0) => symbolic.push(spec),
+            // Not a symbolic ref, or no ref at all.
+            Some(1) => kept.push(spec),
+            _ => {
+                return Err(format!(
+                    "git symbolic-ref could not read {}: {}",
+                    String::from_utf8_lossy(dst),
+                    exit.stderr
+                ));
+            }
+        }
+    }
+    selection.kept = kept;
+    Ok(symbolic)
 }
 
 /// `git fetch --prune --no-tags REMOTE REFSPEC...`, run by `watch` from the
@@ -1319,13 +1369,16 @@ pub enum Skip {
 /// only their destinations; `--refmap=` stops it from also storing a
 /// fetched ref through the other configured refspecs, and `--no-prune-tags`
 /// overrides `fetch.pruneTags` and `remote.NAME.pruneTags`. A remote with
-/// no such refspec is not fetched. Git stores nothing through a symbolic
-/// ref at a destination and prunes none (`ignore_symref_update` and
-/// `get_stale_heads` in its remote.c), so one under `refs/remotes/` that
-/// names a local branch moves nothing. No `FETCH_HEAD`
+/// no such refspec is not fetched. A symbolic ref under `refs/remotes/`
+/// that names a local branch moves nothing: Git prunes none
+/// (`get_stale_heads` in its remote.c) and stores nothing through one for a
+/// refspec with a `*` (`ignore_symref_update`), and a refspec with no `*`
+/// whose destination is a symbolic ref, which Git would store through, is
+/// left out ([`symbolic_destinations`]). No `FETCH_HEAD`
 /// (`--no-write-fetch-head`; a linked worktree's `FETCH_HEAD` is part of
 /// its last change), no tags, no `refs/remotes/NAME/HEAD` (Git sets it only
-/// when no refspec is given), no submodules, no automatic
+/// when no refspec is given, and `remote.NAME.followRemoteHEAD` is `never`
+/// for Git 2.48 and later besides), no submodules, no automatic
 /// `git maintenance` or `gc`, and hooks stay off (`command`).
 ///
 /// It never waits for a person. Git's terminal prompt is off (`command`);
@@ -1353,7 +1406,11 @@ pub fn fetch(dir: &Path, remote: &str) -> Result<Fetched, String> {
         }
     };
     let (values, others) = remote_config(&out, remote);
-    let selection = select(&values, &others);
+    let mut selection = select(&values, &others);
+    let symbolic: Vec<String> = symbolic_destinations(dir, &mut selection)?
+        .into_iter()
+        .map(|spec| String::from_utf8_lossy(spec).into_owned())
+        .collect();
     let reaching = selection
         .reaching
         .iter()
@@ -1365,7 +1422,9 @@ pub fn fetch(dir: &Path, remote: &str) -> Result<Fetched, String> {
         })
         .collect();
     if !selection.stores() {
-        let skip = if selection.reaching.is_empty() {
+        let skip = if !symbolic.is_empty() {
+            Skip::LeftOut
+        } else if selection.reaching.is_empty() {
             Skip::NoRemoteTrackingRefspec
         } else {
             Skip::OtherRemotesRefs
@@ -1373,6 +1432,7 @@ pub fn fetch(dir: &Path, remote: &str) -> Result<Fetched, String> {
         return Ok(Fetched {
             skipped: Some(skip),
             reaching,
+            symbolic,
         });
     }
     let refspecs = selection.kept;
@@ -1387,6 +1447,16 @@ pub fn fetch(dir: &Path, remote: &str) -> Result<Fetched, String> {
         cmd.env("SSH_ASKPASS_REQUIRE", "never")
             .env_remove("SSH_ASKPASS")
             .env("GCM_INTERACTIVE", "never");
+        // Git 2.48 and later may also set refs/remotes/REMOTE/HEAD from the
+        // remote's HEAD as it fetches. `command` removed the user's
+        // GIT_CONFIG_COUNT, so this is the only setting it adds, and the
+        // remote's name is never parsed out of a `-c NAME=VALUE`.
+        cmd.env("GIT_CONFIG_COUNT", "1")
+            .env(
+                "GIT_CONFIG_KEY_0",
+                format!("remote.{remote}.followRemoteHEAD"),
+            )
+            .env("GIT_CONFIG_VALUE_0", "never");
         new_session(&mut cmd);
         cmd
     };
@@ -1413,6 +1483,7 @@ pub fn fetch(dir: &Path, remote: &str) -> Result<Fetched, String> {
         Ok(Fetched {
             skipped: None,
             reaching,
+            symbolic,
         })
     } else {
         Err(format!(
@@ -1794,8 +1865,8 @@ mod tests {
     //! is checked by `.github/watch-smoke.sh` (case 12).
 
     use super::{
-        MAX_LIMITED, MAX_LIMITED_BYTES, Status, merge_limited, remote_config, select,
-        topmost_untracked, within_limit,
+        MAX_LIMITED, MAX_LIMITED_BYTES, Selection, Status, merge_limited, remote_config, select,
+        symbolic_destinations, topmost_untracked, within_limit,
     };
     use std::collections::{BTreeSet, HashSet};
     use std::path::{Path, PathBuf};
@@ -1957,6 +2028,41 @@ mod tests {
             ]),
             None
         );
+    }
+
+    #[test]
+    fn a_refspec_with_no_star_onto_a_symbolic_ref_is_left_out() {
+        // Git stores through a symbolic ref at the destination of a
+        // refspec with no `*`, into the branch it names; it ignores one only
+        // for a refspec with a `*`.
+        let dir = std::env::temp_dir().join(format!("residue-symref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let git = |args: &[&str]| {
+            let mut cmd = std::process::Command::new("git");
+            cmd.arg("-C").arg(&dir).args(args);
+            let out =
+                crate::run::run(&mut cmd, std::time::Duration::from_secs(30), 1 << 20).unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&["init", "-q"]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/topic",
+            "refs/heads/side",
+        ]);
+        let exact = b"+refs/heads/topic:refs/remotes/origin/topic".as_slice();
+        let glob = b"+refs/heads/*:refs/remotes/origin/*".as_slice();
+        let absent = b"refs/heads/main:refs/remotes/origin/main".as_slice();
+        let negative = b"^refs/heads/secret".as_slice();
+        let mut selection = Selection {
+            kept: vec![exact, glob, absent, negative],
+            reaching: Vec::new(),
+        };
+        let symbolic = symbolic_destinations(&dir, &mut selection).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(symbolic, [exact]);
+        assert_eq!(selection.kept, [glob, absent, negative]);
     }
 
     #[test]
