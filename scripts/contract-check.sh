@@ -3544,6 +3544,36 @@ target_fixture '[build]
 target-dir = "/"' none
 target_explain '$t.path == "/" and $t.state == "not_measured" and $t.reason == "holds_worktree" and $t.size == null'
 
+# A file mounted from another filesystem on the folder's path, as a
+# container's /etc/hostname is: refused there as on another filesystem,
+# never "missing" after a look into it (#218). Linux only, and only where
+# such a file is mounted in a folder on the filesystem of /.
+name=target-dir-mounted-file
+mounted_file=
+if [ "$(uname -s)" = Linux ]; then
+    root_dev=$(stat -c %d /)
+    while read -r _ _ _ _ point _; do
+        case $point in *\\* | *\"*) continue ;; esac
+        [ -f "$point" ] && [ ! -L "$point" ] || continue
+        parent=$(dirname "$point")
+        [ "$(cd "$parent" 2>/dev/null && pwd -P)" = "$parent" ] || continue
+        if [ "$(stat -c %d "$parent")" = "$root_dev" ] && [ "$(stat -c %d "$point")" != "$root_dev" ]; then
+            mounted_file=$point
+            break
+        fi
+    done </proc/self/mountinfo
+fi
+if [ -n "$mounted_file" ]; then
+    target_fixture "[build]
+target-dir = \"$mounted_file/x\"" none
+    export MOUNTED_FILE=$mounted_file
+    target_explain '$t.path == ($ENV.MOUNTED_FILE + "/x") and $t.state == "not_measured"
+        and $t.reason == "unreadable" and $t.size == null
+        and ($t.detail | startswith($ENV.MOUNTED_FILE + ": on another filesystem"))'
+else
+    echo "skip $name: no file here is mounted from another filesystem in a folder on the filesystem of /"
+fi
+
 # Inside the checkout: the walk counts it, so it is not named.
 name=target-dir-inside
 target_fixture '[build]

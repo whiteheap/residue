@@ -379,7 +379,7 @@ impl Mounts {
     )]
     fn other(&self, path: &Path, meta: &Stat) -> bool {
         // statx says so itself (Linux 5.8 and later): the root of a mount.
-        if meta.mount_root {
+        if meta.mount_root == Some(true) {
             return true;
         }
         match self {
@@ -1248,9 +1248,10 @@ struct Stat {
     /// The ID of the mount it is on, where the system gives one: Linux 5.8
     /// and later ([`statx`]).
     mount: Option<u64>,
-    /// It is the root of a mount, where the system says so: Linux 5.8 and
-    /// later (`STATX_ATTR_MOUNT_ROOT`).
-    mount_root: bool,
+    /// Whether it is the root of a mount, where the system says: Linux 5.8
+    /// and later (`STATX_ATTR_MOUNT_ROOT` in `stx_attributes_mask`). `None`
+    /// where it does not, which is unknown, never "not a mount root".
+    mount_root: Option<bool>,
     dev: u64,
     ino: u64,
     nlink: u64,
@@ -1331,7 +1332,7 @@ impl From<&sys::stat> for Stat {
             file: matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFLNK),
             link: st.st_mode & libc::S_IFMT == libc::S_IFLNK,
             mount: None,
-            mount_root: false,
+            mount_root: None,
             dev: st.st_dev as u64,
             ino: st.st_ino as u64,
             nlink: st.st_nlink as u64,
@@ -1360,6 +1361,19 @@ fn fstat(fd: BorrowedFd) -> io::Result<Stat> {
 fn lstat_at(at: BorrowedFd, name: &CStr) -> io::Result<Stat> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some(stat) = statx::lstat(at, name) {
+        return stat;
+    }
+    lstat_raw(at, name).map(|st| Stat::from(&st))
+}
+
+/// `lstat` of one entry for what names it: its type, device, inode and
+/// mount. On Linux it does not make a filesystem mounted at `name` refresh
+/// its attributes ([`statx::identity`]); its links, size, blocks and time
+/// are not to be read. Only [`read_in`] uses it: the walk needs those, as
+/// they are now.
+fn identity_at(at: BorrowedFd, name: &CStr) -> io::Result<Stat> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(stat) = statx::identity(at, name) {
         return stat;
     }
     lstat_raw(at, name).map(|st| Stat::from(&st))
@@ -1485,6 +1499,31 @@ mod statx {
     /// mount is `None` where the kernel gives none (before Linux 5.8) or
     /// gives 0 (qemu-user before 11).
     pub fn lstat(at: BorrowedFd, name: &CStr) -> Option<io::Result<Stat>> {
+        call(at, name, 0, MASK)
+    }
+
+    /// What [`identity`] asks for: the type, inode and mount. The device
+    /// always comes.
+    const IDENTITY: libc::c_uint = libc::STATX_TYPE | libc::STATX_INO | libc::STATX_MNT_ID;
+
+    /// `lstat` of `name` in `at` for its type, device, inode and mount
+    /// alone, with `AT_STATX_DONT_SYNC`, or `None` where there is no
+    /// statx. Its links, size, blocks and time are not to be read: they can
+    /// be stale. The lookup of `name` in `at` checks the entry as any lstat
+    /// does, and an entry's type and inode never change, so these are not.
+    /// What it spares is the filesystem mounted at `name`, if one is: NFS
+    /// (`nfs_getattr`) and FUSE (`fuse_update_get_attr`) answer from their
+    /// cache, not their server. A filesystem may ignore the flag.
+    pub fn identity(at: BorrowedFd, name: &CStr) -> Option<io::Result<Stat>> {
+        call(at, name, libc::AT_STATX_DONT_SYNC, IDENTITY)
+    }
+
+    fn call(
+        at: BorrowedFd,
+        name: &CStr,
+        flags: libc::c_int,
+        mask: libc::c_uint,
+    ) -> Option<io::Result<Stat>> {
         if state() == State::Missing {
             return None;
         }
@@ -1497,8 +1536,8 @@ mod statx {
                 libc::SYS_statx,
                 at.as_raw_fd(),
                 name.as_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT,
-                MASK,
+                libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT | flags,
+                mask,
                 &raw mut stx,
             )
         };
@@ -1520,7 +1559,8 @@ mod statx {
             link: kind == libc::S_IFLNK,
             mount: (stx.stx_mask & libc::STATX_MNT_ID != 0 && stx.stx_mnt_id != 0)
                 .then_some(stx.stx_mnt_id),
-            mount_root: stx.stx_attributes_mask & root != 0 && stx.stx_attributes & root != 0,
+            mount_root: (stx.stx_attributes_mask & root != 0)
+                .then_some(stx.stx_attributes & root != 0),
             dev,
             ino: stx.stx_ino,
             nlink: u64::from(stx.stx_nlink),
@@ -2126,7 +2166,7 @@ mod bulk {
                 file: true,
                 link: false,
                 mount: None,
-                mount_root: false,
+                mount_root: None,
                 // As std's MetadataExt::dev widens st_dev.
                 dev: self.dev? as u64,
                 ino: self.ino?,
@@ -2411,10 +2451,15 @@ pub enum Read {
 /// `.` or `..`. It opens `dir` from `/` one name at a time, never through a
 /// symbolic link, as the walk opens a worktree, and looks a name up only in
 /// a folder on one of `devices`, the filesystems the worktree's own path is
-/// on: a path from that file never makes residue look into another
+/// on. A name on another filesystem, a file mounted there too, is refused
+/// on its lstat, before residue decides on what it is or opens it: a path
+/// from that file never makes residue open or read anything on another
 /// filesystem, which could wait on a network server or mount an
-/// automounted folder. `name` is opened only once lstat shows a regular
-/// file, so never a FIFO or a device.
+/// automounted folder. That lstat still reaches the root of a mount at the
+/// name, as any lookup does; on Linux it asks only for what names the
+/// entry, which NFS and FUSE answer from their cache ([`identity_at`]).
+/// `name` is opened only once lstat shows a regular file, so never a FIFO
+/// or a device.
 pub fn read_in(dir: &Path, name: &str, devices: &[u64], limit: usize) -> io::Result<Read> {
     let mut names = Vec::new();
     for part in dir.components() {
@@ -2453,17 +2498,22 @@ pub fn read_in(dir: &Path, name: &str, devices: &[u64], limit: usize) -> io::Res
             ),
         )
     };
+    // Each folder opened below is on one of `devices`: its lstat was
+    // refused otherwise, and its fstat matches that lstat.
+    if !devices.contains(&here.dev()) {
+        return Err(elsewhere(&reached));
+    }
     for part in names {
-        if !devices.contains(&here.dev()) {
-            return Err(elsewhere(&reached));
-        }
         reached.push(part);
         let c = leaf(&reached).map_err(|e| at_path(&reached, e))?;
-        let next = match lstat_at(at.as_fd(), &c) {
+        let next = match identity_at(at.as_fd(), &c) {
             Ok(next) => next,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Read::NoFolder),
             Err(e) => return Err(at_path(&reached, e)),
         };
+        if on_another_filesystem(&next, devices) {
+            return Err(elsewhere(&reached));
+        }
         if next.link {
             return Err(at_path(
                 &reached,
@@ -2479,17 +2529,17 @@ pub fn read_in(dir: &Path, name: &str, devices: &[u64], limit: usize) -> io::Res
             return Err(at_path(&reached, changed("another folder is in its place")));
         }
     }
-    if !devices.contains(&here.dev()) {
-        return Err(elsewhere(&reached));
-    }
     let folder = (here.dev(), here.ino());
     let path = reached.join(name);
     let c = leaf(&path).map_err(|e| at_path(&path, e))?;
-    let meta = match lstat_at(at.as_fd(), &c) {
+    let meta = match identity_at(at.as_fd(), &c) {
         Ok(meta) => meta,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Read::NoFile),
         Err(e) => return Err(at_path(&path, e)),
     };
+    if on_another_filesystem(&meta, devices) {
+        return Err(elsewhere(&path));
+    }
     if meta.link {
         return Err(at_path(
             &path,
@@ -2533,6 +2583,22 @@ pub fn read_in(dir: &Path, name: &str, devices: &[u64], limit: usize) -> io::Res
     Ok(Read::File(bytes, folder))
 }
 
+/// Whether `meta`, the lstat of a name in a folder on one of `devices`, is
+/// on another filesystem: a mount there. Its device tells, except for a
+/// file on Linux, which overlayfs can give the device of the layer it comes
+/// from ([`ANY_ENTRY_BY_DEVICE`]): there statx tells the root of a mount,
+/// and where statx gives no mount (before Linux 5.8) or does not say
+/// whether it is a mount root, the device still does.
+fn on_another_filesystem(meta: &Stat, devices: &[u64]) -> bool {
+    if devices.contains(&meta.dev()) {
+        return false;
+    }
+    if meta.is_dir() || ANY_ENTRY_BY_DEVICE || meta.mount.is_none() {
+        return true;
+    }
+    meta.mount_root != Some(false)
+}
+
 #[cfg(test)]
 mod tests {
     //! The walk's folder opens, on real folders in a temporary directory:
@@ -2547,14 +2613,17 @@ mod tests {
     use super::bulk::Extended;
     #[cfg(target_os = "macos")]
     use super::git_spelling;
+    #[cfg(target_os = "linux")]
+    use super::identity_at;
     use super::{
         Bucket, HELD, Mounts, Parent, Pending, Place, REOPENED, Reopened, Step, lstat_at, measure,
-        measure_with, open_listed, open_root, spell_names, table,
+        measure_with, open_listed, open_root, read_in, spell_names, table,
     };
     use std::ffi::CString;
     use std::fs;
     use std::os::fd::{AsFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
@@ -3608,7 +3677,7 @@ swap\t/srv/rc/wt/a b\ttmpfs\txattr,dev=5000001\t1762700000
             let new = lstat_at(dir.as_fd(), &c(name)).unwrap();
             let old = Stat::from(&lstat_raw(dir.as_fd(), &c(name)).unwrap());
             assert_eq!(fields(&new), fields(&old), "{name}");
-            assert!(!new.mount_root, "{name}");
+            assert_ne!(new.mount_root, Some(true), "{name}");
         }
         let top = open_root(&w).unwrap().0;
         // Linux 5.8 and later; CI's kernels are.
@@ -3647,14 +3716,128 @@ swap\t/srv/rc/wt/a b\ttmpfs\txattr,dev=5000001\t1762700000
         let slash = open(Path::new("/"));
         let proc = lstat_at(slash.as_fd(), &c("proc")).unwrap();
         let etc = lstat_at(slash.as_fd(), &c("etc")).unwrap();
-        if proc.mount.is_none() && !proc.mount_root {
+        if proc.mount.is_none() && proc.mount_root != Some(true) {
             eprintln!("this kernel says neither; the walk reads the mount table");
             return;
         }
-        assert!(proc.mount_root);
-        assert!(!etc.mount_root);
+        assert_eq!(proc.mount_root, Some(true));
+        assert_eq!(etc.mount_root, Some(false));
         let none = super::Mounts::Device;
         assert!(none.other(Path::new("/proc"), &proc));
         assert!(!none.other(Path::new("/etc"), &etc));
+    }
+
+    /// `read_in` tells a name on another filesystem by its device, except
+    /// a file on Linux, which overlayfs can give its layer's device: there
+    /// only the root of a mount is, or any file where statx gives no mount.
+    #[test]
+    fn read_in_tells_another_filesystem_by_device_and_on_linux_a_files_mount() {
+        let at = |dir: bool, dev: u64, mount: Option<u64>, mount_root: Option<bool>| super::Stat {
+            dir,
+            file: !dir,
+            link: false,
+            mount,
+            mount_root,
+            dev,
+            ino: 2,
+            nlink: 1,
+            blocks: 0,
+            len: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+            unshared: None,
+            clones: None,
+        };
+        let devices = [1, 2];
+        let elsewhere = |meta| super::on_another_filesystem(&meta, &devices);
+        assert!(!elsewhere(at(true, 2, Some(7), Some(false))));
+        assert!(!elsewhere(at(false, 1, Some(7), Some(true))));
+        assert!(!elsewhere(at(false, 1, Some(7), None)));
+        assert!(elsewhere(at(true, 3, Some(8), Some(true))));
+        assert!(elsewhere(at(true, 3, None, Some(false))));
+        assert!(elsewhere(at(false, 3, Some(8), Some(true))));
+        assert!(elsewhere(at(false, 3, None, Some(false))));
+        // A file on overlayfs that shows its lower layer's device.
+        assert_eq!(
+            elsewhere(at(false, 3, Some(7), Some(false))),
+            super::ANY_ENTRY_BY_DEVICE
+        );
+        // A file on another device whose statx does not say whether it is
+        // a mount root: the device decides.
+        assert!(elsewhere(at(false, 3, Some(7), None)));
+    }
+
+    /// statx answers whether an entry is a mount root only when
+    /// `stx_attributes_mask` holds `STATX_ATTR_MOUNT_ROOT`; otherwise the
+    /// answer is unknown, never "not a mount root".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_an_unreported_mount_root_is_unknown() {
+        let root = libc::STATX_ATTR_MOUNT_ROOT as u64;
+        // SAFETY: statx is plain data; all zeroes is a valid value.
+        let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+        stx.stx_mode = libc::S_IFREG as u16;
+        stx.stx_attributes = root;
+        assert_eq!(super::statx::from(&stx).mount_root, None);
+        stx.stx_attributes_mask = root;
+        assert_eq!(super::statx::from(&stx).mount_root, Some(true));
+        stx.stx_attributes = 0;
+        assert_eq!(super::statx::from(&stx).mount_root, Some(false));
+    }
+
+    /// A name on another filesystem than the worktree's is refused on its
+    /// lstat, the last one too: `/dev` is a mount of its own on Linux,
+    /// macOS and FreeBSD, so a file `dev` in `/` is never looked for there.
+    #[test]
+    fn read_in_refuses_a_last_name_on_another_filesystem() {
+        let root = fs::symlink_metadata("/").unwrap().dev();
+        if fs::symlink_metadata("/dev")
+            .map(|m| m.dev())
+            .unwrap_or(root)
+            == root
+        {
+            eprintln!("/dev is on the filesystem of /");
+            return;
+        }
+        let e = match read_in(Path::new("/"), "dev", &[root], 64) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("/dev was read"),
+        };
+        assert!(e.starts_with("/dev: on another filesystem"), "{e}");
+    }
+
+    /// A file mounted from another filesystem on a path is refused there,
+    /// before residue decides it is no folder: a container's
+    /// `/etc/hostname`, a bind mount of a file of the host's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_read_in_refuses_a_file_mounted_on_its_path() {
+        let root = fs::symlink_metadata("/").unwrap().dev();
+        let etc = open(Path::new("/etc"));
+        let Some(file) = ["hostname", "hosts", "resolv.conf"]
+            .into_iter()
+            .find(|name| {
+                identity_at(etc.as_fd(), &c(name)).is_ok_and(|m| {
+                    !m.dir && !m.link && m.mount_root == Some(true) && m.dev() != root
+                })
+            })
+        else {
+            eprintln!("no file in /etc is mounted from another filesystem here");
+            return;
+        };
+        if fs::symlink_metadata("/etc").unwrap().dev() != root {
+            eprintln!("/etc is on another filesystem than /");
+            return;
+        }
+        let mounted = Path::new("/etc").join(file);
+        let refused = |dir: &Path, name: &str| match read_in(dir, name, &[root], 64) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("{} was read", dir.join(name).display()),
+        };
+        let want = format!("{}: on another filesystem", mounted.display());
+        let e = refused(&mounted.join("x"), "CACHEDIR.TAG");
+        assert!(e.starts_with(&want), "{e}");
+        let e = refused(Path::new("/etc"), file);
+        assert!(e.starts_with(&want), "{e}");
     }
 }

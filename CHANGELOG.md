@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **A Cargo build folder whose path crosses onto another filesystem is `unreadable`, never `missing`** (#218). residue already refused to look into a folder on another filesystem than the worktree's on a `build.target-dir` path, but it checked a name's filesystem only after it had decided whether that name was a folder and opened it. A file mounted from another filesystem on the path, such as a container's `/etc/hostname`, was taken as no folder, and `explain` said `missing`. residue now refuses each name on the path, and the `CACHEDIR.TAG` or config file at its end, as soon as it looks it up, so it opens and reads nothing on another filesystem, and the detail says `on another filesystem than the worktree's`. On Linux that lookup asks only for the name's type, inode and mount, which NFS and FUSE give from their cache without asking their server. No check, verdict or removal changes.
+
 ## 0.0.14 (2026-11-11)
 
 residue keeps more worktrees that are in use or that it cannot fully see, `service status` shows what `watch` did last and what it waits for, and a program that shows a plan or a restore can have residue act only on what you confirmed.
