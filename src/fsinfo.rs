@@ -379,7 +379,7 @@ impl Mounts {
     )]
     fn other(&self, path: &Path, meta: &Stat) -> bool {
         // statx says so itself (Linux 5.8 and later): the root of a mount.
-        if meta.mount_root {
+        if meta.mount_root == Some(true) {
             return true;
         }
         match self {
@@ -1248,9 +1248,10 @@ struct Stat {
     /// The ID of the mount it is on, where the system gives one: Linux 5.8
     /// and later ([`statx`]).
     mount: Option<u64>,
-    /// It is the root of a mount, where the system says so: Linux 5.8 and
-    /// later (`STATX_ATTR_MOUNT_ROOT`).
-    mount_root: bool,
+    /// Whether it is the root of a mount, where the system says: Linux 5.8
+    /// and later (`STATX_ATTR_MOUNT_ROOT` in `stx_attributes_mask`). `None`
+    /// where it does not, which is unknown, never "not a mount root".
+    mount_root: Option<bool>,
     dev: u64,
     ino: u64,
     nlink: u64,
@@ -1331,7 +1332,7 @@ impl From<&sys::stat> for Stat {
             file: matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFLNK),
             link: st.st_mode & libc::S_IFMT == libc::S_IFLNK,
             mount: None,
-            mount_root: false,
+            mount_root: None,
             dev: st.st_dev as u64,
             ino: st.st_ino as u64,
             nlink: st.st_nlink as u64,
@@ -1558,7 +1559,8 @@ mod statx {
             link: kind == libc::S_IFLNK,
             mount: (stx.stx_mask & libc::STATX_MNT_ID != 0 && stx.stx_mnt_id != 0)
                 .then_some(stx.stx_mnt_id),
-            mount_root: stx.stx_attributes_mask & root != 0 && stx.stx_attributes & root != 0,
+            mount_root: (stx.stx_attributes_mask & root != 0)
+                .then_some(stx.stx_attributes & root != 0),
             dev,
             ino: stx.stx_ino,
             nlink: u64::from(stx.stx_nlink),
@@ -2164,7 +2166,7 @@ mod bulk {
                 file: true,
                 link: false,
                 mount: None,
-                mount_root: false,
+                mount_root: None,
                 // As std's MetadataExt::dev widens st_dev.
                 dev: self.dev? as u64,
                 ino: self.ino?,
@@ -2585,8 +2587,8 @@ pub fn read_in(dir: &Path, name: &str, devices: &[u64], limit: usize) -> io::Res
 /// on another filesystem: a mount there. Its device tells, except for a
 /// file on Linux, which overlayfs can give the device of the layer it comes
 /// from ([`ANY_ENTRY_BY_DEVICE`]): there statx tells the root of a mount,
-/// and where statx gives no mount (before Linux 5.8), the device still
-/// does.
+/// and where statx gives no mount (before Linux 5.8) or does not say
+/// whether it is a mount root, the device still does.
 fn on_another_filesystem(meta: &Stat, devices: &[u64]) -> bool {
     if devices.contains(&meta.dev()) {
         return false;
@@ -2594,7 +2596,7 @@ fn on_another_filesystem(meta: &Stat, devices: &[u64]) -> bool {
     if meta.is_dir() || ANY_ENTRY_BY_DEVICE || meta.mount.is_none() {
         return true;
     }
-    meta.mount_root
+    meta.mount_root != Some(false)
 }
 
 #[cfg(test)]
@@ -3675,7 +3677,7 @@ swap\t/srv/rc/wt/a b\ttmpfs\txattr,dev=5000001\t1762700000
             let new = lstat_at(dir.as_fd(), &c(name)).unwrap();
             let old = Stat::from(&lstat_raw(dir.as_fd(), &c(name)).unwrap());
             assert_eq!(fields(&new), fields(&old), "{name}");
-            assert!(!new.mount_root, "{name}");
+            assert_ne!(new.mount_root, Some(true), "{name}");
         }
         let top = open_root(&w).unwrap().0;
         // Linux 5.8 and later; CI's kernels are.
@@ -3714,12 +3716,12 @@ swap\t/srv/rc/wt/a b\ttmpfs\txattr,dev=5000001\t1762700000
         let slash = open(Path::new("/"));
         let proc = lstat_at(slash.as_fd(), &c("proc")).unwrap();
         let etc = lstat_at(slash.as_fd(), &c("etc")).unwrap();
-        if proc.mount.is_none() && !proc.mount_root {
+        if proc.mount.is_none() && proc.mount_root != Some(true) {
             eprintln!("this kernel says neither; the walk reads the mount table");
             return;
         }
-        assert!(proc.mount_root);
-        assert!(!etc.mount_root);
+        assert_eq!(proc.mount_root, Some(true));
+        assert_eq!(etc.mount_root, Some(false));
         let none = super::Mounts::Device;
         assert!(none.other(Path::new("/proc"), &proc));
         assert!(!none.other(Path::new("/etc"), &etc));
@@ -3730,7 +3732,7 @@ swap\t/srv/rc/wt/a b\ttmpfs\txattr,dev=5000001\t1762700000
     /// only the root of a mount is, or any file where statx gives no mount.
     #[test]
     fn read_in_tells_another_filesystem_by_device_and_on_linux_a_files_mount() {
-        let at = |dir: bool, dev: u64, mount: Option<u64>, mount_root: bool| super::Stat {
+        let at = |dir: bool, dev: u64, mount: Option<u64>, mount_root: Option<bool>| super::Stat {
             dir,
             file: !dir,
             link: false,
@@ -3748,17 +3750,39 @@ swap\t/srv/rc/wt/a b\ttmpfs\txattr,dev=5000001\t1762700000
         };
         let devices = [1, 2];
         let elsewhere = |meta| super::on_another_filesystem(&meta, &devices);
-        assert!(!elsewhere(at(true, 2, Some(7), false)));
-        assert!(!elsewhere(at(false, 1, Some(7), true)));
-        assert!(elsewhere(at(true, 3, Some(8), true)));
-        assert!(elsewhere(at(true, 3, None, false)));
-        assert!(elsewhere(at(false, 3, Some(8), true)));
-        assert!(elsewhere(at(false, 3, None, false)));
+        assert!(!elsewhere(at(true, 2, Some(7), Some(false))));
+        assert!(!elsewhere(at(false, 1, Some(7), Some(true))));
+        assert!(!elsewhere(at(false, 1, Some(7), None)));
+        assert!(elsewhere(at(true, 3, Some(8), Some(true))));
+        assert!(elsewhere(at(true, 3, None, Some(false))));
+        assert!(elsewhere(at(false, 3, Some(8), Some(true))));
+        assert!(elsewhere(at(false, 3, None, Some(false))));
         // A file on overlayfs that shows its lower layer's device.
         assert_eq!(
-            elsewhere(at(false, 3, Some(7), false)),
+            elsewhere(at(false, 3, Some(7), Some(false))),
             super::ANY_ENTRY_BY_DEVICE
         );
+        // A file on another device whose statx does not say whether it is
+        // a mount root: the device decides.
+        assert!(elsewhere(at(false, 3, Some(7), None)));
+    }
+
+    /// statx answers whether an entry is a mount root only when
+    /// `stx_attributes_mask` holds `STATX_ATTR_MOUNT_ROOT`; otherwise the
+    /// answer is unknown, never "not a mount root".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_an_unreported_mount_root_is_unknown() {
+        let root = libc::STATX_ATTR_MOUNT_ROOT as u64;
+        // SAFETY: statx is plain data; all zeroes is a valid value.
+        let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+        stx.stx_mode = libc::S_IFREG as u16;
+        stx.stx_attributes = root;
+        assert_eq!(super::statx::from(&stx).mount_root, None);
+        stx.stx_attributes_mask = root;
+        assert_eq!(super::statx::from(&stx).mount_root, Some(true));
+        stx.stx_attributes = 0;
+        assert_eq!(super::statx::from(&stx).mount_root, Some(false));
     }
 
     /// A name on another filesystem than the worktree's is refused on its
@@ -3793,8 +3817,9 @@ swap\t/srv/rc/wt/a b\ttmpfs\txattr,dev=5000001\t1762700000
         let Some(file) = ["hostname", "hosts", "resolv.conf"]
             .into_iter()
             .find(|name| {
-                identity_at(etc.as_fd(), &c(name))
-                    .is_ok_and(|m| !m.dir && !m.link && m.mount_root && m.dev() != root)
+                identity_at(etc.as_fd(), &c(name)).is_ok_and(|m| {
+                    !m.dir && !m.link && m.mount_root == Some(true) && m.dev() != root
+                })
             })
         else {
             eprintln!("no file in /etc is mounted from another filesystem here");
