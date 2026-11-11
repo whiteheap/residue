@@ -42,7 +42,10 @@ jobs:
             echo "code=true" >>"$GITHUB_OUTPUT"
             exit 0
           fi
-          git diff --name-only HEAD^1 HEAD >"$RUNNER_TEMP/changed"
+          # --no-renames lists a renamed file under both names, so a code
+          # file moved to a docs path still counts as code; a deleted file
+          # is listed by its path, and one outside the docs paths counts too.
+          git diff --no-renames --name-only HEAD^1 HEAD >"$RUNNER_TEMP/changed"
           code=false
           while IFS= read -r file; do
             case $file in
