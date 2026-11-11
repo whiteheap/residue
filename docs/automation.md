@@ -121,6 +121,14 @@ The log has one line per pass only when its summary changes, so a quiet day stay
 
 Free space changing within the same side of `--min-free` does not count as a change. The record decides nothing: `watch` never reads it back. One it cannot write is logged once, `cannot write the record of this pass, which service status shows (...); passes and removals go on as before`, and when it can again, `the record of each pass is written again`. One `service status` cannot read is a line that says so, and changes neither its other lines nor its exit status.
 
+When one activity reason keeps every worktree no process was seen in, the count `activity 22` does not say why, so the log names the reason and the process, or where residue runs, once until the reason changes:
+
+```text
+2026-11-11T06:46:31Z residue watch: activity unknown (unnamed_file) keeps every worktree no process was seen in, so watch removes none of them: procfs cannot give the path of a file process 4242 (holder) holds, and residue cannot read where that file is, so it cannot show that no process is using it; logged again when the reason changes
+```
+
+That happens on Linux while one process of yours holds a file in an io_uring ring that residue cannot name (`unnamed_file`, [The activity probe on each platform](platforms-and-testing.md#the-activity-probe-on-each-platform)), wherever residue cannot see every process of yours (`hidden_processes`, or `probe_failed` in a sandbox on macOS), and when the probe fails outright. `watch --once` logs it too. Once it no longer keeps them all, the log says `activity unknown (unnamed_file) no longer keeps every worktree no process was seen in`. The line decides nothing; `residue explain PATH` gives one worktree's reasons.
+
 ### After an upgrade
 
 The service runs the new release within about six minutes. Before each pass, and at least every five minutes while it waits, `watch` checks that the path the service starts still names the file it runs. Once an upgrade replaces that file, `watch` logs one line and exits 1 between passes, never during one, and launchd or systemd starts the new release:
