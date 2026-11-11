@@ -88,7 +88,7 @@ pub struct Seen {
     /// directory holding one of them, found by its device and inode, is in
     /// use by that process; where residue cannot look, it is `unknown`
     /// (`unnamed_file`), never `not_observed`. The illumos and FreeBSD
-    /// backends fill it.
+    /// backends fill it, and the Linux one for an io_uring ring.
     pub unnamed: Vec<Unnamed>,
     /// Set when residue runs where processes of yours can be hidden from
     /// the probe: inside a container (a PID namespace of its own) or under
@@ -125,7 +125,8 @@ impl Hidden {
 
 /// A file a process holds whose path the backend could not read: on
 /// illumos one below a folder renamed after the kernel cached its path, on
-/// FreeBSD one the kernel's name cache does not hold.
+/// FreeBSD one the kernel's name cache does not hold, on Linux one in an
+/// io_uring ring whose `fdinfo` does not name every file it holds.
 pub struct Unnamed {
     pub pid: u32,
     pub command: String,
@@ -1133,7 +1134,7 @@ mod platform {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::{Hidden, Seen, Snapshot, Use, maps, procview, unavailable};
+    use super::{Hidden, Seen, Snapshot, Unnamed, Use, maps, procview, unavailable, uring};
     use std::fs;
     use std::io::ErrorKind;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -1166,6 +1167,7 @@ mod platform {
             Err(e) => return unavailable(BACKEND, "probe_missing", format!("/proc: {e}")),
         };
         let mut uses = Vec::new();
+        let mut unnamed = Vec::new();
         let mut total = 0;
         let mut inspected = 0;
         let mut paths: Vec<Vec<u8>> = Vec::new();
@@ -1250,6 +1252,15 @@ mod platform {
                 command: command.clone(),
                 path,
             }));
+            // A file in an io_uring ring that residue could not name may be
+            // anywhere, so no directory can be shown unused.
+            if files.rings_unnamed {
+                unnamed.push(Unnamed {
+                    pid,
+                    command: command.clone(),
+                    file: None,
+                });
+            }
             // Inspected means residue read the process's open files and its
             // mapped files. One it cannot read (another user's, one of yours
             // that is not dumpable, or one that exited) is not counted; what
@@ -1266,7 +1277,7 @@ mod platform {
                 total: Some(total),
                 limits: None,
                 spelling: None,
-                unnamed: Vec::new(),
+                unnamed,
                 hidden,
             }),
         }
@@ -1277,6 +1288,9 @@ mod platform {
         /// It read every descriptor table the process's threads hold.
         fds_read: bool,
         maps_read: bool,
+        /// An io_uring ring of the process may hold a file residue could
+        /// not name (`Read::rings_unnamed`).
+        rings_unnamed: bool,
         /// Each thread whose open or mapped files, or whose list of
         /// threads, the kernel refused to show (Permission denied).
         refused: Vec<Refused>,
@@ -1289,8 +1303,9 @@ mod platform {
         tid: u32,
         error: std::io::Error,
         /// The list of threads was refused while the main thread had
-        /// ended: no running thread can be judged by its own `status`, so
-        /// the process is judged by the ids in the main thread's.
+        /// ended, or while its maps could not be read, so it may have: no
+        /// running thread can be judged by its own `status`, so the
+        /// process is judged by the ids in the main thread's.
         unlisted: bool,
     }
 
@@ -1383,11 +1398,16 @@ mod platform {
     /// `status` and `fd` are root's (`task_dump_owner` in
     /// `fs/proc/base.c`). So each thread in `/proc/PID/task` is read too:
     /// its working directory and descriptors unless kcmp says it shares
-    /// those already read, and, when the main thread has no memory map,
-    /// the maps and executable of one that has, since all threads share
-    /// one. A thread that exits meanwhile is gone; a refusal of any of
-    /// these reads is kept in `refused` for `take` to judge by that
-    /// thread's `status`; any other error stops the probe.
+    /// those already read, and, when the main thread has no memory map or
+    /// residue could not read its maps, the maps and executable of one
+    /// that has, since all threads share one. The files an io_uring ring
+    /// holds show in no descriptor's link, so each ring in a table read is
+    /// read from its `fdinfo` ([`uring`]), and a ring the process maps
+    /// without a descriptor of it, which stays open with every file in it,
+    /// leaves its files unnamed. A thread that
+    /// exits meanwhile is gone; a refusal of any of these reads is kept in
+    /// `refused` for `take` to judge by that thread's `status`; any other
+    /// error stops the probe.
     fn read_files(
         base: &Path,
         pid: u32,
@@ -1405,23 +1425,32 @@ mod platform {
         // index), holds no descriptor and no working directory there.
         // They also tell whether the main thread ended: one that did has
         // no memory map, nor a working directory or descriptor table, and
-        // the kernel shows a task without a map an empty `maps` and asks
+        // procfs shows a task without a map an empty `maps` and asks
         // nothing more (`mm_access`), where it refuses one with a map that
-        // residue may not inspect. Never the `exe` error: the kernel checks
-        // access before it looks for the map, so a refused main thread
-        // that ended answers Permission denied there, not ENOENT.
-        let exited = read.maps(base, pid, pid, paths, &mut refused)? == Maps::Empty;
+        // residue may not inspect. A security module that mediates the
+        // open (Landlock, AppArmor, SELinux) checks first, and can refuse
+        // either, so a `maps` residue could not read (refused or gone)
+        // leaves open whether the main thread ended: then each thread's
+        // `maps` is read too, until one is, and a refusal there is judged
+        // by that thread's own `status`. Never the `exe` error: the kernel
+        // checks access before it looks for the map, so a refused main
+        // thread that ended answers Permission denied there, not ENOENT.
+        let main = read.maps(base, pid, pid, paths, &mut refused)?;
+        // Only an empty `maps` says the main thread holds no table: its
+        // `fd` is root's then, and a refusal of it is no refused table.
+        let exited = main == Maps::Empty;
         let mut files_ref = read
             .fds(base, pid, !exited, paths, &mut refused)?
             .then_some(pid);
         let mut fs_ref = cwd.then_some(pid);
-        let mut need_maps = exited;
+        let mut need_maps = main != Maps::Mapped;
         let tasks = match fs::read_dir(base.join("task")) {
             Ok(tasks) => Some(tasks),
             Err(e) if procview::gone(&e) => None,
-            // With the main thread ended, no thread's `status` is left to
-            // judge it by, so this refusal is judged by the process's ids.
-            Err(e) if e.kind() == ErrorKind::PermissionDenied && exited => {
+            // With the main thread perhaps ended, no thread's `status` may
+            // be left to judge it by, so this refusal is judged by the
+            // process's ids.
+            Err(e) if e.kind() == ErrorKind::PermissionDenied && need_maps => {
                 refused.push(Refused {
                     dir: base.to_path_buf(),
                     tid: pid,
@@ -1476,6 +1505,7 @@ mod platform {
         Ok(Files {
             fds_read: read.fds && !read.fds_refused,
             maps_read: read.maps,
+            rings_unnamed: read.rings_unnamed(),
             refused,
         })
     }
@@ -1488,6 +1518,34 @@ mod platform {
         /// A table of a thread that holds one was refused.
         fds_refused: bool,
         maps: bool,
+        /// The inode of each io_uring ring a table read holds.
+        ring_fds: Vec<u64>,
+        /// The inode of each io_uring ring the process maps.
+        ring_maps: Vec<u64>,
+        /// A ring a table read holds named not every file it holds.
+        ring_unnamed: bool,
+    }
+
+    impl Read {
+        /// Whether a ring of the process may hold a file residue could not
+        /// name: one whose `fdinfo` did not name them all, or one the
+        /// process maps and holds no descriptor of. A ring stays open while
+        /// it is mapped, with every file in it.
+        fn rings_unnamed(&self) -> bool {
+            self.ring_unnamed || self.ring_maps.iter().any(|i| !self.ring_fds.contains(i))
+        }
+    }
+
+    /// The running kernel's major and minor version, read once, when a
+    /// ring first holds a file. One residue cannot read is `None`, which
+    /// leaves every file in a ring unnamed.
+    fn kernel() -> Option<(u32, u32)> {
+        static VERSION: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+        *VERSION.get_or_init(|| {
+            fs::read_to_string("/proc/sys/kernel/osrelease")
+                .ok()
+                .and_then(|release| uring::version(&release))
+        })
     }
 
     /// What a read of a thread's `maps` found.
@@ -1503,13 +1561,14 @@ mod platform {
     }
 
     impl Read {
-        /// Adds the open files of the thread at `dir` to `paths`: whether
-        /// residue read its descriptor table. `holds` is false for a main
-        /// thread that exited, which holds none: its `fd` is root's, and
-        /// a refusal of it leaves `fds_refused` alone. A table residue may
-        /// list but whose descriptors the kernel refuses (one of another
-        /// group's, whose `fd` is still owned by your user) is refused as
-        /// a whole, and is never a kcmp reference.
+        /// Adds the open files of the thread at `dir` to `paths`, with the
+        /// files each io_uring ring in its table holds: whether residue
+        /// read its descriptor table. `holds` is false for a main thread
+        /// that exited, which holds none: its `fd` is root's, and a refusal
+        /// of it leaves `fds_refused` alone. A table residue may list but
+        /// whose descriptors, or a ring's `fdinfo`, the kernel refuses (one
+        /// of another group's, whose `fd` is still owned by your user) is
+        /// refused as a whole, and is never a kcmp reference.
         fn fds(
             &mut self,
             dir: &Path,
@@ -1521,16 +1580,42 @@ mod platform {
             match fs::read_dir(dir.join("fd")) {
                 Ok(fds) => {
                     for fd in fds.flatten() {
-                        match fs::read_link(fd.path()) {
-                            Ok(target) => paths.push(target.into_os_string().into_vec()),
+                        let target = match fs::read_link(fd.path()) {
+                            Ok(target) => target.into_os_string().into_vec(),
                             Err(e) if e.kind() == ErrorKind::PermissionDenied => {
                                 self.fds_refused |= holds;
                                 refuse(refused, dir, tid, e);
                                 return Ok(false);
                             }
                             // An fd closed between listing and readlink is gone; skip it.
-                            Err(_) => {}
+                            Err(_) => continue,
+                        };
+                        if target == uring::LINK {
+                            let fdinfo = dir.join("fdinfo").join(fd.file_name());
+                            match self.ring(&fd.path(), &fdinfo, paths) {
+                                Ok(()) => {}
+                                Err(maps::Error::Unreadable(e))
+                                    if e.kind() == ErrorKind::PermissionDenied =>
+                                {
+                                    self.fds_refused |= holds;
+                                    refuse(refused, dir, tid, e);
+                                    return Ok(false);
+                                }
+                                // Closed since it was listed.
+                                Err(maps::Error::Unreadable(e)) if procview::gone(&e) => continue,
+                                Err(maps::Error::Unreadable(e)) => {
+                                    return Err(format!("{}: {e}", fdinfo.display()));
+                                }
+                                Err(maps::Error::TooLarge) => {
+                                    return Err(format!(
+                                        "{} is larger than {} MiB, so residue cannot read every file that io_uring ring holds",
+                                        fdinfo.display(),
+                                        maps::CAP >> 20
+                                    ));
+                                }
+                            }
                         }
+                        paths.push(target);
                     }
                     self.fds = true;
                     Ok(true)
@@ -1545,6 +1630,24 @@ mod platform {
             }
         }
 
+        /// Adds the files the io_uring ring at the descriptor `fd` holds,
+        /// as its `fdinfo` names them, to `paths`, and notes its inode.
+        fn ring(
+            &mut self,
+            fd: &Path,
+            fdinfo: &Path,
+            paths: &mut Vec<Vec<u8>>,
+        ) -> Result<(), maps::Error> {
+            let inode = fs::metadata(fd).map_err(maps::Error::Unreadable)?.ino();
+            if uring::read(fdinfo, kernel, paths)? == uring::Ring::Unnamed {
+                self.ring_unnamed = true;
+            }
+            // Only once its files were read: a ring whose descriptor closed
+            // meanwhile is not taken for read where the process maps it.
+            self.ring_fds.push(inode);
+            Ok(())
+        }
+
         /// Adds the files the thread at `dir` maps to `paths`.
         fn maps(
             &mut self,
@@ -1554,7 +1657,7 @@ mod platform {
             paths: &mut Vec<Vec<u8>>,
             refused: &mut Vec<Refused>,
         ) -> Result<Maps, String> {
-            match maps::read(&dir.join("maps"), paths) {
+            match maps::read(&dir.join("maps"), paths, &mut self.ring_maps) {
                 Ok(mapped) => {
                     self.maps = true;
                     Ok(if mapped { Maps::Mapped } else { Maps::Empty })
@@ -1717,9 +1820,165 @@ mod platform {
 
     #[cfg(test)]
     mod tests {
-        use super::{Read, link};
+        use super::{Read, link, read_files};
         use std::fs;
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        use std::path::{Path, PathBuf};
+
+        /// A process laid out as in `/proc/4242`: its main thread ended, so
+        /// it has a working directory of `/` and no executable, and thread
+        /// 4243 runs with `/` as its working directory and `thread_maps` as
+        /// its maps. The main thread's maps is `main_maps`, or missing.
+        fn ended(name: &str, main_maps: Option<&str>, thread_maps: &str) -> PathBuf {
+            let root = std::env::temp_dir().join(format!("residue-{name}-{}", std::process::id()));
+            let base = root.join("4242");
+            let thread = base.join("task/4243");
+            fs::create_dir_all(base.join("fd")).unwrap();
+            fs::create_dir_all(base.join("fdinfo")).unwrap();
+            fs::create_dir_all(base.join("task/4242")).unwrap();
+            fs::create_dir_all(thread.join("fd")).unwrap();
+            symlink("/", base.join("cwd")).unwrap();
+            symlink("/", thread.join("cwd")).unwrap();
+            symlink("/usr/bin/mh", thread.join("exe")).unwrap();
+            if let Some(maps) = main_maps {
+                fs::write(base.join("maps"), maps).unwrap();
+            }
+            fs::write(thread.join("maps"), thread_maps).unwrap();
+            base
+        }
+
+        fn names(paths: &[Vec<u8>]) -> Vec<&str> {
+            paths
+                .iter()
+                .map(|p| std::str::from_utf8(p).unwrap())
+                .collect()
+        }
+
+        fn deny(file: &Path) {
+            fs::set_permissions(file, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+
+        const LIB: &str = "7f00-7f01 r--p 00000000 08:01 7      /w/a/lib.so\n";
+
+        /// When residue cannot read the main thread's maps, it cannot tell
+        /// whether the main thread ended, so it reads a running thread's:
+        /// a file mapped there is a use, and a refusal there is that
+        /// thread's. File permissions stand in for the kernel's refusal,
+        /// which root would pass.
+        #[test]
+        fn a_main_thread_maps_residue_cannot_read_leaves_the_threads_maps_to_read() {
+            // SAFETY: geteuid only returns this process's effective user.
+            if unsafe { libc::geteuid() } == 0 {
+                return;
+            }
+            // Refused, as a security module refuses the open.
+            let base = ended("maps-refused", Some(""), LIB);
+            deny(&base.join("maps"));
+            let mut paths = Vec::new();
+            let files = read_files(&base, 4242, None, &mut paths).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(names(&paths), vec!["/", "/usr/bin/mh", "/w/a/lib.so"]);
+            assert_eq!(
+                files.refused.iter().map(|r| r.tid).collect::<Vec<_>>(),
+                vec![4242]
+            );
+            assert!(files.maps_read);
+
+            // Refused there too: the running thread's refusal is recorded.
+            deny(&base.join("task/4243/maps"));
+            let mut paths = Vec::new();
+            let files = read_files(&base, 4242, None, &mut paths).unwrap_or_else(|e| panic!("{e}"));
+            fs::remove_dir_all(base.parent().unwrap()).unwrap();
+            assert_eq!(names(&paths), vec!["/"]);
+            let refused: Vec<(u32, std::io::ErrorKind)> = files
+                .refused
+                .iter()
+                .map(|r| (r.tid, r.error.kind()))
+                .collect();
+            assert_eq!(
+                refused,
+                vec![
+                    (4242, std::io::ErrorKind::PermissionDenied),
+                    (4243, std::io::ErrorKind::PermissionDenied)
+                ]
+            );
+
+            // Gone, as one answering ESRCH or ENOENT is.
+            let base = ended("maps-gone", None, LIB);
+            let mut paths = Vec::new();
+            let files = read_files(&base, 4242, None, &mut paths).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(names(&paths), vec!["/", "/usr/bin/mh", "/w/a/lib.so"]);
+            assert!(files.refused.is_empty());
+
+            // The task list refused too: judged by the process's ids.
+            fs::set_permissions(base.join("task"), fs::Permissions::from_mode(0o000)).unwrap();
+            let files =
+                read_files(&base, 4242, None, &mut Vec::new()).unwrap_or_else(|e| panic!("{e}"));
+            fs::set_permissions(base.join("task"), fs::Permissions::from_mode(0o700)).unwrap();
+            fs::remove_dir_all(base.parent().unwrap()).unwrap();
+            assert_eq!(files.refused.len(), 1);
+            assert!(files.refused[0].unlisted);
+
+            // An empty maps says the main thread ended, as before; a live
+            // one's maps covers every thread, whose own is not read.
+            for main in ["", LIB] {
+                let base = ended(
+                    "maps-read",
+                    Some(main),
+                    "7f00-7f01 r--p 0 08:01 8 /w/b/x.so\n",
+                );
+                let mut paths = Vec::new();
+                read_files(&base, 4242, None, &mut paths).unwrap_or_else(|e| panic!("{e}"));
+                fs::remove_dir_all(base.parent().unwrap()).unwrap();
+                let read = names(&paths);
+                assert_eq!(
+                    read.contains(&"/w/a/lib.so"),
+                    main == LIB,
+                    "{main:?}: {read:?}"
+                );
+                assert_eq!(
+                    read.contains(&"/w/b/x.so"),
+                    main.is_empty(),
+                    "{main:?}: {read:?}"
+                );
+            }
+        }
+
+        /// A descriptor of an io_uring ring links to `anon_inode:[io_uring]`;
+        /// here that names a file beside it, which gives it its inode.
+        #[test]
+        fn a_ring_mapped_without_its_descriptor_leaves_its_files_unnamed() {
+            let base = ended("rings", Some(LIB), "");
+            let ring = base.join("fd/anon_inode:[io_uring]");
+            fs::write(&ring, "").unwrap();
+            let inode = fs::metadata(&ring).unwrap().ino();
+            symlink("anon_inode:[io_uring]", base.join("fd/5")).unwrap();
+            let mapped = |inode: u64| {
+                format!("{LIB}7f02-7f03 rw-s 00000000 00:11 {inode}      anon_inode:[io_uring]\n")
+            };
+            let unnamed = |fdinfo: Option<&str>, maps: &str| {
+                fs::write(base.join("maps"), maps).unwrap();
+                match fdinfo {
+                    Some(text) => fs::write(base.join("fdinfo/5"), text).unwrap(),
+                    None => fs::remove_file(base.join("fdinfo/5")).unwrap(),
+                }
+                let mut paths = Vec::new();
+                let files =
+                    read_files(&base, 4242, None, &mut paths).unwrap_or_else(|e| panic!("{e}"));
+                assert!(names(&paths).contains(&"/w/a/lib.so"));
+                files.rings_unnamed
+            };
+            let empty = "UserFiles:\t0\nUserBufs:\t0\n";
+            // Its table holds nothing, and the ring it maps is that one.
+            assert!(!unnamed(Some(empty), LIB));
+            assert!(!unnamed(Some(empty), &mapped(inode)));
+            // Its slots are left out.
+            assert!(unnamed(Some("pos:\t0\nino:\t1\n"), LIB));
+            // It maps a ring it holds no descriptor of, or whose
+            // descriptor closed while it was read.
+            assert!(unnamed(Some(empty), &mapped(inode + 1)));
+            assert!(unnamed(None, &mapped(inode)));
+            fs::remove_dir_all(base.parent().unwrap()).unwrap();
+        }
 
         /// A thread's links laid out as in `/proc/PID/task/TID`, where file
         /// permissions stand in for the kernel's refusal: a folder that may
@@ -2080,10 +2339,14 @@ mod maps {
         TooLarge,
     }
 
-    /// Adds the path of every file `file` maps to `paths`: whether it lists
-    /// any mapping at all, of a file or not. A task with no memory map has
-    /// none.
-    pub fn read(file: &Path, paths: &mut Vec<Vec<u8>>) -> Result<bool, Error> {
+    /// Adds the path of every file `file` maps to `paths`, and the inode of
+    /// every io_uring ring it maps to `rings`: whether it lists any mapping
+    /// at all, of a file or not. A task with no memory map has none.
+    pub fn read(
+        file: &Path,
+        paths: &mut Vec<Vec<u8>>,
+        rings: &mut Vec<u64>,
+    ) -> Result<bool, Error> {
         let file = std::fs::File::open(file).map_err(Error::Unreadable)?;
         let mut reader = BufReader::with_capacity(64 << 10, file.take(CAP + 1));
         let mut line = Vec::new();
@@ -2099,6 +2362,7 @@ mod maps {
                 return Err(Error::TooLarge);
             }
             let Some(path) = path(&line) else {
+                rings.extend(ring(&line));
                 continue;
             };
             // A library maps four or five regions in a row.
@@ -2127,6 +2391,26 @@ mod maps {
         (name.first() == Some(&b'/')).then_some(name)
     }
 
+    /// The inode of the io_uring ring a maps line maps, named
+    /// `anon_inode:[io_uring]`, or `None` for a line of anything else. From
+    /// Linux 6.0 each ring has an inode of its own, the one its descriptor
+    /// shows; before, every ring shares one. An inode residue cannot read is
+    /// 0, which names no ring, so it matches no descriptor.
+    pub fn ring(line: &[u8]) -> Option<u64> {
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        if !line.ends_with(super::uring::LINK) {
+            return None;
+        }
+        let mut fields = line.splitn(6, |b| *b == b' ');
+        let inode = fields.nth(4)?;
+        (fields.next()?.trim_ascii_start() == super::uring::LINK).then(|| {
+            std::str::from_utf8(inode)
+                .ok()
+                .and_then(|i| i.parse().ok())
+                .unwrap_or(0)
+        })
+    }
+
     /// `path` with each `\012` turned back into the newline the kernel
     /// escaped, when it has one. The caller keeps both readings, since the
     /// path may have held those four bytes: a use read either way is a use.
@@ -2145,6 +2429,203 @@ mod maps {
             }
         }
         Some(out)
+    }
+}
+
+/// Linux: the files an io_uring ring holds. A process can register files
+/// with a ring (`IORING_REGISTER_FILES`) or open them straight into its
+/// table (a direct descriptor), and close every descriptor of them: the
+/// ring keeps them open, and its own descriptor shows only
+/// `anon_inode:[io_uring]`. The ring's `fdinfo` gives the size of its table
+/// as `UserFiles:\tN`, then a line for each slot that holds a file, from
+/// Linux 6.14: `%5u: ` and the path `d_path` gives, with each space, tab,
+/// newline and backslash written as `\` and three octal digits
+/// (`seq_file_path(m, f, " \t\n\\")`), then `UserBufs:`. Before 6.14 a slot
+/// line gave only the last part of the file's name, so residue cannot tell
+/// which file a slot holds there. The kernel only tries the ring's lock to
+/// print it: from 6.15 a ring whose lock is taken prints none of this, and
+/// 6.14 prints `UserFiles:` and leaves the slots out (`io_uring/fdinfo.c`).
+#[cfg(any(target_os = "linux", test))]
+mod uring {
+    use super::maps::{CAP, Error};
+    use std::io::{BufRead, BufReader, Read};
+    use std::path::Path;
+
+    /// What the link of a ring's descriptor and the name of its mapping read.
+    pub const LINK: &[u8] = b"anon_inode:[io_uring]";
+
+    /// What a ring's `fdinfo` told of the files it holds.
+    #[derive(Debug, PartialEq)]
+    pub enum Ring {
+        /// Every file it holds that has a path is in `paths`.
+        Named,
+        /// Not every file it holds could be named: the slots are left out,
+        /// the kernel gives no full path, or a line is not one residue
+        /// knows. What could be named is in `paths`.
+        Unnamed,
+    }
+
+    /// Adds the path of each file the ring whose `fdinfo` is `file` holds
+    /// to `paths`, with `kernel` giving the running kernel's major and
+    /// minor version when a slot holds anything.
+    pub fn read(
+        file: &Path,
+        kernel: impl FnOnce() -> Option<(u32, u32)>,
+        paths: &mut Vec<Vec<u8>>,
+    ) -> Result<Ring, Error> {
+        let file = std::fs::File::open(file).map_err(Error::Unreadable)?;
+        parse(file, CAP, kernel, paths)
+    }
+
+    /// [`read`] from `text`, of which it reads at most `cap` bytes.
+    pub fn parse(
+        text: impl Read,
+        cap: u64,
+        kernel: impl FnOnce() -> Option<(u32, u32)>,
+        paths: &mut Vec<Vec<u8>>,
+    ) -> Result<Ring, Error> {
+        let mut reader = BufReader::with_capacity(64 << 10, text.take(cap + 1));
+        let mut line = Vec::new();
+        let mut read: u64 = 0;
+        // The next line into `line`: whether there was one.
+        let mut next = |line: &mut Vec<u8>| {
+            line.clear();
+            match reader.read_until(b'\n', line) {
+                Ok(0) => Ok(false),
+                Ok(n) => {
+                    read += n as u64;
+                    if read > cap {
+                        Err(Error::TooLarge)
+                    } else {
+                        Ok(true)
+                    }
+                }
+                Err(e) => Err(Error::Unreadable(e)),
+            }
+        };
+        // Before it: the ring's queues and the requests in them.
+        let size = loop {
+            if !next(&mut line)? {
+                return Ok(Ring::Unnamed);
+            }
+            if let Some(size) = line.strip_prefix(b"UserFiles:\t") {
+                let size = size.strip_suffix(b"\n").unwrap_or(size);
+                match std::str::from_utf8(size)
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok())
+                {
+                    Some(size) => break size,
+                    None => return Ok(Ring::Unnamed),
+                }
+            }
+        };
+        if size == 0 {
+            return Ok(Ring::Named);
+        }
+        let Some(version) = kernel().filter(|v| *v >= (6, 14)) else {
+            return Ok(Ring::Unnamed);
+        };
+        let mut last: Option<u32> = None;
+        loop {
+            if !next(&mut line)? {
+                return Ok(Ring::Unnamed);
+            }
+            if line.starts_with(b"UserBufs:") {
+                break;
+            }
+            let Some((index, name)) = slot(&line) else {
+                return Ok(Ring::Unnamed);
+            };
+            if index >= size || last.is_some_and(|last| index <= last) {
+                return Ok(Ring::Unnamed);
+            }
+            last = Some(index);
+            if name.first() == Some(&b'/') {
+                let Some(path) = unescape(name) else {
+                    return Ok(Ring::Unnamed);
+                };
+                paths.push(path);
+            } else if !pseudo(name) {
+                return Ok(Ring::Unnamed);
+            }
+        }
+        // No slot line: from 6.15 every slot is empty; in 6.14 the lock
+        // may have been taken.
+        if last.is_none() && version < (6, 15) {
+            return Ok(Ring::Unnamed);
+        }
+        Ok(Ring::Named)
+    }
+
+    /// The index and name of a slot line, `%5u: NAME\n`.
+    fn slot(line: &[u8]) -> Option<(u32, &[u8])> {
+        let line = line.strip_suffix(b"\n")?;
+        let line = line.trim_ascii_start();
+        let colon = line.iter().position(|b| *b == b':')?;
+        let (digits, name) = line.split_at(colon);
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let index = std::str::from_utf8(digits).ok()?.parse().ok()?;
+        let name = name.strip_prefix(b": ")?;
+        (!name.is_empty()).then_some((index, name))
+    }
+
+    /// `name` with each `\` and three octal digits turned back into the
+    /// byte the kernel wrote that way, or `None` when a `\` begins none.
+    /// The kernel writes every backslash so, so each one begins an escape.
+    fn unescape(name: &[u8]) -> Option<Vec<u8>> {
+        let mut out = Vec::with_capacity(name.len());
+        let mut rest = name;
+        while let Some((&byte, tail)) = rest.split_first() {
+            if byte != b'\\' {
+                out.push(byte);
+                rest = tail;
+                continue;
+            }
+            let mut value: u32 = 0;
+            for digit in tail.get(..3)? {
+                if !(b'0'..=b'7').contains(digit) {
+                    return None;
+                }
+                value = value * 8 + u32::from(digit - b'0');
+            }
+            out.push(u8::try_from(value).ok()?);
+            rest = &tail[3..];
+        }
+        Some(out)
+    }
+
+    /// Whether `name` is one `d_path` gives a file that has no path: a
+    /// socket or pipe (`socket:[N]`, `pipe:[N]`), a namespace (`net:[N]`)
+    /// or an anonymous inode (`anon_inode:[eventfd]`, `anon_inode:inotify`).
+    /// A descriptor's link reads the same, and the probe drops it there.
+    fn pseudo(name: &[u8]) -> bool {
+        if name.starts_with(b"anon_inode:") {
+            return true;
+        }
+        let Some(colon) = name.iter().position(|b| *b == b':') else {
+            return false;
+        };
+        let (kind, rest) = name.split_at(colon);
+        !kind.is_empty()
+            && kind.iter().all(|b| b.is_ascii_lowercase() || *b == b'_')
+            && rest
+                .strip_prefix(b":[")
+                .and_then(|n| n.strip_suffix(b"]"))
+                .is_some_and(|n| !n.is_empty() && n.iter().all(u8::is_ascii_digit))
+    }
+
+    /// The major and minor version in a kernel release such as
+    /// `6.8.0-48-generic`.
+    pub fn version(release: &str) -> Option<(u32, u32)> {
+        let mut parts = release.trim().splitn(3, '.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?;
+        let end = minor
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(minor.len());
+        Some((major, minor[..end].parse().ok()?))
     }
 }
 
@@ -3707,13 +4188,13 @@ mod tests {
         let file = std::env::temp_dir().join(format!("residue-maps-empty-{}", std::process::id()));
         let mut paths = Vec::new();
         std::fs::write(&file, "").unwrap();
-        let empty = super::maps::read(&file, &mut paths);
+        let empty = super::maps::read(&file, &mut paths, &mut Vec::new());
         std::fs::write(
             &file,
             "7f2c3e5bd000-7f2c3e5c0000 rw-p 00000000 00:00 0 \n7fff6b3a0000-7fff6b3c1000 rw-p 00000000 00:00 0                          [stack]\n",
         )
         .unwrap();
-        let anonymous = super::maps::read(&file, &mut paths);
+        let anonymous = super::maps::read(&file, &mut paths, &mut Vec::new());
         std::fs::remove_file(&file).unwrap();
         assert!(matches!(empty, Ok(false)));
         assert!(matches!(anonymous, Ok(true)));
@@ -3723,7 +4204,11 @@ mod tests {
     #[test]
     fn maps_that_cannot_be_opened_say_why() {
         let mut paths = Vec::new();
-        let read = super::maps::read(Path::new("/nonexistent/residue/maps"), &mut paths);
+        let read = super::maps::read(
+            Path::new("/nonexistent/residue/maps"),
+            &mut paths,
+            &mut Vec::new(),
+        );
         assert!(
             matches!(read, Err(super::maps::Error::Unreadable(e)) if e.kind() == std::io::ErrorKind::NotFound)
         );
@@ -4050,7 +4535,8 @@ mod tests {
 
     /// A maps file as Linux prints it (proc_pid_maps(5)): libraries over
     /// several regions, the pseudo-names, an anonymous mapping, a path with
-    /// spaces, a deleted file and a path with an escaped newline.
+    /// spaces, a deleted file, a path with an escaped newline, and the two
+    /// regions of an io_uring ring as Linux 7.0 prints them.
     const MAPS: &str = "\
 55d0c4a00000-55d0c4a02000 r--p 00000000 08:01 1835012                    /usr/bin/sleep
 55d0c4a02000-55d0c4a06000 r-xp 00002000 08:01 1835012                    /usr/bin/sleep
@@ -4060,6 +4546,8 @@ mod tests {
 7f2c3e5bd000-7f2c3e5c0000 rw-p 00000000 00:00 0 \n\
 7f2c3e600000-7f2c3e601000 r--s 00000000 08:01 1835240                    /w/gone/.git/index (deleted)
 7f2c3e700000-7f2c3e701000 r--p 00000000 08:01 1835241                    /w/line\\012break/x.so
+7f2c3e800000-7f2c3e802000 rw-s 00000000 00:11 7010859                    anon_inode:[io_uring]
+7f2c3e802000-7f2c3e803000 rw-s 10000000 00:11 7010859                    anon_inode:[io_uring]
 7fff6b3a0000-7fff6b3c1000 rw-p 00000000 00:00 0                          [stack]
 7fff6b3fc000-7fff6b3fe000 r-xp 00000000 00:00 0                          [vdso]
 ";
@@ -4069,9 +4557,11 @@ mod tests {
         let file = std::env::temp_dir().join(format!("residue-maps-test-{}", std::process::id()));
         std::fs::write(&file, MAPS).unwrap();
         let mut paths = Vec::new();
-        let read = super::maps::read(&file, &mut paths);
+        let mut rings = Vec::new();
+        let read = super::maps::read(&file, &mut paths, &mut rings);
         std::fs::remove_file(&file).unwrap();
         assert!(matches!(read, Ok(true)));
+        assert_eq!(rings, vec![7010859, 7010859]);
         let paths: Vec<&[u8]> = paths.iter().map(Vec::as_slice).collect();
         assert_eq!(
             paths,
@@ -4395,6 +4885,182 @@ mod tests {
             path(b"7f00-7f01 r--p 00000000 08:01 7      /a  b \n"),
             Some(&b"/a  b "[..])
         );
+    }
+
+    #[test]
+    fn a_maps_line_names_a_ring_only_by_its_own_name() {
+        use super::maps::ring;
+        let line = |name: &str| format!("7f00-7f01 rw-s 00000000 00:11 42      {name}\n");
+        assert_eq!(ring(line("anon_inode:[io_uring]").as_bytes()), Some(42));
+        assert_eq!(
+            ring(b"7f00-7f01 rw-s 0 00:11 42 anon_inode:[io_uring]"),
+            Some(42)
+        );
+        // A file named so, and an anonymous mapping a process named so.
+        assert_eq!(ring(line("/w/anon_inode:[io_uring]").as_bytes()), None);
+        assert_eq!(ring(line("[anon:x anon_inode:[io_uring]").as_bytes()), None);
+        assert_eq!(ring(line("anon_inode:[eventfd]").as_bytes()), None);
+        // An inode residue cannot read is 0, which matches no descriptor.
+        assert_eq!(
+            ring(b"7f00-7f01 rw-s 0 00:11 x4 anon_inode:[io_uring]\n"),
+            Some(0)
+        );
+    }
+
+    /// A ring's `fdinfo` as Linux 7.0 prints it, for a table of `size`
+    /// slots whose lines are `slots`.
+    fn fdinfo(size: u32, slots: &str) -> String {
+        format!(
+            "pos:\t0\nflags:\t02000002\nmnt_id:\t16\nino:\t7010859\nSqMask:\t0x3\nSqHead:\t0\nSqTail:\t0\nCachedSqHead:\t0\nCqMask:\t0x7\nCqHead:\t0\nCqTail:\t0\nCachedCqTail:\t0\nSQEs:\t0\nCQEs:\t1\n    0: user_data:0, res:8, flags:0\nSqThread:\t-1\nSqThreadCpu:\t-1\nSqTotalTime:\t0\nSqWorkTime:\t0\nUserFiles:\t{size}\n{slots}UserBufs:\t1\n    0: 0x7f2c3e400000/4096\nPollList:\nCqOverflowList:\n"
+        )
+    }
+
+    /// What `fdinfo` says on a kernel of `version`, with the paths it named.
+    fn ring_files(text: &str, version: (u32, u32)) -> (super::uring::Ring, Vec<Vec<u8>>) {
+        let mut paths = Vec::new();
+        let ring = super::uring::parse(
+            text.as_bytes(),
+            super::maps::CAP,
+            || Some(version),
+            &mut paths,
+        )
+        .unwrap_or_else(|_| panic!("{text} must be read"));
+        (ring, paths)
+    }
+
+    #[test]
+    fn a_ring_names_each_file_it_holds() {
+        use super::uring::Ring::Named;
+        let slots = "    0: /w/busy/a\\040b\\134c\\012d\\011e\n    3: pipe:[7027844]\n    4: socket:[7027845]\n    5: anon_inode:[eventfd]\n    6: anon_inode:inotify\n    7: net:[4026531840]\n    9: /w/gone/x (deleted)\n100000: /w/far\n";
+        let (ring, paths) = ring_files(&fdinfo(100_001, slots), (7, 0));
+        assert_eq!(ring, Named);
+        assert_eq!(
+            paths,
+            vec![
+                b"/w/busy/a b\\c\nd\te".to_vec(),
+                b"/w/gone/x (deleted)".to_vec(),
+                b"/w/far".to_vec()
+            ]
+        );
+        // A table with no file in it, or of no slots, holds none, and the
+        // kernel need not be asked.
+        let mut paths = Vec::new();
+        for size in [0, 4] {
+            let text = fdinfo(size, "");
+            let held = super::uring::parse(
+                text.as_bytes(),
+                super::maps::CAP,
+                || Some((6, 15)),
+                &mut paths,
+            );
+            assert_eq!(held.ok(), Some(Named));
+        }
+        let none = super::uring::parse(
+            fdinfo(0, "").as_bytes(),
+            super::maps::CAP,
+            || panic!("asked for the kernel"),
+            &mut paths,
+        );
+        assert_eq!(none.ok(), Some(Named));
+        assert!(paths.is_empty());
+        // From 6.14 an empty slot has no line, so a short list is a sparse
+        // table, not a cut one.
+        assert_eq!(ring_files(&fdinfo(4, "    2: /w/a\n"), (6, 14)).0, Named);
+        assert_eq!(ring_files(&fdinfo(1, "    0: /w/a\n"), (6, 14)).0, Named);
+    }
+
+    #[test]
+    fn a_ring_residue_cannot_read_whole_leaves_its_files_unnamed() {
+        use super::uring::Ring::Unnamed;
+        let unnamed = |text: &str, version| {
+            let (ring, _) = ring_files(text, version);
+            assert_eq!(ring, Unnamed, "{text}");
+        };
+        let new = (7, 0);
+        // No slot list: from 6.15 a ring whose lock was taken prints none
+        // of it; a list cut before `UserBufs:`.
+        unnamed(
+            "pos:\t0\nflags:\t02000002\nmnt_id:\t16\nino:\t7010859\n",
+            new,
+        );
+        unnamed("UserFiles:\t2\n    0: /w/a\n", new);
+        unnamed("UserFiles:\t2\n    0: /w/a", new);
+        unnamed("UserFiles:\tlots\nUserBufs:\t0\n", new);
+        // In 6.14 a ring whose lock was taken prints its size and no slot.
+        unnamed(&fdinfo(4, ""), (6, 14));
+        // Before 6.14 a slot names only the last part of its file's name,
+        // and a kernel residue cannot tell holds anything.
+        unnamed(&fdinfo(2, "    0: a\n    1: <none>\n"), (6, 8));
+        unnamed(&fdinfo(2, "    0: /\n    1: <none>\n"), (6, 13));
+        let mut paths = Vec::new();
+        let held = super::uring::parse(
+            fdinfo(1, "    0: /w/a\n").as_bytes(),
+            super::maps::CAP,
+            || None,
+            &mut paths,
+        );
+        assert_eq!(held.ok(), Some(Unnamed));
+        // A relative or unknown name, an escape the kernel does not write,
+        // and slots out of order, repeated or past the table.
+        for slots in [
+            "    0: w/a\n",
+            "    0: a\n",
+            "    0: <none>\n",
+            "    0: Pipe:[1]\n",
+            "    0: pipe:[]\n",
+            "    0: /w/a\\04\n",
+            "    0: /w/a\\0x0b\n",
+            "    0: /w/a\\777\n",
+            "    0: /w/a\\\n",
+            "    1: /w/a\n    0: /w/b\n",
+            "    1: /w/a\n    1: /w/b\n",
+            "    4: /w/a\n",
+            "    0: \n",
+            "    0:/w/a\n",
+            "    x: /w/a\n",
+            "    0: user_data:0, res:8, flags:0\n",
+        ] {
+            unnamed(&fdinfo(4, slots), new);
+        }
+        // What was named before the doubt is still a use.
+        let (ring, paths) = ring_files(&fdinfo(4, "    0: /w/a\n    1: w/b\n"), new);
+        assert_eq!((ring, paths), (Unnamed, vec![b"/w/a".to_vec()]));
+    }
+
+    #[test]
+    fn a_ring_fdinfo_past_the_cap_is_too_large_to_read() {
+        let text = fdinfo(3, "    0: /w/a\n    1: /w/b\n    2: /w/c\n");
+        let cap = text.find("    2: ").unwrap() as u64;
+        let mut paths = Vec::new();
+        let read = super::uring::parse(text.as_bytes(), cap, || Some((7, 0)), &mut paths);
+        assert!(matches!(read, Err(super::maps::Error::TooLarge)));
+        let read = super::uring::parse(
+            text.as_bytes(),
+            text.len() as u64,
+            || Some((7, 0)),
+            &mut paths,
+        );
+        assert_eq!(read.ok(), Some(super::uring::Ring::Named));
+        let read = super::uring::read(
+            Path::new("/nonexistent/residue/fdinfo"),
+            || None,
+            &mut paths,
+        );
+        assert!(
+            matches!(read, Err(super::maps::Error::Unreadable(e)) if e.kind() == std::io::ErrorKind::NotFound)
+        );
+    }
+
+    #[test]
+    fn a_kernel_release_gives_its_major_and_minor_version() {
+        use super::uring::version;
+        assert_eq!(version("6.8.0-48-generic\n"), Some((6, 8)));
+        assert_eq!(version("7.0.14-linuxkit"), Some((7, 0)));
+        assert_eq!(version("6.14-rc1"), Some((6, 14)));
+        assert_eq!(version("6.15"), Some((6, 15)));
+        assert_eq!(version("6"), None);
+        assert_eq!(version("6.x"), None);
+        assert_eq!(version(""), None);
     }
 
     #[test]
