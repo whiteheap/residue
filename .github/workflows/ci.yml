@@ -266,7 +266,13 @@ jobs:
         with:
           release: "6.4"
           copyback: false
-          prepare: pkg install -y rust git bash jq
+          # The image comes with openssl 3.0 (libssl.so.12). pkg install keeps
+          # an installed dependency, but the repository's rust links the
+          # openssl it carries now, 3.5 (libssl.so.17), so cargo would not
+          # start (#212). Upgrade what the image has first.
+          prepare: |
+            pkg upgrade -y
+            pkg install -y rust git bash jq
           run: |
             # /tmp is tmpfs, which reports itself 100% free, so the watch
             # smoke test's disk-pressure case needs a disk-backed TMPDIR.
