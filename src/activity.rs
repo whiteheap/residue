@@ -1220,7 +1220,7 @@ mod platform {
                         // it was before is not known, so it counts.
                         (_, Ok(Some(after))) if again.tid != tid => procview::refusal(&after, &me),
                         (Ok(Some(before)), Ok(Some(after)))
-                            if before == after && yours(&again.dir, euid) =>
+                            if before == after && again.yours(euid) =>
                         {
                             procview::refusal(&after, &me)
                         }
@@ -1288,11 +1288,39 @@ mod platform {
         dir: PathBuf,
         tid: u32,
         error: std::io::Error,
+        /// The list of threads was refused while the main thread had
+        /// ended: no running thread can be judged by its own `status`, so
+        /// the process is judged by the ids in the main thread's.
+        unlisted: bool,
     }
 
-    /// The first of `refused` that is yours (`yours`).
+    impl Refused {
+        /// Whether the refused thread is yours (`yours`), or, for a list
+        /// of threads refused after the main thread ended, runs as `euid`.
+        fn yours(&self, euid: u32) -> bool {
+            yours(&self.dir, euid)
+                || (self.unlisted
+                    && creds(&self.dir)
+                        .is_ok_and(|c| c.and_then(|c| c.uid).is_some_and(|uid| uid[1] == euid)))
+        }
+    }
+
+    /// The first of `refused` that is yours (`Refused::yours`).
     fn mine(refused: &[Refused], euid: u32) -> Option<&Refused> {
-        refused.iter().find(|r| yours(&r.dir, euid))
+        refused.iter().find(|r| r.yours(euid))
+    }
+
+    /// Records that the kernel refused a read of the thread at `dir`. Its
+    /// reads come one after another, so one entry per thread is enough.
+    fn refuse(refused: &mut Vec<Refused>, dir: &Path, tid: u32, error: std::io::Error) {
+        if refused.last().is_none_or(|r| r.tid != tid) {
+            refused.push(Refused {
+                dir: dir.to_path_buf(),
+                tid,
+                error,
+                unlisted: false,
+            });
+        }
     }
 
     /// kcmp(2) (`include/uapi/linux/kcmp.h`): whether two threads share
@@ -1356,10 +1384,10 @@ mod platform {
     /// `fs/proc/base.c`). So each thread in `/proc/PID/task` is read too:
     /// its working directory and descriptors unless kcmp says it shares
     /// those already read, and, when the main thread has no memory map,
-    /// the executable and maps of one that has, since all threads share
-    /// one. A thread that exits meanwhile is gone; a refusal is kept in
-    /// `refused` for `take` to judge by that thread's `status`; any other
-    /// error stops the probe.
+    /// the maps and executable of one that has, since all threads share
+    /// one. A thread that exits meanwhile is gone; a refusal of any of
+    /// these reads is kept in `refused` for `take` to judge by that
+    /// thread's `status`; any other error stops the probe.
     fn read_files(
         base: &Path,
         pid: u32,
@@ -1370,35 +1398,40 @@ mod platform {
         let mut read = Read::default();
         // A kernel thread has no executable, and a process that exits
         // mid-scan loses its working directory: neither link is required.
-        let cwd = link(base, "cwd", paths);
-        // The executable comes from the memory map, which a main thread
-        // that exited no longer has (ENOENT), nor its working directory
-        // or descriptor table.
-        let exited = match fs::read_link(base.join("exe")) {
-            Ok(target) => {
-                paths.push(target.into_os_string().into_vec());
-                false
-            }
-            Err(e) => e.kind() == ErrorKind::NotFound || procview::gone(&e),
-        };
-        let mut files_ref = read
-            .fds(base, pid, !exited, paths, &mut refused)?
-            .then_some(pid);
+        let cwd = link(base, pid, "cwd", paths, &mut refused);
+        link(base, pid, "exe", paths, &mut refused);
         // Mapped files: a shared library or native module loaded from a
         // worktree, or a file a process maps and then closes (Git's
         // index), holds no descriptor and no working directory there.
-        read.maps(base, pid, pid, paths, &mut refused)?;
+        // They also tell whether the main thread ended: one that did has
+        // no memory map, nor a working directory or descriptor table, and
+        // the kernel shows a task without a map an empty `maps` and asks
+        // nothing more (`mm_access`), where it refuses one with a map that
+        // residue may not inspect. Never the `exe` error: the kernel checks
+        // access before it looks for the map, so a refused main thread
+        // that ended answers Permission denied there, not ENOENT.
+        let exited = read.maps(base, pid, pid, paths, &mut refused)? == Maps::Empty;
+        let mut files_ref = read
+            .fds(base, pid, !exited, paths, &mut refused)?
+            .then_some(pid);
         let mut fs_ref = cwd.then_some(pid);
         let mut need_maps = exited;
         let tasks = match fs::read_dir(base.join("task")) {
             Ok(tasks) => Some(tasks),
             Err(e) if procview::gone(&e) => None,
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+            // With the main thread ended, no thread's `status` is left to
+            // judge it by, so this refusal is judged by the process's ids.
+            Err(e) if e.kind() == ErrorKind::PermissionDenied && exited => {
                 refused.push(Refused {
                     dir: base.to_path_buf(),
                     tid: pid,
                     error: e,
+                    unlisted: true,
                 });
+                None
+            }
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                refuse(&mut refused, base, pid, e);
                 None
             }
             Err(e) => return Err(format!("/proc/{pid}/task: {e}")),
@@ -1420,7 +1453,7 @@ mod platform {
                 kcmp.zip(reference)
                     .is_some_and(|(kcmp, reference)| kcmp.shares(reference, tid, kind))
             };
-            if !shared(fs_ref, KCMP_FS) && link(&dir, "cwd", paths) {
+            if !shared(fs_ref, KCMP_FS) && link(&dir, tid, "cwd", paths, &mut refused) {
                 fs_ref.get_or_insert(tid);
             }
             if !shared(files_ref, KCMP_FILES) && read.fds(&dir, tid, true, paths, &mut refused)? {
@@ -1430,8 +1463,11 @@ mod platform {
                 paths.sort_unstable();
                 paths.dedup();
             }
-            if need_maps && link(&dir, "exe", paths) {
-                need_maps = !read.maps(&dir, pid, tid, paths, &mut refused)?;
+            // The maps first, whatever the executable link answers: a
+            // refusal there is the one that counts.
+            if need_maps && read.maps(&dir, pid, tid, paths, &mut refused)? == Maps::Mapped {
+                link(&dir, tid, "exe", paths, &mut refused);
+                need_maps = false;
             }
         }
         paths.retain(|p| p.first() == Some(&b'/'));
@@ -1454,11 +1490,26 @@ mod platform {
         maps: bool,
     }
 
+    /// What a read of a thread's `maps` found.
+    #[derive(PartialEq)]
+    enum Maps {
+        /// At least one mapping.
+        Mapped,
+        /// None: the task has no memory map (a main thread that ended, a
+        /// kernel thread, a process that exited).
+        Empty,
+        /// Not read: the thread is gone, or the kernel refused it.
+        Unread,
+    }
+
     impl Read {
         /// Adds the open files of the thread at `dir` to `paths`: whether
         /// residue read its descriptor table. `holds` is false for a main
         /// thread that exited, which holds none: its `fd` is root's, and
-        /// a refusal of it leaves `fds_refused` alone.
+        /// a refusal of it leaves `fds_refused` alone. A table residue may
+        /// list but whose descriptors the kernel refuses (one of another
+        /// group's, whose `fd` is still owned by your user) is refused as
+        /// a whole, and is never a kcmp reference.
         fn fds(
             &mut self,
             dir: &Path,
@@ -1470,9 +1521,15 @@ mod platform {
             match fs::read_dir(dir.join("fd")) {
                 Ok(fds) => {
                     for fd in fds.flatten() {
-                        // An fd closed between listing and readlink is gone; skip it.
-                        if let Ok(target) = fs::read_link(fd.path()) {
-                            paths.push(target.into_os_string().into_vec());
+                        match fs::read_link(fd.path()) {
+                            Ok(target) => paths.push(target.into_os_string().into_vec()),
+                            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                                self.fds_refused |= holds;
+                                refuse(refused, dir, tid, e);
+                                return Ok(false);
+                            }
+                            // An fd closed between listing and readlink is gone; skip it.
+                            Err(_) => {}
                         }
                     }
                     self.fds = true;
@@ -1481,19 +1538,14 @@ mod platform {
                 Err(e) if procview::gone(&e) => Ok(false),
                 Err(e) if e.kind() == ErrorKind::PermissionDenied => {
                     self.fds_refused |= holds;
-                    refused.push(Refused {
-                        dir: dir.to_path_buf(),
-                        tid,
-                        error: e,
-                    });
+                    refuse(refused, dir, tid, e);
                     Ok(false)
                 }
                 Err(e) => Err(format!("{}: {e}", dir.join("fd").display())),
             }
         }
 
-        /// Adds the files the thread at `dir` maps to `paths`: whether
-        /// residue read them.
+        /// Adds the files the thread at `dir` maps to `paths`.
         fn maps(
             &mut self,
             dir: &Path,
@@ -1501,23 +1553,16 @@ mod platform {
             tid: u32,
             paths: &mut Vec<Vec<u8>>,
             refused: &mut Vec<Refused>,
-        ) -> Result<bool, String> {
+        ) -> Result<Maps, String> {
             match maps::read(&dir.join("maps"), paths) {
-                Ok(()) => {
+                Ok(mapped) => {
                     self.maps = true;
-                    Ok(true)
+                    Ok(if mapped { Maps::Mapped } else { Maps::Empty })
                 }
-                Err(maps::Error::Unreadable(e)) if procview::gone(&e) => Ok(false),
+                Err(maps::Error::Unreadable(e)) if procview::gone(&e) => Ok(Maps::Unread),
                 Err(maps::Error::Unreadable(e)) if e.kind() == ErrorKind::PermissionDenied => {
-                    // Its `fd` was refused just before: one entry is enough.
-                    if refused.last().is_none_or(|r| r.tid != tid) {
-                        refused.push(Refused {
-                            dir: dir.to_path_buf(),
-                            tid,
-                            error: e,
-                        });
-                    }
-                    Ok(false)
+                    refuse(refused, dir, tid, e);
+                    Ok(Maps::Unread)
                 }
                 Err(maps::Error::Unreadable(e)) => {
                     Err(format!("{}: {e}", dir.join("maps").display()))
@@ -1530,14 +1575,25 @@ mod platform {
         }
     }
 
-    /// Adds the target of the link `name` of the thread at `dir` to
-    /// `paths`: whether there was one. A link the kernel refuses or that
-    /// is gone adds nothing; the descriptor and maps reads judge refusals.
-    fn link(dir: &Path, name: &str, paths: &mut Vec<Vec<u8>>) -> bool {
+    /// Adds the target of the link `name` of the thread `tid` at `dir` to
+    /// `paths`: whether there was one. A link that is gone adds nothing;
+    /// one the kernel refuses is a refusal of that thread, judged by its
+    /// `status` like a refused table or `maps`.
+    fn link(
+        dir: &Path,
+        tid: u32,
+        name: &str,
+        paths: &mut Vec<Vec<u8>>,
+        refused: &mut Vec<Refused>,
+    ) -> bool {
         match fs::read_link(dir.join(name)) {
             Ok(target) => {
                 paths.push(target.into_os_string().into_vec());
                 true
+            }
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                refuse(refused, dir, tid, e);
+                false
             }
             Err(_) => false,
         }
@@ -1657,6 +1713,85 @@ mod platform {
             }
         }
         groups
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Read, link};
+        use std::fs;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        /// A thread's links laid out as in `/proc/PID/task/TID`, where file
+        /// permissions stand in for the kernel's refusal: a folder that may
+        /// be listed but not searched answers each readlink in it with
+        /// Permission denied, as a thread's `fd` of another group's does.
+        /// Root passes every permission check, so it has nothing to check.
+        #[test]
+        fn a_refused_link_or_descriptor_is_a_refusal_of_its_thread() {
+            // SAFETY: geteuid only returns this process's effective user.
+            if unsafe { libc::geteuid() } == 0 {
+                return;
+            }
+            let base =
+                std::env::temp_dir().join(format!("residue-thread-test-{}", std::process::id()));
+            let dir = base.join("task/7");
+            fs::create_dir_all(dir.join("fd")).unwrap();
+            symlink("/w/a", dir.join("cwd")).unwrap();
+            symlink("/w/a/file", dir.join("fd/3")).unwrap();
+            let gone = base.join("task/8");
+
+            let mut paths = Vec::new();
+            let mut refused = Vec::new();
+            let mut read = Read::default();
+            let cwd = link(&dir, 7, "cwd", &mut paths, &mut refused);
+            let exe = link(&dir, 7, "exe", &mut paths, &mut refused);
+            let fds = read.fds(&dir, 7, true, &mut paths, &mut refused);
+            let gone_fds = read.fds(&gone, 8, true, &mut paths, &mut refused);
+            assert!(cwd && !exe);
+            assert_eq!(fds, Ok(true));
+            assert_eq!(gone_fds, Ok(false));
+            assert_eq!(paths, vec![b"/w/a".to_vec(), b"/w/a/file".to_vec()]);
+            assert!(refused.is_empty() && read.fds && !read.fds_refused);
+
+            // The table lists, but its descriptor is refused: the table
+            // counts as refused, for a thread that holds one, and is not
+            // read, so it is never a kcmp reference.
+            fs::set_permissions(dir.join("fd"), fs::Permissions::from_mode(0o400)).unwrap();
+            let mut paths = Vec::new();
+            let mut read = Read::default();
+            let fds = read.fds(&dir, 7, true, &mut paths, &mut refused);
+            fs::set_permissions(dir.join("fd"), fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(fds, Ok(false));
+            assert!(!read.fds && read.fds_refused);
+            assert_eq!(refused.len(), 1);
+            assert_eq!(
+                (refused[0].tid, refused[0].dir.as_path()),
+                (7, dir.as_path())
+            );
+            // A main thread that ended holds no table: its refusal is
+            // recorded, for its `status` to judge, but the table is not.
+            let mut read = Read::default();
+            fs::set_permissions(dir.join("fd"), fs::Permissions::from_mode(0o400)).unwrap();
+            let fds = read.fds(&dir, 9, false, &mut paths, &mut refused);
+            fs::set_permissions(dir.join("fd"), fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(fds, Ok(false));
+            assert!(!read.fds_refused);
+            assert_eq!(refused.len(), 2);
+
+            // A refused working directory is a refusal too, once per thread.
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o600)).unwrap();
+            let cwd = link(&dir, 10, "cwd", &mut paths, &mut refused);
+            let exe = link(&dir, 10, "exe", &mut paths, &mut refused);
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::remove_dir_all(&base).unwrap();
+            assert!(!cwd && !exe && paths.is_empty());
+            assert_eq!(refused.len(), 3);
+            assert_eq!(refused[2].tid, 10);
+            assert_eq!(
+                refused[2].error.kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
     }
 }
 
@@ -1945,8 +2080,10 @@ mod maps {
         TooLarge,
     }
 
-    /// Adds the path of every file `file` maps to `paths`.
-    pub fn read(file: &Path, paths: &mut Vec<Vec<u8>>) -> Result<(), Error> {
+    /// Adds the path of every file `file` maps to `paths`: whether it lists
+    /// any mapping at all, of a file or not. A task with no memory map has
+    /// none.
+    pub fn read(file: &Path, paths: &mut Vec<Vec<u8>>) -> Result<bool, Error> {
         let file = std::fs::File::open(file).map_err(Error::Unreadable)?;
         let mut reader = BufReader::with_capacity(64 << 10, file.take(CAP + 1));
         let mut line = Vec::new();
@@ -1954,7 +2091,7 @@ mod maps {
         loop {
             line.clear();
             match reader.read_until(b'\n', &mut line) {
-                Ok(0) => return Ok(()),
+                Ok(0) => return Ok(read > 0),
                 Ok(n) => read += n as u64,
                 Err(e) => return Err(Error::Unreadable(e)),
             }
@@ -3562,6 +3699,27 @@ mod tests {
         );
     }
 
+    /// A task with no memory map, such as a main thread that ended, shows an
+    /// empty `maps`, which is how the Linux probe tells it ended; one whose
+    /// mappings are all anonymous still has a map.
+    #[test]
+    fn maps_say_whether_the_task_has_any_mapping() {
+        let file = std::env::temp_dir().join(format!("residue-maps-empty-{}", std::process::id()));
+        let mut paths = Vec::new();
+        std::fs::write(&file, "").unwrap();
+        let empty = super::maps::read(&file, &mut paths);
+        std::fs::write(
+            &file,
+            "7f2c3e5bd000-7f2c3e5c0000 rw-p 00000000 00:00 0 \n7fff6b3a0000-7fff6b3c1000 rw-p 00000000 00:00 0                          [stack]\n",
+        )
+        .unwrap();
+        let anonymous = super::maps::read(&file, &mut paths);
+        std::fs::remove_file(&file).unwrap();
+        assert!(matches!(empty, Ok(false)));
+        assert!(matches!(anonymous, Ok(true)));
+        assert!(paths.is_empty());
+    }
+
     #[test]
     fn maps_that_cannot_be_opened_say_why() {
         let mut paths = Vec::new();
@@ -3913,7 +4071,7 @@ mod tests {
         let mut paths = Vec::new();
         let read = super::maps::read(&file, &mut paths);
         std::fs::remove_file(&file).unwrap();
-        assert!(read.is_ok());
+        assert!(matches!(read, Ok(true)));
         let paths: Vec<&[u8]> = paths.iter().map(Vec::as_slice).collect();
         assert_eq!(
             paths,
