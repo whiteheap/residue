@@ -20,9 +20,10 @@
 # step failed). A setup failure is never reported as a product result.
 #
 # Needs bash, git and jq, and on Linux a C compiler (cc) for
-# scripts/thread-holder.c. Everything lives under one fresh directory with
-# its own HOME and Git config, and only that directory is deleted. It never
-# touches the caller's repositories, fetches nothing and starts no service.
+# scripts/thread-holder.c and scripts/uring-holder.c. Everything lives under
+# one fresh directory with its own HOME and Git config, and only that
+# directory is deleted. It never touches the caller's repositories, fetches
+# nothing and starts no service.
 # The prompt race is scripts/race-check.sh; the work-landed requirement is
 # .github/watch-smoke.sh. This file does not repeat them.
 set -uo pipefail
@@ -1690,6 +1691,91 @@ if [ "$(uname -s)" = Linux ]; then
         elif ! jq -e '.activity.available == true and .worktree.activity.state == "not_observed"' "$out" >/dev/null; then fail "with a process that is not dumpable in it, the probe says $(jq -c '[.activity, .worktree.activity]' "$out"), want available and not_observed"
         else ok; fi
     fi
+fi
+
+# 10c. Linux: a process whose only use of a worktree is a file it keeps in
+# an io_uring ring keeps it. Such a file has no descriptor of its own: the
+# ring's descriptor reads anon_inode:[io_uring], and the ring's fdinfo
+# lists the file. scripts/uring-holder.c, built here with cc and working in
+# /, holds sub/file.txt registered with a ring (`register`), opened straight
+# into the ring (`direct`), or registered with a ring whose descriptor it
+# closed and that it only maps (`mapped`). From Linux 6.14 the fdinfo
+# names the file, so the first two must be in_use by uring-holder; before,
+# it gives only the last part of the name, and with no descriptor there is
+# no fdinfo, so the rest must be unknown (unnamed_file). Either way
+# `remove --yes` must refuse it, and once it exits the worktree is a
+# candidate. Where io_uring is refused (a seccomp filter, as Docker's
+# default, or kernel.io_uring_disabled) the case is skipped, except in
+# GitHub Actions, where it must run.
+uring_case() { # MODE
+    local mode=$1 before wt_real holder i log held major minor want st
+    name=activity-uring-$mode
+    make_repo
+    before=$(sums "$wt")
+    wt_real=$(cd "$wt" && pwd -P) || exit 2
+    log=$work/$name.holder
+    (cd "$work" && exec "$uring_bin" "$mode" "$wt_real/sub/file.txt") >"$log" 2>&1 &
+    holder=$!
+    holders="$holders $holder"
+    for ((i = 0; i < 100; i++)); do
+        grep -qx ready "$log" && break
+        kill -0 "$holder" 2>/dev/null || break
+        sleep 0.1
+    done
+    if ! grep -qx ready "$log"; then
+        kill "$holder" 2>/dev/null
+        wait "$holder" 2>/dev/null
+        st=$?
+        if [ "$st" != 77 ]; then
+            echo "contract-check: setup failed in $name: uring-holder $mode never held the file (exit $st): $(head -n 3 "$log")" >&2
+            exit 2
+        elif [ -n "${GITHUB_ACTIONS:-}" ]; then
+            out=$log err=
+            fail "io_uring is refused here ($(head -n 1 "$log")), and in GitHub Actions this case must run"
+        else
+            echo "skip $name: io_uring is refused here ($(head -n 1 "$log"))"
+        fi
+        return
+    fi
+    IFS=. read -r major minor _ <<<"$(uname -r)"
+    minor=${minor%%[!0-9]*}
+    if [ "$mode" != mapped ] && { [ "$major" -gt 6 ] || { [ "$major" = 6 ] && [ "${minor:-0}" -ge 14 ]; }; }; then
+        held='.state == "in_use" and any(.processes[]; .pid == $pid and .command == "uring-holder")'
+        want="in_use by uring-holder[$holder]"
+    else
+        held='.state == "unknown" and .reason == "unnamed_file" and (.detail | contains("process \($pid) (uring-holder)"))'
+        want="unknown (unnamed_file) naming uring-holder[$holder]"
+    fi
+    run explain --json "$wt"
+    local busy=$work/$name.busy busy_status=$status
+    mv "$out" "$busy" || exit 2
+    run remove --yes --json "$wt"
+    kill "$holder" 2>/dev/null
+    wait "$holder" 2>/dev/null
+    if [ "$busy_status" != 0 ]; then out=$busy; fail "explain exit $busy_status, want 0"
+    elif ! jq -e --argjson pid "$holder" ".worktree.verdict != \"candidate\" and (.worktree.activity | $held)" "$busy" >/dev/null; then
+        out=$busy; fail "with uring-holder $mode in it on Linux $(uname -r), activity is $(jq -c '.worktree.activity' "$busy"), want $want"
+    elif [ "$status" != 3 ]; then fail "remove exit $status, want 3"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), want refused"
+    elif [ "$(failing_checks 0)" != activity ]; then fail "failing checks: $(failing_checks 0), want activity"
+    elif untouched "$before"; then
+        run explain --json "$wt"
+        if ! jq -e '.worktree.activity.state == "not_observed" and .worktree.verdict == "candidate"' "$out" >/dev/null; then
+            fail "after uring-holder exited, activity is $(jq -c '.worktree.activity' "$out") and the verdict $(jq -r '.worktree.verdict' "$out"), want not_observed and candidate"
+        else
+            ok
+            echo "     Linux $(uname -r), io_uring_disabled $(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo absent): $(jq -c '.worktree.activity | {state, reason}' "$busy")"
+        fi
+    fi
+}
+if [ "$(uname -s)" = Linux ]; then
+    name=activity-uring-build
+    uring_bin=$work/uring-holder
+    setup cc -O2 -Wall -Werror -o "$uring_bin" "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/uring-holder.c"
+    uring_case register
+    uring_case direct
+    uring_case mapped
 fi
 
 # 11. Ignored folders that `git status --ignored=matching` lists
