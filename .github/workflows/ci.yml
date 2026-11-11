@@ -334,25 +334,27 @@ jobs:
           release: "r151054-build"
           copyback: false
           # pkg retries some network errors but not a failed TLS handshake,
-          # E_SSL_CONNECT_ERROR, which stopped this step in run 43013552072
-          # (#225). So try each install three times. pkg keeps what a failed
-          # run downloaded, and exit status 4 means nothing to do. The rustup
-          # installer goes to a file: curl's retry into a pipe can repeat
-          # bytes, and plain --retry skips a TLS error.
+          # E_SSL_CONNECT_ERROR, and pkg.omnios.org drops handshakes in
+          # bursts (runs 43013552072 and 43024707707, #225). So try each
+          # install five times, waiting 15 s and then twice as long each
+          # time. A retry fetches only the files the last try did not get,
+          # and exit status 4 means nothing to do. The rustup installer goes
+          # to a file: curl's retry into a pipe can repeat bytes, and plain
+          # --retry skips a TLS error.
           prepare: |
             pkg_install() {
-              n=1
+              n=1 t=15
               until pkg install "$@"; do
                 s=$?
                 [ "$s" -eq 4 ] && return 0
-                [ "$n" -lt 3 ] || return "$s"
-                n=$((n + 1))
-                sleep 10
+                [ "$n" -lt 5 ] || return "$s"
+                sleep "$t"
+                n=$((n + 1)) t=$((t * 2))
               done
             }
             pkg_install developer/versioning/git
             pkg_install jq || pkg_install ooce/text/jq
-            curl -sSf --retry 3 --retry-all-errors -o /tmp/rustup-init.sh https://sh.rustup.rs
+            curl -sSf --retry 5 --retry-all-errors -o /tmp/rustup-init.sh https://sh.rustup.rs
             sh /tmp/rustup-init.sh -y --profile minimal
           run: |
             . "$HOME/.cargo/env"
