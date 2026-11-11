@@ -1138,7 +1138,7 @@ mod platform {
     use std::io::ErrorKind;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::MetadataExt;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     const BACKEND: &str = "procfs";
 
@@ -1160,6 +1160,7 @@ mod platform {
         };
         // SAFETY: geteuid only returns this process's effective user.
         let euid = unsafe { libc::geteuid() };
+        let kcmp = Kcmp::usable();
         let listing = match fs::read_dir("/proc") {
             Ok(listing) => listing,
             Err(e) => return unavailable(BACKEND, "probe_missing", format!("/proc: {e}")),
@@ -1187,29 +1188,39 @@ mod platform {
                 .map(|c| c.trim_end().to_string())
                 .unwrap_or_default();
             paths.clear();
-            let mut files = match read_files(&base, pid, &mut paths) {
+            let mut files = match read_files(&base, pid, kcmp, &mut paths) {
                 Ok(files) => files,
                 Err(detail) => return unavailable(BACKEND, "probe_failed", detail),
             };
             // A process of yours that the kernel refuses to show: residue
             // cannot see whether it is using a worktree. Where residue
             // already counts every process as maybe hidden (`hidden`),
-            // there is nothing more to learn from it.
-            if hidden.is_none() && files.refused.is_some() && yours(&base, euid) {
+            // there is nothing more to learn from it. Each thread is judged
+            // by its own `status`, so a process whose main thread exited
+            // (whose `status` is root's) is judged by the threads that run.
+            let first = match hidden {
+                None => mine(&files.refused, euid).map(|r| (r.dir.clone(), r.tid)),
+                Some(_) => None,
+            };
+            if let Some((dir, tid)) = first {
                 // One that changes its user while residue reads it, as one
                 // cron, sshd, su or `docker exec -u` starts does, can be
                 // refused once: it is read again, and fails the probe only
                 // when it is still refused and its credentials held.
-                let before = creds(&base);
+                let before = creds(&dir);
                 paths.clear();
-                files = match read_files(&base, pid, &mut paths) {
+                files = match read_files(&base, pid, kcmp, &mut paths) {
                     Ok(files) => files,
                     Err(detail) => return unavailable(BACKEND, "probe_failed", detail),
                 };
-                if let Some(error) = &files.refused {
-                    let why = match (before, creds(&base)) {
+                if let Some(again) = mine(&files.refused, euid) {
+                    let after = creds(&again.dir);
+                    let why = match (before, after) {
+                        // A thread refused only on the second read: what
+                        // it was before is not known, so it counts.
+                        (_, Ok(Some(after))) if again.tid != tid => procview::refusal(&after, &me),
                         (Ok(Some(before)), Ok(Some(after)))
-                            if before == after && yours(&base, euid) =>
+                            if before == after && yours(&again.dir, euid) =>
                         {
                             procview::refusal(&after, &me)
                         }
@@ -1218,11 +1229,17 @@ mod platform {
                         _ => None,
                     };
                     if let Some(why) = why {
+                        let error = &again.error;
+                        let whose = if again.tid == pid {
+                            format!("{command}[{pid}]")
+                        } else {
+                            format!("thread {} of {command}[{pid}]", again.tid)
+                        };
                         return unavailable(
                             BACKEND,
                             "probe_failed",
                             format!(
-                                "the kernel would not show the files of {command}[{pid}], which runs as your user ({error}): {why}"
+                                "the kernel would not show the files of {whose}, which runs as your user ({error}): {why}"
                             ),
                         );
                     }
@@ -1255,84 +1272,291 @@ mod platform {
         }
     }
 
-    /// What residue read of one process's files.
+    /// What residue read of one process's files, over all its threads.
     struct Files {
+        /// It read every descriptor table the process's threads hold.
         fds_read: bool,
         maps_read: bool,
-        /// Why the kernel refused to show its open or mapped files, if it
-        /// did (Permission denied).
-        refused: Option<std::io::Error>,
+        /// Each thread whose open or mapped files, or whose list of
+        /// threads, the kernel refused to show (Permission denied).
+        refused: Vec<Refused>,
     }
 
-    /// Adds the paths of the working directory, executable, open files and
-    /// mapped files of the process at `base` to `paths`, or says why the
-    /// probe cannot go on.
-    fn read_files(base: &Path, pid: u32, paths: &mut Vec<Vec<u8>>) -> Result<Files, String> {
+    /// A thread whose files the kernel refused to show.
+    struct Refused {
+        /// `/proc/PID` for the main thread, `/proc/PID/task/TID` for another.
+        dir: PathBuf,
+        tid: u32,
+        error: std::io::Error,
+    }
+
+    /// The first of `refused` that is yours (`yours`).
+    fn mine(refused: &[Refused], euid: u32) -> Option<&Refused> {
+        refused.iter().find(|r| yours(&r.dir, euid))
+    }
+
+    /// kcmp(2) (`include/uapi/linux/kcmp.h`): whether two threads share
+    /// one descriptor table (`KCMP_FILES`) or one working directory
+    /// (`KCMP_FS`). A thread made with `CLONE_FILES` or `CLONE_FS`, as
+    /// every thread glibc, musl, Rust, Go and the JVM make is, shares its
+    /// process's, and reading it again would only cost time.
+    #[derive(Clone, Copy)]
+    struct Kcmp;
+
+    const KCMP_FILES: libc::c_int = 2;
+    const KCMP_FS: libc::c_int = 3;
+
+    impl Kcmp {
+        /// `Some` when kcmp answers here and takes the PIDs this `/proc`
+        /// names. A kernel built without it, or a seccomp filter (Docker's
+        /// default refuses it), leaves every thread read. kcmp takes PIDs
+        /// as residue's PID namespace numbers them, so `/proc/self` must
+        /// name residue by the PID it has there: in another namespace's
+        /// `/proc` the numbers would name other tasks.
+        fn usable() -> Option<Kcmp> {
+            let me = std::process::id();
+            let named = fs::read_link("/proc/self").ok()?;
+            (named.as_os_str().as_bytes() == me.to_string().as_bytes()
+                && Kcmp.shares(me, me, KCMP_FILES))
+            .then_some(Kcmp)
+        }
+
+        /// Whether kcmp says `a` and `b` share the object of `kind`. Any
+        /// error (one of them gone, or not one residue may inspect) is no.
+        fn shares(self, a: u32, b: u32, kind: libc::c_int) -> bool {
+            let (Ok(a), Ok(b)) = (libc::pid_t::try_from(a), libc::pid_t::try_from(b)) else {
+                return false;
+            };
+            // SAFETY: kcmp only compares two tasks' kernel objects; the two
+            // index arguments are unused for these kinds and passed as 0.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_kcmp,
+                    a,
+                    b,
+                    kind,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                )
+            };
+            rc == 0
+        }
+    }
+
+    /// Adds the paths of the working directories, executable, open files
+    /// and mapped files of the process at `base` to `paths`, from every
+    /// thread, or says why the probe cannot go on.
+    ///
+    /// Linux keeps a working directory and a descriptor table per thread:
+    /// a thread made without `CLONE_FS` or `CLONE_FILES`, or after
+    /// unshare(2) of them, has its own, and `/proc/PID` shows only the main
+    /// thread's. A main thread that exited while others run (pthread_exit
+    /// in `main`) keeps none of them, and no memory map either, so its
+    /// `status` and `fd` are root's (`task_dump_owner` in
+    /// `fs/proc/base.c`). So each thread in `/proc/PID/task` is read too:
+    /// its working directory and descriptors unless kcmp says it shares
+    /// those already read, and, when the main thread has no memory map,
+    /// the executable and maps of one that has, since all threads share
+    /// one. A thread that exits meanwhile is gone; a refusal is kept in
+    /// `refused` for `take` to judge by that thread's `status`; any other
+    /// error stops the probe.
+    fn read_files(
+        base: &Path,
+        pid: u32,
+        kcmp: Option<Kcmp>,
+        paths: &mut Vec<Vec<u8>>,
+    ) -> Result<Files, String> {
+        let mut refused = Vec::new();
+        let mut read = Read::default();
         // A kernel thread has no executable, and a process that exits
         // mid-scan loses its working directory: neither link is required.
-        for link in ["cwd", "exe"] {
-            if let Ok(target) = fs::read_link(base.join(link)) {
+        let cwd = link(base, "cwd", paths);
+        // The executable comes from the memory map, which a main thread
+        // that exited no longer has (ENOENT), nor its working directory
+        // or descriptor table.
+        let exited = match fs::read_link(base.join("exe")) {
+            Ok(target) => {
                 paths.push(target.into_os_string().into_vec());
-            }
-        }
-        let mut refused: Option<std::io::Error> = None;
-        let fds_read = match fs::read_dir(base.join("fd")) {
-            Ok(fds) => {
-                for fd in fds.flatten() {
-                    // An fd closed between listing and readlink is gone; skip it.
-                    if let Ok(target) = fs::read_link(fd.path()) {
-                        paths.push(target.into_os_string().into_vec());
-                    }
-                }
-                true
-            }
-            Err(e) => {
-                if e.kind() == ErrorKind::PermissionDenied {
-                    refused = Some(e);
-                }
                 false
             }
+            Err(e) => e.kind() == ErrorKind::NotFound || procview::gone(&e),
         };
+        let mut files_ref = read
+            .fds(base, pid, !exited, paths, &mut refused)?
+            .then_some(pid);
         // Mapped files: a shared library or native module loaded from a
         // worktree, or a file a process maps and then closes (Git's
         // index), holds no descriptor and no working directory there.
-        let maps_read = match maps::read(&base.join("maps"), paths) {
-            Ok(()) => true,
-            Err(maps::Error::Unreadable(e)) => {
-                if e.kind() == ErrorKind::PermissionDenied {
-                    refused = refused.or(Some(e));
-                }
-                false
+        read.maps(base, pid, pid, paths, &mut refused)?;
+        let mut fs_ref = cwd.then_some(pid);
+        let mut need_maps = exited;
+        let tasks = match fs::read_dir(base.join("task")) {
+            Ok(tasks) => Some(tasks),
+            Err(e) if procview::gone(&e) => None,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                refused.push(Refused {
+                    dir: base.to_path_buf(),
+                    tid: pid,
+                    error: e,
+                });
+                None
             }
-            Err(maps::Error::TooLarge) => {
-                return Err(format!(
-                    "/proc/{pid}/maps is larger than {} MiB, so residue cannot read every file process {pid} maps",
-                    maps::CAP >> 20
-                ));
-            }
+            Err(e) => return Err(format!("/proc/{pid}/task: {e}")),
         };
+        for task in tasks.into_iter().flatten() {
+            let task = task.map_err(|e| format!("/proc/{pid}/task: {e}"))?;
+            let Some(tid) = task
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if tid == pid {
+                continue;
+            }
+            let dir = task.path();
+            let shared = |reference: Option<u32>, kind| {
+                kcmp.zip(reference)
+                    .is_some_and(|(kcmp, reference)| kcmp.shares(reference, tid, kind))
+            };
+            if !shared(fs_ref, KCMP_FS) && link(&dir, "cwd", paths) {
+                fs_ref.get_or_insert(tid);
+            }
+            if !shared(files_ref, KCMP_FILES) && read.fds(&dir, tid, true, paths, &mut refused)? {
+                files_ref.get_or_insert(tid);
+                // Threads that kcmp cannot compare can each hold the same
+                // table: keep one copy of each path as they are read.
+                paths.sort_unstable();
+                paths.dedup();
+            }
+            if need_maps && link(&dir, "exe", paths) {
+                need_maps = !read.maps(&dir, pid, tid, paths, &mut refused)?;
+            }
+        }
         paths.retain(|p| p.first() == Some(&b'/'));
         paths.sort_unstable();
         paths.dedup();
         Ok(Files {
-            fds_read,
-            maps_read,
+            fds_read: read.fds && !read.fds_refused,
+            maps_read: read.maps,
             refused,
         })
     }
 
-    /// Whether the process at `base` runs as `euid` and is dumpable. The
-    /// kernel gives `/proc/PID/status` the process's effective user as its
+    /// Which of a process's descriptor tables and maps residue read.
+    #[derive(Default)]
+    struct Read {
+        /// At least one descriptor table.
+        fds: bool,
+        /// A table of a thread that holds one was refused.
+        fds_refused: bool,
+        maps: bool,
+    }
+
+    impl Read {
+        /// Adds the open files of the thread at `dir` to `paths`: whether
+        /// residue read its descriptor table. `holds` is false for a main
+        /// thread that exited, which holds none: its `fd` is root's, and
+        /// a refusal of it leaves `fds_refused` alone.
+        fn fds(
+            &mut self,
+            dir: &Path,
+            tid: u32,
+            holds: bool,
+            paths: &mut Vec<Vec<u8>>,
+            refused: &mut Vec<Refused>,
+        ) -> Result<bool, String> {
+            match fs::read_dir(dir.join("fd")) {
+                Ok(fds) => {
+                    for fd in fds.flatten() {
+                        // An fd closed between listing and readlink is gone; skip it.
+                        if let Ok(target) = fs::read_link(fd.path()) {
+                            paths.push(target.into_os_string().into_vec());
+                        }
+                    }
+                    self.fds = true;
+                    Ok(true)
+                }
+                Err(e) if procview::gone(&e) => Ok(false),
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                    self.fds_refused |= holds;
+                    refused.push(Refused {
+                        dir: dir.to_path_buf(),
+                        tid,
+                        error: e,
+                    });
+                    Ok(false)
+                }
+                Err(e) => Err(format!("{}: {e}", dir.join("fd").display())),
+            }
+        }
+
+        /// Adds the files the thread at `dir` maps to `paths`: whether
+        /// residue read them.
+        fn maps(
+            &mut self,
+            dir: &Path,
+            pid: u32,
+            tid: u32,
+            paths: &mut Vec<Vec<u8>>,
+            refused: &mut Vec<Refused>,
+        ) -> Result<bool, String> {
+            match maps::read(&dir.join("maps"), paths) {
+                Ok(()) => {
+                    self.maps = true;
+                    Ok(true)
+                }
+                Err(maps::Error::Unreadable(e)) if procview::gone(&e) => Ok(false),
+                Err(maps::Error::Unreadable(e)) if e.kind() == ErrorKind::PermissionDenied => {
+                    // Its `fd` was refused just before: one entry is enough.
+                    if refused.last().is_none_or(|r| r.tid != tid) {
+                        refused.push(Refused {
+                            dir: dir.to_path_buf(),
+                            tid,
+                            error: e,
+                        });
+                    }
+                    Ok(false)
+                }
+                Err(maps::Error::Unreadable(e)) => {
+                    Err(format!("{}: {e}", dir.join("maps").display()))
+                }
+                Err(maps::Error::TooLarge) => Err(format!(
+                    "/proc/{pid}/maps is larger than {} MiB, so residue cannot read every file process {pid} maps",
+                    maps::CAP >> 20
+                )),
+            }
+        }
+    }
+
+    /// Adds the target of the link `name` of the thread at `dir` to
+    /// `paths`: whether there was one. A link the kernel refuses or that
+    /// is gone adds nothing; the descriptor and maps reads judge refusals.
+    fn link(dir: &Path, name: &str, paths: &mut Vec<Vec<u8>>) -> bool {
+        match fs::read_link(dir.join(name)) {
+            Ok(target) => {
+                paths.push(target.into_os_string().into_vec());
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Whether the thread at `dir` runs as `euid` and is dumpable. The
+    /// kernel gives `/proc/PID/status` the thread's effective user as its
     /// owner, or root when the process is not dumpable (`task_dump_owner` in
     /// `fs/proc/base.c`), as a process that changed its user, ran a setuid
     /// program or turned dumping off (ssh-agent) is. Such a process of
     /// yours the kernel shows to root alone, and it is not inspected, as on
-    /// FreeBSD. One that exited is not yours either.
-    fn yours(base: &Path, euid: u32) -> bool {
-        fs::metadata(base.join("status")).is_ok_and(|meta| meta.uid() == euid)
+    /// FreeBSD. One that exited is not yours either, nor is a main thread
+    /// that exited while other threads run: it has no memory map, so its
+    /// `status` is root's too, and each running thread is judged by its own.
+    fn yours(dir: &Path, euid: u32) -> bool {
+        fs::metadata(dir.join("status")).is_ok_and(|meta| meta.uid() == euid)
     }
 
-    /// The credentials in the `status` of the process at `base`: `None`
+    /// The credentials in the `status` of the thread at `dir`: `None`
     /// when it is gone (`procview::gone`), `Err` when residue could not
     /// read them.
     fn creds(base: &Path) -> Result<Option<procview::Creds>, ()> {
