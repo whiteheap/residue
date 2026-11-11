@@ -544,6 +544,7 @@ pub fn main(args: &[OsString]) -> u8 {
                 },
             };
         }
+        note_blocker(&snap, &mut state);
         let acted = act(&exe, &opts, &snap, &mut state);
         if opts.once {
             // One line when the pass removes nothing, so a preview never
@@ -880,6 +881,9 @@ struct State {
     /// The ROOTs the last pass skipped (`live_roots`), and why: each is
     /// logged once while it is skipped, and the pass record holds them.
     skipped_roots: Vec<crate::pass::Skipped>,
+    /// The activity reason last logged as keeping every worktree no
+    /// process was seen in (`note_blocker`), while it does.
+    blocker: Option<String>,
 }
 
 /// How long the bytes a low-disk removal freed count toward later low-disk
@@ -1024,6 +1028,119 @@ struct Worktree {
     restored: bool,
     /// The filesystem it is on.
     dev: Option<u64>,
+    /// Its `activity` as the scan judged it, or `None` where the scan did
+    /// not (a worktree that is gone). Only for the log (`Blocker`): what
+    /// keeps a worktree is `keeping`, and the child judges it again.
+    activity: Option<Activity>,
+}
+
+/// A worktree's `activity.state` in `scan --json`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Activity {
+    InUse,
+    NotObserved,
+    /// `unknown`, with its `reason` and `detail`.
+    Unknown {
+        reason: String,
+        detail: String,
+    },
+    /// A state this release does not know.
+    Other,
+}
+
+impl Activity {
+    fn of(w: &Value) -> Option<Activity> {
+        let a = w.get("activity").filter(|a| !matches!(a, Value::Null))?;
+        let text = |key: &str| a.get(key).and_then(Value::str).unwrap_or("").to_string();
+        Some(match a.get("state").and_then(Value::str) {
+            Some("in_use") => Activity::InUse,
+            Some("not_observed") => Activity::NotObserved,
+            Some("unknown") => Activity::Unknown {
+                reason: text("reason"),
+                detail: text("detail"),
+            },
+            _ => Activity::Other,
+        })
+    }
+}
+
+/// One activity reason that keeps every worktree of a pass in which no
+/// process was seen, such as Linux's `unnamed_file` while one process of
+/// yours holds a file in an io_uring ring residue cannot name, or a probe
+/// that failed outright: the scan's header says nothing of it, so `watch`
+/// logs it, once until it changes (#219). It only explains the pass: it
+/// changes no removal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Blocker {
+    reason: String,
+    /// The first such worktree's `detail`, which names the process or
+    /// where residue runs.
+    detail: String,
+    /// How many other details the rest give.
+    others: usize,
+}
+
+impl Blocker {
+    /// `None` when a worktree's activity is `not_observed` or a state this
+    /// release does not know, when no worktree's is `unknown`, or when two
+    /// give different reasons: then no one reason keeps them all, and
+    /// `residue explain PATH` gives each.
+    fn of(snap: &Snapshot) -> Option<Blocker> {
+        let mut found: Option<(&str, Vec<&str>)> = None;
+        for w in &snap.worktrees {
+            match &w.activity {
+                None | Some(Activity::InUse) => {}
+                Some(Activity::NotObserved | Activity::Other) => return None,
+                Some(Activity::Unknown { reason, detail }) => match &mut found {
+                    None => found = Some((reason, vec![detail])),
+                    Some((first, _)) if *first != reason => return None,
+                    Some((_, details)) => {
+                        if !details.contains(&detail.as_str()) {
+                            details.push(detail);
+                        }
+                    }
+                },
+            }
+        }
+        let (reason, details) = found?;
+        Some(Blocker {
+            reason: reason.to_string(),
+            detail: details[0].to_string(),
+            others: details.len() - 1,
+        })
+    }
+
+    fn line(&self) -> String {
+        let more = match self.others {
+            0 => String::new(),
+            1 => " (and 1 other detail; residue explain PATH gives each)".to_string(),
+            n => format!(" (and {n} other details; residue explain PATH gives each)"),
+        };
+        format!(
+            "activity unknown ({}) keeps every worktree no process was seen in, so watch removes none of them: {}{more}; logged again when the reason changes",
+            self.reason, self.detail
+        )
+    }
+}
+
+/// Log the pass's `Blocker` when its reason differs from the last one
+/// logged, and that it is gone once it is. Only the reason: a detail can
+/// change on every pass (lsof's count of processes it did not list), and a
+/// line per pass would bury the rest of the log.
+fn note_blocker(snap: &Snapshot, state: &mut State) {
+    let now = Blocker::of(snap);
+    let reason = now.as_ref().map(|b| b.reason.clone());
+    if reason == state.blocker {
+        return;
+    }
+    match (&now, &state.blocker) {
+        (Some(blocker), _) => log(&blocker.line()),
+        (None, Some(was)) => log(&format!(
+            "activity unknown ({was}) no longer keeps every worktree no process was seen in"
+        )),
+        (None, None) => {}
+    }
+    state.blocker = reason;
 }
 
 struct Repo {
@@ -1224,6 +1341,7 @@ fn scan(exe: &Path, opts: &Options, roots: &[PathBuf]) -> Result<Snapshot, ScanE
                     .collect(),
                 restored: put_back(w),
                 dev: std::fs::metadata(path).ok().map(|m| m.dev()),
+                activity: Activity::of(w),
             });
         }
     }
@@ -2361,6 +2479,7 @@ mod tests {
             keeping: Vec::new(),
             restored: false,
             dev: Some(1),
+            activity: Some(Activity::NotObserved),
         }
     }
 
@@ -2613,6 +2732,65 @@ mod tests {
         assert_eq!((seen.tried, seen.removed), (1, 1));
         assert_eq!(seen.next_deadline, Some(5));
         assert_eq!(seen.next_fetch, None, "0 is due now, not a time");
+    }
+
+    /// One activity reason is logged only when it keeps every worktree no
+    /// process was seen in, with the first worktree's detail (#219).
+    #[test]
+    fn blocker_needs_one_reason_for_every_unseen_worktree() {
+        let unknown = |path: &str, reason: &str, detail: &str| {
+            let mut w = worktree(path);
+            w.activity = Some(Activity::Unknown {
+                reason: reason.into(),
+                detail: detail.into(),
+            });
+            w
+        };
+        let held = "procfs cannot give the path of a file process 42 (holder) holds";
+        let snap = |worktrees| Snapshot {
+            repos: Vec::new(),
+            worktrees,
+        };
+        let mut in_use = worktree("/r/u");
+        in_use.activity = Some(Activity::InUse);
+        let mut gone = worktree("/r/g");
+        gone.activity = None;
+        let blocker = Blocker::of(&snap(vec![
+            unknown("/r/a", "unnamed_file", held),
+            in_use,
+            gone,
+            unknown("/s/b", "unnamed_file", held),
+        ]))
+        .unwrap();
+        assert_eq!(
+            blocker.line(),
+            format!(
+                "activity unknown (unnamed_file) keeps every worktree no process was seen in, so watch removes none of them: {held}; logged again when the reason changes"
+            )
+        );
+        assert!(!blocker.line().contains("removed "), "watch-smoke greps it");
+        let other = Blocker::of(&snap(vec![
+            unknown("/r/a", "unnamed_file", held),
+            unknown("/r/b", "unnamed_file", "another"),
+            unknown("/r/c", "unnamed_file", "a third"),
+        ]))
+        .unwrap();
+        assert_eq!((other.detail.as_str(), other.others), (held, 2));
+        for worktrees in [
+            vec![unknown("/r/a", "unnamed_file", held), worktree("/r/b")],
+            vec![
+                unknown("/r/a", "unnamed_file", held),
+                unknown("/r/b", "long_path", "long"),
+            ],
+            vec![{
+                let mut w = worktree("/r/a");
+                w.activity = Some(Activity::Other);
+                w
+            }],
+            Vec::new(),
+        ] {
+            assert_eq!(Blocker::of(&snap(worktrees)), None);
+        }
     }
 
     /// A record is stale only after a running watch would have passed.
