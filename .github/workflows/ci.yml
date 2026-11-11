@@ -215,7 +215,16 @@ jobs:
         with:
           release: "10"
           copyback: false
-          prepare: /usr/sbin/pkg_add rust git-base bash jq
+          # A mirror that cuts off one download fails the whole pkg_add
+          # (a truncated llvm archive, run 42701729488, #225). Try it three
+          # times.
+          prepare: |
+            n=1
+            until /usr/sbin/pkg_add rust git-base bash jq; do
+              [ $n -lt 3 ] || exit 1
+              n=$((n + 1))
+              sleep 10
+            done
           run: |
             # /tmp is tmpfs, which reports itself 100% free, so the watch
             # smoke test's disk-pressure case needs a disk-backed TMPDIR.
@@ -324,10 +333,27 @@ jobs:
         with:
           release: "r151054-build"
           copyback: false
+          # pkg retries some network errors but not a failed TLS handshake,
+          # E_SSL_CONNECT_ERROR, which stopped this step in run 43013552072
+          # (#225). So try each install three times. pkg keeps what a failed
+          # run downloaded, and exit status 4 means nothing to do. The rustup
+          # installer goes to a file: curl's retry into a pipe can repeat
+          # bytes, and plain --retry skips a TLS error.
           prepare: |
-            pkg install developer/versioning/git || [ $? -eq 4 ]
-            pkg install jq || pkg install ooce/text/jq || [ $? -eq 4 ]
-            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            pkg_install() {
+              n=1
+              until pkg install "$@"; do
+                s=$?
+                [ "$s" -eq 4 ] && return 0
+                [ "$n" -lt 3 ] || return "$s"
+                n=$((n + 1))
+                sleep 10
+              done
+            }
+            pkg_install developer/versioning/git
+            pkg_install jq || pkg_install ooce/text/jq
+            curl -sSf --retry 3 --retry-all-errors -o /tmp/rustup-init.sh https://sh.rustup.rs
+            sh /tmp/rustup-init.sh -y --profile minimal
           run: |
             . "$HOME/.cargo/env"
             uname -a
