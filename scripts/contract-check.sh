@@ -19,7 +19,8 @@
 # could not run (no binary, no jq, a terminal on stdin, or a fixture setup
 # step failed). A setup failure is never reported as a product result.
 #
-# Needs bash, git and jq. Everything lives under one fresh directory with
+# Needs bash, git and jq, and on Linux a C compiler (cc) for
+# scripts/thread-holder.c. Everything lives under one fresh directory with
 # its own HOME and Git config, and only that directory is deleted. It never
 # touches the caller's repositories, fetches nothing and starts no service.
 # The prompt race is scripts/race-check.sh; the work-landed requirement is
@@ -1575,6 +1576,119 @@ if [ "$(uname -s)" = Linux ]; then
     elif untouched "$before"; then
         ok
         echo "     maps: $maps_procs processes readable, $maps_lines lines, $maps_bytes bytes; one cat of them all took ${maps_s} s, the explain that read them ${explain_s} s"
+    fi
+fi
+
+# 10b. Linux: a process whose only use of a worktree is in a thread other
+# than its main one keeps it in use. Linux keeps a working directory and a
+# descriptor table per thread, and /proc/PID shows only the main thread's.
+# scripts/thread-holder.c, built here with cc, holds sub/ in three ways: a
+# thread with a working directory of its own (clone without CLONE_FS), one
+# with a descriptor table of its own (without CLONE_FILES), and threads
+# that keep both after the main thread ended with pthread_exit. Each must
+# be in_use by it in `explain`, and `remove --yes` must refuse it; once
+# it exits, the worktree is not in use.
+# Every link of PID's threads other than its main one, then its main one's.
+other_threads() { # PID
+    local t f
+    for t in /proc/"$1"/task/*; do
+        [ "${t##*/}" = "$1" ] && continue
+        readlink "$t/cwd"
+        for f in "$t"/fd/*; do readlink "$f"; done
+    done 2>/dev/null
+}
+main_thread() { # PID
+    local f
+    { readlink "/proc/$1/cwd"; for f in /proc/"$1"/fd/*; do readlink "$f"; done; } 2>/dev/null
+}
+thread_case() { # NAME MODE
+    name=$1
+    make_repo
+    local before wt_real holder i shaped others main
+    before=$(sums "$wt")
+    wt_real=$(cd "$wt" && pwd -P) || exit 2
+    case $2 in
+    own-cwd) set -- "$2" "$wt_real/sub" ;;
+    own-files) set -- "$2" "$wt_real/sub/file.txt" ;;
+    main-exited) set -- "$2" "$wt_real/sub" "$wt_real/sub/file.txt" ;;
+    esac
+    (cd "$work" && exec "$holder_bin" "$@") >/dev/null 2>&1 &
+    holder=$!
+    holders="$holders $holder"
+    # The shape is in place: another thread uses the worktree and the main
+    # thread's own view shows no use of it.
+    shaped=
+    for ((i = 0; i < 100; i++)); do
+        others=$(other_threads "$holder")
+        main=$(main_thread "$holder")
+        if grep -qF "$wt_real/" <<<"$others" && ! grep -qF "$wt_real/" <<<"$main"; then
+            case $1 in
+            main-exited) grep -q '^State:[[:space:]]*Z' "/proc/$holder/status" 2>/dev/null && shaped=yes ;;
+            *) shaped=yes ;;
+            esac
+        fi
+        [ -n "$shaped" ] && break
+        sleep 0.1
+    done
+    [ -n "$shaped" ] || { echo "contract-check: setup failed in $name: thread-holder $1 never held the worktree from another thread alone" >&2; kill "$holder" 2>/dev/null; exit 2; }
+    run explain --json "$wt"
+    local busy=$work/$name.busy
+    mv "$out" "$busy" || exit 2
+    local busy_status=$status
+    run remove --yes --json "$wt"
+    local remove_status=$status
+    local removed=$work/$name.remove
+    cp "$out" "$removed" || exit 2
+    kill "$holder" 2>/dev/null
+    wait "$holder" 2>/dev/null
+    if [ "$busy_status" != 0 ]; then out=$busy; fail "explain exit $busy_status, want 0"
+    elif ! jq -e --argjson pid "$holder" '.worktree.activity.state == "in_use" and .worktree.verdict == "keep" and any(.worktree.activity.processes[]; .pid == $pid and .command == "thread-holder")' "$busy" >/dev/null; then
+        out=$busy; fail "with thread-holder $1 in it, activity is $(jq -c '.worktree.activity' "$busy"), want in_use by thread-holder[$holder]"
+    elif [ "$remove_status" != 3 ]; then out=$removed; fail "remove exit $remove_status, want 3"
+    elif ! json_ok 1; then fail "stdout is not one valid remove document with 1 result"
+    elif [ "$(result 0 result)" != refused ]; then fail "result $(result 0 result), want refused"
+    elif [ "$(failing_checks 0)" != activity ]; then fail "failing checks: $(failing_checks 0), want activity"
+    elif ! untouched "$before"; then :
+    else
+        run explain --json "$wt"
+        if ! jq -e '.worktree.activity.state == "not_observed" and .worktree.verdict == "candidate"' "$out" >/dev/null; then fail "after thread-holder exited, activity is $(jq -c '.worktree.activity' "$out") and the verdict $(jq -r '.worktree.verdict' "$out"), want not_observed and candidate"
+        else ok; fi
+    fi
+}
+if [ "$(uname -s)" = Linux ]; then
+    name=activity-thread-build
+    command -v cc >/dev/null || { echo "contract-check: setup failed in $name: no C compiler (cc) to build scripts/thread-holder.c" >&2; exit 2; }
+    holder_bin=$work/thread-holder
+    setup cc -O2 -Wall -Werror -pthread -o "$holder_bin" "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/thread-holder.c"
+    thread_case activity-thread-own-cwd own-cwd
+    thread_case activity-thread-own-files own-files
+    thread_case activity-thread-main-exited main-exited
+    # A threaded process of yours that is not dumpable, as ssh-agent is, is
+    # one the kernel shows to root alone, in every thread: it is not
+    # inspected, as the README says, and the probe does not fail on it.
+    name=activity-thread-not-dumpable
+    if [ "$(id -u)" = 0 ]; then
+        echo "skip $name: root may read a process that is not dumpable"
+    else
+        make_repo
+        wt_real=$(cd "$wt" && pwd -P) || exit 2
+        (cd "$work" && exec "$holder_bin" not-dumpable "$wt_real/sub") >/dev/null 2>&1 &
+        holder=$!
+        holders="$holders $holder"
+        shaped=
+        for ((i = 0; i < 100; i++)); do
+            tasks=(/proc/"$holder"/task/*)
+            owner=$(stat -c %u "/proc/$holder/status" 2>/dev/null)
+            [ "${#tasks[@]}" = 2 ] && [ -n "$owner" ] && [ "$owner" != "$(id -u)" ] && { shaped=yes; break; }
+            sleep 0.1
+        done
+        [ -n "$shaped" ] || { echo "contract-check: setup failed in $name: thread-holder not-dumpable never ran two threads shown to root alone" >&2; kill "$holder" 2>/dev/null; exit 2; }
+        run explain --json "$wt"
+        kill "$holder" 2>/dev/null
+        wait "$holder" 2>/dev/null
+        if [ "$status" != 0 ]; then fail "explain exit $status, want 0"
+        elif ! jq -e '.activity.available == true and .worktree.activity.state == "not_observed"' "$out" >/dev/null; then fail "with a process that is not dumpable in it, the probe says $(jq -c '[.activity, .worktree.activity]' "$out"), want available and not_observed"
+        else ok; fi
     fi
 fi
 
