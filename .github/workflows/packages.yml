@@ -264,7 +264,7 @@ jobs:
   # serves them at https://whiteheap.github.io/residue/, an address that does
   # not change with this repository's name. Both secrets, the signing key and
   # the deploy key that can push there, belong to the github-pages
-  # environment, which only main and v* tags can use, so only this job can
+  # environment, which only main can use, so only this job can
   # read them. It signs only packages this workflow attested on main. One
   # run publishes at a time; the push's lease and the second latest-release
   # check keep a late run from replacing a newer release.
