@@ -266,7 +266,12 @@ jobs:
         with:
           release: "6.4"
           copyback: false
-          prepare: pkg install -y rust git bash jq
+          prepare: |
+            pkg query -a '%n %o %v' | grep -E '^(openssl|curl|libssh2|rsync) ' || true
+            pkg upgrade -y
+            pkg install -y rust git bash jq
+            pkg query -a '%n %o %v' | grep -E '^(openssl|curl|libssh2|rsync|rust) ' || true
+            ldd /usr/local/bin/cargo
           run: |
             # /tmp is tmpfs, which reports itself 100% free, so the watch
             # smoke test's disk-pressure case needs a disk-backed TMPDIR.
