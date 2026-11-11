@@ -41,6 +41,7 @@ const FORMAT: i64 = 1;
 /// `watch` has finished a pass since.
 pub const STALE_AFTER: i64 = 7 * 60 * 60;
 /// `STALE_AFTER`'s six hours, for the text that explains it.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 const PASSES_EVERY: &str = "6 hours";
 /// A record is under 2 KB, plus two paths for each ROOT the pass skipped; a
 /// reader stops at this, so nothing at the path can make it read without
@@ -530,6 +531,7 @@ fn write_at(path: &Path, pass: &Pass) -> Result<(), String> {
 }
 
 /// The record, or `None` when no `watch` has written one.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn read() -> Result<Option<Pass>, String> {
     read_at(&path()?)
 }
