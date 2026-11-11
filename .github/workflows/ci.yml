@@ -333,33 +333,30 @@ jobs:
         with:
           release: "r151054-build"
           copyback: false
-          # pkg.omnios.org drops TLS handshakes in bursts. pkg does not retry
-          # that error, E_SSL_CONNECT_ERROR, and fetches content over 20
-          # connections, so one dropped handshake stops the install (runs
-          # 43013552072 and 43029058196, #225). So package files come from
-          # OmniOS's US West mirror, another host, which pkg prefers while
-          # it is unused; catalogs and manifests still come from
-          # pkg.omnios.org, and pkg checks each file against its manifest.
-          # Each install gets five tries, waiting 15 s and then twice as
-          # long each time. A retry fetches only the files the last try did
-          # not get, and exit status 4 means nothing to do. The rustup
-          # installer goes to a file: curl's retry into a pipe can repeat
-          # bytes, and plain --retry skips a TLS error.
+          # pkg.omnios.org drops TLS handshakes for minutes at a time. pkg
+          # does not retry that error, E_SSL_CONNECT_ERROR, and opens 20
+          # connections for a download, so one dropped handshake stops the
+          # install (runs 43013552072 and 43029058196, #225). So each
+          # install gets eight tries over about 16 minutes, waiting 15 s,
+          # then twice as long each time up to 4 minutes. A retry fetches
+          # only the files the last try did not get, and exit status 4
+          # means nothing to do. The rustup installer goes to a file:
+          # curl's retry into a pipe can repeat bytes, and plain --retry
+          # skips a TLS error.
           prepare: |
-            pkg set-publisher --no-refresh -m https://us-west.mirror.omnios.org/r151054/core/ omnios
-            pkg set-publisher --no-refresh -m https://us-west.mirror.omnios.org/r151054/extra/ extra.omnios
             pkg_install() {
               n=1 t=15
               until pkg install "$@"; do
                 s=$?
                 [ "$s" -eq 4 ] && return 0
-                [ "$n" -lt 5 ] || return "$s"
+                [ "$n" -lt 8 ] || return "$s"
                 sleep "$t"
-                n=$((n + 1)) t=$((t * 2))
+                n=$((n + 1))
+                [ "$t" -ge 240 ] || t=$((t * 2))
               done
             }
             pkg_install developer/versioning/git
-            pkg_install jq || pkg_install ooce/text/jq
+            pkg_install jq
             curl -sSf --retry 5 --retry-all-errors -o /tmp/rustup-init.sh https://sh.rustup.rs
             sh /tmp/rustup-init.sh -y --profile minimal
           run: |
