@@ -86,6 +86,16 @@ jobs:
       - name: Lint
         if: env.CODE == 'true'
         run: cargo clippy --locked --all-targets -- -D warnings
+      # The FreeBSD, NetBSD and illumos jobs build in a VM but do not lint, so
+      # code that only one cfg reaches goes unused there unseen (#222). Clippy
+      # checks those targets from here without a VM or a linker.
+      - name: Lint for FreeBSD, NetBSD and illumos
+        if: ${{ env.CODE == 'true' && matrix.os == 'ubuntu-24.04' }}
+        run: |
+          for target in x86_64-unknown-freebsd x86_64-unknown-netbsd x86_64-unknown-illumos; do
+            rustup target add "$target"
+            cargo clippy --locked --all-targets --target "$target" -- -D warnings
+          done
       - name: In-crate tests
         if: env.CODE == 'true'
         run: cargo test --locked
