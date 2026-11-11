@@ -150,7 +150,19 @@ pub fn find(worktree: &Path) -> Option<TargetDir> {
         },
         Err(e) => return not_read(folder.join("config"), e.to_string()),
     };
-    let value = match target_dir(&bytes) {
+    // The text comes from the repository. The reader never panics on any
+    // input, as its tests check at every byte of several configs; should a
+    // fault in it slip through anyway, it costs this worktree's config,
+    // which reads as not read with the fault named, and the panic message
+    // still reaches stderr, never the scan of every other worktree, which a
+    // panic in an `inspect::all` worker stops.
+    let parsed = std::panic::catch_unwind(|| target_dir(&bytes)).unwrap_or_else(|panic| {
+        let text = (panic.downcast_ref::<&str>().copied())
+            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("no message");
+        Err(format!("residue failed while reading it ({text})"))
+    });
+    let value = match parsed {
         Ok(Some(value)) => value,
         Ok(None) => return None,
         Err(why) => return not_read(config, why),
@@ -359,8 +371,15 @@ impl Parser<'_> {
         self.s.get(self.i).copied()
     }
 
+    /// Whether `text` comes next. Every advance stops at the end of the
+    /// input, so `i` is never past it; the tests' debug builds check that
+    /// here and in `line_at`, and a release build reads past the end as the
+    /// end rather than stop every worktree's scan with a panic.
     fn at(&self, text: &str) -> bool {
-        self.s[self.i..].starts_with(text.as_bytes())
+        debug_assert!(self.i <= self.s.len());
+        self.s
+            .get(self.i..)
+            .is_some_and(|rest| rest.starts_with(text.as_bytes()))
     }
 
     fn eat(&mut self, byte: u8) -> bool {
@@ -372,8 +391,17 @@ impl Parser<'_> {
         }
     }
 
+    /// The line `i` is on. It counts from the start of the file, so only an
+    /// error asks for it: once per call would make reading a file of many
+    /// lines quadratic.
     fn line(&self) -> usize {
-        1 + self.s[..self.i].iter().filter(|&&b| b == b'\n').count()
+        self.line_at(self.i)
+    }
+
+    fn line_at(&self, i: usize) -> usize {
+        debug_assert!(i <= self.s.len());
+        let end = i.min(self.s.len());
+        1 + self.s[..end].iter().filter(|&&b| b == b'\n').count()
     }
 
     fn unexpected(&self) -> String {
@@ -453,7 +481,7 @@ impl Parser<'_> {
 
     /// `[table]` or `[[array.of.tables]]`.
     fn header(&mut self) -> Result<(), String> {
-        let line = self.line();
+        let start = self.i;
         self.i += 1;
         let array = self.eat(b'[');
         self.spaces();
@@ -468,7 +496,11 @@ impl Parser<'_> {
         // `build.target-dir` as a table, or `build` as an array of tables:
         // not a string, which Cargo refuses, and not one residue reads.
         if starts_with(&path, &KEY) || (array && starts_with(&KEY, &path)) {
-            return Err(format!("its line {line} makes {} a table", path.join(".")));
+            return Err(format!(
+                "its line {} makes {} a table",
+                self.line_at(start),
+                path.join(".")
+            ));
         }
         self.table = path;
         Ok(())
@@ -481,12 +513,19 @@ impl Parser<'_> {
             return Err(self.unexpected());
         }
         self.spaces();
-        let mut path = self.table.clone();
+        // The full key is the table's keys and the pair's. The table's are
+        // moved in and back, never copied: a copy per pair would cost the
+        // length of the header for each line under it.
+        let mut path = std::mem::take(&mut self.table);
+        let table = path.len();
         path.extend(key);
         if path == ["include"] {
             self.include = true;
         }
-        self.value(Some(&path))?;
+        let value = self.value(Some(&path));
+        path.truncate(table);
+        self.table = path;
+        value?;
         self.line_end()
     }
 
@@ -746,7 +785,16 @@ impl Parser<'_> {
         loop {
             match self.peek() {
                 None => return Err(self.unexpected()),
-                Some(b'\\') if quote == b'"' => self.i += 2,
+                // An escape is the backslash and the byte after it, so `\"`
+                // does not close the string. A backslash that ends the file
+                // has no byte after it: the string is not closed.
+                Some(b'\\') if quote == b'"' => {
+                    self.i += 1;
+                    if self.peek().is_none() {
+                        return Err(self.unexpected());
+                    }
+                    self.i += 1;
+                }
                 Some(c) if c == quote => {
                     let run = self.s[self.i..].iter().take_while(|&&b| b == quote).count();
                     self.i += run;
@@ -920,6 +968,81 @@ target-dir = "/b/x"
             found("include = [\"o.toml\"]\n[build]\ntarget-dir = \"/x\"\n"),
             "/x"
         );
+    }
+
+    #[test]
+    fn a_backslash_that_ends_the_file_is_an_error() {
+        // 8 bytes: a `"""` string whose last byte is a backslash. Reading it
+        // stepped past the end and panicked, which stopped the whole scan.
+        assert_eq!(
+            read("x = \"\"\"\\").unwrap_err(),
+            "residue does not read its line 1 as TOML"
+        );
+        for text in [
+            "a = [\"\"\"abc\\",
+            "build.target-dir = \"/x\"\nx = \"\"\"\\",
+            "x = \"\"\"\r\n\\",
+            "x = \"\"\"\\\\\\",
+        ] {
+            assert!(read(text).is_err(), "{text:?} gave {:?}", read(text));
+        }
+        // An escaped quote does not close the string; the escaped backslash
+        // before the closing quotes does not open an escape.
+        assert_eq!(read("x = \"\"\"a\\\"\"\"\"\n"), Ok(None));
+        assert_eq!(read("x = \"\"\"a\\\\\"\"\"\n"), Ok(None));
+    }
+
+    #[test]
+    fn every_prefix_of_a_config_is_an_answer_or_an_error() {
+        // Cut at every byte, as a file being written is, or one that ends
+        // inside a character: the text comes from the repository, so each
+        // must give an answer or an error and never a panic.
+        let configs: [&[u8]; 5] = [
+            b"[build]\ntarget-dir = \"../t\"\n",
+            "multi = \"\"\"\nline \\\"one\\\"\\\n  two \\t \\u00e9 \\U0001F600 \\\\\n\"\"\"\"\"\n\
+             lit = '''\n'one' ''two''\n'''\n\
+             [build]\ntarget-dir = \"/b\\u002fx\"\n"
+                .as_bytes(),
+            b"[alias]\nb = [\"build\", \"--release\"] # a comment\n\
+              [env]\nA = { value = \"v\", force = true, relative = false }\n\
+              nested = [[1, 2], { a = [\"b\", 'c'] }, ]\n\
+              when = 1979-05-27 07:32:00Z\n\
+              build = { jobs = 2, target-dir = 'C:\\t' }\n",
+            b"[build]\r\njobs = 4\r\n# CRLF\r\nm = \"\"\"\r\na\\\r\n\"\"\"\r\ntarget-dir = \"t\"\r\n",
+            "[\"b\u{e9}\".'x']\nk = \"\u{1F600}\"\n[[a.b]]\nc = '\u{e9}'\n".as_bytes(),
+        ];
+        for config in configs {
+            // Whole, each is TOML the reader reads through.
+            let whole = target_dir(config);
+            assert!(whole.is_ok(), "{whole:?}");
+            for end in 0..config.len() {
+                let _answer_or_error = target_dir(&config[..end]);
+            }
+        }
+    }
+
+    #[test]
+    fn reading_takes_time_in_proportion_to_the_file() {
+        // The largest file residue reads, in the shapes that made reading
+        // it quadratic: a header of many keys or one long key, then a pair
+        // per line under it (a copy of the header per pair), and a header
+        // per line (a count of lines from the start per header). A scan of
+        // the first took 39 s of CPU and of the last 1.8 s (#208); now each
+        // is milliseconds, and a debug build stays far below this bound.
+        let half = CONFIG_LIMIT / 2;
+        let pairs = "b=1\n".repeat(half / 4 - 1);
+        let shapes = [
+            format!("[{}]\n{pairs}", vec!["a"; half / 2].join(".")),
+            format!("[{}]\n{pairs}", "a".repeat(half)),
+            "[a]\n".repeat(CONFIG_LIMIT / 4),
+        ];
+        let start = std::time::Instant::now();
+        for text in &shapes {
+            assert!(text.len() <= CONFIG_LIMIT);
+            assert_eq!(read(text), Ok(None));
+        }
+        let took = start.elapsed();
+        assert!(took < std::time::Duration::from_secs(10), "{took:?}");
     }
 
     /// A folder of the test's own, by its canonical path, holding `wt`, a
